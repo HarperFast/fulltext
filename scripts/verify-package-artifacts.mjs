@@ -1,4 +1,5 @@
 import { readdirSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 
 import { platformTriple } from '../dist/load-addon.js';
 
@@ -11,4 +12,6 @@ export function verifyPackageArtifacts(entries, expectedArtifact) {
 	}
 }
 
-verifyPackageArtifacts(readdirSync(new URL('../', import.meta.url)), `fulltext.${platformTriple()}.node`);
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+	verifyPackageArtifacts(readdirSync(new URL('../', import.meta.url)), `fulltext.${platformTriple()}.node`);
+}

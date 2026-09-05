@@ -20,6 +20,11 @@ fulltext function, method, and constructor uses that option to contain argument 
 conversion panics. That outer boundary uses napi-rs error mapping; the inner boundary adds stable
 error codes and per-handle poison state for package-owned operations.
 
+napi-rs 2.16 accumulates generated type records in a checkout-specific temporary file. Native build
+scripts remove those exact intermediate files and refresh the crate entry point's modification time
+before rebuilding, so switching between test and release features cannot retain test-only
+declarations through Cargo's incremental compilation.
+
 ## JavaScript development graph
 
 | Dependency            | Scope       | Purpose                                                               |

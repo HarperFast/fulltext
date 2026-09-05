@@ -374,13 +374,17 @@ fn verify_watch(directory: &dyn Directory) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::collections::HashMap;
+	use std::path::PathBuf;
 	use std::sync::atomic::AtomicBool;
+	use std::sync::RwLock;
 
 	use tantivy::directory::{Lock, MmapDirectory};
 
 	#[derive(Clone, Debug)]
 	struct BrokenDirectory {
 		inner: MmapDirectory,
+		atomic_files: Arc<RwLock<HashMap<PathBuf, Vec<u8>>>>,
 		ignore_locks: bool,
 		fail_next_atomic_write: Arc<AtomicBool>,
 		non_atomic_next_write: Arc<AtomicBool>,
@@ -392,6 +396,7 @@ mod tests {
 		fn new(ignore_locks: bool) -> Self {
 			Self {
 				inner: MmapDirectory::create_from_tempdir().unwrap(),
+				atomic_files: Arc::new(RwLock::new(HashMap::new())),
 				ignore_locks,
 				fail_next_atomic_write: Arc::new(AtomicBool::new(false)),
 				non_atomic_next_write: Arc::new(AtomicBool::new(false)),
@@ -428,7 +433,13 @@ mod tests {
 		}
 
 		fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
-			let result = self.inner.atomic_read(path);
+			let result = self
+				.atomic_files
+				.read()
+				.unwrap()
+				.get(path)
+				.cloned()
+				.ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_path_buf()));
 			if self.non_atomic_write_active.load(Ordering::Acquire)
 				&& match &result {
 					Ok(bytes) => bytes.len() != 4096,
@@ -442,12 +453,10 @@ mod tests {
 		fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
 			if self.non_atomic_next_write.swap(false, Ordering::AcqRel) {
 				self.non_atomic_write_active.store(true, Ordering::Release);
-				if self.inner.exists(path).unwrap_or(false) {
-					self.inner.delete(path).map_err(io::Error::other)?;
-				}
-				let mut writer = self.inner.open_write(path).map_err(io::Error::other)?;
-				writer.write_all(&data[..data.len() / 2])?;
-				writer.flush()?;
+				self.atomic_files
+					.write()
+					.unwrap()
+					.insert(path.to_path_buf(), data[..data.len() / 2].to_vec());
 				let deadline = std::time::Instant::now() + Duration::from_secs(2);
 				while !self.partial_write_observed.load(Ordering::Acquire) {
 					if std::time::Instant::now() >= deadline {
@@ -456,20 +465,24 @@ mod tests {
 					}
 					thread::yield_now();
 				}
-				writer.write_all(&data[data.len() / 2..])?;
-				let result = writer.terminate();
+				self.atomic_files
+					.write()
+					.unwrap()
+					.insert(path.to_path_buf(), data.to_vec());
 				self.non_atomic_write_active.store(false, Ordering::Release);
-				return result;
+				return Ok(());
 			}
 			if !self.fail_next_atomic_write.swap(false, Ordering::AcqRel) {
-				return self.inner.atomic_write(path, data);
+				self.atomic_files
+					.write()
+					.unwrap()
+					.insert(path.to_path_buf(), data.to_vec());
+				return Ok(());
 			}
-			if self.inner.exists(path).unwrap_or(false) {
-				self.inner.delete(path).map_err(io::Error::other)?;
-			}
-			let mut writer = self.inner.open_write(path).map_err(io::Error::other)?;
-			writer.write_all(&data[..data.len() / 2])?;
-			writer.flush()?;
+			self.atomic_files
+				.write()
+				.unwrap()
+				.insert(path.to_path_buf(), data[..data.len() / 2].to_vec());
 			Err(io::Error::other("injected partial write"))
 		}
 
@@ -521,6 +534,9 @@ mod tests {
 		let after = vec![b'b'; 4096];
 		directory.atomic_write(Path::new("meta.json"), &before).unwrap();
 		directory.make_next_write_non_atomic();
-		assert!(verify_concurrent_atomic_replacement(&directory, &before, &after).is_err());
+		assert_eq!(
+			verify_concurrent_atomic_replacement(&directory, &before, &after).unwrap_err(),
+			"atomic metadata observer saw a partial value"
+		);
 	}
 }

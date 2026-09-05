@@ -29,10 +29,11 @@
 	},
 	"scripts": {
 		"build": "npm run build:typescript && npm run build:native",
-		"build:debug": "npm run build:typescript && napi build --platform --js false --dts ts/addon.d.ts --features node-api",
-		"build:native": "napi build --platform --js false --dts ts/addon.d.ts --release --features node-api",
-		"build:test-native": "napi build --platform --js false --dts ts/addon.d.ts --features test-panic",
+		"build:debug": "npm run clean:generated-native && npm run build:typescript && napi build --platform --js false --dts ts/addon.d.ts --features node-api",
+		"build:native": "npm run clean:generated-native && napi build --platform --js false --dts ts/addon.d.ts --release --features node-api",
+		"build:test-native": "npm run clean:generated-native && napi build --platform --js false --dts ts/addon.d.ts --features test-panic",
 		"build:typescript": "tsc -p tsconfig.json",
+		"clean:generated-native": "node scripts/clean-native-build-state.mjs",
 		"check": "npm run format:check && npm run lint && npm run test",
 		"format": "prettier --write . && cargo fmt",
 		"format:check": "prettier --check . && cargo fmt --check",
@@ -40,7 +41,7 @@
 		"prepack": "npm run build:native && npm run build:typescript && npm run verify:package-artifacts",
 		"test": "cargo test --locked --all-features && npm run test:node",
 		"test:rust": "cargo test --locked --all-features",
-		"test:node": "npm run build:test-native && npm run build:typescript && node --test test/dependencies.test.mjs test/napi-boundaries.test.mjs test/native.test.mjs test/package-artifacts.test.mjs && npm run build:native && npm run build:typescript && node --test test/package.test.mjs",
+		"test:node": "npm run build:test-native && npm run build:typescript && node scripts/run-node-tests.mjs test && npm run build:native && npm run build:typescript && node scripts/run-node-tests.mjs release",
 		"verify:package-artifacts": "node scripts/verify-package-artifacts.mjs"
 	},
 	"engines": {

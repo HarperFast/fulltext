@@ -6,25 +6,28 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-const npmInvocation = process.env.npm_execpath
+const npmCommand = process.env.npm_execpath
 	? { executable: process.execPath, prefix: [process.env.npm_execpath] }
 	: { executable: process.platform === 'win32' ? process.env.ComSpec || 'cmd.exe' : 'npm', prefix: [] };
 
 function runNpm(arguments_, options) {
-	const argumentsWithPrefix = [...npmInvocation.prefix];
-	if (process.platform === 'win32' && npmInvocation.prefix.length === 0) {
+	const argumentsWithPrefix = [...npmCommand.prefix];
+	if (process.platform === 'win32' && npmCommand.prefix.length === 0) {
 		argumentsWithPrefix.push('/d', '/s', '/c', 'npm.cmd');
 	}
 	argumentsWithPrefix.push(...arguments_);
-	return execFileSync(npmInvocation.executable, argumentsWithPrefix, options);
+	return execFileSync(npmCommand.executable, argumentsWithPrefix, options);
 }
 
 test('the packed package loads without consumer lifecycle scripts', (context) => {
 	const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-'));
 	context.after(() => rmSync(temporaryDirectory, { force: true, recursive: true }));
-	const packOutput = runNpm(['pack', '--json', '--pack-destination', temporaryDirectory], {
-		encoding: 'utf8',
-	});
+	const packOutput = runNpm(
+		['pack', '--json', '--foreground-scripts=false', '--pack-destination', temporaryDirectory],
+		{
+			encoding: 'utf8',
+		},
+	);
 	const parsedOutput = JSON.parse(packOutput);
 	const pack = Array.isArray(parsedOutput) ? parsedOutput[0] : parsedOutput['@harperfast/fulltext'];
 	const { filename, files } = pack;
@@ -32,6 +35,7 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 	assert(includedPaths.includes('dist/native.js'));
 	assert(includedPaths.some((file) => /^fulltext\..+\.node$/.test(file)));
 	assert(!includedPaths.some((file) => file.startsWith('src/') || file === 'ts/addon.d.ts'));
+	assert.doesNotMatch(readFileSync(new URL('../ts/addon.d.ts', import.meta.url), 'utf8'), /TestHandle/);
 
 	const projectDirectory = path.join(temporaryDirectory, 'consumer');
 	mkdirSync(projectDirectory);
