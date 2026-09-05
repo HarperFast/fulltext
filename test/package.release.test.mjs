@@ -1,7 +1,6 @@
 import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -62,15 +61,14 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 		assert(!installedManifest.scripts?.[lifecycle], `${lifecycle} must not run in a consumer installation`);
 	}
 	const artifact = includedPaths.find((file) => /^fulltext\..+\.node$/.test(file));
-	const require = createRequire(import.meta.url);
-	const installedAddon = require(path.join(projectDirectory, 'node_modules/@harperfast/fulltext', artifact));
-	assert(!('__testCreateHandle' in installedAddon));
+	const installedAddonPath = path.join(projectDirectory, 'node_modules/@harperfast/fulltext', artifact);
 	const output = execFileSync(
 		process.execPath,
 		[
 			'--input-type=module',
 			'--eval',
-			"import('@harperfast/fulltext/native').then(x => x.runtimeInfo()).then(console.log)",
+			"import { createRequire } from 'node:module'; const addon = createRequire(import.meta.url)(process.argv[1]); if ('__testCreateHandle' in addon) process.exit(1); console.log(await import('@harperfast/fulltext/native').then(x => x.runtimeInfo()));",
+			installedAddonPath,
 		],
 		{ cwd: projectDirectory, encoding: 'utf8' },
 	);

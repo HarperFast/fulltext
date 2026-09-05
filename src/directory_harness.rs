@@ -242,7 +242,6 @@ where
 	let observer_before = before.to_vec();
 	let observer_after = after.to_vec();
 	let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
-	let (stop_sender, stop_receiver) = mpsc::channel();
 	let observer = thread::spawn(move || -> Result<(), String> {
 		let initial = observer_directory
 			.atomic_read(path)
@@ -251,26 +250,27 @@ where
 			return Err("atomic metadata observer did not read the initial value".to_owned());
 		}
 		ready_sender.send(()).map_err(|error| error.to_string())?;
+		let deadline = std::time::Instant::now() + Duration::from_secs(2);
 		loop {
-			match stop_receiver.try_recv() {
-				Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
-				Err(mpsc::TryRecvError::Empty) => {}
-			}
 			let observed = observer_directory
 				.atomic_read(path)
 				.map_err(|error| error.to_string())?;
-			if observed != observer_before && observed != observer_after {
+			if observed == observer_after {
+				return Ok(());
+			}
+			if observed != observer_before {
 				return Err("atomic metadata observer saw a partial value".to_owned());
+			}
+			if std::time::Instant::now() >= deadline {
+				return Err("atomic metadata observer did not observe the replacement".to_owned());
 			}
 			thread::yield_now();
 		}
-		Ok(())
 	});
 	ready_receiver
 		.recv_timeout(Duration::from_secs(2))
 		.map_err(|error| error.to_string())?;
 	let write_result = directory.atomic_write(path, after).map_err(|error| error.to_string());
-	let _ = stop_sender.send(());
 	let observer_result = observer
 		.join()
 		.map_err(|_| "atomic metadata observer panicked".to_owned())?;
