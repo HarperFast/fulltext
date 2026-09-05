@@ -1,4 +1,5 @@
 Cargo.lock
+package-lock.json
 dist/
 target/
 ts/addon.d.ts

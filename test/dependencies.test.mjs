@@ -11,8 +11,10 @@ test('every direct dependency is documented', () => {
 	for (const dependency of cargoDependencies(cargoManifest)) {
 		assert(dependencyLedger.includes(`\`${dependency}\``), `${dependency} is absent from dependencies.md`);
 	}
-	for (const dependency of Object.keys(packageManifest.devDependencies)) {
-		assert(dependencyLedger.includes(`\`${dependency}\``), `${dependency} is absent from dependencies.md`);
+	for (const section of ['dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies']) {
+		for (const dependency of Object.keys(packageManifest[section] ?? {})) {
+			assert(dependencyLedger.includes(`\`${dependency}\``), `${dependency} is absent from dependencies.md`);
+		}
 	}
 });
 

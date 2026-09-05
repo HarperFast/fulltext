@@ -1,14 +1,19 @@
 use std::fmt;
+use std::future::Future;
 use std::io::{self, Write};
 use std::ops::Range;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread;
 use std::time::Duration;
 
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
-	Directory, DirectoryLock, FileHandle, OwnedBytes, WatchCallback, WatchHandle, WritePtr, INDEX_WRITER_LOCK,
+	Directory, DirectoryLock, FileHandle, OwnedBytes, TerminatingWrite, WatchCallback, WatchHandle, WritePtr,
+	INDEX_WRITER_LOCK,
 };
 use tantivy::HasLen;
 
@@ -75,6 +80,21 @@ impl FileHandle for InstrumentedFileHandle {
 			.fetch_add((range.end - range.start) as u64, Ordering::Relaxed);
 		self.inner.read_bytes(range)
 	}
+
+	fn read_bytes_async<'life0, 'async_trait>(
+		&'life0 self,
+		range: Range<usize>,
+	) -> Pin<Box<dyn Future<Output = io::Result<OwnedBytes>> + Send + 'async_trait>>
+	where
+		'life0: 'async_trait,
+		Self: 'async_trait,
+	{
+		self.counters.calls.fetch_add(1, Ordering::Relaxed);
+		self.counters
+			.bytes_requested
+			.fetch_add((range.end - range.start) as u64, Ordering::Relaxed);
+		self.inner.read_bytes_async(range)
+	}
 }
 
 impl<D> Directory for InstrumentedDirectory<D>
@@ -130,13 +150,26 @@ pub fn verify_directory_baseline<D>(directory: D) -> Result<LogicalReadMetrics, 
 where
 	D: Directory + Clone,
 {
+	verify_concurrent_atomic_visibility(&directory)?;
 	let directory = InstrumentedDirectory::new(directory);
+	verify_missing_file_errors(&directory)?;
 	verify_write_read_delete(&directory)?;
 	verify_atomic_metadata(&directory)?;
 	verify_in_process_writer_exclusion(&directory)?;
 	verify_watch(&directory)?;
 	directory.sync_directory().map_err(|error| error.to_string())?;
 	Ok(directory.logical_read_metrics())
+}
+
+fn verify_missing_file_errors(directory: &dyn Directory) -> Result<(), String> {
+	let path = Path::new("missing");
+	if !matches!(directory.open_read(path), Err(OpenReadError::FileDoesNotExist(_))) {
+		return Err("opening a missing file returned the wrong result".to_owned());
+	}
+	if !matches!(directory.delete(path), Err(DeleteError::FileDoesNotExist(_))) {
+		return Err("deleting a missing file returned the wrong result".to_owned());
+	}
+	Ok(())
 }
 
 fn verify_write_read_delete<D>(directory: &D) -> Result<(), String>
@@ -146,37 +179,127 @@ where
 	let path = Path::new("segment");
 	let mut writer = directory.open_write(path).map_err(|error| error.to_string())?;
 	writer.write_all(b"0123456789").map_err(|error| error.to_string())?;
-	writer.flush().map_err(|error| error.to_string())?;
+	writer.terminate().map_err(|error| error.to_string())?;
+	if !matches!(directory.open_write(path), Err(OpenWriteError::FileAlreadyExists(_))) {
+		return Err("opening an existing file for write returned the wrong result".to_owned());
+	}
 
 	let file = directory.open_read(path).map_err(|error| error.to_string())?;
 	let middle = file.slice(2..7).read_bytes().map_err(|error| error.to_string())?;
 	if middle.as_slice() != b"23456" {
 		return Err("range read returned unexpected bytes".to_owned());
 	}
+	let asynchronous = block_on(file.slice(7..10).read_bytes_async()).map_err(|error| error.to_string())?;
+	if asynchronous.as_slice() != b"789" {
+		return Err("asynchronous range read returned unexpected bytes".to_owned());
+	}
+	let empty = file.slice(4..4).read_bytes().map_err(|error| error.to_string())?;
+	if !empty.is_empty() {
+		return Err("zero-length range read returned bytes".to_owned());
+	}
 	let deleting_directory = directory.clone();
 	let delete_result = std::thread::spawn(move || deleting_directory.delete(Path::new("segment")))
 		.join()
 		.map_err(|_| "segment deletion panicked".to_owned())?;
-	if cfg!(windows) {
-		if delete_result.is_ok() {
-			return Err("Windows deleted a mapped file unexpectedly".to_owned());
-		}
-		let retained = file.read_bytes().map_err(|error| error.to_string())?;
-		if retained.as_slice() != b"0123456789" {
-			return Err("an open file changed after a rejected deletion".to_owned());
-		}
-		drop(retained);
-		drop(middle);
-		drop(file);
+	let retained = file.read_bytes().map_err(|error| error.to_string())?;
+	if retained.as_slice() != b"0123456789" {
+		return Err("an open file changed while deletion was attempted".to_owned());
+	}
+	let deletion_succeeded = delete_result.is_ok();
+	drop(retained);
+	drop(asynchronous);
+	drop(empty);
+	drop(middle);
+	drop(file);
+	if !deletion_succeeded {
 		directory.delete(path).map_err(|error| error.to_string())?;
-	} else {
-		delete_result.map_err(|error| error.to_string())?;
-		let retained = file.read_bytes().map_err(|error| error.to_string())?;
-		if retained.as_slice() != b"0123456789" {
-			return Err("an open file changed after deletion".to_owned());
-		}
+	}
+	if !matches!(directory.open_read(path), Err(OpenReadError::FileDoesNotExist(_))) {
+		return Err("deleted file remained visible".to_owned());
 	}
 	Ok(())
+}
+
+fn verify_concurrent_atomic_visibility<D>(directory: &D) -> Result<(), String>
+where
+	D: Directory + Clone,
+{
+	let path = Path::new("meta.json");
+	let before = vec![b'a'; 4096];
+	let after = vec![b'b'; 4096];
+	directory
+		.atomic_write(path, &before)
+		.map_err(|error| error.to_string())?;
+	verify_concurrent_atomic_replacement(directory, &before, &after)
+}
+
+fn verify_concurrent_atomic_replacement<D>(directory: &D, before: &[u8], after: &[u8]) -> Result<(), String>
+where
+	D: Directory + Clone,
+{
+	let path = Path::new("meta.json");
+	let observer_directory = directory.clone();
+	let observer_before = before.to_vec();
+	let observer_after = after.to_vec();
+	let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+	let (stop_sender, stop_receiver) = mpsc::channel();
+	let observer = thread::spawn(move || -> Result<(), String> {
+		let initial = observer_directory
+			.atomic_read(path)
+			.map_err(|error| error.to_string())?;
+		if initial != observer_before {
+			return Err("atomic metadata observer did not read the initial value".to_owned());
+		}
+		ready_sender.send(()).map_err(|error| error.to_string())?;
+		loop {
+			match stop_receiver.try_recv() {
+				Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+				Err(mpsc::TryRecvError::Empty) => {}
+			}
+			let observed = observer_directory
+				.atomic_read(path)
+				.map_err(|error| error.to_string())?;
+			if observed != observer_before && observed != observer_after {
+				return Err("atomic metadata observer saw a partial value".to_owned());
+			}
+			thread::yield_now();
+		}
+		Ok(())
+	});
+	ready_receiver
+		.recv_timeout(Duration::from_secs(2))
+		.map_err(|error| error.to_string())?;
+	let write_result = directory.atomic_write(path, after).map_err(|error| error.to_string());
+	let _ = stop_sender.send(());
+	let observer_result = observer
+		.join()
+		.map_err(|_| "atomic metadata observer panicked".to_owned())?;
+	write_result?;
+	observer_result?;
+	if directory.atomic_read(path).map_err(|error| error.to_string())? != after {
+		return Err("atomic metadata replacement returned unexpected bytes".to_owned());
+	}
+	Ok(())
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+	struct ThreadWake(thread::Thread);
+
+	impl Wake for ThreadWake {
+		fn wake(self: Arc<Self>) {
+			self.0.unpark();
+		}
+	}
+
+	let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
+	let mut context = Context::from_waker(&waker);
+	let mut future = std::pin::pin!(future);
+	loop {
+		match future.as_mut().poll(&mut context) {
+			Poll::Ready(output) => return output,
+			Poll::Pending => thread::park(),
+		}
+	}
 }
 
 pub fn verify_failed_atomic_replacement(
@@ -260,6 +383,9 @@ mod tests {
 		inner: MmapDirectory,
 		ignore_locks: bool,
 		fail_next_atomic_write: Arc<AtomicBool>,
+		non_atomic_next_write: Arc<AtomicBool>,
+		non_atomic_write_active: Arc<AtomicBool>,
+		partial_write_observed: Arc<AtomicBool>,
 	}
 
 	impl BrokenDirectory {
@@ -268,11 +394,19 @@ mod tests {
 				inner: MmapDirectory::create_from_tempdir().unwrap(),
 				ignore_locks,
 				fail_next_atomic_write: Arc::new(AtomicBool::new(false)),
+				non_atomic_next_write: Arc::new(AtomicBool::new(false)),
+				non_atomic_write_active: Arc::new(AtomicBool::new(false)),
+				partial_write_observed: Arc::new(AtomicBool::new(false)),
 			}
 		}
 
 		fn fail_next_atomic_write(&self) {
 			self.fail_next_atomic_write.store(true, Ordering::Release);
+		}
+
+		fn make_next_write_non_atomic(&self) {
+			self.non_atomic_next_write.store(true, Ordering::Release);
+			self.partial_write_observed.store(false, Ordering::Release);
 		}
 	}
 
@@ -294,10 +428,39 @@ mod tests {
 		}
 
 		fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
-			self.inner.atomic_read(path)
+			let result = self.inner.atomic_read(path);
+			if self.non_atomic_write_active.load(Ordering::Acquire)
+				&& match &result {
+					Ok(bytes) => bytes.len() != 4096,
+					Err(_) => true,
+				} {
+				self.partial_write_observed.store(true, Ordering::Release);
+			}
+			result
 		}
 
 		fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+			if self.non_atomic_next_write.swap(false, Ordering::AcqRel) {
+				self.non_atomic_write_active.store(true, Ordering::Release);
+				if self.inner.exists(path).unwrap_or(false) {
+					self.inner.delete(path).map_err(io::Error::other)?;
+				}
+				let mut writer = self.inner.open_write(path).map_err(io::Error::other)?;
+				writer.write_all(&data[..data.len() / 2])?;
+				writer.flush()?;
+				let deadline = std::time::Instant::now() + Duration::from_secs(2);
+				while !self.partial_write_observed.load(Ordering::Acquire) {
+					if std::time::Instant::now() >= deadline {
+						self.non_atomic_write_active.store(false, Ordering::Release);
+						return Err(io::Error::other("observer did not inspect partial metadata"));
+					}
+					thread::yield_now();
+				}
+				writer.write_all(&data[data.len() / 2..])?;
+				let result = writer.terminate();
+				self.non_atomic_write_active.store(false, Ordering::Release);
+				return result;
+			}
 			if !self.fail_next_atomic_write.swap(false, Ordering::AcqRel) {
 				return self.inner.atomic_write(path, data);
 			}
@@ -330,8 +493,8 @@ mod tests {
 	fn mmap_directory_satisfies_the_contract() {
 		let directory = MmapDirectory::create_from_tempdir().unwrap();
 		let metrics = verify_directory_baseline(directory).unwrap();
-		assert_eq!(metrics.calls, 4);
-		assert_eq!(metrics.bytes_requested, 26);
+		assert_eq!(metrics.calls, 6);
+		assert_eq!(metrics.bytes_requested, 29);
 	}
 
 	#[test]
@@ -349,5 +512,15 @@ mod tests {
 			directory.atomic_write(Path::new("meta.json"), b"replacement")
 		})
 		.is_err());
+	}
+
+	#[test]
+	fn harness_rejects_partial_metadata_during_successful_replacement() {
+		let directory = BrokenDirectory::new(false);
+		let before = vec![b'a'; 4096];
+		let after = vec![b'b'; 4096];
+		directory.atomic_write(Path::new("meta.json"), &before).unwrap();
+		directory.make_next_write_non_atomic();
+		assert!(verify_concurrent_atomic_replacement(&directory, &before, &after).is_err());
 	}
 }

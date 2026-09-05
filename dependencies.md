@@ -16,8 +16,9 @@ The Rust dependency graph must not include RocksDB. The future Rocks backend cal
 capability table owned by rocksdb-js rather than linking a second RocksDB runtime.
 
 napi-rs 2.16 generates an outer unwind boundary only for exports marked `catch_unwind`. Every
-fulltext function and method uses that option to cover argument and result conversion; the inner
-boundary adds stable error codes and per-handle poison state for package-owned operations.
+fulltext function, method, and constructor uses that option to contain argument and result
+conversion panics. That outer boundary uses napi-rs error mapping; the inner boundary adds stable
+error codes and per-handle poison state for package-owned operations.
 
 ## JavaScript development graph
 

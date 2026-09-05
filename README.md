@@ -28,7 +28,8 @@ console.log(info.tantivyVersion);
 ```
 
 `runtimeInfo()` is asynchronous so later search and indexing operations can remain off the Node.js
-event loop without changing the public calling convention.
+event loop without changing the public calling convention. Its first call may synchronously load
+the native artifact; search, indexing, commit, and storage work will use the package executor.
 
 ## Storage boundaries
 

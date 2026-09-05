@@ -30,7 +30,9 @@ of `npm pack` into a temporary consumer project.
 - Do not link RocksDB into this addon. The future Rocks backend must use the versioned lease owned
   by rocksdb-js.
 - Do not expose generated Node-API declarations as the public TypeScript API.
-- Keep CPU and I/O work off the Node.js event loop.
+- Keep CPU and sustained I/O work off the Node.js event loop. The promise-shaped capability call may
+  synchronously load the addon once; no search, indexing, commit, or storage operation gets that
+  exception.
 - Add a direct test for each source module.
 
 Open an issue before changing a public package entry point, native ABI, persistence contract, or

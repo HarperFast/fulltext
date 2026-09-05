@@ -37,10 +37,11 @@
 		"format": "prettier --write . && cargo fmt",
 		"format:check": "prettier --check . && cargo fmt --check",
 		"lint": "tsc -p tsconfig.json --noEmit && cargo clippy --locked --all-targets --all-features -- -D warnings",
-		"prepack": "npm run build:native && npm run build:typescript",
+		"prepack": "npm run build:native && npm run build:typescript && npm run verify:package-artifacts",
 		"test": "cargo test --locked --all-features && npm run test:node",
 		"test:rust": "cargo test --locked --all-features",
-		"test:node": "npm run build:test-native && npm run build:typescript && node --test --test-concurrency=1 test/*.test.mjs"
+		"test:node": "npm run build:test-native && npm run build:typescript && node --test test/dependencies.test.mjs test/napi-boundaries.test.mjs test/native.test.mjs test/package-artifacts.test.mjs && npm run build:native && npm run build:typescript && node --test test/package.test.mjs",
+		"verify:package-artifacts": "node scripts/verify-package-artifacts.mjs"
 	},
 	"engines": {
 		"node": "^22.18.0 || >=24.0.0"

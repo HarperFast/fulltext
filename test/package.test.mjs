@@ -19,11 +19,10 @@ function runNpm(arguments_, options) {
 	return execFileSync(npmInvocation.executable, argumentsWithPrefix, options);
 }
 
-test('the packed package loads without lifecycle scripts', (context) => {
+test('the packed package loads without consumer lifecycle scripts', (context) => {
 	const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-'));
 	context.after(() => rmSync(temporaryDirectory, { force: true, recursive: true }));
-	runNpm(['run', 'build:native'], { stdio: 'pipe' });
-	const packOutput = runNpm(['pack', '--json', '--ignore-scripts', '--pack-destination', temporaryDirectory], {
+	const packOutput = runNpm(['pack', '--json', '--pack-destination', temporaryDirectory], {
 		encoding: 'utf8',
 	});
 	const parsedOutput = JSON.parse(packOutput);
@@ -55,7 +54,9 @@ test('the packed package loads without lifecycle scripts', (context) => {
 	const installedManifest = JSON.parse(
 		readFileSync(path.join(projectDirectory, 'node_modules/@harperfast/fulltext/package.json'), 'utf8'),
 	);
-	assert(!installedManifest.scripts?.install);
+	for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepare']) {
+		assert(!installedManifest.scripts?.[lifecycle], `${lifecycle} must not run in a consumer installation`);
+	}
 	const artifact = includedPaths.find((file) => /^fulltext\..+\.node$/.test(file));
 	const require = createRequire(import.meta.url);
 	const installedAddon = require(path.join(projectDirectory, 'node_modules/@harperfast/fulltext', artifact));

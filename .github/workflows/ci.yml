@@ -39,6 +39,7 @@ jobs:
       - run: npm run format:check
       - run: npm run lint
       - run: npm test
+      - run: git diff --exit-code -- ts/addon.d.ts
 
   supply-chain:
     name: Supply chain and native linkage
@@ -62,7 +63,12 @@ jobs:
           artifact=fulltext.linux-x64-gnu.node
           test -f "$artifact"
           if cargo tree --locked --all-features | grep -qi rocksdb; then exit 1; fi
-          if nm --defined-only "$artifact" | grep -qi rocksdb; then exit 1; fi
-          if ldd "$artifact" | grep -qi rocksdb; then exit 1; fi
+          nm -D --defined-only "$artifact" > "$RUNNER_TEMP/fulltext-symbols.txt"
+          test -s "$RUNNER_TEMP/fulltext-symbols.txt"
+          grep -q napi_register_module_v1 "$RUNNER_TEMP/fulltext-symbols.txt"
+          if grep -qi rocksdb "$RUNNER_TEMP/fulltext-symbols.txt"; then exit 1; fi
+          ldd "$artifact" > "$RUNNER_TEMP/fulltext-linkage.txt"
+          test -s "$RUNNER_TEMP/fulltext-linkage.txt"
+          if grep -qi rocksdb "$RUNNER_TEMP/fulltext-linkage.txt"; then exit 1; fi
       - name: Verify unwind profile
         run: cargo rustc --locked --release --features node-api -- --print cfg | grep 'panic="unwind"'

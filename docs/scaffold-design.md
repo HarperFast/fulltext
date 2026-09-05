@@ -119,9 +119,9 @@ The crate builds as:
 
 The initial N-API surface is deliberately small: typed package/version/ABI capability reporting
 proves loading and generated declarations without JSON serialization. The public façade exposes it
-as a Promise so no future work API inherits a synchronous public signature. Constant-time native
-introspection may be implemented synchronously underneath that façade; blocking, `block_on`, and
-CPU- or I/O-bearing synchronous exports are forbidden. Issue #17 introduces the bounded
+as a Promise so no future work API inherits a synchronous public signature. The first call may
+synchronously load the native addon before performing constant-time introspection; sustained
+blocking, `block_on`, and CPU- or I/O-bearing synchronous exports are forbidden. Issue #17 introduces the bounded
 package-owned executor before any search, indexing, commit, or storage operation is exposed.
 Packed operations use borrowed request buffers and transfer owned `Vec<u8>` responses rather than
 JSON strings. Batch operations are the default shape; the façade never invokes native code once per
@@ -132,8 +132,11 @@ The release and benchmark profiles use thin LTO, one codegen unit, and `panic = 
 The addon does not install a global allocator because doing so could change allocation behavior for
 the host Node process. Every package-owned N-API boundary invokes a shared `catch_unwind` adapter
 that converts a panic into a JavaScript error with a stable native `code`; every exported function
-and method also enables napi-rs 2.16's generated `catch_unwind` wrapper so result conversion remains
-inside an unwind boundary. A test-only Cargo feature exposes a handle-level panic probe to the Node
+and method, including constructors, also enables napi-rs 2.16's generated `catch_unwind` wrapper so
+argument and result conversion remain inside an unwind boundary. A source-level CI gate rejects new
+Node-API functions without that wrapper. The outer wrapper is a process-safety net: conversion-time
+panics use napi-rs error mapping and do not participate in handle poisoning. A test-only Cargo
+feature exposes a handle-level panic probe to the Node
 smoke suite, but the probe and feature are absent from published artifacts. All public errors carry
 stable codes from the first release.
 
@@ -145,11 +148,15 @@ during unwinding, and a panic wholly inside an upstream-owned thread can still a
 those paths are explicitly out of scope for `catch_unwind` and remain targets for input bounds,
 upstream qualification, and process supervision rather than false error-containment claims.
 
-Any caught panic on a stateful handle poisons that handle. It and all work derived from it fail fast
+Any panic caught by a stateful handle's inner boundary poisons that handle. It and all work derived from it fail fast
 with `E_POISONED`; callers cannot retry through potentially corrupted Tantivy or adapter state.
 Stateless capability inspection remains available, and an unrelated handle remains healthy. The
 panic smoke route verifies the original coded failure, terminal handle poisoning, and isolation
-from another handle. CI also asserts that the effective release profile retains `panic = "unwind"`.
+from another handle. An operation completing after a concurrent panic also returns `E_POISONED`.
+Caught panics still invoke Rust's process-wide panic hook before returning the coded error; Harper
+logging must classify the subsequent error as contained rather than treating the hook output alone
+as evidence of process failure. CI also asserts that the effective release profile retains
+`panic = "unwind"`.
 
 Tantivy is pinned exactly to 0.26.1. napi-rs is a build and binding dependency, not part of the
 public API. The Cargo feature layout must allow Rust unit tests to exercise engine code without
@@ -178,9 +185,10 @@ loaded and smoke-tested on its target architecture; producing a file is
 not sufficient. A missing or mismatched artifact fails with the resolved platform triple and never
 falls back to an install-time source build or download. Linux arm64, Linux musl, and macOS x64 are
 added to the manifest only with target-native loading coverage under the dedicated release issue.
-Platform packages and publishing automation are completed there as well. No install script compiles
-or downloads code silently in this scaffold; `prepack` creates a release artifact so test-only
-exports cannot enter a package assembled from developer state.
+Platform packages and publishing automation are completed there as well. No consumer install script
+compiles or downloads code silently in this scaffold. `prepack` creates the host release artifact
+and rejects any additional native artifact in the package root, preventing a stale or test-feature
+cross-build from entering the tarball.
 
 ## Testing and end-to-end route
 
@@ -193,16 +201,20 @@ Every introduced source module has a direct test. The scaffold gates:
 5. a Node smoke test that imports the public native entry point, awaits typed capability reporting,
    and proves a test-only native panic becomes a stable coded JavaScript error;
 6. a backend-parameterized Rust `Directory` baseline harness, initially run against Tantivy
-   `MmapDirectory`, covering successful atomic metadata replacement, in-process writer exclusion,
-   platform-correct open-file deletion, boundary range reads, `meta.json` watch notification, and
-   `sync_directory`; logical read-call and requested-byte counters establish the Tantivy access
-   pattern, while the Rocks adapter adds physical fetched/copied-byte accounting;
-7. negative controls proving the harness rejects always-successful locks and visible partial
-   metadata after a fault-injected replacement;
+   `MmapDirectory`, covering concurrent atomic metadata visibility, missing-file error variants,
+   in-process writer exclusion, backend-neutral open-handle deletion semantics, synchronous and
+   asynchronous boundary reads, write termination, `meta.json` watch notification, and
+   `sync_directory`; logical read-call and requested-byte counters prove the instrumentation and a
+   fixed baseline for the harness's own operations, while the Rocks adapter adds physical
+   fetched/copied-byte accounting around real indexing and search;
+7. negative controls proving the harness rejects always-successful locks, failed partial metadata,
+   and partial metadata exposed during a successful replacement;
 8. a smoke test installed from `npm pack` output rather than the repository tree, proving the
    exports map, packaged files, addon resolution, stable errors, and platform artifact together;
 9. package-content and loaded-addon inspection proving private generated bindings, unintended
-   source artifacts, unlisted subpaths, test-only probes, and package install scripts are absent;
+   source artifacts, unlisted subpaths, test-only probes, consumer lifecycle scripts, and stale
+   native artifacts are absent; CI also verifies committed generated declarations against a release
+   build;
 10. `cargo deny` gates for advisories, licenses, sources, bans, and duplicate native libraries,
     plus a policy-scoped npm audit.
 

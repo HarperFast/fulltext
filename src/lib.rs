@@ -42,7 +42,7 @@ pub struct TestHandle {
 #[cfg(feature = "test-panic")]
 #[napi]
 impl TestHandle {
-	#[napi(constructor)]
+	#[napi(catch_unwind, constructor)]
 	pub fn new() -> Self {
 		Self::default()
 	}
