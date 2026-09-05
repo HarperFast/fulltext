@@ -153,6 +153,10 @@ with `E_POISONED`; callers cannot retry through potentially corrupted Tantivy or
 Stateless capability inspection remains available, and an unrelated handle remains healthy. The
 panic smoke route verifies the original coded failure, terminal handle poisoning, and isolation
 from another handle. An operation completing after a concurrent panic also returns `E_POISONED`.
+The poison flag is not a substitute for synchronization: an owning writer or other mutable handle
+must serialize its state-changing operations before entering this boundary. Concurrent operations
+are permitted only over immutable or independently synchronized state, so no successful operation
+can observe a sibling mutation while that sibling is unwinding.
 Caught panics still invoke Rust's process-wide panic hook before returning the coded error; Harper
 logging must classify the subsequent error as contained rather than treating the hook output alone
 as evidence of process failure. CI also asserts that the effective release profile retains

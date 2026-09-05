@@ -27,6 +27,10 @@ test('the Node-API boundary check rejects syntax that previously failed open', (
 		() => verifyNapiBoundaries('#[napi(\ncatch_unwind\n)]\npub fn multiline() {}', 'multiline.rs'),
 		/must be written on one line/,
 	);
+	assert.throws(
+		() => verifyNapiBoundaries('#[napi]\n/* boundary note */\npub fn commented() {}', 'commented.rs'),
+		/lacks catch_unwind/,
+	);
 	assert.doesNotThrow(() =>
 		verifyNapiBoundaries(
 			'#[napi(ts_args_type = "Array<(string)>", catch_unwind)]\n#[allow(dead_code)]\npub fn guarded() {}',
@@ -49,8 +53,19 @@ function verifyNapiBoundaries(source, entry) {
 		);
 
 		let itemIndex = index + 1;
+		let inBlockComment = false;
 		while (itemIndex < lines.length) {
 			const line = lines[itemIndex].trim();
+			if (inBlockComment) {
+				inBlockComment = !line.includes('*/');
+				itemIndex++;
+				continue;
+			}
+			if (line.startsWith('/*')) {
+				inBlockComment = !line.includes('*/');
+				itemIndex++;
+				continue;
+			}
 			if (line === '' || line.startsWith('//')) {
 				itemIndex++;
 				continue;

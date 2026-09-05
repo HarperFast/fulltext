@@ -35,7 +35,7 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 	assert(includedPaths.includes('dist/native.js'));
 	assert(includedPaths.some((file) => /^fulltext\..+\.node$/.test(file)));
 	assert(!includedPaths.some((file) => file.startsWith('src/') || file === 'ts/addon.d.ts'));
-	assert.doesNotMatch(readFileSync(new URL('../ts/addon.d.ts', import.meta.url), 'utf8'), /TestHandle/);
+	assert.doesNotMatch(readFileSync(new URL('../ts/addon.d.ts', import.meta.url), 'utf8'), /__test/);
 
 	const projectDirectory = path.join(temporaryDirectory, 'consumer');
 	mkdirSync(projectDirectory);
@@ -64,7 +64,7 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 	const artifact = includedPaths.find((file) => /^fulltext\..+\.node$/.test(file));
 	const require = createRequire(import.meta.url);
 	const installedAddon = require(path.join(projectDirectory, 'node_modules/@harperfast/fulltext', artifact));
-	assert(!('TestHandle' in installedAddon));
+	assert(!('__testCreateHandle' in installedAddon));
 	const output = execFileSync(
 		process.execPath,
 		[

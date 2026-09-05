@@ -9,6 +9,13 @@ mod boundary;
 #[cfg(feature = "node-api")]
 use napi_derive::napi;
 
+#[cfg(feature = "test-panic")]
+use std::collections::HashMap;
+#[cfg(feature = "test-panic")]
+use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "test-panic")]
+use std::sync::{Arc, Mutex, OnceLock};
+
 pub const NATIVE_ABI_VERSION: u32 = 1;
 pub const TANTIVY_VERSION: &str = "0.26.1";
 
@@ -33,27 +40,45 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 }
 
 #[cfg(feature = "test-panic")]
-#[napi]
-#[derive(Default)]
-pub struct TestHandle {
-	poison: boundary::PoisonState,
+static NEXT_TEST_HANDLE: AtomicU32 = AtomicU32::new(1);
+#[cfg(feature = "test-panic")]
+static TEST_HANDLES: OnceLock<Mutex<HashMap<u32, Arc<boundary::PoisonState>>>> = OnceLock::new();
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testCreateHandle")]
+pub fn test_create_handle() -> boundary::Result<u32> {
+	boundary::run_stateless(|| {
+		let id = NEXT_TEST_HANDLE.fetch_add(1, Ordering::Relaxed);
+		TEST_HANDLES
+			.get_or_init(Default::default)
+			.lock()
+			.unwrap()
+			.insert(id, Arc::new(boundary::PoisonState::default()));
+		id
+	})
 }
 
 #[cfg(feature = "test-panic")]
-#[napi]
-impl TestHandle {
-	#[napi(catch_unwind, constructor)]
-	pub fn new() -> Self {
-		Self::default()
-	}
+#[napi(catch_unwind, skip_typescript, js_name = "__testPanic")]
+pub fn test_panic(id: u32) -> boundary::Result<()> {
+	test_handle(id)?.run(|| panic!("test panic"))
+}
 
-	#[napi(catch_unwind)]
-	pub fn panic(&self) -> boundary::Result<()> {
-		self.poison.run(|| panic!("test panic"))
-	}
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testCheck")]
+pub fn test_check(id: u32) -> boundary::Result<bool> {
+	test_handle(id)?.run(|| true)
+}
 
-	#[napi(catch_unwind)]
-	pub fn check(&self) -> boundary::Result<bool> {
-		self.poison.run(|| true)
-	}
+#[cfg(feature = "test-panic")]
+fn test_handle(id: u32) -> boundary::Result<Arc<boundary::PoisonState>> {
+	boundary::run_stateless(|| {
+		TEST_HANDLES
+			.get_or_init(Default::default)
+			.lock()
+			.unwrap()
+			.get(&id)
+			.cloned()
+			.expect("unknown test handle")
+	})
 }

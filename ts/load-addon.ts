@@ -11,14 +11,11 @@ interface NativeRuntimeInfo {
 	storageBackends: Array<string>;
 }
 
-interface NativeTestHandle {
-	panic(): void;
-	check(): boolean;
-}
-
 interface NativeAddonApi {
 	runtimeInfo(): NativeRuntimeInfo;
-	TestHandle?: new () => NativeTestHandle;
+	__testCreateHandle?(): number;
+	__testPanic?(id: number): void;
+	__testCheck?(id: number): boolean;
 }
 
 const require = createRequire(import.meta.url);

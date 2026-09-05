@@ -17,16 +17,18 @@ test('loads the artifact for the executing platform', async () => {
 });
 
 test('turns a panic into a coded terminal error', async () => {
-	const firstHandle = new (loadAddon().TestHandle)();
-	const secondHandle = new (loadAddon().TestHandle)();
+	const addon = loadAddon();
+	assert(addon.__testCreateHandle && addon.__testPanic && addon.__testCheck);
+	const firstHandle = addon.__testCreateHandle();
+	const secondHandle = addon.__testCreateHandle();
 	assert.throws(
-		() => firstHandle.panic(),
+		() => addon.__testPanic(firstHandle),
 		(error) => normalizeNativeError(error).code === 'E_NATIVE_PANIC',
 	);
 	assert.throws(
-		() => firstHandle.check(),
+		() => addon.__testCheck(firstHandle),
 		(error) => normalizeNativeError(error).code === 'E_POISONED',
 	);
-	assert.strictEqual(secondHandle.check(), true);
+	assert.strictEqual(addon.__testCheck(secondHandle), true);
 	await assert.doesNotReject(runtimeInfo());
 });
