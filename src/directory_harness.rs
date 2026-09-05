@@ -151,12 +151,12 @@ where
 	D: Directory + Clone,
 {
 	verify_concurrent_atomic_visibility(&directory)?;
+	verify_watch(&directory)?;
 	let directory = InstrumentedDirectory::new(directory);
 	verify_missing_file_errors(&directory)?;
 	verify_write_read_delete(&directory)?;
 	verify_atomic_metadata(&directory)?;
 	verify_in_process_writer_exclusion(&directory)?;
-	verify_watch(&directory)?;
 	directory.sync_directory().map_err(|error| error.to_string())?;
 	Ok(directory.logical_read_metrics())
 }
@@ -302,15 +302,48 @@ fn block_on<F: Future>(future: F) -> F::Output {
 	}
 }
 
-pub fn verify_failed_atomic_replacement(
-	directory: &dyn Directory,
+pub fn verify_failed_atomic_replacement<D>(
+	directory: &D,
 	replacement: impl FnOnce() -> io::Result<()>,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+	D: Directory + Clone,
+{
 	let path = Path::new("meta.json");
 	let before = directory.atomic_read(path).map_err(|error| error.to_string())?;
-	if replacement().is_ok() {
+	let observer_directory = directory.clone();
+	let observer_before = before.clone();
+	let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+	let (stop_sender, stop_receiver) = mpsc::channel();
+	let observer = thread::spawn(move || -> Result<(), String> {
+		ready_sender.send(()).map_err(|error| error.to_string())?;
+		loop {
+			match stop_receiver.try_recv() {
+				Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+				Err(mpsc::TryRecvError::Empty) => {}
+			}
+			let observed = observer_directory
+				.atomic_read(path)
+				.map_err(|error| error.to_string())?;
+			if observed != observer_before {
+				return Err("failed metadata replacement became observable".to_owned());
+			}
+			thread::yield_now();
+		}
+		Ok(())
+	});
+	ready_receiver
+		.recv_timeout(Duration::from_secs(2))
+		.map_err(|error| error.to_string())?;
+	let replacement_result = replacement();
+	let _ = stop_sender.send(());
+	let observer_result = observer
+		.join()
+		.map_err(|_| "failed metadata observer panicked".to_owned())?;
+	if replacement_result.is_ok() {
 		return Err("fault injection did not fail the metadata replacement".to_owned());
 	}
+	observer_result?;
 	let after = directory.atomic_read(path).map_err(|error| error.to_string())?;
 	if before != after {
 		return Err("failed metadata replacement became observable".to_owned());
@@ -356,19 +389,30 @@ where
 	Ok(())
 }
 
-fn verify_watch(directory: &dyn Directory) -> Result<(), String> {
+fn verify_watch<D>(directory: &D) -> Result<(), String>
+where
+	D: Directory + Clone,
+{
 	let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+	let watched_directory = directory.clone();
 	let _handle = directory
 		.watch(WatchCallback::new(move || {
-			let _ = sender.try_send(());
+			let observed = watched_directory.atomic_read(Path::new("meta.json")).ok();
+			let _ = sender.try_send(observed);
 		}))
 		.map_err(|error| error.to_string())?;
 	directory
 		.atomic_write(Path::new("meta.json"), b"watched")
 		.map_err(|error| error.to_string())?;
-	receiver
-		.recv_timeout(Duration::from_secs(2))
-		.map_err(|_| "meta.json watch did not fire".to_owned())
+	let deadline = std::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+		match receiver.recv_timeout(remaining) {
+			Ok(Some(bytes)) if bytes == b"watched" => return Ok(()),
+			Ok(_) => {}
+			Err(_) => return Err("meta.json watch did not observe the tested write".to_owned()),
+		}
+	}
 }
 
 #[cfg(test)]
@@ -479,10 +523,23 @@ mod tests {
 					.insert(path.to_path_buf(), data.to_vec());
 				return Ok(());
 			}
+			let before = self.atomic_files.read().unwrap().get(path).cloned().unwrap_or_default();
+			self.non_atomic_write_active.store(true, Ordering::Release);
+			self.partial_write_observed.store(false, Ordering::Release);
 			self.atomic_files
 				.write()
 				.unwrap()
 				.insert(path.to_path_buf(), data[..data.len() / 2].to_vec());
+			let deadline = std::time::Instant::now() + Duration::from_secs(2);
+			while !self.partial_write_observed.load(Ordering::Acquire) {
+				if std::time::Instant::now() >= deadline {
+					self.non_atomic_write_active.store(false, Ordering::Release);
+					return Err(io::Error::other("observer did not inspect failed partial metadata"));
+				}
+				thread::yield_now();
+			}
+			self.atomic_files.write().unwrap().insert(path.to_path_buf(), before);
+			self.non_atomic_write_active.store(false, Ordering::Release);
 			Err(io::Error::other("injected partial write"))
 		}
 
@@ -519,12 +576,15 @@ mod tests {
 	#[test]
 	fn harness_rejects_visible_partial_metadata() {
 		let directory = BrokenDirectory::new(false);
-		directory.atomic_write(Path::new("meta.json"), b"stable").unwrap();
+		let before = vec![b'a'; 4096];
+		let after = vec![b'b'; 4096];
+		directory.atomic_write(Path::new("meta.json"), &before).unwrap();
 		directory.fail_next_atomic_write();
-		assert!(verify_failed_atomic_replacement(&directory, || {
-			directory.atomic_write(Path::new("meta.json"), b"replacement")
-		})
-		.is_err());
+		assert_eq!(
+			verify_failed_atomic_replacement(&directory, || directory.atomic_write(Path::new("meta.json"), &after))
+				.unwrap_err(),
+			"failed metadata replacement became observable"
+		);
 	}
 
 	#[test]

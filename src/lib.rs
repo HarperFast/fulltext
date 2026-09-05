@@ -72,13 +72,13 @@ pub fn test_check(id: u32) -> boundary::Result<bool> {
 
 #[cfg(feature = "test-panic")]
 fn test_handle(id: u32) -> boundary::Result<Arc<boundary::PoisonState>> {
-	boundary::run_stateless(|| {
+	let handle = boundary::run_stateless(|| {
 		TEST_HANDLES
 			.get_or_init(Default::default)
 			.lock()
 			.unwrap()
 			.get(&id)
 			.cloned()
-			.expect("unknown test handle")
-	})
+	})?;
+	handle.ok_or_else(|| napi::Error::new("E_NATIVE_FAILURE", "unknown test handle"))
 }

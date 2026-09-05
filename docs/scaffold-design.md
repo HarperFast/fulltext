@@ -203,16 +203,19 @@ Every introduced source module has a direct test. The scaffold gates:
 3. TypeScript type checking;
 4. native addon build;
 5. a Node smoke test that imports the public native entry point, awaits typed capability reporting,
-   and proves a test-only native panic becomes a stable coded JavaScript error;
+   verifies package and Tantivy versions against their manifests, and proves a test-only native
+   panic becomes a stable coded JavaScript error;
 6. a backend-parameterized Rust `Directory` baseline harness, initially run against Tantivy
    `MmapDirectory`, covering concurrent atomic metadata visibility, missing-file error variants,
    in-process writer exclusion, backend-neutral open-handle deletion semantics, synchronous and
-   asynchronous boundary reads, write termination, `meta.json` watch notification, and
+   asynchronous boundary reads, write termination, content-correlated `meta.json` watch
+   notification, and
    `sync_directory`; logical read-call and requested-byte counters prove the instrumentation and a
    fixed baseline for the harness's own operations, while the Rocks adapter adds physical
    fetched/copied-byte accounting around real indexing and search;
-7. negative controls proving the harness rejects always-successful locks, failed partial metadata,
-   and partial metadata exposed during a successful replacement;
+7. negative controls proving the harness rejects always-successful locks, partial metadata exposed
+   and then restored by a failed replacement, and partial metadata exposed during a successful
+   replacement;
 8. a smoke test installed from `npm pack` output rather than the repository tree, proving the
    exports map, packaged files, addon resolution, stable errors, and platform artifact together;
 9. package-content and loaded-addon inspection proving private generated bindings, unintended

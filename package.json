@@ -40,7 +40,7 @@
 		"prepack": "npm run build:native && npm run build:typescript && npm run verify:package-artifacts",
 		"test": "cargo test --locked --all-features && npm run test:node",
 		"test:rust": "cargo test --locked --all-features",
-		"test:node": "npm run build:test-native && npm run build:typescript && node scripts/run-node-tests.mjs test && npm run build:native && npm run build:typescript && node scripts/run-node-tests.mjs release",
+		"test:node": "npm run build:test-native && npm run build:typescript && node scripts/run-node-tests.mjs test && node scripts/run-node-tests.mjs release",
 		"verify:package-artifacts": "node scripts/verify-package-artifacts.mjs"
 	},
 	"engines": {
