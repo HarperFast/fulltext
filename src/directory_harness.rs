@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
@@ -389,18 +389,18 @@ where
 	Ok(())
 }
 
-fn verify_watch<D>(directory: &D) -> Result<(), String>
-where
-	D: Directory + Clone,
-{
+fn verify_watch(directory: &dyn Directory) -> Result<(), String> {
 	let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-	let watched_directory = directory.clone();
+	let armed = Arc::new(AtomicBool::new(false));
+	let callback_armed = armed.clone();
 	let _handle = directory
 		.watch(WatchCallback::new(move || {
-			let observed = watched_directory.atomic_read(Path::new("meta.json")).ok();
-			let _ = sender.try_send(observed);
+			if callback_armed.load(Ordering::Acquire) {
+				let _ = sender.try_send(());
+			}
 		}))
 		.map_err(|error| error.to_string())?;
+	armed.store(true, Ordering::Release);
 	directory
 		.atomic_write(Path::new("meta.json"), b"watched")
 		.map_err(|error| error.to_string())?;
@@ -408,8 +408,14 @@ where
 	loop {
 		let remaining = deadline.saturating_duration_since(std::time::Instant::now());
 		match receiver.recv_timeout(remaining) {
-			Ok(Some(bytes)) if bytes == b"watched" => return Ok(()),
-			Ok(_) => {}
+			Ok(()) => {
+				let observed = directory
+					.atomic_read(Path::new("meta.json"))
+					.map_err(|error| error.to_string())?;
+				if observed == b"watched" {
+					return Ok(());
+				}
+			}
 			Err(_) => return Err("meta.json watch did not observe the tested write".to_owned()),
 		}
 	}
