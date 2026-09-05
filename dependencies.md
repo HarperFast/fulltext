@@ -15,6 +15,10 @@ reviewed deliberately.
 The Rust dependency graph must not include RocksDB. The future Rocks backend calls a C-ABI
 capability table owned by rocksdb-js rather than linking a second RocksDB runtime.
 
+napi-rs 2.16 generates an outer unwind boundary only for exports marked `catch_unwind`. Every
+fulltext function and method uses that option to cover argument and result conversion; the inner
+boundary adds stable error codes and per-handle poison state for package-owned operations.
+
 ## JavaScript development graph
 
 | Dependency            | Scope       | Purpose                                                               |

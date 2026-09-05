@@ -130,11 +130,12 @@ thread per call.
 
 The release and benchmark profiles use thin LTO, one codegen unit, and `panic = "unwind"`.
 The addon does not install a global allocator because doing so could change allocation behavior for
-the host Node process. Every package-owned N-API boundary invokes a shared
-`catch_unwind` adapter that converts a panic into a JavaScript error with a stable `code`; a panic
-reaching that boundary may not unwind through FFI. A test-only Cargo feature exposes a panic probe
-to the Node smoke suite, but the probe and feature are absent from published artifacts. All public
-errors carry stable codes from the first release.
+the host Node process. Every package-owned N-API boundary invokes a shared `catch_unwind` adapter
+that converts a panic into a JavaScript error with a stable native `code`; every exported function
+and method also enables napi-rs 2.16's generated `catch_unwind` wrapper so result conversion remains
+inside an unwind boundary. A test-only Cargo feature exposes a handle-level panic probe to the Node
+smoke suite, but the probe and feature are absent from published artifacts. All public errors carry
+stable codes from the first release.
 
 Before implementing the adapter, the pinned napi-rs behavior is verified so the wrapper neither
 double-wraps panics nor replaces useful native error mapping. Every package-owned worker entry
@@ -144,10 +145,11 @@ during unwinding, and a panic wholly inside an upstream-owned thread can still a
 those paths are explicitly out of scope for `catch_unwind` and remain targets for input bounds,
 upstream qualification, and process supervision rather than false error-containment claims.
 
-Any caught panic poisons its owning object. That object and all work derived from it fail fast with
-`E_POISONED`; callers cannot retry through potentially corrupted Tantivy or adapter state. The
-panic smoke route verifies both the original coded failure and terminal poison behavior. CI also
-asserts that the effective release profile retains `panic = "unwind"`.
+Any caught panic on a stateful handle poisons that handle. It and all work derived from it fail fast
+with `E_POISONED`; callers cannot retry through potentially corrupted Tantivy or adapter state.
+Stateless capability inspection remains available, and an unrelated handle remains healthy. The
+panic smoke route verifies the original coded failure, terminal handle poisoning, and isolation
+from another handle. CI also asserts that the effective release profile retains `panic = "unwind"`.
 
 Tantivy is pinned exactly to 0.26.1. napi-rs is a build and binding dependency, not part of the
 public API. The Cargo feature layout must allow Rust unit tests to exercise engine code without
@@ -165,18 +167,20 @@ Harper CI. Scripts cover:
 - formatting checks;
 - napi-rs artifact assembly.
 
-The initial platform matrix follows the qualified intersection of HNSW and Symphony:
+The initial scaffold qualifies only the targets exercised end to end in CI:
 
-- Linux x64 and arm64, glibc and musl;
-- macOS arm64 and x64 build artifacts;
+- Linux x64 glibc;
+- macOS arm64;
 - Windows x64.
 
 One addon artifact is built per platform rather than one per backend. Every matrix artifact is
 loaded and smoke-tested on its target architecture; producing a file is
 not sufficient. A missing or mismatched artifact fails with the resolved platform triple and never
-falls back to an install-time source build or download. Platform packages and publishing automation
-are structured now but completed under the dedicated release issue. No install script compiles or
-downloads code silently in this scaffold.
+falls back to an install-time source build or download. Linux arm64, Linux musl, and macOS x64 are
+added to the manifest only with target-native loading coverage under the dedicated release issue.
+Platform packages and publishing automation are completed there as well. No install script compiles
+or downloads code silently in this scaffold; `prepack` creates a release artifact so test-only
+exports cannot enter a package assembled from developer state.
 
 ## Testing and end-to-end route
 
@@ -188,15 +192,13 @@ Every introduced source module has a direct test. The scaffold gates:
 4. native addon build;
 5. a Node smoke test that imports the public native entry point, awaits typed capability reporting,
    and proves a test-only native panic becomes a stable coded JavaScript error;
-6. a backend-parameterized Rust `Directory` conformance harness, initially run against Tantivy
-   `MmapDirectory`, covering atomic metadata writes, exclusive writer/meta locks, open-file
-   deletion, boundary range reads, `meta.json` watch notification, and `sync_directory`; the
-   harness includes two-writer lock races, watch/delete/read concurrency, and counters for read
-   calls and requested bytes; the Rocks adapter adds copied-byte accounting so later implementations
-   expose read amplification;
-7. negative-control Directory implementations with non-atomic metadata and always-successful locks
-   that the harness must reject, plus a realistic KV-shaped control using process-local locks,
-   polling watches, and non-atomic chunk publication;
+6. a backend-parameterized Rust `Directory` baseline harness, initially run against Tantivy
+   `MmapDirectory`, covering successful atomic metadata replacement, in-process writer exclusion,
+   platform-correct open-file deletion, boundary range reads, `meta.json` watch notification, and
+   `sync_directory`; logical read-call and requested-byte counters establish the Tantivy access
+   pattern, while the Rocks adapter adds physical fetched/copied-byte accounting;
+7. negative controls proving the harness rejects always-successful locks and visible partial
+   metadata after a fault-injected replacement;
 8. a smoke test installed from `npm pack` output rather than the repository tree, proving the
    exports map, packaged files, addon resolution, stable errors, and platform artifact together;
 9. package-content and loaded-addon inspection proving private generated bindings, unintended
@@ -204,9 +206,11 @@ Every introduced source module has a direct test. The scaffold gates:
 10. `cargo deny` gates for advisories, licenses, sources, bans, and duplicate native libraries,
     plus a policy-scoped npm audit.
 
-All Cargo operations use `--locked`; npm CI operations use `npm ci`. The scaffold gates loading
-on the executing architecture, not merely cross-compilation. It does not claim to exercise
-indexing, search, Rocks durability, concurrency, or catalog performance.
+All Cargo operations use `--locked`; npm CI operations use `npm ci`. The scaffold gates loading on
+the executing architecture, not merely cross-compilation. Cross-process Rocks writer exclusion,
+crash durability, physical read amplification, chunk publication, and bounded watch latency require
+the concrete Rocks lease and remain mandatory Phase 0 tests. The scaffold does not claim to
+exercise indexing, search, Rocks durability, cross-process concurrency, or catalog performance.
 
 The end-to-end route for this issue is the Node smoke test against the built addon through the
 published `./native` entry point. Rocks behavior is intentionally not observable end to end until
@@ -227,9 +231,9 @@ Every dependency added by the scaffold is recorded in `dependencies.md` with its
 whether it appears in the runtime, build, or development graph. CI checks the documented direct
 dependency names against Cargo and npm manifests so the ledger cannot silently drift.
 
-Platform package names are reserved before the first npm release. They are published with
-provenance and referenced at the exact root-package version, preventing an unrelated package or
-version from satisfying artifact resolution.
+Before the first npm release, the release work reserves the qualified platform package names,
+publishes them with provenance, and references each at the exact root-package version. The scaffold
+does not resolve undeclared platform packages.
 
 ## Approaches considered
 

@@ -1,4 +1,13 @@
-export type FulltextErrorCode = 'E_NATIVE_ADDON_NOT_FOUND' | 'E_NATIVE_PANIC' | 'E_POISONED' | 'E_NATIVE_FAILURE';
+const errorCodes = [
+	'E_NATIVE_ADDON_NOT_FOUND',
+	'E_NATIVE_ABI_MISMATCH',
+	'E_NATIVE_CAPABILITY_MISMATCH',
+	'E_NATIVE_PANIC',
+	'E_POISONED',
+	'E_NATIVE_FAILURE',
+] as const;
+
+export type FulltextErrorCode = (typeof errorCodes)[number];
 
 export class FulltextError extends Error {
 	readonly code: FulltextErrorCode;
@@ -15,13 +24,19 @@ export function normalizeNativeError(error: unknown): FulltextError {
 		return error;
 	}
 	const message = error instanceof Error ? error.message : String(error);
-	const match = /^\[(E_[A-Z_]+)]\s*(.*)$/.exec(message);
-	if (match && isErrorCode(match[1])) {
-		return new FulltextError(match[1], match[2] || match[1], error);
+	const code = readErrorCode(error);
+	if (code) {
+		return new FulltextError(code, message || code, error);
 	}
 	return new FulltextError('E_NATIVE_FAILURE', message, error);
 }
 
-function isErrorCode(value: string): value is FulltextErrorCode {
-	return value === 'E_NATIVE_ADDON_NOT_FOUND' || value === 'E_NATIVE_PANIC' || value === 'E_POISONED';
+function readErrorCode(error: unknown): FulltextErrorCode | undefined {
+	if (typeof error !== 'object' || error === null || !('code' in error)) {
+		return undefined;
+	}
+	const code = error.code;
+	return typeof code === 'string' && errorCodes.includes(code as FulltextErrorCode)
+		? (code as FulltextErrorCode)
+		: undefined;
 }

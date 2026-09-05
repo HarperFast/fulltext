@@ -58,7 +58,11 @@ jobs:
       - run: npm run build:native
       - name: Reject linked RocksDB symbols
         run: |
-          if cargo tree --locked | grep -i rocksdb; then exit 1; fi
-          if nm -D fulltext.linux-x64-gnu.node | grep -i rocksdb; then exit 1; fi
+          set -euo pipefail
+          artifact=fulltext.linux-x64-gnu.node
+          test -f "$artifact"
+          if cargo tree --locked --all-features | grep -qi rocksdb; then exit 1; fi
+          if nm --defined-only "$artifact" | grep -qi rocksdb; then exit 1; fi
+          if ldd "$artifact" | grep -qi rocksdb; then exit 1; fi
       - name: Verify unwind profile
         run: cargo rustc --locked --release --features node-api -- --print cfg | grep 'panic="unwind"'

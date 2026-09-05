@@ -15,6 +15,9 @@ are not yet available.
 The package never compiles or downloads native code during installation. A supported prebuilt
 artifact must be present for the executing platform.
 
+The initial CI-qualified targets are Linux x64 glibc, macOS arm64, and Windows x64. Additional
+targets are added only after their artifacts are loaded and tested on the target runtime.
+
 ## Native usage
 
 ```js

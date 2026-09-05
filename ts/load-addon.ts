@@ -2,13 +2,30 @@ import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-import type * as NativeAddon from './addon.js';
 import { FulltextError } from './errors.js';
 
-const require = createRequire(import.meta.url);
-let loadedAddon: typeof NativeAddon | undefined;
+interface NativeRuntimeInfo {
+	packageVersion: string;
+	tantivyVersion: string;
+	nativeAbiVersion: number;
+	storageBackends: Array<string>;
+}
 
-export function loadAddon(): typeof NativeAddon {
+interface NativeTestHandle {
+	panic(): void;
+	check(): boolean;
+}
+
+interface NativeAddonApi {
+	runtimeInfo(): NativeRuntimeInfo;
+	TestHandle?: new () => NativeTestHandle;
+}
+
+const require = createRequire(import.meta.url);
+const expectedNativeAbiVersion = 1;
+let loadedAddon: NativeAddonApi | undefined;
+
+export function loadAddon(): NativeAddonApi {
 	if (loadedAddon) {
 		return loadedAddon;
 	}
@@ -16,23 +33,12 @@ export function loadAddon(): typeof NativeAddon {
 	const artifact = `fulltext.${triple}.node`;
 	const localPath = fileURLToPath(new URL(`../${artifact}`, import.meta.url));
 	if (existsSync(localPath)) {
-		loadedAddon = require(localPath) as typeof NativeAddon;
+		const addon = require(localPath) as NativeAddonApi;
+		validateAddon(addon, localPath);
+		loadedAddon = addon;
 		return loadedAddon;
 	}
-
-	const platformPackage = `@harperfast/fulltext-${triple}`;
-	let packagePath: string;
-	try {
-		packagePath = require.resolve(platformPackage);
-	} catch (error) {
-		throw new FulltextError(
-			'E_NATIVE_ADDON_NOT_FOUND',
-			`No fulltext native artifact is installed for ${triple}`,
-			error,
-		);
-	}
-	loadedAddon = require(packagePath) as typeof NativeAddon;
-	return loadedAddon;
+	throw new FulltextError('E_NATIVE_ADDON_NOT_FOUND', `No fulltext native artifact is installed for ${triple}`);
 }
 
 export function platformTriple(): string {
@@ -54,4 +60,20 @@ export function platformTriple(): string {
 function usesGlibc(): boolean {
 	const report = process.report?.getReport() as { header?: { glibcVersionRuntime?: string } } | undefined;
 	return Boolean(report?.header?.glibcVersionRuntime);
+}
+
+function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
+	const info = addon.runtimeInfo();
+	if (info.nativeAbiVersion !== expectedNativeAbiVersion) {
+		throw new FulltextError(
+			'E_NATIVE_ABI_MISMATCH',
+			`Fulltext native ABI ${info.nativeAbiVersion} from ${artifactPath} does not match ${expectedNativeAbiVersion}`,
+		);
+	}
+	if (info.storageBackends.length !== 1 || info.storageBackends[0] !== 'native') {
+		throw new FulltextError(
+			'E_NATIVE_CAPABILITY_MISMATCH',
+			`Unexpected storage capabilities from ${artifactPath}: ${info.storageBackends.join(', ')}`,
+		);
+	}
 }

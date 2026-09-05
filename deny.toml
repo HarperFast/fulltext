@@ -1,3 +1,6 @@
+[graph]
+all-features = true
+
 [advisories]
 yanked = "deny"
 
@@ -6,6 +9,7 @@ allow = [
 	"Apache-2.0",
 	"Apache-2.0 WITH LLVM-exception",
 	"BSD-3-Clause",
+	"ISC",
 	"MIT",
 	"Unicode-3.0",
 	"Zlib",
@@ -14,7 +18,10 @@ allow = [
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
-skip = [{ name = "windows-sys", version = "0.59.0" }]
+skip = [
+	{ name = "syn", version = "2.0.119" },
+	{ name = "windows-sys", version = "0.59.0" },
+]
 
 [sources]
 unknown-registry = "deny"

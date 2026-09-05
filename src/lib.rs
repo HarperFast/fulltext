@@ -22,9 +22,9 @@ pub struct RuntimeInfo {
 }
 
 #[cfg(feature = "node-api")]
-#[napi(js_name = "runtimeInfo")]
-pub fn runtime_info() -> napi::Result<RuntimeInfo> {
-	boundary::run(|| RuntimeInfo {
+#[napi(catch_unwind, js_name = "runtimeInfo")]
+pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
+	boundary::run_stateless(|| RuntimeInfo {
 		package_version: env!("CARGO_PKG_VERSION").to_owned(),
 		tantivy_version: TANTIVY_VERSION.to_owned(),
 		native_abi_version: NATIVE_ABI_VERSION,
@@ -33,7 +33,27 @@ pub fn runtime_info() -> napi::Result<RuntimeInfo> {
 }
 
 #[cfg(feature = "test-panic")]
-#[napi(js_name = "__testPanic")]
-pub fn test_panic() -> napi::Result<()> {
-	boundary::run(|| panic!("test panic"))
+#[napi]
+#[derive(Default)]
+pub struct TestHandle {
+	poison: boundary::PoisonState,
+}
+
+#[cfg(feature = "test-panic")]
+#[napi]
+impl TestHandle {
+	#[napi(constructor)]
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	#[napi(catch_unwind)]
+	pub fn panic(&self) -> boundary::Result<()> {
+		self.poison.run(|| panic!("test panic"))
+	}
+
+	#[napi(catch_unwind)]
+	pub fn check(&self) -> boundary::Result<bool> {
+		self.poison.run(|| true)
+	}
 }

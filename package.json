@@ -22,10 +22,6 @@
 			"defaults": false,
 			"additional": [
 				"x86_64-unknown-linux-gnu",
-				"x86_64-unknown-linux-musl",
-				"aarch64-unknown-linux-gnu",
-				"aarch64-unknown-linux-musl",
-				"x86_64-apple-darwin",
 				"aarch64-apple-darwin",
 				"x86_64-pc-windows-msvc"
 			]
@@ -41,9 +37,10 @@
 		"format": "prettier --write . && cargo fmt",
 		"format:check": "prettier --check . && cargo fmt --check",
 		"lint": "tsc -p tsconfig.json --noEmit && cargo clippy --locked --all-targets --all-features -- -D warnings",
-		"test": "cargo test --locked --all-features && npm run build:test-native && npm run build:typescript && node --test --test-concurrency=1 test/*.test.mjs",
+		"prepack": "npm run build:native && npm run build:typescript",
+		"test": "cargo test --locked --all-features && npm run test:node",
 		"test:rust": "cargo test --locked --all-features",
-		"test:node": "node --test --test-concurrency=1 test/*.test.mjs"
+		"test:node": "npm run build:test-native && npm run build:typescript && node --test --test-concurrency=1 test/*.test.mjs"
 	},
 	"engines": {
 		"node": "^22.18.0 || >=24.0.0"

@@ -13,7 +13,7 @@ use tantivy::directory::{
 use tantivy::HasLen;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReadMetrics {
+pub struct LogicalReadMetrics {
 	pub calls: u64,
 	pub bytes_requested: u64,
 }
@@ -38,8 +38,8 @@ impl<D> InstrumentedDirectory<D> {
 		}
 	}
 
-	pub fn read_metrics(&self) -> ReadMetrics {
-		ReadMetrics {
+	pub fn logical_read_metrics(&self) -> LogicalReadMetrics {
+		LogicalReadMetrics {
 			calls: self.counters.calls.load(Ordering::Relaxed),
 			bytes_requested: self.counters.bytes_requested.load(Ordering::Relaxed),
 		}
@@ -101,7 +101,12 @@ where
 	}
 
 	fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
-		self.inner.atomic_read(path)
+		let bytes = self.inner.atomic_read(path)?;
+		self.counters.calls.fetch_add(1, Ordering::Relaxed);
+		self.counters
+			.bytes_requested
+			.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+		Ok(bytes)
 	}
 
 	fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
@@ -121,17 +126,17 @@ where
 	}
 }
 
-pub fn verify_directory<D>(directory: D) -> Result<ReadMetrics, String>
+pub fn verify_directory_baseline<D>(directory: D) -> Result<LogicalReadMetrics, String>
 where
 	D: Directory + Clone,
 {
 	let directory = InstrumentedDirectory::new(directory);
 	verify_write_read_delete(&directory)?;
 	verify_atomic_metadata(&directory)?;
-	verify_writer_exclusion(&directory)?;
+	verify_in_process_writer_exclusion(&directory)?;
 	verify_watch(&directory)?;
 	directory.sync_directory().map_err(|error| error.to_string())?;
-	Ok(directory.read_metrics())
+	Ok(directory.logical_read_metrics())
 }
 
 fn verify_write_read_delete<D>(directory: &D) -> Result<(), String>
@@ -149,13 +154,27 @@ where
 		return Err("range read returned unexpected bytes".to_owned());
 	}
 	let deleting_directory = directory.clone();
-	std::thread::spawn(move || deleting_directory.delete(Path::new("segment")))
+	let delete_result = std::thread::spawn(move || deleting_directory.delete(Path::new("segment")))
 		.join()
-		.map_err(|_| "segment deletion panicked".to_owned())?
-		.map_err(|error| error.to_string())?;
-	let retained = file.read_bytes().map_err(|error| error.to_string())?;
-	if retained.as_slice() != b"0123456789" {
-		return Err("an open file changed after deletion".to_owned());
+		.map_err(|_| "segment deletion panicked".to_owned())?;
+	if cfg!(windows) {
+		if delete_result.is_ok() {
+			return Err("Windows deleted a mapped file unexpectedly".to_owned());
+		}
+		let retained = file.read_bytes().map_err(|error| error.to_string())?;
+		if retained.as_slice() != b"0123456789" {
+			return Err("an open file changed after a rejected deletion".to_owned());
+		}
+		drop(retained);
+		drop(middle);
+		drop(file);
+		directory.delete(path).map_err(|error| error.to_string())?;
+	} else {
+		delete_result.map_err(|error| error.to_string())?;
+		let retained = file.read_bytes().map_err(|error| error.to_string())?;
+		if retained.as_slice() != b"0123456789" {
+			return Err("an open file changed after deletion".to_owned());
+		}
 	}
 	Ok(())
 }
@@ -193,7 +212,7 @@ fn verify_atomic_metadata(directory: &dyn Directory) -> Result<(), String> {
 	Ok(())
 }
 
-fn verify_writer_exclusion<D>(directory: &D) -> Result<(), String>
+fn verify_in_process_writer_exclusion<D>(directory: &D) -> Result<(), String>
 where
 	D: Directory + Clone,
 {
@@ -310,15 +329,15 @@ mod tests {
 	#[test]
 	fn mmap_directory_satisfies_the_contract() {
 		let directory = MmapDirectory::create_from_tempdir().unwrap();
-		let metrics = verify_directory(directory).unwrap();
-		assert_eq!(metrics.calls, 2);
-		assert_eq!(metrics.bytes_requested, 15);
+		let metrics = verify_directory_baseline(directory).unwrap();
+		assert_eq!(metrics.calls, 4);
+		assert_eq!(metrics.bytes_requested, 26);
 	}
 
 	#[test]
 	fn harness_rejects_non_exclusive_locks() {
 		let directory = BrokenDirectory::new(true);
-		assert!(verify_writer_exclusion(&directory).is_err());
+		assert!(verify_in_process_writer_exclusion(&directory).is_err());
 	}
 
 	#[test]
