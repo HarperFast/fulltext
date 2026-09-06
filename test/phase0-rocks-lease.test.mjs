@@ -121,3 +121,40 @@ test(
 		}
 	},
 );
+
+test(
+	'rejects storage leases whose database mode cannot provide bounded writes',
+	{ skip: rocksdbRoot ? false : 'set FULLTEXT_PHASE0_ROCKSDB_JS_ROOT to a feature-enabled rocksdb-js checkout' },
+	async () => {
+		const { RocksDatabase } = await import(pathToFileURL(path.join(rocksdbRoot, 'src/index.ts')).href);
+		const pessimisticPath = path.join(tmpdir(), `fulltext-phase0-pessimistic-${randomBytes(8).toString('hex')}`);
+		const readOnlyPath = path.join(tmpdir(), `fulltext-phase0-readonly-${randomBytes(8).toString('hex')}`);
+		let pessimistic;
+		let writable;
+		let readOnly;
+
+		try {
+			pessimistic = new RocksDatabase(pessimisticPath, {
+				encoding: false,
+				name: 'fulltext-phase0',
+				pessimistic: true,
+			}).open();
+			assert.throws(() => pessimistic.store.db.__nativeStorageLease(), /do not support pessimistic/);
+
+			writable = new RocksDatabase(readOnlyPath, { encoding: false, name: 'fulltext-phase0' }).open();
+			writable.close();
+			readOnly = new RocksDatabase(readOnlyPath, {
+				encoding: false,
+				name: 'fulltext-phase0',
+				readOnly: true,
+			}).open();
+			assert.throws(() => readOnly.store.db.__nativeStorageLease(), /require a writable database/);
+		} finally {
+			pessimistic?.close();
+			writable?.close();
+			readOnly?.close();
+			rmSync(pessimisticPath, { force: true, recursive: true, maxRetries: 3, retryDelay: 100 });
+			rmSync(readOnlyPath, { force: true, recursive: true, maxRetries: 3, retryDelay: 100 });
+		}
+	},
+);

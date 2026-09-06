@@ -370,6 +370,7 @@ dependencies = [
 name = "harper-fulltext"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "napi",
  "napi-build",
  "napi-derive",

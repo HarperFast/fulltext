@@ -12,6 +12,7 @@ use crate::phase0::{KvStore, Mutation, WritePolicy};
 
 const LEASE_MAGIC: u64 = 0x4852_4653_544c_5331;
 const ABI_MAJOR: u32 = 1;
+const ABI_MINOR: u32 = 0;
 const TYPE_TAG_LOWER: u64 = 0x72f7_ab4f_5277_4465;
 const TYPE_TAG_UPPER: u64 = 0xb654_680e_7e1e_4db9;
 const CAP_GET_OWNED: u64 = 1 << 0;
@@ -35,6 +36,7 @@ const POLICY_WAL_SYNC: u32 = 2;
 const POLICY_NO_WAL: u32 = 3;
 const MAX_BUILD_IDENTITY_BYTES: u64 = 4_096;
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct ByteSpan {
 	data: *const u8,
@@ -87,11 +89,12 @@ type RetainFn = unsafe extern "C" fn(*mut c_void, *mut StatusBuffer) -> u32;
 type ReleaseFn = unsafe extern "C" fn(*mut c_void);
 type PollStateFn = unsafe extern "C" fn(*mut c_void) -> u32;
 type GetOwnedFn = unsafe extern "C" fn(*mut c_void, ByteSpan, *mut OwnedBytesResult, *mut StatusBuffer) -> u32;
-type WriteBatchFn = unsafe extern "C" fn(*mut c_void, *const StorageMutation, u64, u32, *mut StatusBuffer) -> u32;
+type WriteBatchFn = unsafe extern "C" fn(*mut c_void, *const StorageMutation, u64, u64, u32, *mut StatusBuffer) -> u32;
 type ScanPageFn =
 	unsafe extern "C" fn(*mut c_void, ByteSpan, ByteSpan, u64, u64, *mut OwnedBytesResult, *mut StatusBuffer) -> u32;
 type CollectStatsFn = unsafe extern "C" fn(*mut c_void, *mut StorageStats, *mut StatusBuffer) -> u32;
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct LeasePrefix {
 	magic: u64,
@@ -103,6 +106,7 @@ struct LeasePrefix {
 	provider_image_token: u64,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct LeaseV1 {
 	magic: u64,
@@ -132,7 +136,7 @@ struct LeaseV1 {
 static PROVIDER_IMAGE_TOKEN: OnceLock<u64> = OnceLock::new();
 
 struct RocksLeaseInner {
-	table: NonNull<LeaseV1>,
+	table: LeaseV1,
 	provider_build_identity: String,
 }
 
@@ -141,7 +145,7 @@ unsafe impl Sync for RocksLeaseInner {}
 
 impl Drop for RocksLeaseInner {
 	fn drop(&mut self) {
-		let table = unsafe { self.table.as_ref() };
+		let table = &self.table;
 		if let Some(release) = table.release {
 			unsafe { release(table.context) };
 		}
@@ -162,21 +166,21 @@ impl RocksLease {
 	pub unsafe fn from_table(table: *mut c_void) -> io::Result<Self> {
 		let prefix = NonNull::new(table.cast::<LeasePrefix>())
 			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "storage lease is null"))?;
-		let prefix = unsafe { prefix.as_ref() };
+		let prefix = unsafe { ptr::read_unaligned(prefix.as_ptr()) };
 		if prefix.magic != LEASE_MAGIC {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,
 				"storage lease magic does not match",
 			));
 		}
-		if prefix.abi_major != ABI_MAJOR {
+		if prefix.abi_major != ABI_MAJOR || prefix.abi_minor > ABI_MINOR {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
 				"storage lease ABI is incompatible",
 			));
 		}
 		if usize::try_from(prefix.struct_size).unwrap_or(0) < size_of::<LeaseV1>()
-			|| usize::try_from(prefix.status_size).unwrap_or(0) < size_of::<StatusBuffer>()
+			|| usize::try_from(prefix.status_size).unwrap_or(0) != size_of::<StatusBuffer>()
 		{
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,
@@ -189,25 +193,13 @@ impl RocksLease {
 				"storage lease is missing required capabilities",
 			));
 		}
-		if let Some(provider_image_token) = PROVIDER_IMAGE_TOKEN.get() {
-			if *provider_image_token != prefix.provider_image_token {
-				return Err(io::Error::new(
-					io::ErrorKind::Unsupported,
-					"storage leases came from different rocksdb-js addon images",
-				));
-			}
-		} else {
-			let _ = PROVIDER_IMAGE_TOKEN.set(prefix.provider_image_token);
-			if PROVIDER_IMAGE_TOKEN.get() != Some(&prefix.provider_image_token) {
-				return Err(io::Error::new(
-					io::ErrorKind::Unsupported,
-					"storage leases came from different rocksdb-js addon images",
-				));
-			}
+		if prefix.provider_image_token == 0 {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"storage lease provider image token is unset",
+			));
 		}
-
-		let table = NonNull::new(table.cast::<LeaseV1>()).unwrap();
-		let lease = unsafe { table.as_ref() };
+		let lease = unsafe { ptr::read_unaligned(table.cast::<LeaseV1>()) };
 		if lease.reserved != 0 || (lease.rocksdb_major, lease.rocksdb_minor, lease.rocksdb_patch) != (11, 8, 1) {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
@@ -237,20 +229,56 @@ impl RocksLease {
 		let retain = lease
 			.retain
 			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "storage lease retain function is missing"))?;
+		let release = lease
+			.release
+			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "storage lease release function is missing"))?;
+		if lease.poll_state.is_none()
+			|| lease.get_owned.is_none()
+			|| lease.write_batch.is_none()
+			|| lease.scan_page.is_none()
+			|| lease.collect_stats.is_none()
+		{
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"storage lease capability table is incomplete",
+			));
+		}
+		if PROVIDER_IMAGE_TOKEN
+			.get()
+			.is_some_and(|provider_image_token| *provider_image_token != prefix.provider_image_token)
+		{
+			return Err(io::Error::new(
+				io::ErrorKind::Unsupported,
+				"storage leases came from different rocksdb-js addon images",
+			));
+		}
 		let mut status = Status::new();
 		let code = unsafe { retain(lease.context, &mut status.raw) };
-		status.result(code)?;
+		if let Err(error) = status.result(code) {
+			if code == STATUS_OK {
+				unsafe { release(lease.context) };
+			}
+			return Err(error);
+		}
+		let provider_image_token = PROVIDER_IMAGE_TOKEN.get_or_init(|| prefix.provider_image_token);
+		if *provider_image_token != prefix.provider_image_token {
+			unsafe { release(lease.context) };
+			return Err(io::Error::new(
+				io::ErrorKind::Unsupported,
+				"storage leases came from different rocksdb-js addon images",
+			));
+		}
 
 		Ok(Self {
 			inner: Arc::new(RocksLeaseInner {
-				table,
+				table: lease,
 				provider_build_identity,
 			}),
 		})
 	}
 
 	fn table(&self) -> &LeaseV1 {
-		unsafe { self.inner.table.as_ref() }
+		&self.inner.table
 	}
 
 	pub fn database_incarnation(&self) -> u64 {
@@ -280,6 +308,7 @@ impl RocksLease {
 		let mut status = Status::new();
 		let code = unsafe { get(self.table().context, ByteSpan::new(key), &mut result, &mut status.raw) };
 		if code == STATUS_NOT_FOUND {
+			status.validate()?;
 			return Ok(None);
 		}
 		status.result(code)?;
@@ -310,6 +339,7 @@ impl RocksLease {
 				self.table().context,
 				raw_mutations.as_ptr(),
 				raw_mutations.len() as u64,
+				size_of::<StorageMutation>() as u64,
 				policy,
 				&mut status.raw,
 			)
@@ -336,7 +366,7 @@ impl RocksLease {
 			)
 		};
 		status.result(code)?;
-		ScanPage::decode(OwnedBytes::new(ProviderBytes::new(result)?))
+		ScanPage::decode(OwnedBytes::new(ProviderBytes::new(result)?), entries, bytes)
 	}
 
 	pub fn stats(&self) -> io::Result<StorageStats> {
@@ -356,12 +386,20 @@ impl RocksLease {
 }
 
 impl KvStore for RocksLease {
+	fn identity(&self) -> crate::phase0::KvStoreIdentity {
+		crate::phase0::KvStoreIdentity(
+			self.table().provider_image_token,
+			self.database_incarnation(),
+			self.column_family_incarnation(),
+		)
+	}
+
 	fn read(&self, key: &[u8]) -> io::Result<Option<OwnedBytes>> {
 		self.get(key)
 	}
 
 	fn write(&self, mutations: &[Mutation], policy: WritePolicy) -> io::Result<()> {
-		self.write(mutations, policy)
+		RocksLease::write(self, mutations, policy)
 	}
 
 	fn sync(&self) -> io::Result<()> {
@@ -430,9 +468,21 @@ pub struct ScanPage {
 }
 
 impl ScanPage {
-	fn decode(bytes: OwnedBytes) -> io::Result<Self> {
+	fn decode(bytes: OwnedBytes, entry_limit: u64, byte_limit: u64) -> io::Result<Self> {
+		if bytes.len() as u64 > byte_limit {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"scan page exceeds byte limit",
+			));
+		}
 		let data = bytes.as_slice();
 		let count = read_u32(data, 0, "scan page is truncated")? as usize;
+		if count as u64 > entry_limit || count > data.len().saturating_sub(4) / 16 {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"scan page count exceeds its bounds",
+			));
+		}
 		let mut cursor = 4usize;
 		let mut entries = Vec::with_capacity(count);
 		for _ in 0..count {
@@ -552,7 +602,18 @@ impl Status {
 		status
 	}
 
+	fn validate(&self) -> io::Result<()> {
+		if self.raw.data != self.message.as_ptr().cast_mut() || self.raw.length >= self.raw.capacity {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"storage provider returned an invalid status buffer",
+			));
+		}
+		Ok(())
+	}
+
 	fn result(&self, code: u32) -> io::Result<()> {
+		self.validate()?;
 		if code == STATUS_OK {
 			return Ok(());
 		}
@@ -631,5 +692,139 @@ pub fn state_name(state: u32) -> &'static str {
 		STATE_CLOSING => "closing",
 		STATE_REVOKED => "revoked",
 		_ => "unknown",
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	static BUILD_IDENTITY: &[u8] = b"test-provider";
+
+	unsafe extern "C" fn retain(_: *mut c_void, _: *mut StatusBuffer) -> u32 {
+		STATUS_OK
+	}
+
+	unsafe extern "C" fn release(context: *mut c_void) {
+		if !context.is_null() {
+			unsafe { &*(context.cast::<AtomicUsize>()) }.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	unsafe extern "C" fn poll(_: *mut c_void) -> u32 {
+		STATE_ACTIVE
+	}
+
+	unsafe extern "C" fn get(_: *mut c_void, _: ByteSpan, _: *mut OwnedBytesResult, _: *mut StatusBuffer) -> u32 {
+		STATUS_NOT_FOUND
+	}
+
+	unsafe extern "C" fn get_with_invalid_status(
+		_: *mut c_void,
+		_: ByteSpan,
+		_: *mut OwnedBytesResult,
+		status: *mut StatusBuffer,
+	) -> u32 {
+		unsafe { (*status).data = NonNull::<c_char>::dangling().as_ptr() };
+		STATUS_NOT_FOUND
+	}
+
+	unsafe extern "C" fn write(
+		_: *mut c_void,
+		_: *const StorageMutation,
+		_: u64,
+		_: u64,
+		_: u32,
+		_: *mut StatusBuffer,
+	) -> u32 {
+		STATUS_OK
+	}
+
+	unsafe extern "C" fn scan(
+		_: *mut c_void,
+		_: ByteSpan,
+		_: ByteSpan,
+		_: u64,
+		_: u64,
+		_: *mut OwnedBytesResult,
+		_: *mut StatusBuffer,
+	) -> u32 {
+		STATUS_OK
+	}
+
+	unsafe extern "C" fn stats(_: *mut c_void, _: *mut StorageStats, _: *mut StatusBuffer) -> u32 {
+		STATUS_OK
+	}
+
+	fn table() -> LeaseV1 {
+		LeaseV1 {
+			magic: LEASE_MAGIC,
+			abi_major: ABI_MAJOR,
+			abi_minor: ABI_MINOR,
+			struct_size: size_of::<LeaseV1>() as u32,
+			status_size: size_of::<StatusBuffer>() as u32,
+			capabilities: REQUIRED_CAPABILITIES,
+			provider_image_token: 1,
+			database_incarnation: 2,
+			column_family_incarnation: 3,
+			rocksdb_major: 11,
+			rocksdb_minor: 8,
+			rocksdb_patch: 1,
+			reserved: 0,
+			provider_build_identity: ByteSpan::new(BUILD_IDENTITY),
+			context: ptr::null_mut(),
+			retain: Some(retain),
+			release: Some(release),
+			poll_state: Some(poll),
+			get_owned: Some(get),
+			write_batch: Some(write),
+			scan_page: Some(scan),
+			collect_stats: Some(stats),
+		}
+	}
+
+	#[test]
+	fn lease_copies_the_table_before_the_external_can_be_released() {
+		let releases = AtomicUsize::new(0);
+		let mut table = Box::new(table());
+		table.context = (&releases as *const AtomicUsize).cast_mut().cast();
+		let pointer = Box::into_raw(table);
+		let lease = unsafe { RocksLease::from_table(pointer.cast()) }.unwrap();
+		unsafe { drop(Box::from_raw(pointer)) };
+		assert_eq!(lease.poll_state(), STATE_ACTIVE);
+		drop(lease);
+		assert_eq!(releases.load(Ordering::Relaxed), 1);
+	}
+
+	#[test]
+	fn not_found_still_validates_the_status_buffer() {
+		let mut table = table();
+		table.get_owned = Some(get_with_invalid_status);
+		let lease = unsafe { RocksLease::from_table((&mut table as *mut LeaseV1).cast()) }.unwrap();
+		assert_eq!(lease.get(b"missing").unwrap_err().kind(), io::ErrorKind::InvalidData);
+	}
+
+	#[test]
+	fn lease_rejects_a_larger_provider_status_layout() {
+		let mut table = table();
+		table.status_size += 8;
+		assert!(unsafe { RocksLease::from_table((&mut table as *mut LeaseV1).cast()) }.is_err());
+	}
+
+	#[test]
+	fn scan_page_rejects_count_before_allocating_entries() {
+		let bytes = OwnedBytes::new(u32::MAX.to_le_bytes().to_vec());
+		assert!(ScanPage::decode(bytes, 4_096, 64 * 1024 * 1024).is_err());
+	}
+
+	#[test]
+	fn scan_page_enforces_the_requested_caps() {
+		let bytes = OwnedBytes::new(0u32.to_le_bytes().to_vec());
+		assert!(ScanPage::decode(bytes.clone(), 4_096, 3).is_err());
+		let mut one = 1u32.to_le_bytes().to_vec();
+		one.extend_from_slice(&0u64.to_le_bytes());
+		one.extend_from_slice(&0u64.to_le_bytes());
+		assert!(ScanPage::decode(OwnedBytes::new(one), 0, 64).is_err());
 	}
 }

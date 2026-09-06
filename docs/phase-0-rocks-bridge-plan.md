@@ -93,9 +93,10 @@ or database—alive. This lets foreign native threads participate in the same cl
 linking Node headers or inventing a second lifecycle. The bridge does not expose `rocksdb::DB*`, open
 the database again, or link another copy of RocksDB.
 
-Tantivy writer locking remains in fulltext's shared in-process index runtime. It is not a RocksDB
-data lock and does not need to join rocksdb-js's key-lock registry. The Phase 0 ABI therefore has no
-native lock callbacks.
+Tantivy writer locking remains in fulltext's shared in-process index runtime. `KvDirectory`
+overrides Tantivy's file-backed default so `.tantivy-writer.lock` and `.tantivy-meta.lock` never
+enter RocksDB or survive a process crash. It is not a RocksDB data lock and does not need to join
+rocksdb-js's key-lock registry. The Phase 0 ABI therefore has no native lock callbacks.
 
 ## Experiment architecture
 
@@ -275,9 +276,10 @@ made the request.
 
 ### 5. Prove locks and watch stay in fulltext
 
-All clones of a `KvDirectory` share one fulltext-owned `DirectoryState`, including the Tantivy writer
-lock and watch callbacks. The production runtime must canonicalize each live storage identity to one
-shared index state so independently constructed JavaScript wrapper objects cannot create multiple
+All clones and independently constructed `KvDirectory` values for the same store identity and index
+namespace share one fulltext-owned `DirectoryState`, including fair Tantivy locks, object-id
+allocation, mutations, and watch callbacks. The production runtime owns the lifecycle of this
+canonical state so independently constructed JavaScript wrapper objects cannot create multiple
 Tantivy writers for the same index. RocksDB key locks protect a different concern and are not reused.
 
 Watch is storage-local notification after successful atomic publication, not a RocksDB filesystem
@@ -300,20 +302,23 @@ rejected.
 - database and column-family incarnation identities;
 - opaque lease context with retain/release;
 - operation admission/release using the existing close fence; and
-- provider-owned status and buffer release.
+- caller-owned status buffers filled in place, plus provider-owned result-buffer release.
 
 Validation is ordered. The Node value must be an External with the shared N-API type tag before the
 consumer obtains its pointer. The pointed-to prefix contains only the fixed magic, ABI version, and
 structure length; the consumer validates that prefix and the minimum length before reading
 capabilities, identities, or any function pointer. Type tagging prevents accidental cross-casting;
 the ABI checks remain mandatory because a type tag is not a security boundary against another
-native addon.
+native addon. ABI v1 accepts only supported minor versions and the exact v1 caller-owned status
+layout. After validation, fulltext copies the plain-data function table and build identity into
+Rust-owned memory, then retains only the opaque provider context; the JavaScript External need not
+remain reachable.
 
 ### Phase 0 operation table
 
 - provider-owned point reads;
-- one atomic ordered batch containing puts and deletes, with explicit `WAL`, `WAL_SYNC`, or
-  `NO_WAL` policy;
+- one atomic ordered batch containing puts and deletes, with an explicit element stride and
+  explicit `WAL`, `WAL_SYNC`, or `NO_WAL` policy;
 - bounded prefix scan returning a provider-owned page;
 - lease retain/release and state polling; and
 - bounded transport statistics needed by the experiment.
@@ -340,11 +345,12 @@ rejected rather than silently weakening `sync_directory()`.
 The function table remains a C ABI owned by rocksdb-js. Every rocksdb-js entry point is `noexcept`,
 catches all C++ exceptions, and converts them to a stable status plus bounded provider context.
 Every returned allocation includes a provider-owned release operation; fulltext never assumes the
-provider allocator. No Rust panic may cross a provider callback frame. Every Directory and writer
-entry catches package panics before returning to Tantivy, poisons the affected Directory, and maps
-the failure to `io::Error`; every later operation on that Directory fails consistently. Fault tests
-inject C++ exceptions and Rust panics immediately around provider calls on writer and merge threads
-and prove the Node process remains alive.
+provider allocator. No Rust panic may cross a provider callback frame. Phase 0 uses fallible state
+access and the Node export boundary to contain prototype failures. The production Directory adds
+per-index panic containment and poisoning before the Rocks backend becomes public, so every later
+operation on an affected Directory fails consistently. Fault tests inject C++ exceptions and Rust
+panics immediately around provider calls on writer and merge threads and prove the Node process
+remains alive.
 
 The lease is deliberately not transaction-joinable. Harper's
 [derived-index protocol](https://github.com/HarperFast/harper/issues/2489) is post-commit,
