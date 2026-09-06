@@ -5,14 +5,14 @@ reviewed deliberately.
 
 ## Rust runtime and build graph
 
-| Dependency                 | Scope                           | Purpose                                                                    |
-| -------------------------- | ------------------------------- | -------------------------------------------------------------------------- |
-| `async-trait` 0.1.92       | optional Phase 0 build/runtime  | Implements Tantivy's asynchronous `FileHandle` read contract.              |
-| `tantivy` 0.26.1           | runtime                         | Full-text indexing and search engine, including the `Directory` contract.  |
-| `napi` 2.16.17             | optional runtime                | Node-API values and error conversion for the addon build.                  |
-| `napi-derive` 2.16.13      | optional build/runtime boundary | Generates Node-API exports.                                                |
-| `napi-build` 2.4.1         | build                           | Configures platform-specific addon linking.                                |
-| `stable_deref_trait` 1.2.1 | optional Phase 0 runtime        | Lets Tantivy `OwnedBytes` retain and directly read provider-owned buffers. |
+| Dependency                 | Scope                            | Purpose                                                                    |
+| -------------------------- | -------------------------------- | -------------------------------------------------------------------------- |
+| `async-trait` 0.1.92       | optional Phase 0 runtime + tests | Implements Tantivy's asynchronous `FileHandle` read contract.              |
+| `tantivy` 0.26.1           | runtime                          | Full-text indexing and search engine, including the `Directory` contract.  |
+| `napi` 2.16.17             | optional runtime                 | Node-API values and error conversion for the addon build.                  |
+| `napi-derive` 2.16.13      | optional build/runtime boundary  | Generates Node-API exports.                                                |
+| `napi-build` 2.4.1         | build                            | Configures platform-specific addon linking.                                |
+| `stable_deref_trait` 1.2.1 | optional Phase 0 runtime         | Lets Tantivy `OwnedBytes` retain and directly read provider-owned buffers. |
 
 The Rust dependency graph must not include RocksDB. The future Rocks backend calls a C-ABI
 capability table owned by rocksdb-js rather than linking a second RocksDB runtime.

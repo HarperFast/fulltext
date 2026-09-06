@@ -4,6 +4,7 @@ use std::io;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -83,9 +84,21 @@ struct State {
 	fail_next_flush: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+static NEXT_FAULTING_KV_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug)]
 pub struct FaultingKv {
+	identity: u64,
 	state: Arc<Mutex<State>>,
+}
+
+impl Default for FaultingKv {
+	fn default() -> Self {
+		Self {
+			identity: next_faulting_kv_identity(),
+			state: Default::default(),
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -150,15 +163,6 @@ impl FaultingKv {
 		}
 	}
 
-	pub fn sync_wal(&self) -> io::Result<()> {
-		let mut state = self.state.lock().unwrap();
-		let pending = std::mem::take(&mut state.pending_wal);
-		for (key, entry) in pending {
-			apply_if_newer(&mut state.durable, key, entry);
-		}
-		Ok(())
-	}
-
 	pub fn complete_flush(&self, barrier: FlushBarrier) -> io::Result<()> {
 		let mut state = self.state.lock().unwrap();
 		if std::mem::take(&mut state.fail_next_flush) {
@@ -173,6 +177,7 @@ impl FaultingKv {
 	pub fn crash(&self) -> Self {
 		let durable = self.state.lock().unwrap().durable.clone();
 		Self {
+			identity: next_faulting_kv_identity(),
 			state: Arc::new(Mutex::new(State {
 				next_sequence: durable.values().map(|entry| entry.sequence).max().unwrap_or(0),
 				visible: durable.clone(),
@@ -195,7 +200,7 @@ impl FaultingKv {
 
 impl KvStore for FaultingKv {
 	fn identity(&self) -> KvStoreIdentity {
-		KvStoreIdentity(0, Arc::as_ptr(&self.state) as usize as u64, 0)
+		KvStoreIdentity(0, self.identity, 0)
 	}
 
 	fn read(&self, key: &[u8]) -> io::Result<Option<OwnedBytes>> {
@@ -207,8 +212,14 @@ impl KvStore for FaultingKv {
 	}
 
 	fn sync(&self) -> io::Result<()> {
-		self.sync_wal()
+		Ok(())
 	}
+}
+
+fn next_faulting_kv_identity() -> u64 {
+	let identity = NEXT_FAULTING_KV_IDENTITY.fetch_add(1, Ordering::Relaxed);
+	assert_ne!(identity, 0, "FaultingKv identity space exhausted");
+	identity
 }
 
 fn apply_if_newer(entries: &mut BTreeMap<Vec<u8>, VersionedValue>, key: Vec<u8>, candidate: VersionedValue) {
@@ -789,6 +800,21 @@ mod tests {
 		let recovered = store.crash();
 		assert_eq!(recovered.get(b"meta.json"), None);
 		assert_eq!(recovered.get(b"object/1"), None);
+	}
+
+	#[test]
+	fn directory_sync_is_not_the_rocks_durability_barrier() {
+		let store = FaultingKv::default();
+		store.write(&[put(b"object/1", b"segment")], WritePolicy::WAL).unwrap();
+		KvStore::sync(&store).unwrap();
+		assert_eq!(store.crash().get(b"object/1"), None);
+
+		store
+			.write(&[put(b"meta.json", b"object/1")], WritePolicy::WAL_SYNC)
+			.unwrap();
+		let recovered = store.crash();
+		assert_eq!(recovered.get(b"object/1"), Some(b"segment".to_vec()));
+		assert_eq!(recovered.get(b"meta.json"), Some(b"object/1".to_vec()));
 	}
 
 	#[test]

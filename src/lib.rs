@@ -240,7 +240,16 @@ pub fn phase0_storage_stats(id: u32) -> boundary::Result<Vec<String>> {
 #[napi(catch_unwind, skip_typescript, js_name = "__phase0VerifyTantivyOnStorageLease")]
 pub fn phase0_verify_tantivy_on_storage_lease(id: u32) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		directory_harness::verify_tantivy_lifecycle(phase0::KvDirectory::new(phase0_lease(id)?))
+		let lease = phase0_lease(id)?;
+		let run = NEXT_TEST_HANDLE.fetch_add(1, Ordering::Relaxed);
+		let case = AtomicU32::new(0);
+		directory_harness::verify_directory_contract(|| {
+			let namespace = format!("phase0-contract/{run}/{}", case.fetch_add(1, Ordering::Relaxed));
+			phase0::KvDirectory::with_namespace(lease.clone(), namespace.as_bytes())
+		})
+		.map_err(|error| napi::Error::new("E_STORAGE", error))?;
+		let namespace = format!("phase0-lifecycle/{run}");
+		directory_harness::verify_tantivy_lifecycle(phase0::KvDirectory::with_namespace(lease, namespace.as_bytes()))
 			.map_err(|error| napi::Error::new("E_STORAGE", error))
 	})?
 }

@@ -199,7 +199,7 @@ impl RocksLease {
 				"storage lease provider image token is unset",
 			));
 		}
-		let lease = unsafe { ptr::read_unaligned(table.cast::<LeaseV1>()) };
+		let mut lease = unsafe { ptr::read_unaligned(table.cast::<LeaseV1>()) };
 		if lease.reserved != 0 || (lease.rocksdb_major, lease.rocksdb_minor, lease.rocksdb_patch) != (11, 8, 1) {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
@@ -268,6 +268,10 @@ impl RocksLease {
 				"storage leases came from different rocksdb-js addon images",
 			));
 		}
+		lease.provider_build_identity = ByteSpan {
+			data: ptr::null(),
+			length: 0,
+		};
 
 		Ok(Self {
 			inner: Arc::new(RocksLeaseInner {
@@ -603,7 +607,12 @@ impl Status {
 	}
 
 	fn validate(&self) -> io::Result<()> {
-		if self.raw.data != self.message.as_ptr().cast_mut() || self.raw.length >= self.raw.capacity {
+		if self.raw.struct_size as usize != size_of::<StatusBuffer>()
+			|| self.raw.reserved != 0
+			|| self.raw.data != self.message.as_ptr().cast_mut()
+			|| self.raw.capacity as usize != self.message.len()
+			|| self.raw.length as usize >= self.message.len()
+		{
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidData,
 				"storage provider returned an invalid status buffer",

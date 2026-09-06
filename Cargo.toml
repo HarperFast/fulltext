@@ -26,6 +26,9 @@ tantivy = "=0.26.1"
 [build-dependencies]
 napi-build = "=2.4.1"
 
+[dev-dependencies]
+async-trait = "=0.1.92"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
