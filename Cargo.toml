@@ -13,11 +13,13 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 node-api = ["dep:napi", "dep:napi-derive"]
-test-panic = ["node-api"]
+phase0 = []
+test-panic = ["node-api", "phase0"]
 
 [dependencies]
 napi = { version = "=2.16.17", default-features = false, features = ["napi8"], optional = true }
 napi-derive = { version = "=2.16.13", optional = true }
+stable_deref_trait = "=1.2.1"
 tantivy = "=0.26.1"
 
 [build-dependencies]

@@ -373,6 +373,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "stable_deref_trait",
  "tantivy",
 ]
 
