@@ -13,15 +13,24 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 node-api = ["dep:napi", "dep:napi-derive"]
-test-panic = ["node-api"]
+phase0 = ["dep:async-trait", "dep:stable_deref_trait"]
+test-panic = ["node-api", "phase0"]
 
 [dependencies]
+async-trait = { version = "=0.1.92", optional = true }
 napi = { version = "=2.16.17", default-features = false, features = ["napi8"], optional = true }
 napi-derive = { version = "=2.16.13", optional = true }
+stable_deref_trait = { version = "=1.2.1", optional = true }
 tantivy = "=0.26.1"
+
+[target.'cfg(windows)'.dependencies]
+libloading = "=0.8.9"
 
 [build-dependencies]
 napi-build = "=2.4.1"
+
+[dev-dependencies]
+async-trait = "=0.1.92"
 
 [profile.release]
 lto = "thin"

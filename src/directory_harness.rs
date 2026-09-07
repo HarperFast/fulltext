@@ -15,12 +15,20 @@ use tantivy::directory::{
 	Directory, DirectoryLock, FileHandle, OwnedBytes, TerminatingWrite, WatchCallback, WatchHandle, WritePtr,
 	INDEX_WRITER_LOCK,
 };
+use tantivy::schema::{Schema, TEXT};
 use tantivy::HasLen;
+use tantivy::{doc, Index, IndexSettings, ReloadPolicy};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogicalReadMetrics {
 	pub calls: u64,
 	pub bytes_requested: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryCaseMetrics {
+	pub name: &'static str,
+	pub logical_reads: LogicalReadMetrics,
 }
 
 #[derive(Debug, Default)]
@@ -146,19 +154,154 @@ where
 	}
 }
 
-pub fn verify_directory_baseline<D>(directory: D) -> Result<LogicalReadMetrics, String>
+pub fn verify_directory_contract<D>(make_directory: impl Fn() -> D) -> Result<Vec<DirectoryCaseMetrics>, String>
 where
 	D: Directory + Clone,
 {
-	verify_concurrent_atomic_visibility(&directory)?;
-	verify_watch(&directory)?;
+	let mut results = Vec::new();
+	run_contract_case(&mut results, "immediate creation", make_directory(), |directory| {
+		verify_immediate_creation(directory)
+	})?;
+	run_contract_case(&mut results, "repeated flush", make_directory(), |directory| {
+		verify_repeated_flush(directory)
+	})?;
+	run_contract_case(&mut results, "read and delete", make_directory(), |directory| {
+		verify_write_read_delete(directory)
+	})?;
+	run_contract_case(&mut results, "missing paths", make_directory(), |directory| {
+		verify_missing_file_errors(directory)
+	})?;
+	run_contract_case(&mut results, "atomic replacement", make_directory(), |directory| {
+		verify_concurrent_atomic_visibility(directory)?;
+		verify_atomic_metadata(directory)
+	})?;
+	run_contract_case(&mut results, "writer exclusion", make_directory(), |directory| {
+		verify_in_process_writer_exclusion(directory)
+	})?;
+	run_contract_case(&mut results, "watch", make_directory(), |directory| {
+		verify_watch(directory)
+	})?;
+	run_contract_case(&mut results, "directory sync", make_directory(), |directory| {
+		directory.sync_directory().map_err(|error| error.to_string())
+	})?;
+	Ok(results)
+}
+
+pub fn verify_tantivy_lifecycle<D>(directory: D) -> Result<(), String>
+where
+	D: Directory + Clone,
+{
+	let mut schema_builder = Schema::builder();
+	let body = schema_builder.add_text_field("body", TEXT);
+	let schema = schema_builder.build();
+	let index =
+		Index::create(directory.clone(), schema, IndexSettings::default()).map_err(|error| error.to_string())?;
+	let mut writer = index.writer(15_000_000).map_err(|error| error.to_string())?;
+	writer
+		.add_document(doc!(body => "red hiking boots"))
+		.map_err(|error| error.to_string())?;
+	writer
+		.add_document(doc!(body => "blue running shoes"))
+		.map_err(|error| error.to_string())?;
+	writer.commit().map_err(|error| error.to_string())?;
+	writer.wait_merging_threads().map_err(|error| error.to_string())?;
+
+	verify_query_count(&index, body, "boots", 1)?;
+	drop(index);
+	let reopened = Index::open(directory).map_err(|error| error.to_string())?;
+	verify_query_count(&reopened, body, "shoes", 1)
+}
+
+fn verify_query_count(
+	index: &Index,
+	field: tantivy::schema::Field,
+	query: &str,
+	expected: usize,
+) -> Result<(), String> {
+	let reader = index
+		.reader_builder()
+		.reload_policy(ReloadPolicy::Manual)
+		.try_into()
+		.map_err(|error: tantivy::TantivyError| error.to_string())?;
+	reader.reload().map_err(|error| error.to_string())?;
+	let parsed = tantivy::query::QueryParser::for_index(index, vec![field])
+		.parse_query(query)
+		.map_err(|error| error.to_string())?;
+	let count = reader
+		.searcher()
+		.search(&parsed, &tantivy::collector::Count)
+		.map_err(|error| error.to_string())?;
+	if count != expected {
+		return Err(format!(
+			"query {query:?} matched {count} documents instead of {expected}"
+		));
+	}
+	Ok(())
+}
+
+fn run_contract_case<D>(
+	results: &mut Vec<DirectoryCaseMetrics>,
+	name: &'static str,
+	directory: D,
+	verify: impl FnOnce(&InstrumentedDirectory<D>) -> Result<(), String>,
+) -> Result<(), String>
+where
+	D: Directory + Clone,
+{
 	let directory = InstrumentedDirectory::new(directory);
-	verify_missing_file_errors(&directory)?;
-	verify_write_read_delete(&directory)?;
-	verify_atomic_metadata(&directory)?;
-	verify_in_process_writer_exclusion(&directory)?;
-	directory.sync_directory().map_err(|error| error.to_string())?;
-	Ok(directory.logical_read_metrics())
+	verify(&directory).map_err(|error| format!("{name}: {error}"))?;
+	results.push(DirectoryCaseMetrics {
+		name,
+		logical_reads: directory.logical_read_metrics(),
+	});
+	Ok(())
+}
+
+fn verify_immediate_creation(directory: &dyn Directory) -> Result<(), String> {
+	let path = Path::new("immediate");
+	let _writer = directory.open_write(path).map_err(|error| error.to_string())?;
+	if !directory.exists(path).map_err(|error| error.to_string())? {
+		return Err("new writer did not create the logical file".to_owned());
+	}
+	let file = directory.open_read(path).map_err(|error| error.to_string())?;
+	if !file.is_empty() {
+		return Err("new logical file was not empty".to_owned());
+	}
+	Ok(())
+}
+
+fn verify_repeated_flush(directory: &dyn Directory) -> Result<(), String> {
+	let path = Path::new("growing");
+	let mut writer = directory.open_write(path).map_err(|error| error.to_string())?;
+	writer.write_all(b"abc").map_err(|error| error.to_string())?;
+	writer.flush().map_err(|error| error.to_string())?;
+	let first = directory.open_read(path).map_err(|error| error.to_string())?;
+	if first.read_bytes().map_err(|error| error.to_string())?.as_slice() != b"abc" {
+		return Err("first flush exposed unexpected bytes".to_owned());
+	}
+
+	writer.write_all(b"def").map_err(|error| error.to_string())?;
+	writer.flush().map_err(|error| error.to_string())?;
+	if first.read_bytes().map_err(|error| error.to_string())?.as_slice() != b"abc" {
+		return Err("later flush changed an open file".to_owned());
+	}
+	drop(first);
+	let second = directory.open_read(path).map_err(|error| error.to_string())?;
+	if second.read_bytes().map_err(|error| error.to_string())?.as_slice() != b"abcdef" {
+		return Err("second flush exposed unexpected bytes".to_owned());
+	}
+
+	writer.write_all(b"ghi").map_err(|error| error.to_string())?;
+	writer.terminate().map_err(|error| error.to_string())?;
+	if second.read_bytes().map_err(|error| error.to_string())?.as_slice() != b"abcdef" {
+		return Err("termination changed an open file".to_owned());
+	}
+	drop(second);
+	let terminated = directory.open_read(path).map_err(|error| error.to_string())?;
+	if terminated.read_bytes().map_err(|error| error.to_string())?.as_slice() != b"abcdefghi" {
+		return Err("termination exposed unexpected bytes".to_owned());
+	}
+	Ok(())
 }
 
 fn verify_missing_file_errors(directory: &dyn Directory) -> Result<(), String> {
@@ -270,7 +413,7 @@ where
 	ready_receiver
 		.recv_timeout(Duration::from_secs(2))
 		.map_err(|error| error.to_string())?;
-	let write_result = directory.atomic_write(path, after).map_err(|error| error.to_string());
+	let write_result = atomic_replace_while_observed(directory, path, after);
 	let observer_result = observer
 		.join()
 		.map_err(|_| "atomic metadata observer panicked".to_owned())?;
@@ -280,6 +423,26 @@ where
 		return Err("atomic metadata replacement returned unexpected bytes".to_owned());
 	}
 	Ok(())
+}
+
+fn atomic_replace_while_observed<D>(directory: &D, path: &Path, data: &[u8]) -> Result<(), String>
+where
+	D: Directory,
+{
+	let deadline = std::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		match directory.atomic_write(path, data) {
+			Ok(()) => return Ok(()),
+			Err(error)
+				if cfg!(windows)
+					&& error.kind() == io::ErrorKind::PermissionDenied
+					&& std::time::Instant::now() < deadline =>
+			{
+				thread::yield_now();
+			}
+			Err(error) => return Err(error.to_string()),
+		}
+	}
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -567,10 +730,16 @@ mod tests {
 
 	#[test]
 	fn mmap_directory_satisfies_the_contract() {
-		let directory = MmapDirectory::create_from_tempdir().unwrap();
-		let metrics = verify_directory_baseline(directory).unwrap();
-		assert_eq!(metrics.calls, 6);
-		assert_eq!(metrics.bytes_requested, 29);
+		let metrics = verify_directory_contract(|| MmapDirectory::create_from_tempdir().unwrap()).unwrap();
+		assert_eq!(metrics.len(), 8);
+		assert_eq!(metrics[0].name, "immediate creation");
+		assert_eq!(metrics[1].name, "repeated flush");
+		assert!(metrics.iter().any(|case| case.logical_reads.calls > 0));
+	}
+
+	#[test]
+	fn mmap_directory_supports_a_real_tantivy_lifecycle() {
+		verify_tantivy_lifecycle(MmapDirectory::create_from_tempdir().unwrap()).unwrap();
 	}
 
 	#[test]
