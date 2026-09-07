@@ -656,6 +656,11 @@ mod node {
 		upper: u64,
 	}
 
+	#[cfg(windows)]
+	type CheckObjectTypeTagFn =
+		unsafe extern "C" fn(sys::napi_env, sys::napi_value, *const NapiTypeTag, *mut bool) -> sys::napi_status;
+
+	#[cfg(not(windows))]
 	unsafe extern "C" {
 		fn napi_check_object_type_tag(
 			env: sys::napi_env,
@@ -665,6 +670,36 @@ mod node {
 		) -> sys::napi_status;
 	}
 
+	#[cfg(not(windows))]
+	unsafe fn check_object_type_tag(
+		env: sys::napi_env,
+		value: sys::napi_value,
+		type_tag: *const NapiTypeTag,
+		result: *mut bool,
+	) -> napi::Result<sys::napi_status> {
+		Ok(unsafe { napi_check_object_type_tag(env, value, type_tag, result) })
+	}
+
+	#[cfg(windows)]
+	unsafe fn check_object_type_tag(
+		env: sys::napi_env,
+		value: sys::napi_value,
+		type_tag: *const NapiTypeTag,
+		result: *mut bool,
+	) -> napi::Result<sys::napi_status> {
+		static CHECK_OBJECT_TYPE_TAG: OnceLock<Result<CheckObjectTypeTagFn, String>> = OnceLock::new();
+		let function = CHECK_OBJECT_TYPE_TAG
+			.get_or_init(|| {
+				let host = libloading::os::windows::Library::this().map_err(|error| error.to_string())?;
+				unsafe { host.get::<CheckObjectTypeTagFn>(b"napi_check_object_type_tag\0") }
+					.map(|symbol| *symbol)
+					.map_err(|error| error.to_string())
+			})
+			.as_ref()
+			.map_err(|error| napi::Error::new(Status::GenericFailure, error.clone()))?;
+		Ok(unsafe { function(env, value, type_tag, result) })
+	}
+
 	pub fn from_external(env: Env, value: JsUnknown) -> napi::Result<RocksLease> {
 		let raw_value = unsafe { value.raw() };
 		let tag = NapiTypeTag {
@@ -672,7 +707,7 @@ mod node {
 			upper: TYPE_TAG_UPPER,
 		};
 		let mut matches = false;
-		let tag_status = unsafe { napi_check_object_type_tag(env.raw(), raw_value, &tag, &mut matches) };
+		let tag_status = unsafe { check_object_type_tag(env.raw(), raw_value, &tag, &mut matches) }?;
 		if tag_status != sys::Status::napi_ok || !matches {
 			return Err(napi::Error::new(
 				Status::InvalidArg,

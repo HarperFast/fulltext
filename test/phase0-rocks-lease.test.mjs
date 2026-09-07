@@ -31,12 +31,16 @@ test(
 
 			addon.__phase0StoragePut(leaseId, Buffer.from('test/a'), Buffer.from('alpha'), true);
 			addon.__phase0StoragePut(leaseId, Buffer.from('test/b'), Buffer.from('beta'), true);
+			addon.__phase0StoragePut(leaseId, Buffer.from('test/empty'), Buffer.alloc(0), true);
 			assert.deepStrictEqual(addon.__phase0StorageGet(leaseId, Buffer.from('test/a')), Buffer.from('alpha'));
+			assert.deepStrictEqual(addon.__phase0StorageGet(leaseId, Buffer.from('test/empty')), Buffer.alloc(0));
 			assert.deepStrictEqual(addon.__phase0StorageScan(leaseId, Buffer.from('test/'), Buffer.alloc(0)), [
 				Buffer.from('test/a'),
 				Buffer.from('alpha'),
 				Buffer.from('test/b'),
 				Buffer.from('beta'),
+				Buffer.from('test/empty'),
+				Buffer.alloc(0),
 			]);
 			addon.__phase0StorageDelete(leaseId, Buffer.from('test/a'), true);
 			assert.strictEqual(addon.__phase0StorageGet(leaseId, Buffer.from('test/a')), null);
