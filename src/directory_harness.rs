@@ -413,7 +413,7 @@ where
 	ready_receiver
 		.recv_timeout(Duration::from_secs(2))
 		.map_err(|error| error.to_string())?;
-	let write_result = directory.atomic_write(path, after).map_err(|error| error.to_string());
+	let write_result = atomic_replace_while_observed(directory, path, after);
 	let observer_result = observer
 		.join()
 		.map_err(|_| "atomic metadata observer panicked".to_owned())?;
@@ -423,6 +423,26 @@ where
 		return Err("atomic metadata replacement returned unexpected bytes".to_owned());
 	}
 	Ok(())
+}
+
+fn atomic_replace_while_observed<D>(directory: &D, path: &Path, data: &[u8]) -> Result<(), String>
+where
+	D: Directory,
+{
+	let deadline = std::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		match directory.atomic_write(path, data) {
+			Ok(()) => return Ok(()),
+			Err(error)
+				if cfg!(windows)
+					&& error.kind() == io::ErrorKind::PermissionDenied
+					&& std::time::Instant::now() < deadline =>
+			{
+				thread::yield_now();
+			}
+			Err(error) => return Err(error.to_string()),
+		}
+	}
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
