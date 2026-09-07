@@ -14,9 +14,10 @@ suggestions, highlighting, derived-index watermarks, and RocksDB storage remain 
 It deliberately implements narrow prerequisites from issues #14 and #17 without closing either
 issue. From #14 it uses one versioned packed mutation request, one packed search result, stable error
 codes, and the lifecycle shape required by this backend. From #17 it uses one bounded dedicated
-actor per index so sustained work stays off JavaScript and libuv. It does not implement the final
-process-wide governor, shared search pool, multi-environment handle registry, cancellation, or
-derived nonblocking admission.
+writer actor and one bounded search executor per index so sustained work stays off JavaScript and
+libuv while search remains independent of write/commit latency. It does not implement the final
+process-wide governor, shared cross-index search pool, multi-environment handle registry,
+cancellation, or derived nonblocking admission.
 
 ## Invariant
 
@@ -85,6 +86,20 @@ interface SearchResult {
 	total: number;
 	hits: Array<{ id: string; score: number }>;
 }
+
+interface FullTextStatus {
+	state: 'open' | 'closing' | 'closed' | 'poisoned';
+	uncommittedMutations: number;
+	queuedCommands: number;
+	queuedBytes: number;
+	commitOpstamp: bigint;
+	metrics: {
+		writerQueueNanoseconds: bigint;
+		writerExecutionNanoseconds: bigint;
+		searchQueueNanoseconds: bigint;
+		searchExecutionNanoseconds: bigint;
+	};
+}
 ```
 
 These native-only limits are required in the pre-1.0 standalone factory so measurements are
@@ -101,10 +116,11 @@ The exported flow is:
    delete-by-ID followed by add, so a committed ID has at most one live document.
 3. `commit()` serializes behind earlier writer commands and publishes through Tantivy's ordinary
    commit path. It does not imply reader reload.
-4. `reload()` refreshes the reader after earlier commits; `search()` uses one captured immutable
-   searcher.
+4. `reload()` crosses the writer barrier and then refreshes the reader on the search executor;
+   `search()` uses one captured immutable searcher without waiting behind indexing or commit work.
 5. `close()` rejects new work, settles admitted commands, shuts down the writer, releases the path
    reservation, and is idempotent.
+6. `status()` reads bounded counters and state without entering either sustained-work queue.
 
 Only English analysis is accepted. `positions` defaults to true and selects frequencies with or
 without positions. Changing that default in a future release is an index-format change, not a
@@ -120,6 +136,13 @@ into bounded result objects. The N-API boundary receives one operation per batch
 per-document native calls are not exposed. The benchmark reports engine execution separately from
 N-API plus result-decoding time so storage and boundary costs cannot be confused.
 
+`encodeMutationBatch()` enforces the configured byte limit incrementally before allocation growth,
+but it is a convenience encoder, not claimed to be an event-loop-free ingestion path. It performs
+UTF-8 encoding on its caller's JavaScript thread. Production callers may build the documented
+packed format in their own worker; Harper's projection path produces it directly. `apply()` then
+makes one required copy into Rust-owned memory before asynchronous admission. Both costs are
+measured, and the benchmark pre-encodes its engine-only corpus so directory results exclude them.
+
 ## Native architecture
 
 ```text
@@ -128,28 +151,30 @@ Node worker
   ▼
 N-API handle registry ── canonical path reservation
   │
-  └─ command ─► one per-index queue bounded by commands and retained bytes
-                                              └─ one dedicated actor
-                                                 ├─ one Tantivy IndexWriter
-                                                 │  └─ Tantivy indexing/merge workers
-                                                 └─ IndexReader/Searcher
+  ├─ write/commit/reload barrier ─► bounded writer queue ─► dedicated writer actor
+  │                                                       └─ Tantivy IndexWriter
+  │                                                          └─ indexing/merge workers
+  └─ search/reload ─► bounded search queue ─► dedicated search executor
+                                             └─ IndexReader/Searcher
 
 writer actor ─► shared engine ─► MmapDirectory (native)
                             later └─ RocksDbDirectory (same engine)
 ```
 
-The native addon owns the actor thread and queue; no sustained operation runs on the JavaScript
-event loop or libuv pool. The actor is the sole owner of `IndexWriter`, `IndexReader`, and searcher
-publication, which makes mutation, commit, reload, search, rollback, and shutdown ordering explicit.
-Tantivy remains free to use its configured indexing and merge workers behind that actor. Independent
-indexes have independent actors and may run concurrently. Searches within one index are serialized
-in this slice; replacing that limitation with the process-wide bounded search pool belongs to #17
-and will not change engine semantics.
+The native addon owns both threads and queues; no sustained operation runs on the JavaScript event
+loop or libuv pool. The writer actor is the sole owner of `IndexWriter`, making mutation, commit,
+rollback, and shutdown ordering explicit. The search executor owns `IndexReader` and its current
+`Searcher`; immutable search work therefore overlaps indexing and commit. `reload()` first crosses
+the writer queue as a barrier, then enters the search queue, so it covers all commits ordered before
+the call without putting ordinary search behind the writer. Tantivy remains free to use its
+configured indexing and merge workers behind the writer actor. Independent indexes and their
+searches may run concurrently. #17 later replaces the per-index search executor with the bounded
+process pool without changing engine behavior.
 
-The queue is bounded by both command count and retained bytes. A JS-owned buffer is copied once into
-a Rust-owned `Vec<u8>` before admission; no actor borrows memory owned by a Node environment. Queue
-wait and engine execution time are reported separately in status/benchmark output. Effective writer
-arena and indexing-thread values are printed in every benchmark record.
+Both queues are bounded by command count and retained bytes. A JS-owned buffer is copied once into a
+Rust-owned `Vec<u8>` before admission; no native thread borrows memory owned by a Node environment.
+Queue wait and engine execution time are reported separately in status/benchmark output. Effective
+writer arena, indexing-thread, and search-thread values are printed in every benchmark record.
 
 The registry rejects a second live open of the same canonical path. This is narrower than the
 eventual shared multi-environment registry, but it preserves the one-writer invariant without
@@ -158,14 +183,25 @@ replace rejection with reference-counted shared handles without changing the ind
 
 ## Schema and query behavior
 
-Each Tantivy schema contains an internal stored/indexed raw ID field and one declared text field per
-configured source field. At creation, the engine performs an initial metadata commit whose payload
-contains a versioned fingerprint of the package ABI, Tantivy version, logical index ID, generation,
-analyzer identity, stop-word policy, positions, surface-term storage, and structural schema. Reopen
-compares both the generated Tantivy schema and this fingerprint before creating a writer. Unknown
-mutation fields, missing IDs, duplicate schema
+Each Tantivy schema contains an internal stored/indexed raw ID field using Tantivy's raw tokenizer
+and one declared text field per configured source field. At creation, the engine atomically writes a
+small backend-neutral identity sidecar through `Directory::atomic_write()` and calls
+`Directory::sync_directory()`. It contains a versioned fingerprint of the package ABI, Tantivy
+version, logical index ID, bounded generation, analyzer identity, stop-word policy, positions,
+surface-term storage, and structural schema. Reopen compares both the generated Tantivy schema and
+this fingerprint before creating a writer. The immutable sidecar is separate from Tantivy's
+per-commit payload, which remains available for standalone checkpoints and derived watermarks.
+Unknown mutation fields, missing IDs, duplicate schema
 field names, empty queries, unknown search fields, oversized batches, and excessive result windows
 fail before search/index work.
+
+Create treats `{sidecar, meta.json}` as a pair. If neither exists, it creates the index and sidecar;
+if both exist, it reopens and verifies them; if only one exists, it reports an incomplete creation
+that requires the caller to rebuild that new path. Absent, unparseable, or mismatched identity is
+never accepted as legacy-compatible. Every declared count and length in packed input is checked
+against the remaining bytes before arithmetic or allocation, the version tag is checked first, and
+invalid UTF-8 is rejected. `indexId` and `generation` have fixed encoded-length limits because they
+are persisted.
 
 The English analyzer is versioned by name and composed from Tantivy's tokenizer primitives:
 `SimpleTokenizer`, `RemoveLongFilter`, `LowerCaser`, optional built-in English
@@ -182,11 +218,14 @@ fixed contract.
 
 ## Failure and lifecycle behavior
 
-All N-API exports retain `catch_unwind`, and the actor catches unwind around initialization and every
-command. A panic poisons only the affected handle, drains and rejects every queued promise, and
-leaves no admitted promise unsettled. Filesystem, schema, query, resource, queue, closed, lock-busy,
-and native failures map to stable package error codes present in the TypeScript allowlist while
-preserving the cause message. No Rust type or Tantivy object crosses the public API or Node worker.
+All N-API exports retain `catch_unwind`, and both native thread entries catch unwind around
+initialization and every command. A panic poisons only the affected handle, drains and rejects every
+queued promise, and leaves no admitted promise unsettled. Filesystem, incomplete-create, identity,
+schema, query, resource, queue, closed, and native failures map to stable package error codes present
+in the TypeScript allowlist while preserving the cause message. A competing process holding
+Tantivy's filesystem writer lock maps to a distinct retryable lock-busy code. A parity test compares
+the Rust error table with the TypeScript allowlist, including asynchronously rejected promises. No
+Rust type or Tantivy object crosses the public API or Node worker.
 
 Successful `commit()` has Tantivy 0.26.1's documented persistence contract: all prior mutations are
 published and persisted, and indexing can resume from that point after a process crash if the
@@ -196,11 +235,18 @@ poisons the writer generation; callers must close and reopen from the last durab
 than guessing which uncommitted opstamps survived.
 
 `close()` defaults to require-clean: uncommitted mutations fail close rather than being silently
-committed or discarded. That failure restores the open state so the caller can commit or request an
-explicit rollback; it does not strand the path reservation in `closing`. A successful close joins
-Tantivy's merge threads before releasing the canonical path. Closing transitions through open,
-closing, and closed states; it settles admitted commands, and repeated successful close calls
-resolve. Process exit does not promise an implicit final commit.
+committed or discarded. That failure restores the open state so the caller can commit or call
+`close({ mode: 'rollback' })`; it does not strand the path reservation in `closing`. A poisoned
+handle always permits rollback close, and a default close after a terminal commit failure performs
+the same forced teardown because there is no valid writer state left to preserve. A successful close
+joins Tantivy's merge threads, stops the search executor, and only then releases the canonical path.
+Closing transitions through open, closing, and closed states; it settles admitted commands, and
+repeated successful close calls resolve. Process exit does not promise an implicit final commit.
+
+Each Node environment registers a cleanup hook. Environment teardown force-closes its handles,
+rejects pending promises without calling into a destroyed environment, joins package threads, and
+releases path reservations. Deferred resolution is bound to the originating environment; handles
+and deferreds are never reused across workers.
 
 ## Performance experiment
 
@@ -240,11 +286,15 @@ hardware and release-over-release history.
   corpus after reopen; kill before commit and verify it is absent. A worker-thread test verifies
   promises settle only into their originating Node environment.
 - Concurrency tests: search during commit/merge, actor panic drains queued promises, concurrent
-  canonical opens admit one writer, and merge files stop changing after close resolves.
+  canonical opens admit one writer, a second process receives the retryable lock-busy error, and
+  merge files stop changing after close resolves.
+- Decoder fuzz/property tests mutate version, counts, lengths, offsets, and UTF-8 and assert every
+  input returns or produces a typed error without an unchecked allocation or process abort.
 - Existing Directory contract tests remain unchanged.
 - `npm run check` and package artifact verification run before review.
 - The release benchmark runs locally at two dataset sizes; raw JSON is retained with the PR
-  verification notes.
+  verification notes. It refuses debug or `test-panic` artifacts so they cannot seed a performance
+  baseline.
 
 End-to-end route: a Node integration test loads the built addon through the published native
 subpath, creates an on-disk index, mutates and commits it, searches it, closes it, reopens it, and
@@ -273,12 +323,19 @@ Rejected because it would expose a third-party API, permit unbounded query synta
 public contract the Rocks and Harper integrations could not safely govern. A directory-only smoke
 also cannot provide the performance baseline Kyle requested.
 
-### Do less on runtime: engine benchmark plus one dedicated actor per index
+### Do less on runtime: engine benchmark plus separate per-index writer and search executors
 
 Adopted. The engine is generic over `Directory`, the pure engine benchmark excludes N-API, and the
-Node slice uses one byte-bounded actor rather than implementing #17's process governor and shared
-search pool. This preserves a usable off-event-loop API while keeping the storage reference
-measurable.
+Node slice uses byte-bounded per-index execution rather than implementing #17's process governor and
+shared cross-index search pool. Keeping search separate from the writer is the minimum needed for a
+baseline that measures Tantivy instead of temporary writer-queue head-of-line blocking.
+
+### Identity sidecar versus repeating identity in every commit payload
+
+The sidecar is chosen. Repeating identity in every commit payload couples immutable engine identity
+to future checkpoint/watermark publication and lets any omitted `set_payload()` erase it. An
+immutable sidecar written through the same `Directory` contract prevents that failure and works for
+both `MmapDirectory` and `RocksDbDirectory` without custom filesystem code.
 
 ### Chosen: one shared engine slice with a thin MmapDirectory constructor
 
@@ -293,5 +350,5 @@ off-event-loop execution, and yields an apples-to-apples reference for the Rocks
 - Phrase, fuzzy, prefix, autocomplete, suggestions, highlighting, snippets, and filters.
 - Shared handles across multiple Node worker environments.
 - Durable benchmark publication, fixed-host regression thresholds, and Rocks/native comparison.
-- Process-wide runtime budgets, concurrent per-index search, cancellation, and cursor-based deep
-  pagination.
+- Process-wide runtime budgets, concurrent searches within one index, cancellation, and cursor-based
+  deep pagination.
