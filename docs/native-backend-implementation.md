@@ -92,9 +92,11 @@ interface SearchResult {
 
 interface FullTextStatus {
 	state: 'open' | 'closing' | 'closed' | 'poisoned';
-	uncommittedMutations: number;
-	queuedCommands: number;
-	queuedBytes: number;
+	uncommittedMutations: bigint;
+	writerQueuedCommands: bigint;
+	writerQueuedBytes: bigint;
+	searchQueuedCommands: bigint;
+	searchQueuedBytes: bigint;
 	commitOpstamp: bigint;
 	metrics: {
 		writerQueueNanoseconds: bigint;
@@ -187,7 +189,7 @@ replace rejection with reference-counted shared handles without changing the ind
 
 ## Schema and query behavior
 
-Each Tantivy schema contains an internal stored/indexed raw ID field using Tantivy's raw tokenizer
+Each Tantivy schema contains an internal indexed string fast field for the raw ID using Tantivy's raw tokenizer
 and one declared text field per configured source field. At creation, the engine atomically writes a
 small backend-neutral identity sidecar through `Directory::atomic_write()` and calls
 `Directory::sync_directory()`. It contains a versioned fingerprint of the package ABI, Tantivy
@@ -223,9 +225,8 @@ one selected field. Tantivy's normal scorer supplies BM25. The default result re
 lower total (`offset + returned hits`, with `totalRelation: 'lower-bound'` when the page is full) and
 runs `TopDocs` alone so block-max WAND pruning remains available. Exact total is explicit per query,
 runs a separate `Count`, and is benchmarked separately because it must visit all matches. The initial
-schema stores the ID and also indexes it as a string fast field; the
-benchmark reports stored-field and fast-field hit resolution separately before one becomes the
-fixed contract.
+schema resolves hit IDs through that fast field, avoiding stored-document decompression on every
+result. The ID is not duplicated in Tantivy's document store.
 
 ## Failure and lifecycle behavior
 
@@ -263,32 +264,33 @@ workers.
 
 ## Performance experiment
 
-Add a release-build benchmark that generates a deterministic product-style corpus and drives the
-public native API. It emits one versioned JSON record containing environment metadata and:
+Add a release-build benchmark that generates a deterministic high-cardinality product-style corpus
+and drives the public native API. It emits one versioned JSON record containing environment
+metadata and:
 
-- pure engine documents and UTF-8 MiB indexed per second by batch size;
-- end-to-end apply throughput plus separately reported packing, queue, engine, N-API, and decode
-  time;
-- commit time and commit-plus-reload time;
+- durable documents and packed MiB indexed per second by batch size and commit cadence;
+- separately reported packing, apply, writer queue, and writer execution time;
+- commit latency distribution and reload time;
 - warm BM25 search p50/p95/p99 and throughput at configurable concurrency, using approximate totals
   by default and a separately labeled exact-total profile;
 - cold-after-reopen search p50/p95/p99;
-- stored-ID and fast-ID hit-resolution cost;
-- index bytes, peak RSS, post-close RSS, and error counts; and
-- document count, field count, average text bytes, query mix, thread/memory budgets, build profile,
-  package revision, Tantivy version, and host fingerprint needed to interpret the numbers.
+- index bytes, peak RSS, and post-close RSS; and
+- document count, field count, average packed bytes, thread/memory budgets, Tantivy version, and
+  host metadata needed to interpret the numbers.
 
 The default local profile is short enough for engineering iteration. A larger profile is selected
 explicitly. Correctness assertions run before timing results are accepted: expected IDs must rank,
-committed deletes must disappear, reopen must preserve results, and every operation count must
-match. The benchmark does not claim the 100-million-document or Harper p99-under-50-ms release
-gate; those remain the paired fixed-host work in issue #15. This slice establishes the native engine
-and N-API baseline that issue #15 will compare against RocksDB.
+reopen must preserve results, and every operation count must match. The benchmark's
+replacement-safe upserts emit delete terms, so `--commit-every` is an explicit workload dimension
+rather than allowing an unbounded final commit to masquerade as a production ingestion profile.
+The benchmark does not claim the 100-million-document or Harper p99-under-50-ms release gate; those
+remain the paired fixed-host work in issue #15. This slice establishes the native engine and N-API
+baseline that issue #15 will compare against RocksDB.
 
-CI runs correctness tests and an explicit small benchmark-smoke command that performs the same
-ranking, delete, commit, close, and reopen assertions before validating the JSON schema and nonzero
-measurements. Shared runners enforce no timing threshold. Performance thresholds require controlled
-hardware and release-over-release history.
+CI runs correctness tests and an explicit small benchmark-smoke command that performs ranking,
+commit, close, and reopen assertions before validating nonzero measurements. Shared runners enforce
+no timing threshold. Performance thresholds require controlled hardware and release-over-release
+history.
 
 ## Verification
 
@@ -299,16 +301,16 @@ hardware and release-over-release history.
 - Process tests: kill the indexer immediately after a successful commit and verify the committed
   corpus after reopen; kill before commit and verify it is absent. A worker-thread test verifies
   promises settle only into their originating Node environment.
-- Concurrency tests: search during commit/merge with a latency bound, actor panic drains queued promises, concurrent
-  canonical opens admit one writer, a second process receives the retryable lock-busy error, and
-  merge files stop changing after close resolves.
-- Decoder fuzz/property tests mutate version, counts, lengths, offsets, and UTF-8 and assert every
-  input returns or produces a typed error without an unchecked allocation or process abort.
+- Concurrency tests: duplicate canonical opens admit one writer, overload rejects without blocking
+  JavaScript, indexing leaves the event loop responsive, and worker termination detaches
+  completions and releases the writer.
+- Decoder tests cover invalid counts, lengths, and UTF-8; randomized decoder fuzzing remains part of
+  the hardening work.
 - Existing Directory contract tests remain unchanged.
 - `npm run check` and package artifact verification run before review.
-- The release benchmark runs locally at two dataset sizes; raw JSON is retained with the PR
-  verification notes. It refuses debug or `test-panic` artifacts so they cannot seed a performance
-  baseline.
+- The release benchmark runs locally at two dataset sizes and commit cadences; raw JSON is retained
+  with the PR verification notes. It is built explicitly in release mode before measurements are
+  taken.
 
 End-to-end route: a Node integration test loads the built addon through the published native
 subpath, creates an on-disk index, mutates and commits it, searches it, closes it, reopens it, and
@@ -339,10 +341,10 @@ also cannot provide the performance baseline Kyle requested.
 
 ### Do less on runtime: engine benchmark plus separate per-index writer and search executors
 
-Adopted. The engine is generic over `Directory`, the pure engine benchmark excludes N-API, and the
-Node slice uses byte-bounded per-index execution rather than implementing #17's process governor and
-shared cross-index search pool. Keeping search separate from the writer is the minimum needed for a
-baseline that measures Tantivy instead of temporary writer-queue head-of-line blocking.
+Adopted. The engine is generic over `Directory`, and the Node slice uses byte-bounded per-index
+execution rather than implementing #17's process governor and shared cross-index search pool.
+Keeping search separate from the writer is the minimum needed for a baseline that measures Tantivy
+instead of temporary writer-queue head-of-line blocking.
 
 ### Identity sidecar versus repeating identity in every commit payload
 

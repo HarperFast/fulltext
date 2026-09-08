@@ -72,3 +72,20 @@ jobs:
           if grep -qi rocksdb "$RUNNER_TEMP/fulltext-linkage.txt"; then exit 1; fi
       - name: Verify unwind profile
         run: cargo rustc --locked --release --features node-api -- --print cfg | grep 'panic="unwind"'
+
+  benchmark-smoke:
+    name: Native benchmark smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci --ignore-scripts
+      - run: npm run build:native
+      - run: npm run build:typescript
+      - run: npm run benchmark:smoke

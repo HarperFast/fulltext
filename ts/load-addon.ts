@@ -13,10 +13,19 @@ interface NativeRuntimeInfo {
 
 interface NativeAddonApi {
 	runtimeInfo(): NativeRuntimeInfo;
+	__nativeOpen(config: Buffer, callback: NativeCallback): void;
+	__nativeApply(handle: number, batch: Buffer, callback: NativeCallback): void;
+	__nativeCommit(handle: number, callback: NativeCallback): void;
+	__nativeReload(handle: number, callback: NativeCallback): void;
+	__nativeSearch(handle: number, request: Buffer, callback: NativeCallback): void;
+	__nativeClose(handle: number, rollback: boolean, callback: NativeCallback): void;
+	__nativeStatus(handle: number): Buffer;
 	__testCreateHandle?(): number;
 	__testPanic?(id: number): void;
 	__testCheck?(id: number): boolean;
 }
+
+export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
 const expectedNativeAbiVersion = 1;

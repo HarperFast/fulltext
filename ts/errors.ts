@@ -5,6 +5,16 @@ const errorCodes = [
 	'E_NATIVE_PANIC',
 	'E_POISONED',
 	'E_NATIVE_FAILURE',
+	'E_CLOSED',
+	'E_DIRTY_CLOSE',
+	'E_DUPLICATE_OPEN',
+	'E_IDENTITY_MISMATCH',
+	'E_INCOMPLETE_CREATE',
+	'E_INVALID_ARGUMENT',
+	'E_LOCK_BUSY',
+	'E_QUEUE_FULL',
+	'E_SCHEMA_MISMATCH',
+	'E_STORAGE',
 ] as const;
 
 export type FulltextErrorCode = (typeof errorCodes)[number];
@@ -16,6 +26,10 @@ export class FulltextError extends Error {
 		super(message, { cause });
 		this.name = 'FulltextError';
 		this.code = code;
+	}
+
+	static isCode(value: string): value is FulltextErrorCode {
+		return errorCodes.includes(value as FulltextErrorCode);
 	}
 }
 
@@ -36,7 +50,5 @@ function readErrorCode(error: unknown): FulltextErrorCode | undefined {
 		return undefined;
 	}
 	const code = error.code;
-	return typeof code === 'string' && errorCodes.includes(code as FulltextErrorCode)
-		? (code as FulltextErrorCode)
-		: undefined;
+	return typeof code === 'string' && FulltextError.isCode(code) ? (code as FulltextErrorCode) : undefined;
 }
