@@ -33,6 +33,8 @@
 		"build:native": "napi build --platform --js false --dts ts/addon.d.ts --release --features node-api",
 		"build:test-native": "napi build --platform --js false --dts ts/addon.d.ts --features test-panic",
 		"build:typescript": "tsc -p tsconfig.json",
+		"benchmark:native": "npm run build && node benchmarks/native.mjs",
+		"benchmark:smoke": "node benchmarks/native.mjs --smoke",
 		"check": "npm run format:check && npm run lint && npm run test",
 		"format": "prettier --write . && cargo fmt",
 		"format:check": "prettier --check . && cargo fmt --check",

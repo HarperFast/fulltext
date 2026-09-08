@@ -2,6 +2,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod directory_harness;
+pub mod engine;
+pub mod error;
+pub mod protocol;
 
 #[cfg(any(test, feature = "phase0"))]
 pub mod phase0;
@@ -11,6 +14,9 @@ pub mod rocks_lease;
 
 #[cfg(feature = "node-api")]
 mod boundary;
+
+#[cfg(feature = "node-api")]
+pub mod native;
 
 #[cfg(feature = "node-api")]
 use napi_derive::napi;

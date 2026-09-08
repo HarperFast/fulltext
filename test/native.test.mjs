@@ -1,8 +1,11 @@
 import assert from 'node:assert';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { runtimeInfo } from '@harperfast/fulltext/native';
+import { decodeResponse, encodeOpen } from '../dist/codec.js';
 import { normalizeNativeError } from '../dist/errors.js';
 import { loadAddon, platformTriple } from '../dist/load-addon.js';
 
@@ -44,6 +47,58 @@ test('turns a panic into a coded terminal error', async () => {
 	assert.strictEqual(addon.__testCheck(secondHandle), true);
 	await assert.doesNotReject(runtimeInfo());
 });
+
+test('default close tears down a poisoned native handle', async (context) => {
+	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-poison-'));
+	context.after(() => rmSync(indexPath, { recursive: true, force: true }));
+	const addon = loadAddon();
+	assert(addon.__testPoisonNativeHandle);
+	const config = {
+		path: indexPath,
+		indexId: 'poison-close',
+		generation: 'one',
+		fields: [{ name: 'title', weight: 1 }],
+		analyzer: 'english@1',
+		stopWords: true,
+		positions: true,
+		surfaceTerms: false,
+		limits: {
+			indexingThreads: 1,
+			searchThreads: 1,
+			writerMemoryBytes: 15_000_000,
+			maxQueuedCommands: 8,
+			maxQueuedBytes: 1024 * 1024,
+			maxBatchBytes: 1024 * 1024,
+		},
+	};
+	const opened = await invoke((callback) => addon.__nativeOpen(encodeOpen(config), callback));
+	const handle = opened.u32();
+	opened.finish();
+	addon.__testPoisonNativeHandle(handle);
+	const closed = await invoke((callback) => addon.__nativeClose(handle, false, callback));
+	closed.finish();
+	const reopened = await invoke((callback) => addon.__nativeOpen(encodeOpen(config), callback));
+	const reopenedHandle = reopened.u32();
+	reopened.finish();
+	const reclosed = await invoke((callback) => addon.__nativeClose(reopenedHandle, false, callback));
+	reclosed.finish();
+});
+
+function invoke(start) {
+	return new Promise((resolve, reject) => {
+		try {
+			start((response) => {
+				try {
+					resolve(decodeResponse(response));
+				} catch (error) {
+					reject(error);
+				}
+			});
+		} catch (error) {
+			reject(normalizeNativeError(error));
+		}
+	});
+}
 
 function tomlSection(manifest, name) {
 	const sectionStart = manifest.indexOf(`[${name}]`);
