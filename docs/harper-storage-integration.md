@@ -16,7 +16,10 @@ optional investigation if a measured question warrants it, not a planned deliver
 
 Harper has no native-filesystem fallback or local Tantivy file cache. Keeping a second on-disk copy,
 even if rebuildable from RocksDB, is outside the approved RocksDB-only storage scope. This is a
-product boundary, not a claim that a file cache could not improve performance.
+product boundary, not a claim that a file cache could not improve performance. The delivery scope
+is recorded in [Ship native full-text search for Harper v5.3](https://github.com/HarperFast/fulltext/issues/1).
+If the supported storage proof misses the workload target, report that result rather than silently
+adding a file cache or relaxing the target.
 A native-only library release is possible; a Harper fulltext release requires the qualified RocksDB
 path. No second RocksDB runtime, database opener,
 private patched rocksdb-js distribution, or external Tantivy service is introduced.
@@ -116,6 +119,10 @@ Required transport properties:
   Establish capacity before starting native work, including internal Tantivy threads. Threads parked
   waiting for a permit still count; admission cannot hide an unbounded second waiting pool. This
   shared budget is a Harper integration requirement, not a claim about the shipped native backend.
+  The proof must account for caller-sized indexing threads, package search threads and the pinned
+  engine's internal merge pool. Where an internal pool cannot be resized, bound resident writers
+  and concurrent opens/rebuilds using its verified thread cost. Transport permits alone cannot
+  enforce a thread bound if additional threads wait outside the permit count.
   Give query work and control/shutdown operations explicit progress under sustained ingestion.
 - A native storage wait must not hold a mutex or permit needed by a JS-facing entry point, the
   storage service or its completion path. Admission and resource limits must leave the completion
@@ -170,7 +177,8 @@ column-family layout; qualify column-family and memtable overhead with multiple 
 | Locks and watch             | Preserve Tantivy writer exclusion and notification lifetime without inventing a distributed lock service.         |
 
 Reuse the existing backend-parameterized Directory harness and experimental immutable-object tests
-where they describe Tantivy semantics rather than native-lease mechanics. Chunk sizing, batched
+where they describe Tantivy semantics rather than native-lease mechanics. Given offset-addressable
+objects, exact chunk sizing, batched
 reads and copy strategy are measurement choices. Pinned native reads, MultiGet, target-CF flush,
 native lock tokens and external SST ingestion are not required APIs in this plan.
 
@@ -195,9 +203,9 @@ at the native-backend baseline has these limitations:
   merely to promise one fsync per commit.
 
 Offset-addressable reads are a structural requirement; exact chunk size, batching and any bounded
-in-memory cache are measurement choices. CI asserts storage-operation and fetched-byte budgets for
-the same-sized range at the beginning and end of a growing file. It also bounds operations per MB
-written, tests concurrent file/merge progress, and measures live versus reclaimable object bytes
+in-memory cache are measurement choices. Before qualification, CI must assert storage-operation and fetched-byte budgets for
+the same-sized range at the beginning and end of a growing file. It must also bound operations per MB
+written, test concurrent file/merge progress, and measure live versus reclaimable object bytes
 through repeated merge cycles. Logical reclamation is measured separately from RocksDB compaction
 returning physical disk space. Establish these bounds before treating a transport benchmark as
 representative of the production design.
@@ -286,7 +294,11 @@ The supported ownership model must be tested, not extended with a new distribute
 One writable RocksDB owner process and the shared in-process fulltext registry together must exclude
 duplicate writers across Harper worker attachments. A second process must be rejected from opening
 the same database for writing, rather than being allowed to race object allocation. Verify this
-against the supported deployment and test duplicate worker attachment, process-open rejection and
+against the supported deployment. All worker views of the same live backing store must resolve to
+one shared store identity and index/generation registry, not per-view identities. Reopening a live
+attachment preserves identity; closing/recreating the underlying store changes its lifetime identity
+and fences old views. Verify physical-store aliasing on supported platforms rather than relying on
+path spelling. Test this identity contract, duplicate worker attachment, process-open rejection and
 close/recreate. Any deployment with multiple writable owner processes requires a separate design;
 it is not implicitly supported by the Directory.
 

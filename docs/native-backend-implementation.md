@@ -248,6 +248,13 @@ compares the Rust error table with the TypeScript allowlist, while integration t
 representative synchronous and asynchronous failures. No Rust type or Tantivy object crosses the
 public API or Node worker.
 
+Caught handle-scoped panics return `E_NATIVE_PANIC` and leave that handle terminally poisoned;
+later work fails with `E_POISONED` rather than continuing with uncertain state. This does not provide
+process isolation: allocation failure, stack overflow, aborts, double panics during unwinding, or
+failures outside the protected thread boundaries can still terminate the process. Keep this limit
+explicit in the public failure guide. A source-level check that every new Node-API export retains
+its panic boundary remains a test requirement, not an existing CI guarantee.
+
 Successful `commit()` delegates to Tantivy 0.26.1's ordinary commit path and resolves only after it
 returns. The process-kill test verifies publication and process-crash recovery. The existing
 `KvDirectory` contract suite supplies the durable file/publication ordering checks; injecting a
