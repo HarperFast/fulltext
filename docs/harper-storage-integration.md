@@ -14,8 +14,11 @@ experimental fulltext code may supply reusable Directory tests and mapping logic
 consumer is not the production integration or a release prerequisite. A three-backend benchmark is
 optional investigation if a measured question warrants it, not a planned delivery gate.
 
-Harper has no native-filesystem fallback. A native-only library release is possible; a Harper
-fulltext release requires the qualified RocksDB path. No second RocksDB runtime, database opener,
+Harper has no native-filesystem fallback or local Tantivy file cache. Keeping a second on-disk copy,
+even if rebuildable from RocksDB, is outside the approved RocksDB-only storage scope. This is a
+product boundary, not a claim that a file cache could not improve performance.
+A native-only library release is possible; a Harper fulltext release requires the qualified RocksDB
+path. No second RocksDB runtime, database opener,
 private patched rocksdb-js distribution, or external Tantivy service is introduced.
 
 This is the current storage and integration plan. The earlier native-lease experiment remains
@@ -83,6 +86,11 @@ A mocked store or the experimental native lease does not clear this milestone. N
 the behavior reference. The first slice may use a narrow term query, but its storage contract must
 exercise actual Tantivy flush, immutable slices and metadata publication.
 
+This slice is an automated integration suite against a pinned Harper checkout and supported
+rocksdb-js build. The source and storage failure cases gate its completion in CI; they are not
+manual demonstration steps. FaultingKv and process-kill tests supplement this suite but do not
+establish the production storage API's durability semantics.
+
 ## Storage transport: establish feasibility, then measure
 
 Tantivy issues synchronous Directory operations from native indexing, merge and search threads.
@@ -142,6 +150,38 @@ where they describe Tantivy semantics rather than native-lease mechanics. Chunk 
 reads and copy strategy are measurement choices. Pinned native reads, MultiGet, target-CF flush,
 native lock tokens and external SST ingestion are not required APIs in this plan.
 
+### Prototype constraints that must change before storage qualification
+
+The existing Phase 0 Directory is reusable evidence, not a production implementation. The source
+at the native-backend baseline has these limitations:
+
+- `KvFileHandle::read_bytes` walks fragments from zero to find a byte offset. A footer read can
+  therefore fetch the whole file. Production bindings must address chunks by offset, through
+  fixed-size chunks or a bounded offset index, without reading preceding payloads.
+- `KvWriter::flush` re-reads its binding while holding the directory-wide mutation mutex, and
+  `open_write` uses the default BufWriter capacity. Production code must not serialize unrelated
+  file writes behind a lock held across host storage waits. Define per-file state and narrowly
+  scoped metadata synchronization; preserve deletion/replacement detection when removing reads.
+- `delete` removes bindings but leaves fragment values. Add bounded physical reclamation after
+  the last referencing binding and open slice disappear. A crash must leave discoverable garbage,
+  and repeated merge/delete cycles must reclaim it without an unbounded foreground scan.
+- `atomic_write` always requests WAL_SYNC. Trace all Tantivy metadata writes, including
+  `.managed.json`, and count actual storage synchronization calls. Reduce redundant syncs only
+  where the pinned Directory contract and crash tests permit; do not weaken atomic_write durability
+  merely to promise one fsync per commit.
+
+Offset-addressable reads are a structural requirement; exact chunk size, batching and any bounded
+in-memory cache are measurement choices. CI asserts storage-operation and fetched-byte budgets for
+the same-sized range at the beginning and end of a growing file. It also bounds operations per MB
+written, tests concurrent file/merge progress, and measures live versus reclaimable object bytes
+through repeated merge cycles. Logical reclamation is measured separately from RocksDB compaction
+returning physical disk space. Establish these bounds before treating a transport benchmark as
+representative of the production design.
+
+Internal namespace, generation, object and path encodings must be unambiguous. Use an existing
+appropriate binary encoding or length-prefixed components and test delimiter-containing identifiers
+and adjacent namespace scans. This is ordinary index isolation, not a multi-tenant feature.
+
 ## Publication, recovery and lifecycle
 
 ```mermaid
@@ -169,6 +209,18 @@ flush support. If WAL-disabled objects are used, their supported durability barr
 before the metadata that references them can be acknowledged durable. An ordinary write promise,
 a visibility flush or a process-kill test alone does not prove power-loss durability.
 
+The transport preserves dependencies across enqueue, execution and acknowledgement: every object
+write required by a publication completes under the selected durability contract before metadata
+is published. Queue batching cannot move dependent writes across that barrier. A later sync proves
+earlier WAL writes durable only when they use the same applicable WAL and ordering is established.
+Audit the actual write options in integration tests; inject delayed, reordered and lost responses
+around the barrier and verify that no newer checkpoint is acknowledged.
+
+An atomic, ordered, durable replacement must recover a complete old or new publication after a
+crash. That guarantee does not by itself provide fallback after later corruption or deletion of an
+object. If recovery retains a prior head, it must retain that head's referenced objects as well;
+otherwise corruption fails closed and Harper rebuilds. Metadata history alone is not recovery.
+
 Do not change Harper's global WAL, flush or transaction-log truncation policy to make this adapter
 work. Measure database-wide flush/write-stall coupling if the existing barrier has that scope.
 Backup/checkpoint tests must prove referenced objects and metadata survive restore together, and
@@ -181,11 +233,26 @@ to skip. Precise cursor/resume and retention gaps in the proposed protocol remai
 integration blockers. They are separate from the rejected native storage bridge and must be
 resolved explicitly using the supported stack before qualification.
 
+A terminal engine or storage failure freezes durable progress, rejects further mutation admission
+and reports the failure to Harper. Queries follow Harper's bounded stale-searcher policy and fail
+closed when that policy expires; a healthy-looking frozen searcher cannot serve indefinitely.
+Unknown partial application requires reopening from a validated durable commit or rebuilding.
+Lock poisoning and worker exit must produce terminal errors and wake waiters, not continue mutation
+with synchronization state whose invariants are unknown.
+
 ## Writer topology and throughput
 
 Tantivy permits one IndexWriter for a physical index generation because segment publication,
 deletion state and merge coordination share one authority. That writer can use Tantivy's indexing
 threads; it does not imply one JavaScript worker, one writer per database or one writer per cluster.
+
+The supported ownership model must be tested, not extended with a new distributed writer lease.
+One writable RocksDB owner process and the shared in-process fulltext registry together must exclude
+duplicate writers across Harper worker attachments. A second process must be rejected from opening
+the same database for writing, rather than being allowed to race object allocation. Verify this
+against the supported deployment and test duplicate worker attachment, process-open rejection and
+close/recreate. Any deployment with multiple writable owner processes requires a separate design;
+it is not implicitly supported by the Directory.
 
 Independent fulltext indexes may ingest, merge and search concurrently. Each has its own writer,
 reader and generation state; shared native and storage-transport budgets bound aggregate work.
@@ -244,12 +311,13 @@ qualified Harper checkout. Apache-2.0 applies to source and published artifacts.
 
 ## Approaches considered
 
-| Axis            | Approach and disposition                                                                                                                                                                 |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Different layer | A native capability table in base rocksdb-js would serve direct native I/O, but engineering has rejected that addition. It is not a production dependency.                               |
-| Deeper cause    | Prove how native Directory calls reach supported host storage without a deadlock or premature publication. Merely naming a private provider does not establish either invariant.         |
-| Do less         | Skip the standalone Rocks backend and mandatory third benchmark arm. The existing native reference plus Harper instrumentation answers the immediate delivery question.                  |
-| Chosen          | Implement and qualify the Harper path first, reusing its derived runtime and storage APIs and the existing fulltext engine. Measure any transport cost before designing an optimization. |
+| Axis                | Approach and disposition                                                                                                                                                                                                          |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Different layer     | A native capability table in base rocksdb-js would serve direct native I/O, but engineering has rejected that addition. It is not a production dependency.                                                                        |
+| Deeper cause        | Adapt the existing KvDirectory unchanged. Rejected: offset reads fetch preceding payloads, directory-wide locks span storage calls, and fragments are not reclaimed. Fix those invariants in the Directory before qualification.  |
+| Do less             | Service storage through existing Harper workers rather than adding dedicated workers. Keep this candidate in the transport proof; it qualifies only if event-loop delay, progress and shutdown bounds hold under concurrent load. |
+| Chosen              | Use offset-addressable Directory objects and bounded host storage transport over existing APIs, sharing the engine and Harper lifecycle. Select worker topology, chunk sizes and optional in-memory caching from the proof.       |
+| Storage alternative | Materialize Tantivy files as a local disk cache of RocksDB objects. Excluded by the approved RocksDB-only storage boundary; its possible latency benefit does not authorize a second on-disk index copy.                          |
 
 ## Execution and decisions still to resolve
 
