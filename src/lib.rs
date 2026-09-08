@@ -15,6 +15,12 @@ pub mod rocks_lease;
 #[cfg(feature = "node-api")]
 mod boundary;
 
+#[cfg(feature = "test-panic")]
+pub mod host_storage;
+
+#[cfg(all(feature = "node-api", feature = "phase0", not(feature = "test-panic")))]
+mod host_storage;
+
 #[cfg(feature = "node-api")]
 pub mod native;
 
