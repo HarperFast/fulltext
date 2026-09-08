@@ -28,7 +28,7 @@ struct HostTransport {
 	next_request_id: AtomicU64,
 	max_operations: usize,
 	max_bytes: usize,
-	timeout: Duration,
+	read_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -55,14 +55,15 @@ impl HostTransport {
 		handler: JsFunction,
 		max_operations: usize,
 		max_bytes: usize,
-		timeout: Duration,
+		read_timeout: Duration,
 	) -> boundary::Result<Self> {
-		if max_operations == 0 || max_bytes == 0 || timeout.is_zero() {
+		if max_operations == 0 || max_bytes == 0 || read_timeout.is_zero() {
 			return Err(napi::Error::new(
 				"E_INVALID_ARGUMENT",
 				"host transport limits must be greater than zero",
 			));
 		}
+		// Production construction must supply the total callback created by createHostStorageHandler.
 		let mut handler = handler
 			.create_threadsafe_function::<Vec<u8>, Buffer, _, ErrorStrategy::Fatal>(
 				max_operations,
@@ -79,7 +80,7 @@ impl HostTransport {
 			next_request_id: AtomicU64::new(1),
 			max_operations,
 			max_bytes,
-			timeout,
+			read_timeout,
 		})
 	}
 
@@ -117,6 +118,9 @@ impl HostTransport {
 					}
 				}));
 				if completed.is_err() {
+					if let Some(transport) = transport.upgrade() {
+						transport.fail(io::ErrorKind::Other, "host storage completion panicked");
+					}
 					callback_response.complete(Err(io::Error::other("host storage completion panicked")));
 				}
 				Ok(())
@@ -388,7 +392,7 @@ impl HostKvStore {
 	fn request(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
 		// Read deadlines cover admission and host execution; a timed-out read has no storage side effect.
 		let deadline = Instant::now()
-			.checked_add(self.transport.timeout)
+			.checked_add(self.transport.read_timeout)
 			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host storage timeout is too large"))?;
 		self.request_with_deadline(request, response_budget, Some(deadline))
 	}
@@ -642,7 +646,7 @@ pub fn test_open_host_transport(
 	handler: JsFunction,
 	max_operations: u32,
 	max_bytes: u32,
-	timeout_ms: u32,
+	read_timeout_ms: u32,
 ) -> boundary::Result<u32> {
 	boundary::run_stateless(|| {
 		let handle = NEXT_TRANSPORT_HANDLE.fetch_add(1, Ordering::Relaxed);
@@ -657,7 +661,7 @@ pub fn test_open_host_transport(
 			handler,
 			max_operations as usize,
 			max_bytes as usize,
-			Duration::from_millis(timeout_ms as u64),
+			Duration::from_millis(read_timeout_ms as u64),
 		)?);
 		registry().insert(handle, transport.clone());
 		if let Err(error) = env.add_async_cleanup_hook(
@@ -699,7 +703,7 @@ pub fn test_host_round_trip(
 			.name(format!("fulltext-host-storage-test-{handle}"))
 			.spawn(move || {
 				let result = test_thread_result(|| {
-					let deadline = use_timeout.then(|| Instant::now() + transport.timeout);
+					let deadline = use_timeout.then(|| Instant::now() + transport.read_timeout);
 					transport.round_trip(request, response_budget as usize, deadline)
 				});
 				let _ = completion.call(result, ThreadsafeFunctionCallMode::NonBlocking);

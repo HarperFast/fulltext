@@ -17,7 +17,7 @@ export type HostStorageMutation = { type: 'put'; key: Buffer; value: Buffer } | 
 
 export interface HostStorage {
 	read(key: Buffer): Buffer | undefined;
-	/** Apply the batch atomically and satisfy the write policy before returning. Mutation buffers are borrowed. */
+	/** Apply all mutations or none, satisfy the policy before returning, and throw only when none were applied. */
 	write(mutations: Array<HostStorageMutation>, policy: HostWritePolicy): void;
 	/** Make prior writes durable before returning. */
 	sync(): void;
@@ -30,7 +30,7 @@ export interface HostStorageHandlerOptions {
 	maxErrorBytes: number;
 }
 
-/** Creates the exception-safe callback required by the native host transport. */
+/** Creates the total callback required by the native transport; storage exceptions become protocol errors. */
 export function createHostStorageHandler(
 	storage: HostStorage,
 	{ maxMutations, maxReadResponseBytes, maxControlResponseBytes, maxErrorBytes }: HostStorageHandlerOptions,

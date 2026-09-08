@@ -28,7 +28,7 @@ interface NativeAddonApi {
 		handler: (request: Buffer) => Buffer,
 		maxOperations: number,
 		maxBytes: number,
-		timeoutMs: number,
+		readTimeoutMs: number,
 	): number;
 	__testHostRoundTrip?(
 		handle: number,
