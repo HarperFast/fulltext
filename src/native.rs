@@ -1,9 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::c_void;
 use std::fs;
+use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -427,10 +426,6 @@ impl CompletionSignal {
 		self.ready.notify_all();
 	}
 
-	fn is_done(&self) -> bool {
-		*lock(&self.done)
-	}
-
 	fn wait(&self, timeout: Duration) -> bool {
 		let done = lock(&self.done);
 		if *done {
@@ -567,8 +562,8 @@ impl Completion {
 			if let Some(callback) = self.callback.take() {
 				let _ = callback.call(bytes, ThreadsafeFunctionCallMode::NonBlocking);
 			}
-		} else {
-			self.callback.take();
+		} else if let Some(callback) = self.callback.take() {
+			mem::forget(callback);
 		}
 	}
 }
@@ -856,10 +851,6 @@ struct CleanupHookData {
 	opening_done: Arc<CompletionSignal>,
 }
 
-struct CleanupHookGuard {
-	raw_handle: usize,
-}
-
 enum CleanupWait {
 	Runtime(Arc<Runtime>),
 	Opening(Arc<CompletionSignal>),
@@ -871,83 +862,37 @@ fn register_async_cleanup(
 	env_alive: Arc<AtomicBool>,
 	opening_done: Arc<CompletionSignal>,
 ) -> boundary::Result<()> {
-	let data = Box::into_raw(Box::new(CleanupHookData {
-		handle,
-		env_alive,
-		opening_done,
-	}));
-	let mut cleanup_handle = ptr::null_mut();
-	// Safety: `data` remains owned by the registered one-shot hook, and Node writes the handle to the supplied pointer.
-	let status = unsafe {
-		napi::sys::napi_add_async_cleanup_hook(
-			env.raw(),
-			Some(async_cleanup),
-			data.cast::<c_void>(),
-			&mut cleanup_handle,
-		)
-	};
-	if status == napi::sys::Status::napi_ok {
-		Ok(())
-	} else {
-		// Safety: registration failed, so Node did not take ownership of `data`.
-		drop(unsafe { Box::from_raw(data) });
-		Err(napi_error("E_NATIVE_FAILURE", napi::Status::from(status)))
-	}
+	env.add_async_cleanup_hook(
+		CleanupHookData {
+			handle,
+			env_alive,
+			opening_done,
+		},
+		|data| {
+			let _ = catch_unwind(AssertUnwindSafe(|| finish_environment_cleanup(data)));
+		},
+	)
+	.map_err(|error| napi_error("E_NATIVE_FAILURE", error))
 }
 
-unsafe extern "C" fn async_cleanup(handle: napi::sys::napi_async_cleanup_hook_handle, data: *mut c_void) {
-	let guard = CleanupHookGuard {
-		raw_handle: handle as usize,
-	};
-	let _ = catch_unwind(AssertUnwindSafe(|| async_cleanup_inner(guard, data)));
-}
-
-fn async_cleanup_inner(guard: CleanupHookGuard, data: *mut c_void) {
-	// Safety: `data` was allocated by `register_async_cleanup` for this one-shot callback.
-	let data = unsafe { Box::from_raw(data.cast::<CleanupHookData>()) };
+fn finish_environment_cleanup(data: CleanupHookData) {
 	data.env_alive.store(false, Ordering::Release);
 	let wait = match cleanup_handle(data.handle) {
 		Some(runtime) => CleanupWait::Runtime(runtime),
 		None => CleanupWait::Opening(data.opening_done.clone()),
 	};
-	if wait.is_done() {
-		return;
+	let finished = catch_unwind(AssertUnwindSafe(|| wait.wait(CLEANUP_TIMEOUT))).unwrap_or(false);
+	if !finished {
+		eprintln!("fulltext native cleanup exceeded {} seconds", CLEANUP_TIMEOUT.as_secs());
 	}
-	let _ = thread::Builder::new()
-		.name(format!("fulltext-cleanup-{}", data.handle))
-		.spawn(move || finish_async_cleanup(guard, wait));
 }
 
 impl CleanupWait {
-	fn is_done(&self) -> bool {
-		match self {
-			Self::Runtime(runtime) => runtime.closed.is_done(),
-			Self::Opening(signal) => signal.is_done(),
-		}
-	}
-
 	fn wait(&self, timeout: Duration) -> bool {
 		match self {
 			Self::Runtime(runtime) => runtime.wait_closed(timeout),
 			Self::Opening(signal) => signal.wait(timeout),
 		}
-	}
-}
-
-fn finish_async_cleanup(guard: CleanupHookGuard, wait: CleanupWait) {
-	let finished = catch_unwind(AssertUnwindSafe(|| wait.wait(CLEANUP_TIMEOUT))).unwrap_or(false);
-	if !finished {
-		eprintln!("fulltext native cleanup exceeded {} seconds", CLEANUP_TIMEOUT.as_secs());
-	}
-	drop(guard);
-}
-
-impl Drop for CleanupHookGuard {
-	fn drop(&mut self) {
-		// Safety: this guard uniquely owns Node's one-shot async cleanup handle.
-		let _ = unsafe {
-			napi::sys::napi_remove_async_cleanup_hook(self.raw_handle as napi::sys::napi_async_cleanup_hook_handle)
-		};
 	}
 }
 
