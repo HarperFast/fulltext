@@ -34,7 +34,7 @@ interface NativeAddonApi {
 		handle: number,
 		request: Buffer,
 		responseBudget: number,
-		terminalOnTimeout: boolean,
+		useTimeout: boolean,
 		callback: NativeCallback,
 	): void;
 	__testVerifyTantivyOnHostTransport?(

@@ -5,7 +5,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -25,6 +25,7 @@ static HOST_TRANSPORTS: OnceLock<Mutex<HashMap<u32, Arc<HostTransport>>>> = Once
 struct HostTransport {
 	handler: HostCallback,
 	state: Mutex<TransportState>,
+	capacity: Condvar,
 	next_request_id: AtomicU64,
 	max_operations: usize,
 	max_bytes: usize,
@@ -51,22 +52,32 @@ struct ResponseSlot {
 }
 
 impl HostTransport {
-	fn new(handler: JsFunction, max_operations: usize, max_bytes: usize, timeout: Duration) -> boundary::Result<Self> {
+	fn new(
+		env: &Env,
+		handler: JsFunction,
+		max_operations: usize,
+		max_bytes: usize,
+		timeout: Duration,
+	) -> boundary::Result<Self> {
 		if max_operations == 0 || max_bytes == 0 || timeout.is_zero() {
 			return Err(napi::Error::new(
 				"E_INVALID_ARGUMENT",
 				"host transport limits must be greater than zero",
 			));
 		}
-		let handler = handler
+		let mut handler = handler
 			.create_threadsafe_function::<Vec<u8>, Buffer, _, ErrorStrategy::Fatal>(
 				max_operations,
 				|context: ThreadSafeCallContext<Vec<u8>>| Ok(vec![Buffer::from(context.value)]),
 			)
 			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
+		handler
+			.unref(env)
+			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
 		Ok(Self {
 			handler,
 			state: Mutex::new(TransportState::default()),
+			capacity: Condvar::new(),
 			next_request_id: AtomicU64::new(1),
 			max_operations,
 			max_bytes,
@@ -79,7 +90,7 @@ impl HostTransport {
 		self: &Arc<Self>,
 		request: Vec<u8>,
 		response_budget: usize,
-		terminal_on_timeout: bool,
+		deadline: Option<Instant>,
 	) -> io::Result<TransportResponse> {
 		let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
 		if request_id == 0 {
@@ -87,7 +98,7 @@ impl HostTransport {
 			return Err(io::Error::other("host storage request id space exhausted"));
 		}
 		let response = Arc::new(ResponseSlot::new());
-		self.admit(request_id, request.len(), response_budget, &response)?;
+		self.admit(request_id, request.len(), response_budget, &response, deadline)?;
 
 		let transport = Arc::downgrade(self);
 		let callback_response = response.clone();
@@ -96,14 +107,19 @@ impl HostTransport {
 			request,
 			ThreadsafeFunctionCallMode::NonBlocking,
 			move |value| {
-				let result = response_bytes(value, max_response_bytes);
-				if let Some(transport) = transport.upgrade() {
-					transport.complete(request_id, result);
-				} else {
-					callback_response.complete(Err(io::Error::new(
-						io::ErrorKind::BrokenPipe,
-						"host storage transport was released",
-					)));
+				let completed = catch_unwind(AssertUnwindSafe(|| {
+					let result = response_bytes(value, max_response_bytes);
+					if let Some(transport) = transport.upgrade() {
+						transport.complete(request_id, result);
+					} else {
+						callback_response.complete(Err(io::Error::new(
+							io::ErrorKind::BrokenPipe,
+							"host storage transport was released",
+						)));
+					}
+				}));
+				if completed.is_err() {
+					callback_response.complete(Err(io::Error::other("host storage completion panicked")));
 				}
 				Ok(())
 			},
@@ -118,7 +134,7 @@ impl HostTransport {
 			);
 		}
 
-		if let Some(result) = response.wait(self.timeout) {
+		if let Some(result) = response.wait(deadline) {
 			return match result {
 				Ok(bytes) => Ok(TransportResponse {
 					bytes,
@@ -131,11 +147,7 @@ impl HostTransport {
 				}
 			};
 		}
-		if terminal_on_timeout {
-			self.fail(io::ErrorKind::TimedOut, "host storage request timed out");
-		} else {
-			self.release(request_id);
-		}
+		self.release(request_id);
 		let _ = response.take();
 		Err(io::Error::new(
 			io::ErrorKind::TimedOut,
@@ -153,6 +165,7 @@ impl HostTransport {
 		request_bytes: usize,
 		response_bytes: usize,
 		response: &Arc<ResponseSlot>,
+		deadline: Option<Instant>,
 	) -> io::Result<()> {
 		let retained_bytes = request_bytes
 			.checked_add(response_bytes)
@@ -164,14 +177,39 @@ impl HostTransport {
 			));
 		}
 		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-		if let Some(error) = &state.closed {
-			return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
-		}
-		if state.operations >= self.max_operations || state.bytes.saturating_add(retained_bytes) > self.max_bytes {
-			return Err(io::Error::new(
-				io::ErrorKind::WouldBlock,
-				"host storage transport is at capacity",
-			));
+		loop {
+			if let Some(error) = &state.closed {
+				return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
+			}
+			if state.operations < self.max_operations && state.bytes.saturating_add(retained_bytes) <= self.max_bytes {
+				break;
+			}
+			state = match deadline {
+				Some(deadline) => {
+					let remaining = deadline.saturating_duration_since(Instant::now());
+					if remaining.is_zero() {
+						return Err(io::Error::new(
+							io::ErrorKind::TimedOut,
+							"host storage request timed out",
+						));
+					}
+					let (state, wait) = self
+						.capacity
+						.wait_timeout(state, remaining)
+						.unwrap_or_else(|poisoned| poisoned.into_inner());
+					if wait.timed_out() {
+						return Err(io::Error::new(
+							io::ErrorKind::TimedOut,
+							"host storage request timed out",
+						));
+					}
+					state
+				}
+				None => self
+					.capacity
+					.wait(state)
+					.unwrap_or_else(|poisoned| poisoned.into_inner()),
+			};
 		}
 		state.operations += 1;
 		state.bytes += retained_bytes;
@@ -203,6 +241,7 @@ impl HostTransport {
 			let pending = state.pending.get_mut(&request_id).unwrap();
 			pending.retained_bytes = response_bytes;
 			pending.completed = true;
+			self.capacity.notify_all();
 			response
 		};
 		if let Some(response) = response {
@@ -217,6 +256,7 @@ impl HostTransport {
 				state.operations -= 1;
 			}
 			state.bytes -= pending.retained_bytes;
+			self.capacity.notify_all();
 		}
 	}
 
@@ -230,6 +270,7 @@ impl HostTransport {
 			state.bytes = 0;
 			std::mem::take(&mut state.pending)
 		};
+		self.capacity.notify_all();
 		for request in pending.into_values() {
 			if let Some(response) = request.response.upgrade() {
 				response.complete(Err(io::Error::new(kind, message.to_owned())));
@@ -285,12 +326,31 @@ impl ResponseSlot {
 		}
 	}
 
-	fn wait(&self, timeout: Duration) -> Option<io::Result<Vec<u8>>> {
-		let slot = self.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-		let (mut slot, _) = self
-			.ready
-			.wait_timeout_while(slot, timeout, |result| result.is_none())
-			.unwrap_or_else(|poisoned| poisoned.into_inner());
+	fn wait(&self, deadline: Option<Instant>) -> Option<io::Result<Vec<u8>>> {
+		let mut slot = self.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		match deadline {
+			Some(deadline) => {
+				while slot.is_none() {
+					let remaining = deadline.saturating_duration_since(Instant::now());
+					if remaining.is_zero() {
+						return None;
+					}
+					let (next, wait) = self
+						.ready
+						.wait_timeout(slot, remaining)
+						.unwrap_or_else(|poisoned| poisoned.into_inner());
+					slot = next;
+					if wait.timed_out() && slot.is_none() {
+						return None;
+					}
+				}
+			}
+			None => {
+				while slot.is_none() {
+					slot = self.ready.wait(slot).unwrap_or_else(|poisoned| poisoned.into_inner());
+				}
+			}
+		}
 		slot.take()
 	}
 
@@ -357,22 +417,25 @@ impl HostKvStore {
 	}
 
 	fn request(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
-		self.request_with_timeout_policy(request, response_budget, false)
+		// Read deadlines cover admission and host execution; a timed-out read has no storage side effect.
+		let deadline = Instant::now()
+			.checked_add(self.transport.timeout)
+			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host storage timeout is too large"))?;
+		self.request_with_deadline(request, response_budget, Some(deadline))
 	}
 
-	fn request_terminal(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
-		self.request_with_timeout_policy(request, response_budget, true)
+	fn request_mutation(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
+		// A dispatched JavaScript mutation cannot be canceled, so wait for its definitive result.
+		self.request_with_deadline(request, response_budget, None)
 	}
 
-	fn request_with_timeout_policy(
+	fn request_with_deadline(
 		&self,
 		request: Vec<u8>,
 		response_budget: usize,
-		terminal_on_timeout: bool,
+		deadline: Option<Instant>,
 	) -> io::Result<ResponseDecoder> {
-		let response = self
-			.transport
-			.round_trip(request, response_budget, terminal_on_timeout)?;
+		let response = self.transport.round_trip(request, response_budget, deadline)?;
 		let mut decoder = ResponseDecoder::new(response);
 		if decoder.u8()? != HOST_PROTOCOL_VERSION {
 			return Err(io::Error::new(
@@ -442,12 +505,12 @@ impl KvStore for HostKvStore {
 				}
 			}
 		}
-		self.request_terminal(request.finish(), self.max_control_response_bytes)?
+		self.request_mutation(request.finish(), self.max_control_response_bytes)?
 			.finish()
 	}
 
 	fn sync(&self) -> io::Result<()> {
-		self.request_terminal(RequestEncoder::new(OP_SYNC).finish(), self.max_control_response_bytes)?
+		self.request_mutation(RequestEncoder::new(OP_SYNC).finish(), self.max_control_response_bytes)?
 			.finish()
 	}
 }
@@ -621,6 +684,7 @@ pub fn test_open_host_transport(
 			));
 		}
 		let transport = Arc::new(HostTransport::new(
+			&env,
 			handler,
 			max_operations as usize,
 			max_bytes as usize,
@@ -652,7 +716,7 @@ pub fn test_host_round_trip(
 	handle: u32,
 	request: Buffer,
 	response_budget: u32,
-	terminal_on_timeout: bool,
+	use_timeout: bool,
 	callback: JsFunction,
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
@@ -666,8 +730,9 @@ pub fn test_host_round_trip(
 			.name(format!("fulltext-host-storage-test-{handle}"))
 			.spawn(move || {
 				let result = test_thread_result(|| {
+					let deadline = use_timeout.then(|| Instant::now() + transport.timeout);
 					transport
-						.round_trip(request, response_budget as usize, terminal_on_timeout)
+						.round_trip(request, response_budget as usize, deadline)
 						.map(TransportResponse::into_bytes)
 				});
 				let _ = completion.call(result, ThreadsafeFunctionCallMode::NonBlocking);
@@ -745,7 +810,7 @@ mod tests {
 		let response = Arc::new(ResponseSlot::new());
 		response.complete(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
 		assert_eq!(
-			response.wait(Duration::ZERO).unwrap().unwrap_err().kind(),
+			response.wait(Some(Instant::now())).unwrap().unwrap_err().kind(),
 			io::ErrorKind::BrokenPipe
 		);
 	}
@@ -755,6 +820,6 @@ mod tests {
 		let response = ResponseSlot::new();
 		response.complete(Ok(vec![1]));
 		response.complete(Ok(vec![2]));
-		assert_eq!(response.wait(Duration::ZERO).unwrap().unwrap(), vec![1]);
+		assert_eq!(response.wait(Some(Instant::now())).unwrap().unwrap(), vec![1]);
 	}
 }

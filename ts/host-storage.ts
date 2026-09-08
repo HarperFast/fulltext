@@ -17,8 +17,9 @@ export type HostStorageMutation = { type: 'put'; key: Buffer; value: Buffer } | 
 
 export interface HostStorage {
 	read(key: Buffer): Buffer | undefined;
-	/** Mutation buffers are borrowed for this call and must not be retained. */
+	/** Apply the batch atomically and satisfy the write policy before returning. Mutation buffers are borrowed. */
 	write(mutations: Array<HostStorageMutation>, policy: HostWritePolicy): void;
+	/** Make prior writes durable before returning. */
 	sync(): void;
 }
 

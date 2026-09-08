@@ -26,7 +26,7 @@ test('host storage transport round-trips bytes intact', async (context) => {
 	assert.deepStrictEqual(response, Buffer.from('response:read:key'));
 });
 
-test('host storage transport rejects work beyond its operation budget', async (context) => {
+test('host storage transport backpressures work beyond its operation budget', async (context) => {
 	const handle = addon.__testOpenHostTransport(
 		(request) => {
 			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
@@ -40,10 +40,24 @@ test('host storage transport rejects work beyond its operation budget', async (c
 
 	const first = roundTrip(handle, Buffer.from('first'));
 	const second = roundTrip(handle, Buffer.from('second'));
-	const results = await Promise.allSettled([first, second]);
-	assert.strictEqual(results.filter(({ status }) => status === 'fulfilled').length, 1);
-	assert.strictEqual(results.filter(({ status }) => status === 'rejected').length, 1);
-	assert.match(results.find(({ status }) => status === 'rejected').reason.message, /at capacity/);
+	assert.deepStrictEqual(await Promise.all([first, second]), [Buffer.from('first'), Buffer.from('second')]);
+});
+
+test('host storage transport backpressures work beyond its byte budget', async (context) => {
+	const handle = addon.__testOpenHostTransport(
+		(request) => {
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+			return request;
+		},
+		2,
+		136,
+		1_000,
+	);
+	context.after(() => addon.__testCloseHostTransport(handle));
+
+	const first = roundTrip(handle, Buffer.from('first'));
+	const second = roundTrip(handle, Buffer.from('second'));
+	assert.deepStrictEqual(await Promise.all([first, second]), [Buffer.from('first'), Buffer.from('second')]);
 });
 
 test('host storage transport reserves response capacity before dispatch', async (context) => {
@@ -63,7 +77,7 @@ test('host storage transport reserves response capacity before dispatch', async 
 	assert.strictEqual(calls, 0);
 });
 
-test('a timed-out host request closes the transport and fences late completion', async (context) => {
+test('a host request can wait for a definitive result without a deadline', async (context) => {
 	const handle = addon.__testOpenHostTransport(
 		(request) => {
 			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40);
@@ -75,8 +89,7 @@ test('a timed-out host request closes the transport and fences late completion',
 	);
 	context.after(() => addon.__testCloseHostTransport(handle));
 
-	await assert.rejects(roundTrip(handle, Buffer.from('slow'), 128, true), /timed out/);
-	await assert.rejects(roundTrip(handle, Buffer.from('later')), /closed|timed out/);
+	assert.deepStrictEqual(await roundTrip(handle, Buffer.from('slow'), 128, false), Buffer.from('slow'));
 });
 
 test('a read timeout fences only that request', async (context) => {
@@ -161,9 +174,33 @@ test('host storage failures cross the native boundary without escaping JavaScrip
 	await assert.rejects(verifyTantivy(handle), /injected host read failure/);
 });
 
-function roundTrip(handle, request, responseBudget = 128, terminalOnTimeout = false) {
+test('host storage handler preserves no-WAL policy and rejects malformed frames', () => {
+	const policies = [];
+	const handler = createHostStorageHandler(
+		{
+			read() {},
+			write(_mutations, policy) {
+				policies.push(policy);
+			},
+			sync() {},
+		},
+		{
+			maxMutations: 4,
+			maxReadResponseBytes: 64,
+			maxControlResponseBytes: 64,
+			maxErrorBytes: 64,
+		},
+	);
+
+	assert.deepStrictEqual(handler(Buffer.from([1, 2, 3, 1, 0, 0, 0, 2, 1, 0, 0, 0, 97])), Buffer.from([1, 0]));
+	assert.deepStrictEqual(policies, ['no-wal']);
+	assert.match(decodeHandlerError(handler(Buffer.from([2, 3]))), /unsupported.*protocol version/);
+	assert.match(decodeHandlerError(handler(Buffer.from([1, 1, 4, 0, 0]))), /truncated/);
+});
+
+function roundTrip(handle, request, responseBudget = 128, useTimeout = true) {
 	return new Promise((resolve, reject) => {
-		addon.__testHostRoundTrip(handle, request, responseBudget, terminalOnTimeout, (encoded) => {
+		addon.__testHostRoundTrip(handle, request, responseBudget, useTimeout, (encoded) => {
 			if (encoded[0] === 0) {
 				resolve(encoded.subarray(1));
 			} else {
@@ -183,4 +220,11 @@ function verifyTantivy(handle) {
 			}
 		});
 	});
+}
+
+function decodeHandlerError(response) {
+	assert.strictEqual(response[0], 1);
+	assert.strictEqual(response[1], 1);
+	const length = response.readUInt32LE(2);
+	return response.subarray(6, 6 + length).toString();
 }
