@@ -1,7 +1,7 @@
 import { parentPort, workerData } from 'node:worker_threads';
 
 const { encodeMutationBatch, openNativeFullTextIndex } = await import(workerData.moduleUrl);
-const index = await openNativeFullTextIndex({
+const opening = openNativeFullTextIndex({
 	path: workerData.indexPath,
 	indexId: 'worker-products',
 	generation: 'generation-1',
@@ -16,6 +16,14 @@ const index = await openNativeFullTextIndex({
 		maxBatchBytes: 16 * 1024 * 1024,
 	},
 });
+if (workerData.mode === 'opening') {
+	parentPort.postMessage('opening');
+}
+const index = await opening;
+if (workerData.mode === 'opening') {
+	parentPort.postMessage('opened');
+	await new Promise(() => {});
+}
 const upserts = Array.from({ length: 50_000 }, (_, id) => ({
 	id: String(id),
 	fields: { title: `worker-owned running product ${id}` },

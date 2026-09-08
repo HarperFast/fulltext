@@ -7,7 +7,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -27,6 +27,7 @@ const STATE_OPEN: u8 = 0;
 const STATE_CLOSING: u8 = 1;
 const STATE_CLOSED: u8 = 2;
 const STATE_POISONED: u8 = 3;
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -64,7 +65,12 @@ struct Runtime {
 	search_queue_nanoseconds: AtomicU64,
 	search_execution_nanoseconds: AtomicU64,
 	search_threads: Mutex<Vec<thread::JoinHandle<()>>>,
-	closed: (Mutex<bool>, Condvar),
+	closed: Arc<CompletionSignal>,
+}
+
+struct CompletionSignal {
+	done: Mutex<bool>,
+	ready: Condvar,
 }
 
 struct QueueState<T> {
@@ -122,19 +128,22 @@ struct SearchCommand {
 pub fn native_open(env: Env, packed_config: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let env_alive = Arc::new(AtomicBool::new(true));
+		let opening_done = Arc::new(CompletionSignal::new());
 		let completion = completion(callback, env_alive.clone())?;
 		let handle = next_handle().map_err(fulltext_napi_error)?;
 		registry().opening.insert(handle);
-		if let Err(error) = register_async_cleanup(&env, handle, env_alive) {
+		if let Err(error) = register_async_cleanup(&env, handle, env_alive, opening_done.clone()) {
 			registry().opening.remove(&handle);
 			return Err(error);
 		}
 		let bytes = packed_config.to_vec();
+		let thread_opening_done = opening_done.clone();
 		if let Err(error) = thread::Builder::new()
 			.name(format!("fulltext-open-{handle}"))
-			.spawn(move || open_on_thread(handle, bytes, completion))
+			.spawn(move || open_on_thread(handle, bytes, completion, thread_opening_done))
 		{
 			registry().opening.remove(&handle);
+			opening_done.signal();
 			return Err(napi_error("E_NATIVE_FAILURE", error));
 		}
 		Ok(())
@@ -306,7 +315,7 @@ impl Runtime {
 			search_queue_nanoseconds: AtomicU64::new(0),
 			search_execution_nanoseconds: AtomicU64::new(0),
 			search_threads: Mutex::new(Vec::with_capacity(search_thread_count)),
-			closed: (Mutex::new(false), Condvar::new()),
+			closed: Arc::new(CompletionSignal::new()),
 		});
 		let writer_runtime = runtime.clone();
 		thread::Builder::new()
@@ -397,17 +406,41 @@ impl Runtime {
 	}
 
 	fn signal_closed(&self) {
-		let (closed, ready) = &self.closed;
-		*lock(closed) = true;
-		ready.notify_all();
+		self.closed.signal();
 	}
 
-	fn wait_closed(&self) {
-		let (closed, ready) = &self.closed;
-		let mut closed = lock(closed);
-		while !*closed {
-			closed = ready.wait(closed).unwrap_or_else(|error| error.into_inner());
+	fn wait_closed(&self, timeout: Duration) -> bool {
+		self.closed.wait(timeout)
+	}
+}
+
+impl CompletionSignal {
+	fn new() -> Self {
+		Self {
+			done: Mutex::new(false),
+			ready: Condvar::new(),
 		}
+	}
+
+	fn signal(&self) {
+		*lock(&self.done) = true;
+		self.ready.notify_all();
+	}
+
+	fn is_done(&self) -> bool {
+		*lock(&self.done)
+	}
+
+	fn wait(&self, timeout: Duration) -> bool {
+		let done = lock(&self.done);
+		if *done {
+			return true;
+		}
+		let (done, _) = self
+			.ready
+			.wait_timeout_while(done, timeout, |done| !*done)
+			.unwrap_or_else(|error| error.into_inner());
+		*done
 	}
 }
 
@@ -709,7 +742,7 @@ fn search_loop(runtime: Arc<Runtime>) {
 	}
 }
 
-fn open_on_thread(handle: u32, bytes: Vec<u8>, completion: Completion) {
+fn open_on_thread(handle: u32, bytes: Vec<u8>, completion: Completion, opening_done: Arc<CompletionSignal>) {
 	let env_alive = completion.env_alive.clone();
 	let result = catch_unwind(AssertUnwindSafe(|| open_runtime(handle, bytes, env_alive)));
 	match result {
@@ -718,6 +751,7 @@ fn open_on_thread(handle: u32, bytes: Vec<u8>, completion: Completion) {
 		Err(_) => completion.failure(FulltextError::new("E_NATIVE_PANIC", "native index open panicked")),
 	}
 	registry().opening.remove(&handle);
+	opening_done.signal();
 }
 
 fn open_runtime(handle: u32, bytes: Vec<u8>, env_alive: Arc<AtomicBool>) -> Result<()> {
@@ -759,6 +793,7 @@ fn open_runtime(handle: u32, bytes: Vec<u8>, env_alive: Arc<AtomicBool>) -> Resu
 		if registry.cancelled.remove(&handle) || !env_alive.load(Ordering::Acquire) {
 			drop(registry);
 			runtime.force_close();
+			let _ = runtime.wait_closed(CLEANUP_TIMEOUT);
 			return Err(FulltextError::new(
 				"E_CLOSED",
 				"Node environment closed during index open",
@@ -818,10 +853,29 @@ fn cleanup_handle(handle: u32) -> Option<Arc<Runtime>> {
 struct CleanupHookData {
 	handle: u32,
 	env_alive: Arc<AtomicBool>,
+	opening_done: Arc<CompletionSignal>,
 }
 
-fn register_async_cleanup(env: &Env, handle: u32, env_alive: Arc<AtomicBool>) -> boundary::Result<()> {
-	let data = Box::into_raw(Box::new(CleanupHookData { handle, env_alive }));
+struct CleanupHookGuard {
+	raw_handle: usize,
+}
+
+enum CleanupWait {
+	Runtime(Arc<Runtime>),
+	Opening(Arc<CompletionSignal>),
+}
+
+fn register_async_cleanup(
+	env: &Env,
+	handle: u32,
+	env_alive: Arc<AtomicBool>,
+	opening_done: Arc<CompletionSignal>,
+) -> boundary::Result<()> {
+	let data = Box::into_raw(Box::new(CleanupHookData {
+		handle,
+		env_alive,
+		opening_done,
+	}));
 	let mut cleanup_handle = ptr::null_mut();
 	// Safety: `data` remains owned by the registered one-shot hook, and Node writes the handle to the supplied pointer.
 	let status = unsafe {
@@ -842,27 +896,59 @@ fn register_async_cleanup(env: &Env, handle: u32, env_alive: Arc<AtomicBool>) ->
 }
 
 unsafe extern "C" fn async_cleanup(handle: napi::sys::napi_async_cleanup_hook_handle, data: *mut c_void) {
+	let guard = CleanupHookGuard {
+		raw_handle: handle as usize,
+	};
+	let _ = catch_unwind(AssertUnwindSafe(|| async_cleanup_inner(guard, data)));
+}
+
+fn async_cleanup_inner(guard: CleanupHookGuard, data: *mut c_void) {
 	// Safety: `data` was allocated by `register_async_cleanup` for this one-shot callback.
 	let data = unsafe { Box::from_raw(data.cast::<CleanupHookData>()) };
 	data.env_alive.store(false, Ordering::Release);
-	let runtime = cleanup_handle(data.handle);
-	let raw_handle = handle as usize;
-	let background_runtime = runtime.clone();
-	let spawned = thread::Builder::new()
+	let wait = match cleanup_handle(data.handle) {
+		Some(runtime) => CleanupWait::Runtime(runtime),
+		None => CleanupWait::Opening(data.opening_done.clone()),
+	};
+	if wait.is_done() {
+		return;
+	}
+	let _ = thread::Builder::new()
 		.name(format!("fulltext-cleanup-{}", data.handle))
-		.spawn(move || finish_async_cleanup(raw_handle, background_runtime));
-	if spawned.is_err() {
-		finish_async_cleanup(raw_handle, runtime);
+		.spawn(move || finish_async_cleanup(guard, wait));
+}
+
+impl CleanupWait {
+	fn is_done(&self) -> bool {
+		match self {
+			Self::Runtime(runtime) => runtime.closed.is_done(),
+			Self::Opening(signal) => signal.is_done(),
+		}
+	}
+
+	fn wait(&self, timeout: Duration) -> bool {
+		match self {
+			Self::Runtime(runtime) => runtime.wait_closed(timeout),
+			Self::Opening(signal) => signal.wait(timeout),
+		}
 	}
 }
 
-fn finish_async_cleanup(raw_handle: usize, runtime: Option<Arc<Runtime>>) {
-	if let Some(runtime) = runtime {
-		runtime.wait_closed();
+fn finish_async_cleanup(guard: CleanupHookGuard, wait: CleanupWait) {
+	let finished = catch_unwind(AssertUnwindSafe(|| wait.wait(CLEANUP_TIMEOUT))).unwrap_or(false);
+	if !finished {
+		eprintln!("fulltext native cleanup exceeded {} seconds", CLEANUP_TIMEOUT.as_secs());
 	}
-	// Safety: Node keeps this async cleanup handle valid until it is removed exactly once here.
-	let _ =
-		unsafe { napi::sys::napi_remove_async_cleanup_hook(raw_handle as napi::sys::napi_async_cleanup_hook_handle) };
+	drop(guard);
+}
+
+impl Drop for CleanupHookGuard {
+	fn drop(&mut self) {
+		// Safety: this guard uniquely owns Node's one-shot async cleanup handle.
+		let _ = unsafe {
+			napi::sys::napi_remove_async_cleanup_hook(self.raw_handle as napi::sys::napi_async_cleanup_hook_handle)
+		};
+	}
 }
 
 fn release_runtime(handle: u32, identity: &PathIdentity) {

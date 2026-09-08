@@ -26,6 +26,25 @@ test('worker termination detaches completions and releases its writer', async (c
 	await index.close();
 });
 
+test('worker termination during open releases its native cleanup hook', async (context) => {
+	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-open-'));
+	context.after(() => rmSync(indexPath, { recursive: true, force: true }));
+	const worker = new Worker(new URL('./fixtures/native-worker-child.mjs', import.meta.url), {
+		workerData: {
+			indexPath,
+			moduleUrl: new URL('../dist/native.js', import.meta.url).href,
+			mode: 'opening',
+		},
+	});
+	await new Promise((resolve, reject) => {
+		worker.once('error', reject);
+		worker.on('message', (message) => message === 'opening' && resolve());
+	});
+	await worker.terminate();
+	const index = await waitForOpen(indexPath);
+	await index.close();
+});
+
 async function waitForOpen(indexPath) {
 	const deadline = performance.now() + 10_000;
 	while (true) {

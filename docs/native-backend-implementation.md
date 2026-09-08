@@ -265,7 +265,10 @@ Each Node environment registers a N-API asynchronous cleanup hook. Environment t
 accepting work, detaches JavaScript completions, schedules a rollback close, and keeps the native
 environment alive until writer shutdown, search-thread joins, and path release complete. The hook
 callback itself does not block on a long merge; a native cleanup thread removes the N-API hook only
-after teardown finishes. Handles and completions are never reused across workers.
+after teardown finishes. Cleanup waiting is capped at 30 seconds, and the hook is removed after a
+timeout or caught panic so worker/process shutdown cannot hang indefinitely. A worker terminated
+while an index is still opening waits on the same bounded completion signal. Handles and
+completions are never reused across workers.
 
 ## Performance experiment
 
