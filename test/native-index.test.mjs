@@ -141,6 +141,37 @@ test('keeps the JavaScript event loop responsive while indexing', async (context
 	await index.close({ mode: 'rollback' });
 });
 
+test('search completes while the writer is processing a large batch', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = {
+		...config.limits,
+		maxQueuedBytes: 16 * 1024 * 1024,
+		maxBatchBytes: 16 * 1024 * 1024,
+	};
+	const index = await openNativeFullTextIndex(config);
+	await index.apply(encodeMutationBatch({ upserts: [{ id: 'visible', fields: { title: 'visible trail shoe' } }] }));
+	await index.commit();
+	await index.reload();
+	const packed = encodeMutationBatch(
+		{
+			upserts: Array.from({ length: 50_000 }, (_, id) => ({
+				id: `pending-${id}`,
+				fields: { title: `pending catalog product ${id}`, description: 'large concurrent batch' },
+			})),
+		},
+		config.limits.maxBatchBytes,
+	);
+	let applySettled = false;
+	const apply = index.apply(packed).finally(() => {
+		applySettled = true;
+	});
+	const result = await index.search({ text: 'visible trail shoe', exactTotal: true });
+	assert.strictEqual(result.hits[0].id, 'visible');
+	assert.strictEqual(applySettled, false, 'search waited for the writer batch to finish');
+	await apply;
+	await index.close({ mode: 'rollback' });
+});
+
 test('rejects overload instead of blocking the JavaScript thread', async (context) => {
 	const indexPath = temporaryIndex(context);
 	const config = options(indexPath);

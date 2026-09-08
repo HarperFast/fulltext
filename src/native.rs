@@ -232,11 +232,11 @@ pub fn native_close(handle: u32, rollback: bool, callback: JsFunction) -> bounda
 				completion.success(Vec::new());
 				Ok(())
 			}
-			Err(STATE_POISONED) if rollback => runtime
+			Err(STATE_POISONED) => runtime
 				.writer_queue
 				.push_force(
 					WriterCommand {
-						operation: WriterOperation::Close { rollback },
+						operation: WriterOperation::Close { rollback: true },
 						completion,
 					},
 					0,
@@ -247,6 +247,16 @@ pub fn native_close(handle: u32, rollback: bool, callback: JsFunction) -> bounda
 				"index is closing or poisoned",
 			))),
 		}
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testPoisonNativeHandle")]
+pub fn test_poison_native_handle(handle: u32) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		let runtime = runtime(handle)?;
+		runtime.poison(FulltextError::new("E_POISONED", "test poison"));
+		Ok(())
 	})?
 }
 
@@ -513,6 +523,17 @@ impl Completion {
 	}
 }
 
+impl Drop for Completion {
+	fn drop(&mut self) {
+		if self.callback.is_some() {
+			self.send(error_envelope(FulltextError::new(
+				"E_CLOSED",
+				"native operation ended before completion",
+			)));
+		}
+	}
+}
+
 impl WriterCommand {
 	fn fail(self, error: FulltextError) {
 		self.completion.failure(error);
@@ -529,13 +550,22 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 		let started = Instant::now();
 		let outcome = catch_unwind(AssertUnwindSafe(|| match operation {
 			WriterOperation::Apply(bytes) => {
-				let result = decode_batch(&bytes)
-					.and_then(|batch| active_writer(&writer)?.apply(batch))
-					.map(|count| {
-						runtime.uncommitted_mutations.fetch_add(count, Ordering::AcqRel);
-						u64_body(count)
-					});
-				WriterOutcome::Continue(result)
+				match decode_batch(&bytes).and_then(|batch| active_writer(&writer)?.prepare(batch)) {
+					Ok(prepared) => match active_writer(&writer).and_then(|writer| writer.apply_prepared(prepared)) {
+						Ok(count) => {
+							runtime.uncommitted_mutations.fetch_add(count, Ordering::AcqRel);
+							WriterOutcome::Continue(Ok(u64_body(count)))
+						}
+						Err(error) => WriterOutcome::Poison(
+							Err(error),
+							FulltextError::new(
+								"E_POISONED",
+								"a mutation failed after writer state changed and the index generation is terminal",
+							),
+						),
+					},
+					Err(error) => WriterOutcome::Continue(Err(error)),
+				}
 			}
 			WriterOperation::Commit => match active_writer_mut(&mut writer).and_then(Writer::commit) {
 				Ok(opstamp) => {
@@ -690,7 +720,7 @@ fn open_runtime(handle: u32, bytes: Vec<u8>, env_alive: Arc<AtomicBool>) -> Resu
 		registry.paths.insert(path_identity.clone(), handle);
 	}
 	let result = (|| {
-		let directory = MmapDirectory::open(&canonical).map_err(FulltextError::native)?;
+		let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
 		let engine = Engine::open(directory, &config)?;
 		let writer = engine.writer(&config)?;
 		let reader = engine.reader()?;
@@ -776,14 +806,14 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
 }
 
 fn create_and_canonicalize(path: &Path) -> Result<PathBuf> {
-	fs::create_dir_all(path).map_err(FulltextError::native)?;
-	fs::canonicalize(path).map_err(FulltextError::native)
+	fs::create_dir_all(path).map_err(storage_error)?;
+	fs::canonicalize(path).map_err(storage_error)
 }
 
 #[cfg(unix)]
 fn path_identity(path: &Path) -> Result<PathIdentity> {
 	use std::os::unix::fs::MetadataExt;
-	let metadata = fs::metadata(path).map_err(FulltextError::native)?;
+	let metadata = fs::metadata(path).map_err(storage_error)?;
 	Ok(PathIdentity::Unix(metadata.dev(), metadata.ino()))
 }
 
@@ -865,4 +895,8 @@ fn fulltext_napi_error(error: FulltextError) -> napi::Error<&'static str> {
 
 fn napi_error(code: &'static str, error: impl std::fmt::Display) -> napi::Error<&'static str> {
 	napi::Error::new(code, error.to_string())
+}
+
+fn storage_error(error: impl std::fmt::Display) -> FulltextError {
+	FulltextError::new("E_STORAGE", error.to_string())
 }

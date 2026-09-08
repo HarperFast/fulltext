@@ -12,7 +12,6 @@ use tantivy::{Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, Sear
 
 use crate::error::{FulltextError, Result};
 use crate::protocol::{EngineConfig, MutationBatch, SearchOperator, SearchRequest};
-use crate::{NATIVE_ABI_VERSION, TANTIVY_VERSION};
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
 const IDENTITY_PATH: &str = ".harper-fulltext-identity";
@@ -25,6 +24,7 @@ pub struct Engine {
 	id_field: Field,
 	fields: Vec<EngineField>,
 	field_lookup: HashMap<String, usize>,
+	analyzer: TextAnalyzer,
 }
 
 #[derive(Clone)]
@@ -39,6 +39,12 @@ pub struct Writer {
 	id_field: Field,
 	fields: Vec<EngineField>,
 	field_lookup: HashMap<String, usize>,
+}
+
+pub(crate) struct PreparedBatch {
+	mutation_count: u64,
+	deletes: Vec<String>,
+	documents: Vec<(String, TantivyDocument)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,7 +93,7 @@ impl Engine {
 			directory.sync_directory().map_err(storage_error)?;
 		}
 
-		let mut index = if meta_exists {
+		let index = if meta_exists {
 			Index::open(directory).map_err(index_error)?
 		} else {
 			Index::create(directory, schema.clone(), IndexSettings::default()).map_err(index_error)?
@@ -98,7 +104,8 @@ impl Engine {
 				"the persisted Tantivy schema does not match the requested configuration",
 			));
 		}
-		register_analyzer(&mut index, config.stop_words)?;
+		let analyzer = build_analyzer(config.stop_words)?;
+		index.tokenizers().register(ANALYZER_NAME, analyzer.clone());
 		let field_lookup = fields
 			.iter()
 			.enumerate()
@@ -109,6 +116,7 @@ impl Engine {
 			id_field,
 			fields,
 			field_lookup,
+			analyzer,
 		})
 	}
 
@@ -144,33 +152,48 @@ impl Engine {
 					.order_by_score(),
 			)
 			.map_err(index_error)?;
-		let mut hits = Vec::with_capacity(top_docs.len());
-		for (score, address) in top_docs {
-			let segment = &searcher.segment_readers()[address.segment_ord as usize];
+		let mut hits_by_segment = HashMap::new();
+		for (index, (_, address)) in top_docs.iter().enumerate() {
+			hits_by_segment
+				.entry(address.segment_ord)
+				.or_insert_with(Vec::new)
+				.push((index, address.doc_id));
+		}
+		let mut ids = vec![String::new(); top_docs.len()];
+		for (segment_ord, segment_hits) in hits_by_segment {
+			let segment = &searcher.segment_readers()[segment_ord as usize];
 			let column = segment
 				.fast_fields()
 				.str(ID_FIELD_NAME)
 				.map_err(index_error)?
 				.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no ID fast field"))?;
-			let ordinal = column
-				.term_ords(address.doc_id)
-				.next()
-				.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"))?;
 			let mut id = Vec::new();
-			if !column
-				.dictionary()
-				.ord_to_term(ordinal, &mut id)
-				.map_err(storage_error)?
-			{
-				return Err(FulltextError::new(
-					"E_NATIVE_FAILURE",
-					"search hit ID ordinal is missing",
-				));
+			for (index, doc_id) in segment_hits {
+				let ordinal = column
+					.term_ords(doc_id)
+					.next()
+					.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"))?;
+				id.clear();
+				if !column
+					.dictionary()
+					.ord_to_term(ordinal, &mut id)
+					.map_err(storage_error)?
+				{
+					return Err(FulltextError::new(
+						"E_NATIVE_FAILURE",
+						"search hit ID ordinal is missing",
+					));
+				}
+				ids[index] = std::str::from_utf8(&id)
+					.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?
+					.to_owned();
 			}
-			let id = String::from_utf8(id)
-				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?;
-			hits.push(SearchHit { id, score });
 		}
+		let hits = top_docs
+			.into_iter()
+			.zip(ids)
+			.map(|((score, _), id)| SearchHit { id, score })
+			.collect::<Vec<_>>();
 		let (total, total_relation) = if request.exact_total {
 			(
 				searcher.search(query.as_ref(), &Count).map_err(index_error)? as u64,
@@ -217,11 +240,7 @@ impl Engine {
 	}
 
 	fn query(&self, text: &str, operator: SearchOperator, fields: &[&EngineField]) -> Result<Box<dyn Query>> {
-		let mut analyzer = self
-			.index
-			.tokenizers()
-			.get(ANALYZER_NAME)
-			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "English analyzer is not registered"))?;
+		let mut analyzer = self.analyzer.clone();
 		let mut stream = analyzer.token_stream(text);
 		let mut tokens = Vec::new();
 		stream.process(&mut |token| tokens.push(token.text.clone()));
@@ -255,6 +274,11 @@ impl Engine {
 
 impl Writer {
 	pub fn apply(&self, batch: MutationBatch) -> Result<u64> {
+		let prepared = self.prepare(batch)?;
+		self.apply_prepared(prepared)
+	}
+
+	pub(crate) fn prepare(&self, batch: MutationBatch) -> Result<PreparedBatch> {
 		let mutation_count = batch.upserts.len() + batch.deletes.len();
 		for id in &batch.deletes {
 			if id.is_empty() {
@@ -262,35 +286,43 @@ impl Writer {
 			}
 		}
 		let mut documents = Vec::with_capacity(batch.upserts.len());
-		for upsert in &batch.upserts {
+		for upsert in batch.upserts {
 			if upsert.id.is_empty() {
 				return Err(FulltextError::invalid("upsert ID must not be empty"));
 			}
 			let mut seen = HashSet::with_capacity(upsert.fields.len());
 			let mut document = TantivyDocument::default();
 			document.add_text(self.id_field, &upsert.id);
-			for (name, values) in &upsert.fields {
+			for (name, values) in upsert.fields {
 				if !seen.insert(name.clone()) {
 					return Err(FulltextError::invalid(format!("duplicate mutation field {name}")));
 				}
 				let index = self
 					.field_lookup
-					.get(name)
+					.get(&name)
 					.ok_or_else(|| FulltextError::invalid(format!("unknown mutation field {name}")))?;
 				for value in values {
-					document.add_text(self.fields[*index].field, value);
+					document.add_text(self.fields[*index].field, &value);
 				}
 			}
-			documents.push((upsert.id.as_str(), document));
+			documents.push((upsert.id, document));
 		}
-		for id in batch.deletes {
+		Ok(PreparedBatch {
+			mutation_count: mutation_count as u64,
+			deletes: batch.deletes,
+			documents,
+		})
+	}
+
+	pub(crate) fn apply_prepared(&self, prepared: PreparedBatch) -> Result<u64> {
+		for id in prepared.deletes {
 			self.inner.delete_term(Term::from_field_text(self.id_field, &id));
 		}
-		for (id, document) in documents {
-			self.inner.delete_term(Term::from_field_text(self.id_field, id));
+		for (id, document) in prepared.documents {
+			self.inner.delete_term(Term::from_field_text(self.id_field, &id));
 			self.inner.add_document(document).map_err(index_error)?;
 		}
-		Ok(mutation_count as u64)
+		Ok(prepared.mutation_count)
 	}
 
 	pub fn commit(&mut self) -> Result<u64> {
@@ -338,7 +370,7 @@ fn build_schema(config: &EngineConfig) -> Result<(Schema, Field, Vec<EngineField
 	Ok((builder.build(), id_field, fields))
 }
 
-fn register_analyzer(index: &mut Index, stop_words: bool) -> Result<()> {
+fn build_analyzer(stop_words: bool) -> Result<TextAnalyzer> {
 	let mut builder = TextAnalyzer::builder(SimpleTokenizer::default())
 		.filter_dynamic(RemoveLongFilter::limit(40))
 		.filter_dynamic(LowerCaser);
@@ -347,15 +379,11 @@ fn register_analyzer(index: &mut Index, stop_words: bool) -> Result<()> {
 			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "English stop words are unavailable"))?;
 		builder = builder.filter_dynamic(stop_filter);
 	}
-	let analyzer = builder.filter_dynamic(Stemmer::new(Language::English)).build();
-	index.tokenizers().register(ANALYZER_NAME, analyzer);
-	Ok(())
+	Ok(builder.filter_dynamic(Stemmer::new(Language::English)).build())
 }
 
 fn identity_bytes(config: &EngineConfig) -> Vec<u8> {
 	let mut bytes = b"HTFI\x01\x00".to_vec();
-	push_u32(&mut bytes, NATIVE_ABI_VERSION);
-	push_string(&mut bytes, TANTIVY_VERSION);
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
 	push_string(&mut bytes, &config.analyzer);
@@ -376,12 +404,8 @@ fn push_string(bytes: &mut Vec<u8>, value: &str) {
 	bytes.extend_from_slice(value.as_bytes());
 }
 
-fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-	bytes.extend_from_slice(&value.to_le_bytes());
-}
-
 fn storage_error(error: impl std::fmt::Display) -> FulltextError {
-	FulltextError::new("E_NATIVE_FAILURE", error.to_string())
+	FulltextError::new("E_STORAGE", error.to_string())
 }
 
 fn index_error(error: tantivy::TantivyError) -> FulltextError {
@@ -389,6 +413,10 @@ fn index_error(error: tantivy::TantivyError) -> FulltextError {
 		tantivy::TantivyError::LockFailure(tantivy::directory::error::LockError::LockBusy, _) => {
 			FulltextError::new("E_LOCK_BUSY", "another writer owns the Tantivy index lock")
 		}
+		tantivy::TantivyError::OpenDirectoryError(_)
+		| tantivy::TantivyError::OpenReadError(_)
+		| tantivy::TantivyError::OpenWriteError(_)
+		| tantivy::TantivyError::IoError(_) => storage_error(error),
 		other => FulltextError::native(other),
 	}
 }

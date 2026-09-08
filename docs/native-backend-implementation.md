@@ -192,11 +192,13 @@ replace rejection with reference-counted shared handles without changing the ind
 Each Tantivy schema contains an internal indexed string fast field for the raw ID using Tantivy's raw tokenizer
 and one declared text field per configured source field. At creation, the engine atomically writes a
 small backend-neutral identity sidecar through `Directory::atomic_write()` and calls
-`Directory::sync_directory()`. It contains a versioned fingerprint of the package ABI, Tantivy
-version, logical index ID, bounded generation, analyzer identity, stop-word policy, positions,
-surface-term storage, and structural schema. Reopen compares both the generated Tantivy schema and
-this fingerprint before creating a writer. The immutable sidecar is separate from Tantivy's
-per-commit payload, which remains available for standalone checkpoints and derived watermarks.
+`Directory::sync_directory()`. It contains a versioned fingerprint of the logical index ID, bounded
+generation, analyzer identity, stop-word policy, positions, surface-term storage, and structural
+schema. It deliberately excludes the Node wire ABI and Tantivy package version: wire changes do not
+change durable semantics, and Tantivy performs its own index-format compatibility check. Reopen
+compares both the generated Tantivy schema and this fingerprint before creating a writer. The
+immutable sidecar is separate from Tantivy's per-commit payload, which remains available for
+standalone checkpoints and derived watermarks.
 Unknown mutation fields, missing IDs, duplicate schema
 field names, empty queries, unknown search fields, oversized batches, and excessive result windows
 fail before search/index work.
@@ -223,10 +225,12 @@ analyzed term is searched across the selected fields, applying configured field 
 scores documents matching at least one term; `all` requires every analyzed term to match at least
 one selected field. Tantivy's normal scorer supplies BM25. The default result reports a bounded
 lower total (`offset + returned hits`, with `totalRelation: 'lower-bound'` when the page is full) and
-runs `TopDocs` alone so block-max WAND pruning remains available. Exact total is explicit per query,
-runs a separate `Count`, and is benchmarked separately because it must visit all matches. The initial
-schema resolves hit IDs through that fast field, avoiding stored-document decompression on every
-result. The ID is not duplicated in Tantivy's document store.
+runs `TopDocs::order_by_score()` alone. In pinned Tantivy 0.26.1 that collector invokes
+`Weight::for_each_pruning`, and Boolean term unions select the block-WAND implementation. Exact
+total is explicit per query, runs a separate `Count`, and is benchmarked separately at the same
+concurrency because it must visit all matches. The initial schema resolves hit IDs through that fast
+field once per result segment, avoiding stored-document decompression on every result. The ID is not
+duplicated in Tantivy's document store.
 
 ## Failure and lifecycle behavior
 
@@ -235,17 +239,18 @@ initialization and every command. A panic poisons only the affected handle, drai
 queued promise, and leaves no admitted promise unsettled. Filesystem, incomplete-create, identity,
 schema, query, resource, queue, closed, and native failures map to stable package error codes present
 in the TypeScript allowlist while preserving the cause message. A competing process holding
-Tantivy's filesystem writer lock maps to a distinct retryable lock-busy code. A parity test compares
-the Rust error table with the TypeScript allowlist, including asynchronously rejected promises. No
-Rust type or Tantivy object crosses the public API or Node worker.
+Tantivy's filesystem writer lock maps to a distinct retryable lock-busy code. A source-parity test
+compares the Rust error table with the TypeScript allowlist, while integration tests assert codes on
+representative synchronous and asynchronous failures. No Rust type or Tantivy object crosses the
+public API or Node worker.
 
-Successful `commit()` has Tantivy 0.26.1's documented persistence contract. The process-kill test
-verifies publication and process-crash recovery; durable-state fault tests over `KvDirectory`
-separately verify that a published commit does not reference non-durable files. The implementation
-uses `prepare_commit()`, installs the versioned engine
-payload, and completes Tantivy's metadata write and directory sync before resolving. A commit error
-poisons the writer generation; callers must close and reopen from the last durable commit rather
-than guessing which uncommitted opstamps survived.
+Successful `commit()` delegates to Tantivy 0.26.1's ordinary commit path and resolves only after it
+returns. The process-kill test verifies publication and process-crash recovery. The existing
+`KvDirectory` contract suite supplies the durable file/publication ordering checks; injecting a
+commit failure through the complete shared engine remains part of Rocks-backend hardening. Engine
+payload publication is intentionally deferred to the derived-index checkpoint work. A commit or
+post-validation mutation failure poisons the writer generation; callers close and reopen from the
+last durable commit rather than guessing which uncommitted opstamps survived.
 
 `close()` defaults to require-clean: uncommitted mutations fail close rather than being silently
 committed or discarded. That failure restores the open state so the caller can commit or call
@@ -272,9 +277,9 @@ metadata and:
 - separately reported packing, apply, writer queue, and writer execution time;
 - commit latency distribution and reload time;
 - warm BM25 search p50/p95/p99 and throughput at configurable concurrency, using approximate totals
-  by default and a separately labeled exact-total profile;
+  by default and same-concurrency single-worker approximate/exact profiles;
 - cold-after-reopen search p50/p95/p99;
-- index bytes, peak RSS, and post-close RSS; and
+- index bytes, periodically sampled peak RSS, and post-close RSS; and
 - document count, field count, average packed bytes, thread/memory budgets, Tantivy version, and
   host metadata needed to interpret the numbers.
 

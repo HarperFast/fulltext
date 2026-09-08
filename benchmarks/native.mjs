@@ -38,6 +38,11 @@ try {
 	let applyMilliseconds = 0;
 	let packedBytes = 0;
 	let uncommittedDocuments = 0;
+	let peakRssBytes = process.memoryUsage().rss;
+	const rssSampler = setInterval(() => {
+		peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
+	}, 10);
+	rssSampler.unref();
 	const commitLatencies = [];
 	const indexingStarted = performance.now();
 	for (let start = 0; start < documents; start += batchSize) {
@@ -50,11 +55,13 @@ try {
 		const applyStarted = performance.now();
 		assert.strictEqual(await index.apply(packed), batch.length);
 		applyMilliseconds += performance.now() - applyStarted;
+		peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
 		uncommittedDocuments += batch.length;
 		if (end === documents || uncommittedDocuments >= commitEvery) {
 			const commitStarted = performance.now();
 			await index.commit();
 			commitLatencies.push(performance.now() - commitStarted);
+			peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
 			uncommittedDocuments = 0;
 		}
 	}
@@ -72,9 +79,11 @@ try {
 		await index.search({ text: query, limit: 10 });
 	}
 	const warm = await measureSearch(index, queryMix, queryCount, concurrency, false);
-	const exact = await measureSearch(index, queryMix, Math.max(4, Math.floor(queryCount / 10)), 1, true);
+	const exactComparisonCount = Math.max(4, Math.floor(queryCount / 10));
+	const approximateSingle = await measureSearch(index, queryMix, exactComparisonCount, 1, false);
+	const exact = await measureSearch(index, queryMix, exactComparisonCount, 1, true);
 	const status = index.status();
-	const peakRssBytes = process.memoryUsage().rss;
+	peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
 	await index.close();
 
 	const reopenStarted = performance.now();
@@ -82,6 +91,7 @@ try {
 	const reopenMilliseconds = performance.now() - reopenStarted;
 	const cold = await measureSearch(index, queryMix, Math.min(20, queryCount), 1, false);
 	await index.close();
+	clearInterval(rssSampler);
 	const sortedCommitLatencies = [...commitLatencies].sort((left, right) => left - right);
 	const output = {
 		formatVersion: 1,
@@ -121,7 +131,13 @@ try {
 			commitP99Milliseconds: percentile(sortedCommitLatencies, 0.99),
 			reloadMilliseconds,
 		},
-		search: { warmApproximate: warm, warmExactTotal: exact, coldAfterReopen: cold, reopenMilliseconds },
+		search: {
+			warmApproximate: warm,
+			warmApproximateSingle: approximateSingle,
+			warmExactTotal: exact,
+			coldAfterReopen: cold,
+			reopenMilliseconds,
+		},
 		resources: {
 			indexBytes: await directoryBytes(indexPath),
 			peakRssBytes,

@@ -23,6 +23,7 @@ interface NativeAddonApi {
 	__testCreateHandle?(): number;
 	__testPanic?(id: number): void;
 	__testCheck?(id: number): boolean;
+	__testPoisonNativeHandle?(handle: number): void;
 }
 
 export type NativeCallback = (response: Buffer) => void;

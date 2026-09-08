@@ -129,10 +129,15 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 	let mut cursor = Cursor::new(bytes, *b"FTMB")?;
 	let upsert_count = cursor.u32()? as usize;
 	let delete_count = cursor.u32()? as usize;
-	let minimum_entries = upsert_count
-		.checked_add(delete_count)
+	let minimum_bytes = upsert_count
+		.checked_mul(6)
+		.and_then(|bytes| {
+			delete_count
+				.checked_mul(4)
+				.and_then(|deletes| bytes.checked_add(deletes))
+		})
 		.ok_or_else(|| FulltextError::invalid("mutation count overflow"))?;
-	if minimum_entries > bytes.len() / 4 {
+	if minimum_bytes > cursor.remaining() {
 		return Err(FulltextError::invalid("mutation counts exceed the packed batch length"));
 	}
 	let mut upserts = Vec::with_capacity(upsert_count);
@@ -142,10 +147,18 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 		if field_count > MAX_FIELDS {
 			return Err(FulltextError::invalid("upsert field count exceeds 1024"));
 		}
+		if field_count > cursor.remaining() / 6 {
+			return Err(FulltextError::invalid(
+				"upsert field count exceeds the packed batch length",
+			));
+		}
 		let mut fields = Vec::with_capacity(field_count);
 		for _ in 0..field_count {
 			let name = cursor.string()?;
 			let value_count = cursor.u16()? as usize;
+			if value_count > cursor.remaining() / 4 {
+				return Err(FulltextError::invalid("value count exceeds the packed batch length"));
+			}
 			let mut values = Vec::with_capacity(value_count);
 			for _ in 0..value_count {
 				values.push(cursor.string()?);
@@ -153,6 +166,9 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 			fields.push((name, values));
 		}
 		upserts.push(Upsert { id, fields });
+	}
+	if delete_count > cursor.remaining() / 4 {
+		return Err(FulltextError::invalid("delete count exceeds the packed batch length"));
 	}
 	let mut deletes = Vec::with_capacity(delete_count);
 	for _ in 0..delete_count {
@@ -327,6 +343,10 @@ impl<'a> Cursor<'a> {
 			Err(FulltextError::invalid("packed request has trailing bytes"))
 		}
 	}
+
+	fn remaining(&self) -> usize {
+		self.bytes.len() - self.offset
+	}
 }
 
 #[cfg(test)]
@@ -347,5 +367,24 @@ mod tests {
 		bytes.extend_from_slice(&1u32.to_le_bytes());
 		bytes.push(0xff);
 		assert_eq!(decode_search(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+	}
+
+	#[test]
+	fn rejects_nested_counts_before_allocating() {
+		let mut fields = b"FTMB\x01\x00".to_vec();
+		fields.extend_from_slice(&1u32.to_le_bytes());
+		fields.extend_from_slice(&0u32.to_le_bytes());
+		fields.extend_from_slice(&0u32.to_le_bytes());
+		fields.extend_from_slice(&u16::MAX.to_le_bytes());
+		assert_eq!(decode_batch(&fields).unwrap_err().code, "E_INVALID_ARGUMENT");
+
+		let mut values = b"FTMB\x01\x00".to_vec();
+		values.extend_from_slice(&1u32.to_le_bytes());
+		values.extend_from_slice(&0u32.to_le_bytes());
+		values.extend_from_slice(&0u32.to_le_bytes());
+		values.extend_from_slice(&1u16.to_le_bytes());
+		values.extend_from_slice(&0u32.to_le_bytes());
+		values.extend_from_slice(&u16::MAX.to_le_bytes());
+		assert_eq!(decode_batch(&values).unwrap_err().code, "E_INVALID_ARGUMENT");
 	}
 }

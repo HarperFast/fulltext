@@ -91,7 +91,7 @@ npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25
 The benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
 JSON record. It reports packing, apply, durable end-to-end ingestion, actor queue and execution
 time, commit distributions, reload cost, warm and cold BM25 p50/p95/p99, exact-total overhead,
-index bytes, and process RSS. `--commit-every` sets the target number of mutations between
+index bytes, and periodically sampled process RSS. `--commit-every` sets the target number of mutations between
 durability points; it materially affects throughput and peak memory because replacement-safe
 upserts include delete terms. CI runs only the correctness smoke profile; timing comparisons
 require controlled hardware.
