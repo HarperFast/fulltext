@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io;
-use std::ops::Deref;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
@@ -42,7 +41,6 @@ struct TransportState {
 
 struct PendingRequest {
 	retained_bytes: usize,
-	completed: bool,
 	response: Weak<ResponseSlot>,
 }
 
@@ -91,7 +89,7 @@ impl HostTransport {
 		request: Vec<u8>,
 		response_budget: usize,
 		deadline: Option<Instant>,
-	) -> io::Result<TransportResponse> {
+	) -> io::Result<Vec<u8>> {
 		let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
 		if request_id == 0 {
 			self.fail(io::ErrorKind::Other, "host storage request id space exhausted");
@@ -135,17 +133,7 @@ impl HostTransport {
 		}
 
 		if let Some(result) = response.wait(deadline) {
-			return match result {
-				Ok(bytes) => Ok(TransportResponse {
-					bytes,
-					transport: Arc::downgrade(self),
-					request_id,
-				}),
-				Err(error) => {
-					self.release(request_id);
-					Err(error)
-				}
-			};
+			return result;
 		}
 		self.release(request_id);
 		let _ = response.take();
@@ -217,7 +205,6 @@ impl HostTransport {
 			request_id,
 			PendingRequest {
 				retained_bytes,
-				completed: false,
 				response: Arc::downgrade(response),
 			},
 		);
@@ -227,20 +214,30 @@ impl HostTransport {
 	fn complete(&self, request_id: u64, result: io::Result<Vec<u8>>) {
 		let response = {
 			let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-			let Some(pending) = state.pending.get(&request_id) else {
+			let Some(pending) = state.pending.remove(&request_id) else {
 				return;
 			};
-			if pending.completed {
+			if state.operations == 0 || state.bytes < pending.retained_bytes {
+				state.closed = Some("host storage transport accounting failed".to_owned());
+				state.operations = 0;
+				state.bytes = 0;
+				let remaining = std::mem::take(&mut state.pending);
+				drop(state);
+				self.capacity.notify_all();
+				let error = || io::Error::other("host storage transport accounting failed");
+				if let Some(response) = pending.response.upgrade() {
+					response.complete(Err(error()));
+				}
+				for pending in remaining.into_values() {
+					if let Some(response) = pending.response.upgrade() {
+						response.complete(Err(error()));
+					}
+				}
 				return;
 			}
 			let response = pending.response.upgrade();
-			let reserved_bytes = pending.retained_bytes;
-			let response_bytes = result.as_ref().map_or(0, Vec::len);
 			state.operations -= 1;
-			state.bytes = state.bytes - reserved_bytes + response_bytes;
-			let pending = state.pending.get_mut(&request_id).unwrap();
-			pending.retained_bytes = response_bytes;
-			pending.completed = true;
+			state.bytes -= pending.retained_bytes;
 			self.capacity.notify_all();
 			response
 		};
@@ -252,9 +249,12 @@ impl HostTransport {
 	fn release(&self, request_id: u64) {
 		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		if let Some(pending) = state.pending.remove(&request_id) {
-			if !pending.completed {
-				state.operations -= 1;
+			if state.operations == 0 || state.bytes < pending.retained_bytes {
+				drop(state);
+				self.fail(io::ErrorKind::Other, "host storage transport accounting failed");
+				return;
 			}
+			state.operations -= 1;
 			state.bytes -= pending.retained_bytes;
 			self.capacity.notify_all();
 		}
@@ -275,37 +275,6 @@ impl HostTransport {
 			if let Some(response) = request.response.upgrade() {
 				response.complete(Err(io::Error::new(kind, message.to_owned())));
 			}
-		}
-	}
-}
-
-struct TransportResponse {
-	bytes: Vec<u8>,
-	transport: Weak<HostTransport>,
-	request_id: u64,
-}
-
-impl TransportResponse {
-	fn into_bytes(mut self) -> Vec<u8> {
-		std::mem::take(&mut self.bytes)
-	}
-}
-
-impl Deref for TransportResponse {
-	type Target = [u8];
-
-	fn deref(&self) -> &Self::Target {
-		&self.bytes
-	}
-}
-
-// Moving this wrapper never moves the Vec allocation referenced by Deref.
-unsafe impl stable_deref_trait::StableDeref for TransportResponse {}
-
-impl Drop for TransportResponse {
-	fn drop(&mut self) {
-		if let Some(transport) = self.transport.upgrade() {
-			transport.release(self.request_id);
 		}
 	}
 }
@@ -545,12 +514,12 @@ impl RequestEncoder {
 }
 
 struct ResponseDecoder {
-	bytes: TransportResponse,
+	bytes: Vec<u8>,
 	offset: usize,
 }
 
 impl ResponseDecoder {
-	fn new(bytes: TransportResponse) -> Self {
+	fn new(bytes: Vec<u8>) -> Self {
 		Self { bytes, offset: 0 }
 	}
 
@@ -731,9 +700,7 @@ pub fn test_host_round_trip(
 			.spawn(move || {
 				let result = test_thread_result(|| {
 					let deadline = use_timeout.then(|| Instant::now() + transport.timeout);
-					transport
-						.round_trip(request, response_budget as usize, deadline)
-						.map(TransportResponse::into_bytes)
+					transport.round_trip(request, response_budget as usize, deadline)
 				});
 				let _ = completion.call(result, ThreadsafeFunctionCallMode::NonBlocking);
 			})

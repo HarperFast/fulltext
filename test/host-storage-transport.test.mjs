@@ -117,6 +117,14 @@ test('invalid callback responses fail the request without terminating the proces
 	}
 });
 
+test('malformed host protocol responses fail the Tantivy operation', async (context) => {
+	for (const invalid of [Buffer.from([2, 0]), Buffer.from([1])]) {
+		const handle = addon.__testOpenHostTransport(() => invalid, 4, 64 * 1024 * 1024, 1_000);
+		context.after(() => addon.__testCloseHostTransport(handle));
+		await assert.rejects(verifyTantivy(handle), /unsupported protocol version|truncated/);
+	}
+});
+
 test('KvDirectory and Tantivy operate through the host storage transport', async (context) => {
 	const entries = new Map();
 	const requests = [];
@@ -172,6 +180,26 @@ test('host storage failures cross the native boundary without escaping JavaScrip
 	context.after(() => addon.__testCloseHostTransport(handle));
 
 	await assert.rejects(verifyTantivy(handle), /injected host read failure/);
+});
+
+test('host mutation failures return a definitive result without timing out', async (context) => {
+	const storage = {
+		read() {},
+		write() {
+			throw new Error('injected host write failure');
+		},
+		sync() {},
+	};
+	const handler = createHostStorageHandler(storage, {
+		maxMutations: 16,
+		maxReadResponseBytes: 1_024,
+		maxControlResponseBytes: 1_024,
+		maxErrorBytes: 1_024,
+	});
+	const handle = addon.__testOpenHostTransport(handler, 4, 64 * 1024 * 1024, 5);
+	context.after(() => addon.__testCloseHostTransport(handle));
+
+	await assert.rejects(verifyTantivy(handle), /injected host write failure/);
 });
 
 test('host storage handler preserves no-WAL policy and rejects malformed frames', () => {

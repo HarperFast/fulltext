@@ -30,6 +30,7 @@ export interface HostStorageHandlerOptions {
 	maxErrorBytes: number;
 }
 
+/** Creates the exception-safe callback required by the native host transport. */
 export function createHostStorageHandler(
 	storage: HostStorage,
 	{ maxMutations, maxReadResponseBytes, maxControlResponseBytes, maxErrorBytes }: HostStorageHandlerOptions,
