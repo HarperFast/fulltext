@@ -5,8 +5,10 @@ import { createHostStorageHandler } from '../dist/host-storage.js';
 import { loadAddon } from '../dist/load-addon.js';
 
 const addon = loadAddon();
+const readResponseBytes = 1024 * 1024;
+const controlResponseBytes = 64 * 1024;
 
-test('host storage transport round-trips bytes without blocking JavaScript', async (context) => {
+test('host storage transport round-trips bytes intact', async (context) => {
 	const requests = [];
 	const handle = addon.__testOpenHostTransport(
 		(request) => {
@@ -73,15 +75,33 @@ test('a timed-out host request closes the transport and fences late completion',
 	);
 	context.after(() => addon.__testCloseHostTransport(handle));
 
-	await assert.rejects(roundTrip(handle, Buffer.from('slow')), /timed out/);
+	await assert.rejects(roundTrip(handle, Buffer.from('slow'), 128, true), /timed out/);
 	await assert.rejects(roundTrip(handle, Buffer.from('later')), /closed|timed out/);
 });
 
-test('invalid callback responses fail the request without terminating the process', async (context) => {
-	const handle = addon.__testOpenHostTransport(() => 'not a buffer', 1, 1024, 1_000);
+test('a read timeout fences only that request', async (context) => {
+	let calls = 0;
+	const handle = addon.__testOpenHostTransport(
+		(request) => {
+			if (calls++ === 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40);
+			return request;
+		},
+		1,
+		1_024,
+		5,
+	);
 	context.after(() => addon.__testCloseHostTransport(handle));
 
-	await assert.rejects(roundTrip(handle, Buffer.from('read')), /must return a Buffer/);
+	await assert.rejects(roundTrip(handle, Buffer.from('slow')), /timed out/);
+	assert.deepStrictEqual(await roundTrip(handle, Buffer.from('recovered')), Buffer.from('recovered'));
+});
+
+test('invalid callback responses fail the request without terminating the process', async (context) => {
+	for (const invalid of ['not a buffer', {}]) {
+		const handle = addon.__testOpenHostTransport(() => invalid, 1, 1024, 1_000);
+		context.after(() => addon.__testCloseHostTransport(handle));
+		await assert.rejects(roundTrip(handle, Buffer.from('read')), /must return a Buffer/);
+	}
 });
 
 test('KvDirectory and Tantivy operate through the host storage transport', async (context) => {
@@ -106,18 +126,17 @@ test('KvDirectory and Tantivy operate through the host storage transport', async
 	};
 	const handler = createHostStorageHandler(storage, {
 		maxMutations: 1_024,
-		maxReadResponseBytes: 32 * 1024 * 1024,
-		maxErrorBytes: 64 * 1024,
+		maxReadResponseBytes: readResponseBytes,
+		maxControlResponseBytes: controlResponseBytes,
+		maxErrorBytes: controlResponseBytes,
 	});
-	const handle = addon.__testOpenHostTransport(handler, 32, 64 * 1024 * 1024, 5_000);
+	const handle = addon.__testOpenHostTransport(handler, 32, 40 * 1024 * 1024, 5_000);
 	context.after(() => addon.__testCloseHostTransport(handle));
 
 	await verifyTantivy(handle);
 	assert.ok(requests.includes('read'), 'read requests were issued');
-	assert.ok(
-		requests.some((request) => request.startsWith('write:')),
-		'atomic write batches were issued',
-	);
+	assert.ok(requests.includes('write:wal'), 'ordinary objects use WAL writes');
+	assert.ok(requests.includes('write:wal-sync'), 'metadata publication uses a synchronous WAL write');
 	assert.ok(requests.includes('sync'), 'directory sync requests were issued');
 	assert.ok(entries.size > 0, 'Tantivy state remains in host storage for reopen');
 });
@@ -133,6 +152,7 @@ test('host storage failures cross the native boundary without escaping JavaScrip
 	const handler = createHostStorageHandler(storage, {
 		maxMutations: 16,
 		maxReadResponseBytes: 1_024,
+		maxControlResponseBytes: 1_024,
 		maxErrorBytes: 1_024,
 	});
 	const handle = addon.__testOpenHostTransport(handler, 4, 64 * 1024 * 1024, 1_000);
@@ -141,9 +161,9 @@ test('host storage failures cross the native boundary without escaping JavaScrip
 	await assert.rejects(verifyTantivy(handle), /injected host read failure/);
 });
 
-function roundTrip(handle, request, responseBudget = 128) {
+function roundTrip(handle, request, responseBudget = 128, terminalOnTimeout = false) {
 	return new Promise((resolve, reject) => {
-		addon.__testHostRoundTrip(handle, request, responseBudget, (encoded) => {
+		addon.__testHostRoundTrip(handle, request, responseBudget, terminalOnTimeout, (encoded) => {
 			if (encoded[0] === 0) {
 				resolve(encoded.subarray(1));
 			} else {
@@ -155,7 +175,7 @@ function roundTrip(handle, request, responseBudget = 128) {
 
 function verifyTantivy(handle) {
 	return new Promise((resolve, reject) => {
-		addon.__testVerifyTantivyOnHostTransport(handle, (encoded) => {
+		addon.__testVerifyTantivyOnHostTransport(handle, readResponseBytes, controlResponseBytes, (encoded) => {
 			if (encoded[0] === 0) {
 				resolve();
 			} else {

@@ -25,18 +25,24 @@ export interface HostStorage {
 export interface HostStorageHandlerOptions {
 	maxMutations: number;
 	maxReadResponseBytes: number;
+	maxControlResponseBytes: number;
 	maxErrorBytes: number;
 }
 
 export function createHostStorageHandler(
 	storage: HostStorage,
-	{ maxMutations, maxReadResponseBytes, maxErrorBytes }: HostStorageHandlerOptions,
+	{ maxMutations, maxReadResponseBytes, maxControlResponseBytes, maxErrorBytes }: HostStorageHandlerOptions,
 ): (request: Buffer) => Buffer {
 	validateLimit(maxMutations, 'maxMutations');
 	validateLimit(maxReadResponseBytes, 'maxReadResponseBytes');
+	validateLimit(maxControlResponseBytes, 'maxControlResponseBytes');
 	validateLimit(maxErrorBytes, 'maxErrorBytes');
-	if (maxReadResponseBytes < 7 || maxReadResponseBytes < maxErrorBytes) {
-		throw new TypeError('maxReadResponseBytes must be at least 7 and no smaller than maxErrorBytes');
+	if (
+		maxReadResponseBytes < 7 ||
+		maxControlResponseBytes < 2 ||
+		maxErrorBytes > Math.min(maxReadResponseBytes, maxControlResponseBytes)
+	) {
+		throw new TypeError('response byte limits are inconsistent');
 	}
 	return (request) => {
 		try {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::ops::Deref;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
@@ -8,7 +9,7 @@ use std::time::Duration;
 
 use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{Env, JsBuffer, JsFunction, JsUnknown, Status, ValueType};
+use napi::{Env, JsBuffer, JsFunction, JsUnknown, Status};
 use napi_derive::napi;
 use tantivy::directory::OwnedBytes;
 
@@ -73,7 +74,13 @@ impl HostTransport {
 		})
 	}
 
-	fn round_trip(self: &Arc<Self>, request: Vec<u8>, response_budget: usize) -> io::Result<TransportResponse> {
+	// Completion requires the owning JavaScript environment to run, so callers must be native worker threads.
+	fn round_trip(
+		self: &Arc<Self>,
+		request: Vec<u8>,
+		response_budget: usize,
+		terminal_on_timeout: bool,
+	) -> io::Result<TransportResponse> {
 		let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
 		if request_id == 0 {
 			self.fail(io::ErrorKind::Other, "host storage request id space exhausted");
@@ -124,7 +131,11 @@ impl HostTransport {
 				}
 			};
 		}
-		self.fail(io::ErrorKind::TimedOut, "host storage request timed out");
+		if terminal_on_timeout {
+			self.fail(io::ErrorKind::TimedOut, "host storage request timed out");
+		} else {
+			self.release(request_id);
+		}
 		let _ = response.take();
 		Err(io::Error::new(
 			io::ErrorKind::TimedOut,
@@ -239,6 +250,9 @@ impl Deref for TransportResponse {
 	}
 }
 
+// Moving this wrapper never moves the Vec allocation referenced by Deref.
+unsafe impl stable_deref_trait::StableDeref for TransportResponse {}
+
 impl Drop for TransportResponse {
 	fn drop(&mut self) {
 		if let Some(transport) = self.transport.upgrade() {
@@ -281,7 +295,7 @@ impl ResponseSlot {
 }
 
 fn response_bytes(value: JsUnknown, max_bytes: usize) -> io::Result<Vec<u8>> {
-	if value.get_type().map_err(|error| io::Error::other(error.to_string()))? != ValueType::Object {
+	if !value.is_buffer().map_err(|error| io::Error::other(error.to_string()))? {
 		return Err(io::Error::new(
 			io::ErrorKind::InvalidData,
 			"host storage callback must return a Buffer",
@@ -335,7 +349,22 @@ impl HostKvStore {
 	}
 
 	fn request(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
-		let response = self.transport.round_trip(request, response_budget)?;
+		self.request_with_timeout_policy(request, response_budget, false)
+	}
+
+	fn request_terminal(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
+		self.request_with_timeout_policy(request, response_budget, true)
+	}
+
+	fn request_with_timeout_policy(
+		&self,
+		request: Vec<u8>,
+		response_budget: usize,
+		terminal_on_timeout: bool,
+	) -> io::Result<ResponseDecoder> {
+		let response = self
+			.transport
+			.round_trip(request, response_budget, terminal_on_timeout)?;
 		let mut decoder = ResponseDecoder::new(response);
 		if decoder.u8()? != HOST_PROTOCOL_VERSION {
 			return Err(io::Error::new(
@@ -368,8 +397,11 @@ impl KvStore for HostKvStore {
 		request.bytes(key)?;
 		let mut response = self.request(request.finish(), self.max_read_response_bytes)?;
 		let value = match response.u8()? {
-			VALUE_MISSING => None,
-			VALUE_PRESENT => Some(OwnedBytes::new(response.bytes()?.to_vec())),
+			VALUE_MISSING => {
+				response.finish()?;
+				None
+			}
+			VALUE_PRESENT => Some(response.into_owned_bytes()?),
 			_ => {
 				return Err(io::Error::new(
 					io::ErrorKind::InvalidData,
@@ -377,7 +409,6 @@ impl KvStore for HostKvStore {
 				))
 			}
 		};
-		response.finish()?;
 		Ok(value)
 	}
 
@@ -403,12 +434,12 @@ impl KvStore for HostKvStore {
 				}
 			}
 		}
-		self.request(request.finish(), self.max_control_response_bytes)?
+		self.request_terminal(request.finish(), self.max_control_response_bytes)?
 			.finish()
 	}
 
 	fn sync(&self) -> io::Result<()> {
-		self.request(RequestEncoder::new(OP_SYNC).finish(), self.max_control_response_bytes)?
+		self.request_terminal(RequestEncoder::new(OP_SYNC).finish(), self.max_control_response_bytes)?
 			.finish()
 	}
 }
@@ -462,6 +493,23 @@ impl ResponseDecoder {
 	}
 
 	fn bytes(&mut self) -> io::Result<&[u8]> {
+		let range = self.byte_range()?;
+		Ok(&self.bytes[range])
+	}
+
+	fn into_owned_bytes(mut self) -> io::Result<OwnedBytes> {
+		let range = self.byte_range()?;
+		if self.offset != self.bytes.len() {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"host storage response has trailing bytes",
+			));
+		}
+		let bytes = OwnedBytes::new(self.bytes);
+		Ok(bytes.slice(range))
+	}
+
+	fn byte_range(&mut self) -> io::Result<std::ops::Range<usize>> {
 		let length_end = self
 			.offset
 			.checked_add(4)
@@ -478,12 +526,15 @@ impl ResponseDecoder {
 			.offset
 			.checked_add(length)
 			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "host storage response length overflow"))?;
-		let value = self
-			.bytes
-			.get(self.offset..end)
-			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "host storage response is truncated"))?;
+		if end > self.bytes.len() {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"host storage response is truncated",
+			));
+		}
+		let start = self.offset;
 		self.offset = end;
-		Ok(value)
+		Ok(start..end)
 	}
 
 	fn finish(self) -> io::Result<()> {
@@ -529,6 +580,13 @@ fn test_result(result: io::Result<Vec<u8>>) -> Vec<u8> {
 			encoded.extend_from_slice(message.as_bytes());
 			encoded
 		}
+	}
+}
+
+fn test_thread_result(operation: impl FnOnce() -> io::Result<Vec<u8>>) -> Vec<u8> {
+	match catch_unwind(AssertUnwindSafe(operation)) {
+		Ok(result) => test_result(result),
+		Err(_) => test_result(Err(io::Error::other("native host storage test panicked"))),
 	}
 }
 
@@ -586,6 +644,7 @@ pub fn test_host_round_trip(
 	handle: u32,
 	request: Buffer,
 	response_budget: u32,
+	terminal_on_timeout: bool,
 	callback: JsFunction,
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
@@ -594,14 +653,15 @@ pub fn test_host_round_trip(
 			.cloned()
 			.ok_or_else(|| napi::Error::new("E_CLOSED", "unknown or closed host storage transport"))?;
 		let completion = completion(callback)?;
+		let request = request.to_vec();
 		thread::Builder::new()
 			.name(format!("fulltext-host-storage-test-{handle}"))
 			.spawn(move || {
-				let result = test_result(
+				let result = test_thread_result(|| {
 					transport
-						.round_trip(request.to_vec(), response_budget as usize)
-						.map(TransportResponse::into_bytes),
-				);
+						.round_trip(request, response_budget as usize, terminal_on_timeout)
+						.map(TransportResponse::into_bytes)
+				});
 				let _ = completion.call(result, ThreadsafeFunctionCallMode::NonBlocking);
 			})
 			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
@@ -611,7 +671,12 @@ pub fn test_host_round_trip(
 
 #[cfg(feature = "test-panic")]
 #[napi(catch_unwind, skip_typescript, js_name = "__testVerifyTantivyOnHostTransport")]
-pub fn test_verify_tantivy_on_host_transport(handle: u32, callback: JsFunction) -> boundary::Result<()> {
+pub fn test_verify_tantivy_on_host_transport(
+	handle: u32,
+	max_read_response_bytes: u32,
+	max_control_response_bytes: u32,
+	callback: JsFunction,
+) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let transport = registry()
 			.get(&handle)
@@ -621,28 +686,30 @@ pub fn test_verify_tantivy_on_host_transport(handle: u32, callback: JsFunction) 
 		thread::Builder::new()
 			.name(format!("fulltext-host-directory-test-{handle}"))
 			.spawn(move || {
-				let store = HostKvStore::new(
-					transport,
-					KvStoreIdentity(1, handle as u64, 1),
-					32 * 1024 * 1024,
-					64 * 1024,
-				);
-				let run = NEXT_TRANSPORT_HANDLE.fetch_add(1, Ordering::Relaxed);
-				let case = AtomicU32::new(0);
-				let result = crate::directory_harness::verify_directory_contract(|| {
-					let namespace = format!("host-contract/{run}/{}", case.fetch_add(1, Ordering::Relaxed));
-					KvDirectory::with_namespace(store.clone(), namespace.as_bytes())
-				})
-				.and_then(|_| {
-					let namespace = format!("host-lifecycle/{run}");
-					crate::directory_harness::verify_tantivy_lifecycle(KvDirectory::with_namespace(
-						store,
-						namespace.as_bytes(),
-					))
-				})
-				.map(|_| Vec::new())
-				.map_err(io::Error::other);
-				let _ = completion.call(test_result(result), ThreadsafeFunctionCallMode::NonBlocking);
+				let result = test_thread_result(|| {
+					let store = HostKvStore::new(
+						transport,
+						KvStoreIdentity(1, handle as u64, 1),
+						max_read_response_bytes as usize,
+						max_control_response_bytes as usize,
+					);
+					let run = NEXT_TRANSPORT_HANDLE.fetch_add(1, Ordering::Relaxed);
+					let case = AtomicU32::new(0);
+					crate::directory_harness::verify_directory_contract(|| {
+						let namespace = format!("host-contract/{run}/{}", case.fetch_add(1, Ordering::Relaxed));
+						KvDirectory::with_namespace(store.clone(), namespace.as_bytes())
+					})
+					.and_then(|_| {
+						let namespace = format!("host-lifecycle/{run}");
+						crate::directory_harness::verify_tantivy_lifecycle(KvDirectory::with_namespace(
+							store,
+							namespace.as_bytes(),
+						))
+					})
+					.map(|_| Vec::new())
+					.map_err(io::Error::other)
+				});
+				let _ = completion.call(result, ThreadsafeFunctionCallMode::NonBlocking);
 			})
 			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
 		Ok(())

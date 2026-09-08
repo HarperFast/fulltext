@@ -30,8 +30,19 @@ interface NativeAddonApi {
 		maxBytes: number,
 		timeoutMs: number,
 	): number;
-	__testHostRoundTrip?(handle: number, request: Buffer, responseBudget: number, callback: NativeCallback): void;
-	__testVerifyTantivyOnHostTransport?(handle: number, callback: NativeCallback): void;
+	__testHostRoundTrip?(
+		handle: number,
+		request: Buffer,
+		responseBudget: number,
+		terminalOnTimeout: boolean,
+		callback: NativeCallback,
+	): void;
+	__testVerifyTantivyOnHostTransport?(
+		handle: number,
+		maxReadResponseBytes: number,
+		maxControlResponseBytes: number,
+		callback: NativeCallback,
+	): void;
 	__testCloseHostTransport?(handle: number): boolean;
 }
 
