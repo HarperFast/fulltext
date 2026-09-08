@@ -4,7 +4,7 @@ use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,7 @@ struct Registry {
 	paths: HashMap<PathIdentity, u32>,
 	opening: HashSet<u32>,
 	cancelled: HashSet<u32>,
+	environments: HashMap<usize, Weak<EnvironmentState>>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -56,7 +57,7 @@ struct Runtime {
 	writer_queue: Arc<BoundedQueue<WriterCommand>>,
 	search_queue: Arc<BoundedQueue<SearchCommand>>,
 	state: AtomicU8,
-	env_alive: Arc<AtomicBool>,
+	environment: Arc<EnvironmentState>,
 	uncommitted_mutations: AtomicU64,
 	commit_opstamp: AtomicU64,
 	writer_queue_nanoseconds: AtomicU64,
@@ -70,6 +71,11 @@ struct Runtime {
 struct CompletionSignal {
 	done: Mutex<bool>,
 	ready: Condvar,
+}
+
+struct EnvironmentState {
+	alive: Arc<AtomicBool>,
+	handles: Mutex<HashMap<u32, Arc<CompletionSignal>>>,
 }
 
 struct QueueState<T> {
@@ -126,22 +132,21 @@ struct SearchCommand {
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeOpen")]
 pub fn native_open(env: Env, packed_config: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		let env_alive = Arc::new(AtomicBool::new(true));
+		let environment = environment_state(&env)?;
 		let opening_done = Arc::new(CompletionSignal::new());
-		let completion = completion(callback, env_alive.clone())?;
+		let completion = completion(callback, environment.alive.clone())?;
 		let handle = next_handle().map_err(fulltext_napi_error)?;
 		registry().opening.insert(handle);
-		if let Err(error) = register_async_cleanup(&env, handle, env_alive, opening_done.clone()) {
-			registry().opening.remove(&handle);
-			return Err(error);
-		}
+		environment.track(handle, opening_done.clone());
 		let bytes = packed_config.to_vec();
 		let thread_opening_done = opening_done.clone();
+		let thread_environment = environment.clone();
 		if let Err(error) = thread::Builder::new()
 			.name(format!("fulltext-open-{handle}"))
-			.spawn(move || open_on_thread(handle, bytes, completion, thread_opening_done))
+			.spawn(move || open_on_thread(handle, bytes, completion, thread_opening_done, thread_environment))
 		{
 			registry().opening.remove(&handle);
+			environment.release(handle);
 			opening_done.signal();
 			return Err(napi_error("E_NATIVE_FAILURE", error));
 		}
@@ -158,7 +163,7 @@ pub fn native_apply(handle: u32, packed_batch: Buffer, callback: JsFunction) -> 
 			.writer_queue
 			.check_capacity(packed_batch.len())
 			.map_err(fulltext_napi_error)?;
-		let completion = completion(callback, runtime.env_alive.clone())?;
+		let completion = completion(callback, runtime.environment.alive.clone())?;
 		let bytes = packed_batch.to_vec();
 		runtime.enqueue_writer(
 			WriterCommand {
@@ -174,7 +179,7 @@ pub fn native_apply(handle: u32, packed_batch: Buffer, callback: JsFunction) -> 
 pub fn native_commit(handle: u32, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.env_alive.clone())?;
+		let completion = completion(callback, runtime.environment.alive.clone())?;
 		runtime.enqueue_writer(
 			WriterCommand {
 				operation: WriterOperation::Commit,
@@ -189,7 +194,7 @@ pub fn native_commit(handle: u32, callback: JsFunction) -> boundary::Result<()> 
 pub fn native_reload(handle: u32, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.env_alive.clone())?;
+		let completion = completion(callback, runtime.environment.alive.clone())?;
 		runtime.enqueue_writer(
 			WriterCommand {
 				operation: WriterOperation::Reload,
@@ -210,7 +215,7 @@ pub fn native_search(handle: u32, packed_request: Buffer, callback: JsFunction) 
 			.search_queue
 			.check_capacity(packed_request.len())
 			.map_err(fulltext_napi_error)?;
-		let completion = completion(callback, runtime.env_alive.clone())?;
+		let completion = completion(callback, runtime.environment.alive.clone())?;
 		let request = packed_request.to_vec();
 		runtime
 			.search_queue
@@ -223,7 +228,7 @@ pub fn native_search(handle: u32, packed_request: Buffer, callback: JsFunction) 
 pub fn native_close(handle: u32, rollback: bool, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.env_alive.clone())?;
+		let completion = completion(callback, runtime.environment.alive.clone())?;
 		match runtime
 			.state
 			.compare_exchange(STATE_OPEN, STATE_CLOSING, Ordering::AcqRel, Ordering::Acquire)
@@ -286,7 +291,7 @@ impl Runtime {
 		engine: Engine,
 		writer: Writer,
 		reader: IndexReader,
-		env_alive: Arc<AtomicBool>,
+		environment: Arc<EnvironmentState>,
 	) -> Result<Arc<Self>> {
 		let search_thread_count = config.limits.search_threads;
 		let writer_queue = Arc::new(BoundedQueue::new(
@@ -306,7 +311,7 @@ impl Runtime {
 			writer_queue,
 			search_queue,
 			state: AtomicU8::new(STATE_OPEN),
-			env_alive,
+			environment,
 			uncommitted_mutations: AtomicU64::new(0),
 			commit_opstamp: AtomicU64::new(0),
 			writer_queue_nanoseconds: AtomicU64::new(0),
@@ -371,7 +376,7 @@ impl Runtime {
 				operation: WriterOperation::Close { rollback: true },
 				completion: Completion {
 					callback: None,
-					env_alive: self.env_alive.clone(),
+					env_alive: self.environment.alive.clone(),
 				},
 			},
 			0,
@@ -656,7 +661,7 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 					}
 					runtime.writer_queue.close();
 					runtime.state.store(STATE_CLOSED, Ordering::Release);
-					release_runtime(runtime.handle, &runtime.path_identity);
+					release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
 					runtime.signal_closed();
 					WriterOutcome::Stop(close_result.map(|()| Vec::new()))
 				}
@@ -679,14 +684,14 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 				completion.failure(FulltextError::new("E_NATIVE_PANIC", "native writer actor panicked"));
 				runtime.poison(FulltextError::new("E_NATIVE_PANIC", "native writer actor panicked"));
 				runtime.writer_queue.close();
-				release_runtime(runtime.handle, &runtime.path_identity);
+				release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
 				runtime.signal_closed();
 				return;
 			}
 		}
 	}
 	runtime.state.store(STATE_CLOSED, Ordering::Release);
-	release_runtime(runtime.handle, &runtime.path_identity);
+	release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
 	runtime.signal_closed();
 }
 
@@ -737,25 +742,34 @@ fn search_loop(runtime: Arc<Runtime>) {
 	}
 }
 
-fn open_on_thread(handle: u32, bytes: Vec<u8>, completion: Completion, opening_done: Arc<CompletionSignal>) {
-	let env_alive = completion.env_alive.clone();
-	let result = catch_unwind(AssertUnwindSafe(|| open_runtime(handle, bytes, env_alive)));
+fn open_on_thread(
+	handle: u32,
+	bytes: Vec<u8>,
+	completion: Completion,
+	opening_done: Arc<CompletionSignal>,
+	environment: Arc<EnvironmentState>,
+) {
+	let result = catch_unwind(AssertUnwindSafe(|| open_runtime(handle, bytes, environment.clone())));
+	let opened = matches!(result, Ok(Ok(())));
 	match result {
 		Ok(Ok(())) => completion.success(u32_body(handle)),
 		Ok(Err(error)) => completion.failure(error),
 		Err(_) => completion.failure(FulltextError::new("E_NATIVE_PANIC", "native index open panicked")),
 	}
 	registry().opening.remove(&handle);
+	if !opened {
+		environment.release(handle);
+	}
 	opening_done.signal();
 }
 
-fn open_runtime(handle: u32, bytes: Vec<u8>, env_alive: Arc<AtomicBool>) -> Result<()> {
+fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>) -> Result<()> {
 	let config = decode_open(&bytes)?;
 	let canonical = create_and_canonicalize(Path::new(&config.path))?;
 	let path_identity = path_identity(&canonical)?;
 	{
 		let mut registry = registry();
-		if registry.cancelled.remove(&handle) || !env_alive.load(Ordering::Acquire) {
+		if registry.cancelled.remove(&handle) || !environment.alive.load(Ordering::Acquire) {
 			registry.opening.remove(&handle);
 			return Err(FulltextError::new(
 				"E_CLOSED",
@@ -782,10 +796,10 @@ fn open_runtime(handle: u32, bytes: Vec<u8>, env_alive: Arc<AtomicBool>) -> Resu
 			engine,
 			writer,
 			reader,
-			env_alive.clone(),
+			environment.clone(),
 		)?;
 		let mut registry = registry();
-		if registry.cancelled.remove(&handle) || !env_alive.load(Ordering::Acquire) {
+		if registry.cancelled.remove(&handle) || !environment.alive.load(Ordering::Acquire) {
 			drop(registry);
 			runtime.force_close();
 			let _ = runtime.wait_closed(CLEANUP_TIMEOUT);
@@ -799,7 +813,7 @@ fn open_runtime(handle: u32, bytes: Vec<u8>, env_alive: Arc<AtomicBool>) -> Resu
 		Ok(())
 	})();
 	if result.is_err() {
-		release_runtime(handle, &path_identity);
+		release_runtime(handle, &path_identity, &environment);
 	}
 	result
 }
@@ -845,10 +859,9 @@ fn cleanup_handle(handle: u32) -> Option<Arc<Runtime>> {
 	}
 }
 
-struct CleanupHookData {
-	handle: u32,
-	env_alive: Arc<AtomicBool>,
-	opening_done: Arc<CompletionSignal>,
+struct EnvironmentHookData {
+	key: usize,
+	environment: Arc<EnvironmentState>,
 }
 
 enum CleanupWait {
@@ -856,34 +869,68 @@ enum CleanupWait {
 	Opening(Arc<CompletionSignal>),
 }
 
-fn register_async_cleanup(
-	env: &Env,
-	handle: u32,
-	env_alive: Arc<AtomicBool>,
-	opening_done: Arc<CompletionSignal>,
-) -> boundary::Result<()> {
+fn environment_state(env: &Env) -> boundary::Result<Arc<EnvironmentState>> {
+	let key = env.raw() as usize;
+	if let Some(environment) = registry().environments.get(&key).and_then(Weak::upgrade) {
+		return Ok(environment);
+	}
+	let environment = Arc::new(EnvironmentState {
+		alive: Arc::new(AtomicBool::new(true)),
+		handles: Mutex::new(HashMap::new()),
+	});
 	env.add_async_cleanup_hook(
-		CleanupHookData {
-			handle,
-			env_alive,
-			opening_done,
+		EnvironmentHookData {
+			key,
+			environment: environment.clone(),
 		},
 		|data| {
 			let _ = catch_unwind(AssertUnwindSafe(|| finish_environment_cleanup(data)));
 		},
 	)
-	.map_err(|error| napi_error("E_NATIVE_FAILURE", error))
+	.map_err(|error| napi_error("E_NATIVE_FAILURE", error))?;
+	registry().environments.insert(key, Arc::downgrade(&environment));
+	Ok(environment)
 }
 
-fn finish_environment_cleanup(data: CleanupHookData) {
-	data.env_alive.store(false, Ordering::Release);
-	let wait = match cleanup_handle(data.handle) {
-		Some(runtime) => CleanupWait::Runtime(runtime),
-		None => CleanupWait::Opening(data.opening_done.clone()),
-	};
-	let finished = catch_unwind(AssertUnwindSafe(|| wait.wait(CLEANUP_TIMEOUT))).unwrap_or(false);
+fn finish_environment_cleanup(data: EnvironmentHookData) {
+	data.environment.alive.store(false, Ordering::Release);
+	let tracked = data.environment.take_handles();
+	let waits = tracked
+		.into_iter()
+		.map(|(handle, opening_done)| match cleanup_handle(handle) {
+			Some(runtime) => CleanupWait::Runtime(runtime),
+			None => CleanupWait::Opening(opening_done),
+		})
+		.collect::<Vec<_>>();
+	let remove_environment = registry()
+		.environments
+		.get(&data.key)
+		.and_then(Weak::upgrade)
+		.is_some_and(|environment| Arc::ptr_eq(&environment, &data.environment));
+	if remove_environment {
+		registry().environments.remove(&data.key);
+	}
+	let deadline = Instant::now() + CLEANUP_TIMEOUT;
+	let finished = waits.into_iter().all(|wait| {
+		let remaining = deadline.saturating_duration_since(Instant::now());
+		!remaining.is_zero() && wait.wait(remaining)
+	});
 	if !finished {
 		eprintln!("fulltext native cleanup exceeded {} seconds", CLEANUP_TIMEOUT.as_secs());
+	}
+}
+
+impl EnvironmentState {
+	fn track(&self, handle: u32, opening_done: Arc<CompletionSignal>) {
+		lock(&self.handles).insert(handle, opening_done);
+	}
+
+	fn release(&self, handle: u32) {
+		lock(&self.handles).remove(&handle);
+	}
+
+	fn take_handles(&self) -> HashMap<u32, Arc<CompletionSignal>> {
+		mem::take(&mut *lock(&self.handles))
 	}
 }
 
@@ -896,12 +943,14 @@ impl CleanupWait {
 	}
 }
 
-fn release_runtime(handle: u32, identity: &PathIdentity) {
+fn release_runtime(handle: u32, identity: &PathIdentity, environment: &EnvironmentState) {
 	let mut registry = registry();
 	registry.handles.remove(&handle);
 	if registry.paths.get(identity) == Some(&handle) {
 		registry.paths.remove(identity);
 	}
+	drop(registry);
+	environment.release(handle);
 }
 
 fn registry() -> std::sync::MutexGuard<'static, Registry> {

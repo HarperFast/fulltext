@@ -261,16 +261,17 @@ joins Tantivy's merge threads, stops the search executor, and only then releases
 Closing transitions through open, closing, and closed states; it settles admitted commands, and
 repeated successful close calls resolve. Process exit does not promise an implicit final commit.
 
-Each Node environment registers a N-API asynchronous cleanup hook. Environment teardown stops
-accepting work, detaches JavaScript completions, schedules a rollback close, and keeps the native
-environment alive until writer shutdown, search-thread joins, and path release complete. The hook
-uses napi-rs's cleanup primitive and returns only after the native actors stop, so hook completion
-and environment destruction stay on Node's environment thread. Cleanup waiting is capped at 30
-seconds, and a caught panic still returns control to napi-rs so worker/process shutdown cannot hang
-indefinitely. A worker terminated while an index is still opening waits on the same bounded
-completion signal. Completions detached during teardown leave their native thread-safe function to
-Node's environment finalization instead of accessing that environment after the hook returns.
-Handles and completions are never reused across workers.
+Each Node environment registers one N-API asynchronous cleanup hook, shared by every index it opens.
+Environment teardown stops accepting work, detaches JavaScript completions, schedules rollback close
+for every tracked runtime before waiting, and keeps the native environment alive until writer
+shutdown, search-thread joins, and path release complete. The hook uses napi-rs's cleanup primitive
+and returns only after the native actors stop, so hook completion and environment destruction stay
+on Node's environment thread. All runtimes share one 30-second deadline rather than consuming that
+budget serially per index, and a caught panic still returns control to napi-rs so worker/process
+shutdown cannot hang indefinitely. A worker terminated while an index is still opening waits on the
+same bounded completion signal. Completions detached during teardown leave their native thread-safe
+function to Node's environment finalization instead of accessing that environment after the hook
+returns. Handles and completions are never reused across workers.
 
 ## Performance experiment
 

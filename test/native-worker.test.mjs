@@ -45,6 +45,25 @@ test('worker termination during open releases its native cleanup hook', async (c
 	await index.close();
 });
 
+test('worker termination releases every index in one Node environment', async (context) => {
+	const indexPaths = Array.from({ length: 3 }, () => mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-many-')));
+	context.after(() => indexPaths.forEach((indexPath) => rmSync(indexPath, { recursive: true, force: true })));
+	const worker = new Worker(new URL('./fixtures/native-worker-child.mjs', import.meta.url), {
+		workerData: {
+			indexPaths,
+			moduleUrl: new URL('../dist/native.js', import.meta.url).href,
+			mode: 'multiple',
+		},
+	});
+	await new Promise((resolve, reject) => {
+		worker.once('error', reject);
+		worker.on('message', (message) => message === 'multiple-open' && resolve());
+	});
+	await worker.terminate();
+	const indexes = await Promise.all(indexPaths.map(waitForOpen));
+	await Promise.all(indexes.map((index) => index.close()));
+});
+
 async function waitForOpen(indexPath) {
 	const deadline = performance.now() + 10_000;
 	while (true) {

@@ -136,7 +136,7 @@ test('keeps the JavaScript event loop responsive while indexing', async (context
 		applySettled = true;
 	});
 	clearInterval(timer);
-	assert(heartbeatsWhilePending > 0, 'indexing completed without yielding to the event loop');
+	assert(heartbeatsWhilePending > 5, `indexing allowed only ${heartbeatsWhilePending} event-loop heartbeats`);
 	await index.close({ mode: 'rollback' });
 });
 
