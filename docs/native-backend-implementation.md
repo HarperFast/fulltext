@@ -370,6 +370,8 @@ off-event-loop execution, and yields an apples-to-apples reference for the Rocks
 - RocksDbDirectory and rocksdb-js lease use.
 - Phrase, fuzzy, prefix, autocomplete, suggestions, highlighting, snippets, and filters.
 - Shared handles across multiple Node worker environments.
+- A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe
+  callback; this is part of the shared multi-environment runtime in issue #17.
 - Durable benchmark publication, fixed-host regression thresholds, and Rocks/native comparison.
 - Process-wide runtime budgets, cancellation, and cursor-based
   deep pagination.

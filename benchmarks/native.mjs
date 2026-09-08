@@ -38,10 +38,10 @@ try {
 	let applyMilliseconds = 0;
 	let packedBytes = 0;
 	let uncommittedDocuments = 0;
-	let peakRssBytes = process.memoryUsage().rss;
+	let peakRssBytes = process.memoryUsage.rss();
 	const rssSampler = setInterval(() => {
-		peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
-	}, 10);
+		peakRssBytes = Math.max(peakRssBytes, process.memoryUsage.rss());
+	}, 50);
 	rssSampler.unref();
 	const commitLatencies = [];
 	const indexingStarted = performance.now();
@@ -55,13 +55,13 @@ try {
 		const applyStarted = performance.now();
 		assert.strictEqual(await index.apply(packed), batch.length);
 		applyMilliseconds += performance.now() - applyStarted;
-		peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
+		peakRssBytes = Math.max(peakRssBytes, process.memoryUsage.rss());
 		uncommittedDocuments += batch.length;
 		if (end === documents || uncommittedDocuments >= commitEvery) {
 			const commitStarted = performance.now();
 			await index.commit();
 			commitLatencies.push(performance.now() - commitStarted);
-			peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
+			peakRssBytes = Math.max(peakRssBytes, process.memoryUsage.rss());
 			uncommittedDocuments = 0;
 		}
 	}
@@ -83,7 +83,8 @@ try {
 	const approximateSingle = await measureSearch(index, queryMix, exactComparisonCount, 1, false);
 	const exact = await measureSearch(index, queryMix, exactComparisonCount, 1, true);
 	const status = index.status();
-	peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
+	peakRssBytes = Math.max(peakRssBytes, process.memoryUsage.rss());
+	clearInterval(rssSampler);
 	await index.close();
 
 	const reopenStarted = performance.now();
@@ -91,7 +92,6 @@ try {
 	const reopenMilliseconds = performance.now() - reopenStarted;
 	const cold = await measureSearch(index, queryMix, Math.min(20, queryCount), 1, false);
 	await index.close();
-	clearInterval(rssSampler);
 	const sortedCommitLatencies = [...commitLatencies].sort((left, right) => left - right);
 	const output = {
 		formatVersion: 1,
@@ -141,7 +141,7 @@ try {
 		resources: {
 			indexBytes: await directoryBytes(indexPath),
 			peakRssBytes,
-			postCloseRssBytes: process.memoryUsage().rss,
+			postCloseRssBytes: process.memoryUsage.rss(),
 		},
 		metrics: {
 			writerQueueNanoseconds: status.metrics.writerQueueNanoseconds.toString(),
