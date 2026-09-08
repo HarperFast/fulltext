@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::c_void;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -62,6 +64,7 @@ struct Runtime {
 	search_queue_nanoseconds: AtomicU64,
 	search_execution_nanoseconds: AtomicU64,
 	search_threads: Mutex<Vec<thread::JoinHandle<()>>>,
+	closed: (Mutex<bool>, Condvar),
 }
 
 struct QueueState<T> {
@@ -116,17 +119,16 @@ struct SearchCommand {
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeOpen")]
-pub fn native_open(mut env: Env, packed_config: Buffer, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_open(env: Env, packed_config: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let env_alive = Arc::new(AtomicBool::new(true));
 		let completion = completion(callback, env_alive.clone())?;
 		let handle = next_handle().map_err(fulltext_napi_error)?;
 		registry().opening.insert(handle);
-		env.add_env_cleanup_hook((handle, env_alive), |(handle, env_alive)| {
-			env_alive.store(false, Ordering::Release);
-			cleanup_handle(handle);
-		})
-		.map_err(|error| napi_error("E_NATIVE_FAILURE", error))?;
+		if let Err(error) = register_async_cleanup(&env, handle, env_alive) {
+			registry().opening.remove(&handle);
+			return Err(error);
+		}
 		let bytes = packed_config.to_vec();
 		if let Err(error) = thread::Builder::new()
 			.name(format!("fulltext-open-{handle}"))
@@ -304,6 +306,7 @@ impl Runtime {
 			search_queue_nanoseconds: AtomicU64::new(0),
 			search_execution_nanoseconds: AtomicU64::new(0),
 			search_threads: Mutex::new(Vec::with_capacity(search_thread_count)),
+			closed: (Mutex::new(false), Condvar::new()),
 		});
 		let writer_runtime = runtime.clone();
 		thread::Builder::new()
@@ -391,6 +394,20 @@ impl Runtime {
 		push_u64(&mut bytes, self.search_queue_nanoseconds.load(Ordering::Relaxed));
 		push_u64(&mut bytes, self.search_execution_nanoseconds.load(Ordering::Relaxed));
 		bytes
+	}
+
+	fn signal_closed(&self) {
+		let (closed, ready) = &self.closed;
+		*lock(closed) = true;
+		ready.notify_all();
+	}
+
+	fn wait_closed(&self) {
+		let (closed, ready) = &self.closed;
+		let mut closed = lock(closed);
+		while !*closed {
+			closed = ready.wait(closed).unwrap_or_else(|error| error.into_inner());
+		}
 	}
 }
 
@@ -612,6 +629,7 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 					runtime.writer_queue.close();
 					runtime.state.store(STATE_CLOSED, Ordering::Release);
 					release_runtime(runtime.handle, &runtime.path_identity);
+					runtime.signal_closed();
 					WriterOutcome::Stop(close_result.map(|()| Vec::new()))
 				}
 			}
@@ -634,10 +652,14 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 				runtime.poison(FulltextError::new("E_NATIVE_PANIC", "native writer actor panicked"));
 				runtime.writer_queue.close();
 				release_runtime(runtime.handle, &runtime.path_identity);
+				runtime.signal_closed();
 				return;
 			}
 		}
 	}
+	runtime.state.store(STATE_CLOSED, Ordering::Release);
+	release_runtime(runtime.handle, &runtime.path_identity);
+	runtime.signal_closed();
 }
 
 fn settle(completion: Completion, result: Result<Vec<u8>>) {
@@ -773,7 +795,7 @@ fn runtime(handle: u32) -> boundary::Result<Arc<Runtime>> {
 		.ok_or_else(|| napi_error("E_CLOSED", "unknown or closed fulltext index handle"))
 }
 
-fn cleanup_handle(handle: u32) {
+fn cleanup_handle(handle: u32) -> Option<Arc<Runtime>> {
 	let runtime = {
 		let mut registry = registry();
 		match registry.handles.get(&handle).cloned() {
@@ -787,7 +809,60 @@ fn cleanup_handle(handle: u32) {
 	};
 	if let Some(runtime) = runtime {
 		runtime.force_close();
+		Some(runtime)
+	} else {
+		None
 	}
+}
+
+struct CleanupHookData {
+	handle: u32,
+	env_alive: Arc<AtomicBool>,
+}
+
+fn register_async_cleanup(env: &Env, handle: u32, env_alive: Arc<AtomicBool>) -> boundary::Result<()> {
+	let data = Box::into_raw(Box::new(CleanupHookData { handle, env_alive }));
+	let mut cleanup_handle = ptr::null_mut();
+	// Safety: `data` remains owned by the registered one-shot hook, and Node writes the handle to the supplied pointer.
+	let status = unsafe {
+		napi::sys::napi_add_async_cleanup_hook(
+			env.raw(),
+			Some(async_cleanup),
+			data.cast::<c_void>(),
+			&mut cleanup_handle,
+		)
+	};
+	if status == napi::sys::Status::napi_ok {
+		Ok(())
+	} else {
+		// Safety: registration failed, so Node did not take ownership of `data`.
+		drop(unsafe { Box::from_raw(data) });
+		Err(napi_error("E_NATIVE_FAILURE", napi::Status::from(status)))
+	}
+}
+
+unsafe extern "C" fn async_cleanup(handle: napi::sys::napi_async_cleanup_hook_handle, data: *mut c_void) {
+	// Safety: `data` was allocated by `register_async_cleanup` for this one-shot callback.
+	let data = unsafe { Box::from_raw(data.cast::<CleanupHookData>()) };
+	data.env_alive.store(false, Ordering::Release);
+	let runtime = cleanup_handle(data.handle);
+	let raw_handle = handle as usize;
+	let background_runtime = runtime.clone();
+	let spawned = thread::Builder::new()
+		.name(format!("fulltext-cleanup-{}", data.handle))
+		.spawn(move || finish_async_cleanup(raw_handle, background_runtime));
+	if spawned.is_err() {
+		finish_async_cleanup(raw_handle, runtime);
+	}
+}
+
+fn finish_async_cleanup(raw_handle: usize, runtime: Option<Arc<Runtime>>) {
+	if let Some(runtime) = runtime {
+		runtime.wait_closed();
+	}
+	// Safety: Node keeps this async cleanup handle valid until it is removed exactly once here.
+	let _ =
+		unsafe { napi::sys::napi_remove_async_cleanup_hook(raw_handle as napi::sys::napi_async_cleanup_hook_handle) };
 }
 
 fn release_runtime(handle: u32, identity: &PathIdentity) {

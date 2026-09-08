@@ -261,11 +261,11 @@ joins Tantivy's merge threads, stops the search executor, and only then releases
 Closing transitions through open, closing, and closed states; it settles admitted commands, and
 repeated successful close calls resolve. Process exit does not promise an implicit final commit.
 
-Each Node environment registers a cleanup hook. Environment teardown stops accepting work and
-detaches JavaScript completions before the environment disappears. Explicit `close()` remains the
-only operation that waits without a bound for Tantivy merge completion; worker termination does not
-block the JavaScript cleanup hook on a long merge. Handles and completions are never reused across
-workers.
+Each Node environment registers a N-API asynchronous cleanup hook. Environment teardown stops
+accepting work, detaches JavaScript completions, schedules a rollback close, and keeps the native
+environment alive until writer shutdown, search-thread joins, and path release complete. The hook
+callback itself does not block on a long merge; a native cleanup thread removes the N-API hook only
+after teardown finishes. Handles and completions are never reused across workers.
 
 ## Performance experiment
 
