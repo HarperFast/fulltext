@@ -189,13 +189,19 @@ impl HostTransport {
 	fn complete(&self, request_id: u64, result: io::Result<Vec<u8>>) {
 		let response = {
 			let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-			let Some(pending) = state.pending.get_mut(&request_id) else {
+			let Some(pending) = state.pending.get(&request_id) else {
 				return;
 			};
 			if pending.completed {
 				return;
 			}
 			let response = pending.response.upgrade();
+			let reserved_bytes = pending.retained_bytes;
+			let response_bytes = result.as_ref().map_or(0, Vec::len);
+			state.operations -= 1;
+			state.bytes = state.bytes - reserved_bytes + response_bytes;
+			let pending = state.pending.get_mut(&request_id).unwrap();
+			pending.retained_bytes = response_bytes;
 			pending.completed = true;
 			response
 		};
@@ -207,7 +213,9 @@ impl HostTransport {
 	fn release(&self, request_id: u64) {
 		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		if let Some(pending) = state.pending.remove(&request_id) {
-			state.operations -= 1;
+			if !pending.completed {
+				state.operations -= 1;
+			}
 			state.bytes -= pending.retained_bytes;
 		}
 	}
