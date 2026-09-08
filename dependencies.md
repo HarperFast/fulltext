@@ -15,8 +15,10 @@ reviewed deliberately.
 | `libloading` 0.8.9         | Windows runtime                  | Resolves the Node-API type-tag check from the host, matching napi-rs's Windows strategy. |
 | `stable_deref_trait` 1.2.1 | optional Phase 0 runtime         | Lets Tantivy `OwnedBytes` retain and directly read provider-owned buffers.               |
 
-The Rust dependency graph must not include RocksDB. The future Rocks backend calls a C-ABI
-capability table owned by rocksdb-js rather than linking a second RocksDB runtime.
+The Rust dependency graph must not include RocksDB. The planned Harper integration uses supported
+Harper storage APIs through a bounded transport. It does not require a rocksdb-js native lease.
+The optional Phase 0 dependencies above describe retained experimental code, not the production
+Harper storage contract; reassess them when that integration is implemented.
 
 napi-rs 2.16 generates an outer unwind boundary only for exports marked `catch_unwind`. Every
 fulltext function, method, and constructor uses that option to contain argument and result
@@ -32,5 +34,6 @@ error codes and per-handle poison state for package-owned operations.
 | `prettier` 3.6.2      | development | Repository formatting checks.                                         |
 | `typescript` 5.9.3    | development | Compiles the public façade and declarations.                          |
 
-The native entry point has no production npm dependencies. rocksdb-js will be an optional peer
-dependency only when the Rocks entry point is implemented.
+The native entry point has no production npm dependencies. No rocksdb-js peer dependency is planned.
+Harper owns its rocksdb-js version and supplies the qualified integration context. Tests qualify the
+actual Harper/fulltext/storage stack. See [Harper storage integration](docs/harper-storage-integration.md).

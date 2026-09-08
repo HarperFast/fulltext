@@ -377,7 +377,7 @@ off-event-loop execution, and yields an apples-to-apples reference for the Rocks
 ## Explicit deferrals
 
 - Derived-index delivery, checkpoints/watermarks, replay, and Harper lifecycle hooks.
-- RocksDbDirectory and rocksdb-js lease use.
+- Harper-backed Directory and shared derived-index integration; see [the current storage plan](harper-storage-integration.md).
 - Phrase, fuzzy, prefix, autocomplete, suggestions, highlighting, snippets, and filters.
 - Shared handles across multiple Node worker environments.
 - A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe

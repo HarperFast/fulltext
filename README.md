@@ -1,10 +1,10 @@
 # @harperfast/fulltext
 
 Native Tantivy full-text indexing for Node.js, with a native filesystem backend and a planned
-caller-owned rocksdb-js backend for Harper.
+Harper integration backed by Harper's existing RocksDB storage APIs.
 
 This repository is under active development. The native entry point provides a standalone Tantivy
-index backed by `MmapDirectory`. Harper releases will use only the planned RocksDB entry point.
+index backed by `MmapDirectory`. Harper releases will use only the planned Harper entry point; it is not exported yet.
 
 ## Requirements
 
@@ -67,15 +67,20 @@ handle's searches.
 
 ## Storage boundaries
 
-The package is designed around two explicit entry points:
+The delivered storage targets are native Tantivy and Harper:
 
-- `@harperfast/fulltext/native` uses Tantivy's native directory implementation and has no
-  rocksdb-js dependency.
-- `@harperfast/fulltext/rocks` will use a caller-owned rocksdb-js database through a versioned
-  native capability lease. It is not exported until that contract is implemented and tested.
+- `@harperfast/fulltext/native` is implemented and uses Tantivy's native filesystem directory.
+- `@harperfast/fulltext/harper` is planned. It will use Harper's shared derived-index runtime and
+  persist index state through Harper's existing RocksDB storage APIs.
 
-There is no generic storage selector and no fallback between backends. Harper will consume only the
-Rocks entry point. The fulltext addon will not link its own copy of RocksDB.
+There is no supported standalone rocksdb-js backend or planned rocksdb-js peer dependency. The
+fulltext addon does not bundle RocksDB. Harper owns its storage dependency version and lifecycle,
+and never falls back to native Tantivy files.
+
+The next milestone proves the real Harper storage path, bounded threading, durable publication and
+crash/reopen behavior. The experimental native-lease branch remains unmerged and is not a release
+dependency. See [Harper storage integration](docs/harper-storage-integration.md) for the architecture,
+proof obligations and native-versus-Harper benchmark plan.
 
 ## Development
 

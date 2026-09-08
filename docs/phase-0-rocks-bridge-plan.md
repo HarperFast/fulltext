@@ -1,8 +1,15 @@
-# Phase 0: Tantivy Directory semantics and the rocksdb-js bridge
+# Historical experiment: Tantivy Directory and native rocksdb-js lease
+
+> Archived architecture, September 8, 2026. The native storage additions are not approved for base
+> rocksdb-js and their branch remains unmerged. This document describes the experiment and its
+> evidence, not current implementation requirements. The former claim that existing JavaScript APIs
+> cannot support the storage path was too broad; threading, batching and durability must be proven
+> in the actual Harper integration. See [the current design](harper-storage-integration.md).
+> There is no supported standalone Rocks backend or required third benchmark arm.
 
 - **Issue:** [HarperFast/fulltext#7](https://github.com/HarperFast/fulltext/issues/7)
 - **Related rocksdb-js issue:** [HarperFast/rocksdb-js#831](https://github.com/HarperFast/rocksdb-js/issues/831)
-- **Status:** Phase 0 implementation and qualification plan
+- **Status:** historical, unmerged native-storage experiment
 - **Base:** `origin/main` at `89df005`
 - **Tantivy:** 0.26.1 at `d8f4c0b703120ed98f06297724dc1522df6019b9`
 - **rocksdb-js:** `origin/main` at `7ab102ca3e9600343bcefe6f19204b111836ec52`
