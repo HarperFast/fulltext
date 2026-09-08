@@ -41,6 +41,10 @@ contracts; the native backend contributes only canonical path handling and Tanti
 - `MmapDirectory::open` requires an existing directory, canonicalizes it, and owns its mmap cache,
   watcher, filesystem access, and lock behavior.
   `verify: tantivy 0.26.1 src/directory/mmap_directory/mod.rs:166-175,232-295`
+- The reader uses `ReloadPolicy::Manual`, which does not call `Directory::watch`; Tantivy's mmap
+  watcher starts its polling thread only when `watch()` is called. The native backend therefore
+  does not add a metadata-watcher thread per open index.
+  `verify: src/engine.rs:136-141; tantivy 0.26.1 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
 - napi-rs `AsyncTask` executes on the shared libuv pool, so it is not the execution primitive for
   sustained indexing or search.
   `verify: napi 2.16.17 src/task.rs:6-14`
