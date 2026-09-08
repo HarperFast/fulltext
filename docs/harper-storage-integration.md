@@ -111,13 +111,37 @@ Required transport properties:
 - Only package-owned native workers may wait for storage completion. A JS thread servicing storage
   must not synchronously wait for a Tantivy task that needs that same JS thread.
 - Bound queued request count, bytes, response buffers and outstanding operations across all indexes.
+  Include concurrently blocked native threads in a process-wide execution budget, covering writer,
+  indexing, merge and search work; a bounded request queue alone does not bound thread growth.
+  Establish capacity before starting native work, including internal Tantivy threads. Threads parked
+  waiting for a permit still count; admission cannot hide an unbounded second waiting pool. This
+  shared budget is a Harper integration requirement, not a claim about the shipped native backend.
   Give query work and control/shutdown operations explicit progress under sustained ingestion.
+- A native storage wait must not hold a mutex or permit needed by a JS-facing entry point, the
+  storage service or its completion path. Admission and resource limits must leave the completion
+  path able to run.
 - Define response ownership, cancellation, environment exit and late-completion behavior. Stopping
   the storage worker must wake native waiters with errors; closing the database must not strand them.
 - Reject new work and drain or cancel dependencies before releasing the Harper store. Do not hold
   database locks across a round trip that requires another JS callback to finish.
 - A runtime identifies the actual Harper database, index and generation. Reopening or recreating
   a store cannot make an old handle valid again.
+
+Graceful close stops new admission, then drains or cancels accepted work within Harper's existing
+shutdown deadline. Keep storage servicing alive while writers finish or roll back, merge threads
+exit and searches release their slices. Quiesce all native users of the store and settle outstanding
+transport requests before stopping the storage service and releasing its store view. Await this
+sequence asynchronously; never join native threads from the JS thread they need for storage.
+
+Unexpected worker exit or an expired shutdown deadline cannot depend on that worker running a final
+callback. A surviving lifecycle path must fail queued and in-flight requests, wake native waiters,
+and reject late submissions. Request state and buffers remain owned until native users and late
+completions can no longer access them. Cancellation does not prove an executing storage operation
+has stopped or rolled back; fence late completions and establish safe store release separately.
+Test normal close, deadline expiry and worker loss during read, merge and publication, including
+late responses. A timeout is not permission to free state still in use. Charge retained requests to
+the transport budget until the last possible access is gone; persistent teardown failure cannot
+permit unbounded replacement workers or indexes to accumulate retained state.
 
 A bounded staging or read cache may be considered only after measurements show why it is needed;
 its memory, invalidation and recovery obligations must then be specified. Whole-index RAM residency
@@ -177,6 +201,18 @@ written, tests concurrent file/merge progress, and measures live versus reclaima
 through repeated merge cycles. Logical reclamation is measured separately from RocksDB compaction
 returning physical disk space. Establish these bounds before treating a transport benchmark as
 representative of the production design.
+
+Crash-orphan discovery must be incremental: bound each scan/delete batch by keys, bytes and elapsed
+work, yield between batches, and resume safely after interruption. A generation prefix bounds the
+scope, not the amount of work; scanning an entire large generation is not a bounded startup step.
+Prefer existing ordered iteration and object/binding metadata before introducing another registry.
+Use key and binding metadata for discovery, not segment payload scans. Reachability must include
+published and retained heads, unpublished active writers and open slices. Establish a safe scan
+boundary and revalidate deletion so concurrent allocation or publication cannot turn a live object
+into garbage. Persist or safely reconstruct scan progress without a full blocking startup pass.
+Do not block query readiness on a complete garbage sweep; required recovery validation has
+its own bound and failure policy. Transactions protect individual storage updates, but objects
+written across completed transactions can still become orphaned before index publication.
 
 Internal namespace, generation, object and path encodings must be unambiguous. Use an existing
 appropriate binary encoding or length-prefixed components and test delimiter-containing identifiers
@@ -276,7 +312,13 @@ Report two scopes separately:
 
 An end-to-end Harper/native ratio is not a pure RocksDB overhead measurement. Attribute differences
 with spans/counters for projection, packing, transport queue wait, copies, storage calls, commit,
-reload, Tantivy execution and record retrieval. Run focused experiments only when those measurements
+reload, Tantivy execution and record retrieval. Include event-loop delay on the JS environments
+servicing storage, native blocked-thread count and wait duration, and request/response handoff time.
+Separate queueing and handoff from the storage call itself; report inclusive waits separately from
+nested spans so they are not added twice. Exercise saturation, unrelated Harper traffic and shutdown
+while native storage waits are active. Record peak and mean blocked-thread occupancy against the
+configured budget. If counters enter the packed status API, update its versioned codec and parity
+tests together rather than inserting unversioned fields. Run focused experiments only when those measurements
 identify a question. Direct rocksdb-js benchmark results from the retained branch are experimental,
 not a third supported backend and not a release blocker.
 
@@ -323,11 +365,17 @@ qualified Harper checkout. Apache-2.0 applies to source and published artifacts.
 
 1. Prove storage worker/view ownership, bounded request/response transport and Directory semantics
    on the supported Harper stack; record exact source revisions and APIs.
-2. Prove object/metadata durability, close/drop/backup ordering and crash/reopen behavior.
-3. Integrate the shared derived protocol, including exact replay, retention-gap detection,
+2. Select the offset-addressable layout in the first storage slice: fixed-size chunks or a bounded
+   offset index. Record metadata lookup bounds, chunk-size sweeps, read/space/write amplification,
+   append/flush behavior and storage-format versioning before treating benchmarks as representative.
+   Include offset metadata atomicity and reclamation reachability in the choice; a layout that
+   reduces reads but cannot be recovered or safely reclaimed does not qualify.
+3. Prove object/metadata durability, incremental orphan reclamation, close/drop/backup ordering and
+   crash/reopen behavior.
+4. Integrate the shared derived protocol, including exact replay, retention-gap detection,
    replication, eviction and rebuild. Do not represent the issue sketch as shipped code.
-4. Reuse the shared engine for full query behavior and multi-index operation.
-5. Qualify performance, documentation and packages; investigate measured differences as needed.
+5. Reuse the shared engine for full query behavior and multi-index operation.
+6. Qualify performance, documentation and packages; investigate measured differences as needed.
 
 Before the Harper factory is frozen, engineering must resolve transport topology, memory/queue
 budgets, durability options, store registration, and the shared protocol's exact progress/resume
