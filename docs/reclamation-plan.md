@@ -9,11 +9,13 @@ readiness wait for a complete sweep.
 
 ## Grounding
 
-The merged fulltext baseline is `b9964b0`. `KvDirectory` stores immutable 256 KiB chunks and
-revisioned tails. `delete()` currently removes only logical bindings, each successful `flush()` can
-leave the previous tail revision unreachable, and a crashed writer can leave staged chunks that no
-binding ever named. `KvStore` supplies point read, atomic batch write, and sync, but no key
-enumeration. Harper PR #2535 supplies the same narrow storage shape from Harper-owned RocksDB.
+This plan is written against fulltext main at `b9964b0`, the rebase-merged result of
+[Prevent Harper full-text index key collisions #24](https://github.com/HarperFast/fulltext/pull/24).
+`KvDirectory` stores immutable 256 KiB chunks and revisioned tails. `delete()` currently removes
+only logical bindings, each successful `flush()` can leave the previous tail revision unreachable,
+and a crashed writer can leave staged chunks that no binding ever named. `KvStore` supplies point
+read, atomic batch write, and sync, but no key enumeration. Harper PR #2535 supplies the same narrow
+storage shape from Harper-owned RocksDB.
 
 Tantivy's `ManagedDirectory` decides when a logical file name is retired. `KvDirectory` owns the
 physical object behind that name and the lifetime of opened handles. Harper's derived-index runtime
