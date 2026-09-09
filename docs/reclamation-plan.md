@@ -101,9 +101,12 @@ mutex and hands out ids from that range without storage reads; gaps after failur
 in the `u64` identity space. The path registry
 performs an O(1) lookup and never runs a whole-map retain on the indexing or reload path. In slice 3,
 only `open_write()`, `atomic_write()`, and `delete()` take the path's exclusive lifecycle gate;
-file-handle opens remain unchanged until pin registration lands. A writer owns an atomic retirement
-and in-flight-operation fence. Each physical write registers in flight, rechecks retirement with
-sequentially consistent ordering, issues the storage operation, and releases an RAII claim. Delete
+file-handle opens remain unchanged until pin registration lands. Atomic-file writes use that gate to
+preserve completion order against deletion; their short-lived registry allocation is accepted next
+to the required synchronous host write. A writer owns an atomic retirement and in-flight-operation
+fence. Each logical `Write::write()` or `Write::flush()` takes one claim and holds it across all
+dependent storage operations, rechecking retirement after registering in flight with sequentially
+consistent ordering. Delete
 retires the writer, waits for existing claims to reach their definitive result, then rereads the
 binding before enqueueing its final high-waters. Host mutations are deliberately uncancellable once
 dispatched, so writer retirement uses the same unbounded completion contract instead of inventing
@@ -150,8 +153,8 @@ lifecycle, atomic-file transition, and deletion, not by chunk staging or file-ha
 writer retains the shared `DirectoryState` as well as its path state, so reconstructing a Directory
 while a writer remains open converges on the registry that contains its fence. Each path state
 contains an exclusive lifecycle gate and a weak reference to the active writer, whose object id is
-checked before retirement. Writer storage operations use an RAII in-flight claim; after acquiring it they recheck
-retirement with `SeqCst` ordering immediately before their first dependent store operation. Delete
+checked before retirement. Each writer call uses an RAII in-flight claim spanning its dependent
+storage operations and rechecks retirement with `SeqCst` ordering after registering in flight. Delete
 retires only the writer whose object id matches the binding, waits for its in-flight claims to reach
 zero, and rereads the binding before constructing the retirement entry. Different paths therefore proceed
 independently except when replenishing the strided object-id allocator or enqueueing onto the same
@@ -262,9 +265,10 @@ every entry point, decode-time extent limits, and exact reservation I/O counts.
 
 Slice 3 tests the deletion batch directly: object deletion produces one whole-object entry, and a
 confirmed committed delete cannot duplicate or overwrite it on retry. Every enqueue reads the
-persisted shard tail and the target slot, including after reopen. A repeat-count same-path
-writer/delete race proves the `SeqCst` retired/in-flight protocol; different-path deletion and
-different-shard enqueue remain concurrent. A definitively failed delete restores a matching writer,
+persisted shard tail and the target slot, including after reopen. A deterministic admission test
+pins the post-registration retirement recheck; barriered writer/delete races prove that deletion
+waits for both publication and chunk-storage claims and that queued bounds cover the result.
+Different-path deletion and different-shard enqueue remain concurrent. A definitively failed delete restores a matching writer,
 while a confirmed committed delete leaves it retired. `CountingKv` fixes the active-writer and
 closed-writer point-read, write-call, and mutation deltas for delete and proves that a covered chunk write adds no read or mutex-backed
 storage operation. Atomic-only deletion neither decodes nor enqueues a binding. Reclaim entries

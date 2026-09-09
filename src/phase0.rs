@@ -362,9 +362,14 @@ impl WriterFence {
 	}
 
 	fn claim(&self) -> io::Result<WriterClaim<'_>> {
+		self.claim_after_first_check(|| {})
+	}
+
+	fn claim_after_first_check(&self, after_first_check: impl FnOnce()) -> io::Result<WriterClaim<'_>> {
 		if self.retired.load(Ordering::SeqCst) {
 			return Err(writer_retired_error());
 		}
+		after_first_check();
 		let previous = self.in_flight.fetch_add(1, Ordering::SeqCst);
 		if previous == usize::MAX {
 			self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -550,8 +555,7 @@ impl<S: KvStore> KvDirectory<S> {
 			.transpose()?
 			.unwrap_or(0);
 		let entry_key = reclaim_entry_key(&self.namespace, shard, sequence);
-		if let Some(existing) = self.store.read(&entry_key)? {
-			decode_reclaim_entry(&existing)?;
+		if self.store.read(&entry_key)?.is_some() {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidData,
 				"reclaim queue tail references an occupied entry",
@@ -1452,7 +1456,16 @@ fn decode_reclaim_entry(bytes: &[u8]) -> io::Result<ReclaimEntry> {
 			format!("unsupported reclaim entry format version {version}"),
 		));
 	}
-	if bytes.len() != 22 || bytes[1] != RECLAIM_ENTRY_WHOLE_OBJECT {
+	if bytes.len() < 2 {
+		return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed reclaim entry"));
+	}
+	if bytes[1] != RECLAIM_ENTRY_WHOLE_OBJECT {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("unsupported reclaim entry kind {}", bytes[1]),
+		));
+	}
+	if bytes.len() != 22 {
 		return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed reclaim entry"));
 	}
 	let entry = ReclaimEntry {
@@ -2264,6 +2277,28 @@ mod tests {
 	}
 
 	#[test]
+	fn writer_claim_rechecks_retirement_after_registering_in_flight() {
+		let fence = Arc::new(WriterFence::new(1));
+		let (checked, reached_check) = std::sync::mpsc::channel();
+		let (resume, may_resume) = std::sync::mpsc::channel();
+		let claiming_fence = fence.clone();
+		let claiming = std::thread::spawn(move || {
+			claiming_fence
+				.claim_after_first_check(|| {
+					checked.send(()).unwrap();
+					may_resume.recv().unwrap();
+				})
+				.map(drop)
+		});
+		reached_check.recv().unwrap();
+		fence.retire_and_wait();
+		resume.send(()).unwrap();
+
+		assert_eq!(claiming.join().unwrap().unwrap_err().kind(), io::ErrorKind::NotFound);
+		assert_eq!(fence.in_flight.load(Ordering::SeqCst), 0);
+	}
+
+	#[test]
 	fn delete_waits_for_in_flight_writer_storage() {
 		for iteration in 0..32 {
 			let store = BlockingKv::new();
@@ -2935,6 +2970,12 @@ mod tests {
 			.unwrap_err()
 			.to_string()
 			.contains("object id"));
+		let mut unknown_kind = encode_reclaim_entry(&entry).unwrap();
+		unknown_kind[1] = RECLAIM_ENTRY_WHOLE_OBJECT + 1;
+		assert!(decode_reclaim_entry(&unknown_kind)
+			.unwrap_err()
+			.to_string()
+			.contains("unsupported reclaim entry kind"));
 	}
 
 	#[test]
