@@ -9,7 +9,7 @@ readiness wait for a complete sweep.
 
 ## Grounding
 
-The merged fulltext baseline is `2e853d4`. `KvDirectory` stores immutable 256 KiB chunks and
+The merged fulltext baseline is `b9964b0`. `KvDirectory` stores immutable 256 KiB chunks and
 revisioned tails. `delete()` currently removes only logical bindings, each successful `flush()` can
 leave the previous tail revision unreachable, and a crashed writer can leave staged chunks that no
 binding ever named. `KvStore` supplies point read, atomic batch write, and sync, but no key
@@ -24,12 +24,51 @@ reachability.
 
 ### Make every physical key derivable
 
-Extend the binding with monotonic chunk and tail high-waters. Every payload write advances its bound
-in the same atomic batch: staged chunk `n` records at least `n + 1`, and published tail revision `r`
-records at least `r`. `flush()` updates the published fields and binding in that batch as well. The
-complete physical key set is therefore arithmetic—chunk ordinals `0..chunk_high_water` and tail
-revisions `1..=tail_high_water`—even when a writer crashes before publication. A payload key can
-never become durable without a durable record that bounds its existence.
+Extend the binding with monotonic chunk and tail high-waters. Before staging a chunk outside the
+current bound, the writer durably reserves a fixed stride of chunk ordinals in the binding. The
+reservation write completes before any covered payload write is issued; RocksDB WAL prefix ordering
+and the later publication barrier therefore cannot recover or publish a chunk without its earlier
+bound. Tail payload and tail high-water advance together in the existing publication batch. The
+complete possible physical key set is arithmetic—chunk ordinals `0..chunk_high_water` and tail
+revisions `1..=tail_high_water`—even when a writer crashes before publication. Bounds may include
+keys that were never written; missing payload keys are normal during reclamation.
+
+Slice 2 encodes these fields in binding format v3 and advances the directory key-format marker so
+every storage entry point rejects a slice-1 namespace at one choke point. The chunk high-water is an
+exclusive ordinal and must be at least the published full-chunk count. The tail high-water is the
+greatest possible revision, including revisions advanced by an empty-tail flush, so the published
+tail revision must never exceed it. Decoding rejects malformed lengths, inconsistent published
+lengths, either violated bound, and a possible physical extent above the format's 1 TiB hard limit
+before any cleanup work can use the values. Harper may impose a lower operational limit, but the
+library does not expose a customer setting for the on-disk safety bound. The prior unreleased key and
+binding formats are rebuilt rather than migrated.
+
+The first chunk in each 64-ordinal reservation takes the existing directory mutation gate, rereads
+the binding, and verifies that the object id and published file state still match the writer. A
+stored reservation ahead of the writer is adopted as the result of an applied-but-reported-failed
+attempt; a lower stored bound is corruption. Otherwise one binding mutation reserves the next
+stride. Covered chunks keep the current single-put path without a binding read or directory gate.
+An applied-but-reported-failed chunk put is retried idempotently with the same bytes and ordinal.
+Slice 3 installs per-path writer retirement before enabling cleanup, so delete cannot drain a
+captured reservation and then allow its old writer to stage into it. Slice 2 alone does not claim to
+reclaim a deleted binding and remains unavailable to production.
+
+`flush()` treats object identity and published fields—not bookkeeping-only high-waters—as the file
+replacement guard. It preserves the greatest stored bounds and allocates every revision above both
+the published revision and tail high-water, even when the new tail is empty; this makes the decode
+invariant unconditional and prevents later payload reuse. Publication writes any tail payload,
+updated bounds, and published binding in one WAL batch. A retry recognizes an already-published
+intended binding as success before accepting later bytes; a definitely unapplied attempt is cleared
+and recomputed from the preserved writer buffer. Any other published-state change is replacement.
+All mutation gates touched by this slice recover poisoned mutex state and return storage errors
+rather than creating a repeatable actor panic.
+
+The 64-chunk stride bounds overstatement to less than 16 MiB per reservation while reducing a 1 GiB
+file from 4,096 binding reads and updates to 64. A `CountingKv` test pins reservation reads, write
+calls, mutation count, and overstatement so the stride remains an explicit performance choice rather
+than an accidental constant. The existing host-transport large-file test exercises reservation,
+chunk staging, and publication through the Node boundary; host operation counts remain a production
+integration measurement.
 
 `delete()` atomically removes the binding and appends a reclaim entry containing the object id and
 its high-waters to a durable FIFO. Tantivy 0.26.1's `ManagedDirectory` makes this transition complete:
@@ -104,15 +143,17 @@ silently retries forever or advances past unknown data.
 
 ## Alternatives
 
-| Axis                     | Candidate and disposition                                                                                                                                                                                              |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Different layer          | RocksDB compaction and Harper log retention cannot see Tantivy handles. `ManagedDirectory` owns logical retirement, while `KvDirectory` owns physical retirement.                                                      |
-| Discovery                | Prefix enumeration or a dense object-id sweep. Both do work proportional to stored history rather than garbage and add machinery that transition records avoid.                                                        |
-| Different timing         | Delete up to a fixed number of chunks synchronously in `delete()` and enqueue only the remainder. This may help small objects, but it lengthens Tantivy metadata GC and is deferred until measurement shows a net win. |
-| Lower-layer range delete | Add a range-tombstone primitive. This expands the frozen Harper storage surface and makes foreground reads pay tombstone checks until compaction in a shared column family, so it is rejected for the first release.   |
-| Deeper cause             | Record existence in the batch that creates each key and enqueue retirement in the batch that makes it unreachable. This is the chosen foundation.                                                                      |
-| Do less                  | Reclaim only final object deletion and leave superseded tails until then. Real Tantivy flush-count measurement remains a gate, but tail-only FIFO entries cheaply bound the general Directory contract.                |
-| Chosen                   | Binding high-waters plus a transition-fed durable FIFO, with object-id pins and bounded low-priority draining.                                                                                                         |
+| Axis                     | Candidate and disposition                                                                                                                                                                                                                |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Different layer          | RocksDB compaction and Harper log retention cannot see Tantivy handles. `ManagedDirectory` owns logical retirement, while `KvDirectory` owns physical retirement.                                                                        |
+| Discovery                | Prefix enumeration or a dense object-id sweep. `KvStore` exposes no enumeration primitive, and either scan would do work proportional to stored history rather than garbage.                                                             |
+| Managed paths            | Treat Tantivy's `.managed.json` as the discovery source. It names logical paths, not object ids, chunk ordinals, or tail revisions, so delete/recreate cannot recover the retired object's extent.                                       |
+| Bound placement          | Update the binding with every payload, reserve bounded strides in the binding, or add a separate per-object extent key. Strided binding reservation is chosen: it keeps deletion capture atomic in slice 3 without per-chunk host reads. |
+| Different timing         | Delete up to a fixed number of chunks synchronously in `delete()` and enqueue only the remainder. This may help small objects, but it lengthens Tantivy metadata GC and is deferred until measurement shows a net win.                   |
+| Lower-layer range delete | Add a range-tombstone primitive. This expands the frozen Harper storage surface and makes foreground reads pay tombstone checks until compaction in a shared column family, so it is rejected for the first release.                     |
+| Deeper cause             | Record existence in the batch that creates each key and enqueue retirement in the batch that makes it unreachable. This is the chosen foundation.                                                                                        |
+| Do less                  | Reclaim only final object deletion and leave superseded tails until then. Reusing tail keys is invalid because opened handles require immutable revisions; real flush-count measurement remains a gate.                                  |
+| Chosen                   | Binding high-waters plus a transition-fed durable FIFO, with object-id pins and bounded low-priority draining.                                                                                                                           |
 
 ## Persistence format and delivery sequence
 
@@ -138,8 +179,14 @@ storage integration both pass. No native RocksDB storage provider is added to th
 
 ## Verification
 
-The mapping tests cover repeated flush, delete/recreate with a retained old reader, abandoned
-writers, partial object cleanup, restart during a range and between FIFO entries, namespace
+Slice 2 adds an applied-then-report-failure mode to `FaultingKv` and an invariant audit over its
+physical keys. Before deletion is introduced in slice 3, every visible or crash-recovered chunk and
+tail must fall within its surviving binding's bounds. Tests cover reservation failure and adoption,
+idempotent chunk retry, already-published flush retry, empty-tail bounds, former-format rejection at
+every entry point, decode-time extent limits, and exact reservation I/O counts.
+
+The completed mapping tests cover repeated flush, delete/recreate with a retained old reader,
+abandoned writers, partial object cleanup, restart during a range and between FIFO entries, namespace
 isolation, concurrent `open_write()` on distinct paths, and cleanup concurrent with Tantivy merge
 completion. A deterministic hook forces the binding-read/pin-register race. Failure injection
 covers staging and high-water updates, publication and tail enqueue, object retirement and enqueue,

@@ -163,7 +163,7 @@ namespace / index generation
   format marker kind                   -> directory key-format version
   chunk kind: object-id, ordinal       -> immutable 256 KiB data chunk
   tail kind: object-id, revision       -> immutable final partial chunk
-  binding kind: logical path           -> v2 object-id, chunk count, tail revision and visible length
+  binding kind: logical path           -> v3 object-id, published state and physical-key high-waters
   atomic kind: logical path            -> complete small-file bytes
 ```
 
@@ -185,14 +185,22 @@ New logical key kinds, including reclamation metadata, receive new kind tags und
 version. A storage provider must also change `KvStoreIdentity` whenever close, restore, or column-
 family replacement can change the bytes behind an identity.
 
-`open_write()` creates a new object identity and a zero-length binding. The writer stages each full
-chunk under its final ordinal with a WAL write while retaining at most one partial chunk. `flush()`
-atomically publishes a new binding and an immutable, revisioned tail. Filling a previously published
-tail creates a full chunk and a later binding revision; it never overwrites bytes visible to an
-existing file handle. Every flush that replaces a partial tail leaves its previous immutable tail
-revision unreachable. A file appended across K such flushes can therefore leave K-1 tails of up to
-`CHUNK_SIZE - 1` bytes, while a failed publication may additionally leave an unpublished tail or
-full chunks. These values remain until the derived-index reclaimer is implemented.
+`open_write()` creates a new object identity and a zero-length binding. Before writing the first
+chunk outside the binding's exclusive chunk high-water, the writer reserves 64 ordinals with one
+WAL binding update. Covered chunks keep the one-put path, so a 1 GiB file adds 64 reservation reads
+and writes rather than one binding round trip per 256 KiB chunk. The reservation is visible before
+its payloads, and missing keys inside it are valid. The writer retains at most one partial chunk.
+`flush()` atomically publishes a new binding and an immutable, revisioned tail while advancing the
+tail high-water, including for an empty tail. Filling a previously published tail creates a full
+chunk and a later binding revision; it never overwrites bytes visible to an existing file handle.
+Applied-but-reported-failed reservations, chunk puts, and publications are retried idempotently.
+
+Every flush that replaces a partial tail leaves its previous immutable tail revision unreachable.
+A file appended across K such flushes can therefore leave K-1 tails of up to `CHUNK_SIZE - 1` bytes,
+while a failed publication may additionally leave an unpublished tail or full chunks. Binding
+decode enforces that the published chunk count and tail revision stay within the high-waters and
+that their maximum possible physical extent is no more than the 1 TiB format safety bound. These
+values remain until the derived-index reclaimer is implemented.
 
 A file handle captures one binding value. It computes a full-chunk key directly from the requested
 offset and reads the versioned tail only when the range intersects it. A range contained in one

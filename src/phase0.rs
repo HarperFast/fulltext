@@ -84,6 +84,7 @@ struct State {
 	durable: BTreeMap<Vec<u8>, VersionedValue>,
 	pending_wal: Vec<(Vec<u8>, VersionedValue)>,
 	fail_next_write: bool,
+	fail_after_next_write: bool,
 	fail_next_flush: bool,
 }
 
@@ -139,6 +140,7 @@ impl FaultingKv {
 		if std::mem::take(&mut state.fail_next_write) {
 			return Err(io::Error::other("injected write failure"));
 		}
+		let fail_after_write = std::mem::take(&mut state.fail_after_next_write);
 		for mutation in mutations {
 			state.next_sequence += 1;
 			let entry = VersionedValue {
@@ -157,7 +159,11 @@ impl FaultingKv {
 				apply_if_newer(&mut state.durable, key, entry);
 			}
 		}
-		Ok(())
+		if fail_after_write {
+			Err(io::Error::other("injected post-commit write failure"))
+		} else {
+			Ok(())
+		}
 	}
 
 	pub fn begin_flush(&self) -> FlushBarrier {
@@ -187,6 +193,7 @@ impl FaultingKv {
 				durable,
 				pending_wal: Vec::new(),
 				fail_next_write: false,
+				fail_after_next_write: false,
 				fail_next_flush: false,
 			})),
 		}
@@ -194,6 +201,10 @@ impl FaultingKv {
 
 	pub fn fail_next_write(&self) {
 		self.state.lock().unwrap().fail_next_write = true;
+	}
+
+	pub fn fail_after_next_write(&self) {
+		self.state.lock().unwrap().fail_after_next_write = true;
 	}
 
 	pub fn fail_next_flush(&self) {
@@ -499,7 +510,11 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 			io_error: Arc::new(error),
 			filepath: path.to_path_buf(),
 		})?;
-		let _mutation = self.state.mutation.lock().unwrap();
+		let _mutation = self
+			.state
+			.mutation
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		let binding = binding_key(&self.namespace, path);
 		let atomic = atomic_key(&self.namespace, path);
 		if self
@@ -545,7 +560,11 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 	}
 
 	fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-		let _mutation = self.state.mutation.lock().unwrap();
+		let _mutation = self
+			.state
+			.mutation
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		self.ensure_format(true)
 			.map_err(|error| OpenWriteError::wrap_io_error(error, path.to_path_buf()))?;
 		let key = binding_key(&self.namespace, path);
@@ -579,6 +598,8 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 			tail_revision: 0,
 			tail_length: 0,
 			visible_length: 0,
+			chunk_high_water: 0,
+			tail_high_water: 0,
 		};
 		self.store
 			.write(
@@ -598,6 +619,7 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 			tail: Vec::new(),
 			staged_full_chunks: 0,
 			dirty: false,
+			pending_publication: None,
 		})))
 	}
 
@@ -613,7 +635,11 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 
 	fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
 		{
-			let _mutation = self.state.mutation.lock().unwrap();
+			let _mutation = self
+				.state
+				.mutation
+				.lock()
+				.unwrap_or_else(|poisoned| poisoned.into_inner());
 			self.ensure_format(true)?;
 			self.store.write(
 				&[Mutation::Put(atomic_key(&self.namespace, path), data.to_vec())],
@@ -732,6 +758,7 @@ struct KvWriter<S> {
 	tail: Vec<u8>,
 	staged_full_chunks: u32,
 	dirty: bool,
+	pending_publication: Option<Binding>,
 }
 
 impl<S: KvStore> Write for KvWriter<S> {
@@ -739,6 +766,7 @@ impl<S: KvStore> Write for KvWriter<S> {
 		if bytes.is_empty() {
 			return Ok(0);
 		}
+		self.reconcile_pending_publication()?;
 		self.stage_full_tail()?;
 		let accepted = bytes.len().min(CHUNK_SIZE - self.tail.len());
 		self.tail
@@ -750,21 +778,89 @@ impl<S: KvStore> Write for KvWriter<S> {
 	}
 
 	fn flush(&mut self) -> io::Result<()> {
+		self.reconcile_pending_publication()?;
 		if !self.dirty {
 			return Ok(());
 		}
 		self.stage_full_tail()?;
-		let _mutation = self.state.mutation.lock().unwrap();
+		let state = self.state.clone();
+		let _mutation = state.mutation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		let current = self.current_binding()?;
+		let expected = self.next_binding()?;
+		if current == expected {
+			self.finish_flush(expected);
+			return Ok(());
+		}
+		self.adopt_high_waters(&current)?;
+		let next = self.next_binding()?;
+		let binding = Mutation::Put(binding_key(&self.namespace, &self.path), encode_binding(&next));
+		self.pending_publication = Some(next.clone());
+		let result = if self.tail.is_empty() {
+			self.store.write(&[binding], WritePolicy::WAL)
+		} else {
+			self.store.write(
+				&[
+					Mutation::Put(
+						tail_key(&self.namespace, self.binding.object_id, next.tail_revision),
+						self.tail.clone(),
+					),
+					binding,
+				],
+				WritePolicy::WAL,
+			)
+		};
+		result?;
+		self.finish_flush(next);
+		Ok(())
+	}
+}
+
+impl<S: KvStore> KvWriter<S> {
+	fn reconcile_pending_publication(&mut self) -> io::Result<()> {
+		let Some(pending) = self.pending_publication.clone() else {
+			return Ok(());
+		};
+		let state = self.state.clone();
+		let _mutation = state.mutation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		let current = self.current_binding()?;
+		if current == pending {
+			self.finish_flush(pending);
+			return Ok(());
+		}
+		self.adopt_high_waters(&current)?;
+		self.pending_publication = None;
+		Ok(())
+	}
+
+	fn current_binding(&self) -> io::Result<Binding> {
 		let current = self
 			.store
 			.read(&binding_key(&self.namespace, &self.path))?
 			.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file was deleted while its writer was open"))?;
-		if decode_binding(&current)? != self.binding {
+		decode_binding(&current)
+	}
+
+	fn adopt_high_waters(&mut self, current: &Binding) -> io::Result<()> {
+		if !current.same_published_state(&self.binding) {
 			return Err(io::Error::new(
 				io::ErrorKind::NotFound,
 				"file was replaced while its writer was open",
 			));
 		}
+		if current.chunk_high_water < self.binding.chunk_high_water
+			|| current.tail_high_water < self.binding.tail_high_water
+		{
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"binding high-water moved backward",
+			));
+		}
+		self.binding.chunk_high_water = current.chunk_high_water;
+		self.binding.tail_high_water = current.tail_high_water;
+		Ok(())
+	}
+
+	fn next_binding(&self) -> io::Result<Binding> {
 		let full_chunks = self
 			.binding
 			.full_chunks
@@ -777,7 +873,7 @@ impl<S: KvStore> Write for KvWriter<S> {
 			.ok_or_else(|| io::Error::other("visible length exhausted"))?;
 		let tail_revision = self
 			.binding
-			.tail_revision
+			.tail_high_water
 			.checked_add(1)
 			.ok_or_else(|| io::Error::other("tail revision exhausted"))?;
 		let next = Binding {
@@ -787,30 +883,20 @@ impl<S: KvStore> Write for KvWriter<S> {
 			tail_length: u32::try_from(self.tail.len())
 				.map_err(|_| io::Error::other("tail length exceeds its format"))?,
 			visible_length,
+			chunk_high_water: self.binding.chunk_high_water,
+			tail_high_water: tail_revision,
 		};
-		let binding = Mutation::Put(binding_key(&self.namespace, &self.path), encode_binding(&next));
-		if self.tail.is_empty() {
-			self.store.write(&[binding], WritePolicy::WAL)?;
-		} else {
-			self.store.write(
-				&[
-					Mutation::Put(
-						tail_key(&self.namespace, self.binding.object_id, tail_revision),
-						self.tail.clone(),
-					),
-					binding,
-				],
-				WritePolicy::WAL,
-			)?;
-		}
+		validate_binding(&next)?;
+		Ok(next)
+	}
+
+	fn finish_flush(&mut self, next: Binding) {
 		self.binding = next;
 		self.staged_full_chunks = 0;
 		self.dirty = false;
-		Ok(())
+		self.pending_publication = None;
 	}
-}
 
-impl<S: KvStore> KvWriter<S> {
 	fn stage_full_tail(&mut self) -> io::Result<()> {
 		if self.tail.len() != CHUNK_SIZE {
 			return Ok(());
@@ -820,6 +906,7 @@ impl<S: KvStore> KvWriter<S> {
 			.full_chunks
 			.checked_add(self.staged_full_chunks)
 			.ok_or_else(|| io::Error::other("chunk count exhausted"))?;
+		self.reserve_chunk(chunk)?;
 		let mutation = Mutation::Put(
 			chunk_key(&self.namespace, self.binding.object_id, chunk),
 			std::mem::take(&mut self.tail),
@@ -837,6 +924,49 @@ impl<S: KvStore> KvWriter<S> {
 		self.staged_full_chunks += 1;
 		Ok(())
 	}
+
+	fn reserve_chunk(&mut self, chunk: u32) -> io::Result<()> {
+		if chunk < self.binding.chunk_high_water {
+			return Ok(());
+		}
+		let state = self.state.clone();
+		let _mutation = state.mutation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		let current = self.current_binding()?;
+		self.adopt_high_waters(&current)?;
+		if chunk < self.binding.chunk_high_water {
+			return Ok(());
+		}
+		if chunk != self.binding.chunk_high_water {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"chunk reservation is not contiguous",
+			));
+		}
+		let tail_extent = self.binding.tail_high_water as u128 * (CHUNK_SIZE - 1) as u128;
+		let available = MAX_OBJECT_EXTENT_BYTES
+			.checked_sub(tail_extent)
+			.ok_or_else(|| io::Error::other("object physical extent exhausted"))?;
+		let max_high_water = u32::try_from(available / CHUNK_SIZE as u128)
+			.map_err(|_| io::Error::other("chunk reservation exceeds its format"))?;
+		let desired = chunk.saturating_add(CHUNK_RESERVATION_STRIDE).min(max_high_water);
+		if desired <= chunk {
+			return Err(io::Error::other("object physical extent exhausted"));
+		}
+		let mut reserved = self.binding.clone();
+		reserved.chunk_high_water = desired;
+		validate_binding(&reserved)?;
+		let result = self.store.write(
+			&[Mutation::Put(
+				binding_key(&self.namespace, &self.path),
+				encode_binding(&reserved),
+			)],
+			WritePolicy::WAL,
+		);
+		if result.is_ok() {
+			self.binding = reserved;
+		}
+		result
+	}
 }
 
 impl<S: KvStore> TerminatingWrite for KvWriter<S> {
@@ -852,6 +982,18 @@ struct Binding {
 	tail_revision: u64,
 	tail_length: u32,
 	visible_length: usize,
+	chunk_high_water: u32,
+	tail_high_water: u64,
+}
+
+impl Binding {
+	fn same_published_state(&self, other: &Self) -> bool {
+		self.object_id == other.object_id
+			&& self.full_chunks == other.full_chunks
+			&& self.tail_revision == other.tail_revision
+			&& self.tail_length == other.tail_length
+			&& self.visible_length == other.visible_length
+	}
 }
 
 fn counter_key(namespace: &[u8]) -> Vec<u8> {
@@ -866,7 +1008,10 @@ fn atomic_key(namespace: &[u8], path: &Path) -> Vec<u8> {
 	prefixed_path(&namespaced_prefix(namespace, KEY_KIND_ATOMIC), path)
 }
 
-const KEY_FORMAT_VERSION: u8 = 1;
+const KEY_FORMAT_VERSION: u8 = 2;
+const BINDING_FORMAT_VERSION: u8 = 3;
+const CHUNK_RESERVATION_STRIDE: u32 = 64;
+const MAX_OBJECT_EXTENT_BYTES: u128 = 1 << 40;
 const KEY_KIND_COUNTER: u8 = 1;
 const KEY_KIND_BINDING: u8 = 2;
 const KEY_KIND_ATOMIC: u8 = 3;
@@ -978,25 +1123,27 @@ fn tail_key(namespace: &[u8], object_id: u64, revision: u64) -> Vec<u8> {
 }
 
 fn encode_binding(binding: &Binding) -> Vec<u8> {
-	let mut bytes = Vec::with_capacity(33);
-	bytes.push(2);
+	let mut bytes = Vec::with_capacity(45);
+	bytes.push(BINDING_FORMAT_VERSION);
 	bytes.extend_from_slice(&binding.object_id.to_be_bytes());
 	bytes.extend_from_slice(&binding.full_chunks.to_be_bytes());
 	bytes.extend_from_slice(&binding.tail_revision.to_be_bytes());
 	bytes.extend_from_slice(&binding.tail_length.to_be_bytes());
 	bytes.extend_from_slice(&(binding.visible_length as u64).to_be_bytes());
+	bytes.extend_from_slice(&binding.chunk_high_water.to_be_bytes());
+	bytes.extend_from_slice(&binding.tail_high_water.to_be_bytes());
 	bytes
 }
 
 fn decode_binding(bytes: &[u8]) -> io::Result<Binding> {
-	if bytes.first().copied() != Some(2) {
+	if bytes.first().copied() != Some(BINDING_FORMAT_VERSION) {
 		let version = bytes.first().copied().unwrap_or(0);
 		return Err(io::Error::new(
 			io::ErrorKind::InvalidData,
 			format!("unsupported binding format version {version}"),
 		));
 	}
-	if bytes.len() != 33 {
+	if bytes.len() != 45 {
 		return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed binding"));
 	}
 	let visible_length = usize::try_from(decode_u64(&bytes[25..33])?)
@@ -1015,7 +1162,18 @@ fn decode_binding(bytes: &[u8]) -> io::Result<Binding> {
 				.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid tail length"))?,
 		),
 		visible_length,
+		chunk_high_water: u32::from_be_bytes(
+			bytes[33..37]
+				.try_into()
+				.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk high-water"))?,
+		),
+		tail_high_water: decode_u64(&bytes[37..45])?,
 	};
+	validate_binding(&binding)?;
+	Ok(binding)
+}
+
+fn validate_binding(binding: &Binding) -> io::Result<()> {
 	let expected_length = usize::try_from(binding.full_chunks)
 		.ok()
 		.and_then(|chunks| chunks.checked_mul(CHUNK_SIZE))
@@ -1026,7 +1184,21 @@ fn decode_binding(bytes: &[u8]) -> io::Result<Binding> {
 			"binding length is inconsistent",
 		));
 	}
-	Ok(binding)
+	if binding.chunk_high_water < binding.full_chunks || binding.tail_high_water < binding.tail_revision {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			"binding high-water is below published state",
+		));
+	}
+	let possible_extent = binding.chunk_high_water as u128 * CHUNK_SIZE as u128
+		+ binding.tail_high_water as u128 * (CHUNK_SIZE - 1) as u128;
+	if possible_extent > MAX_OBJECT_EXTENT_BYTES {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			"binding physical extent exceeds the format limit",
+		));
+	}
+	Ok(())
 }
 
 fn decode_u64(bytes: &[u8]) -> io::Result<u64> {
@@ -1045,6 +1217,8 @@ mod tests {
 	struct CountingKv {
 		inner: FaultingKv,
 		reads: Arc<AtomicUsize>,
+		writes: Arc<AtomicUsize>,
+		mutations: Arc<AtomicUsize>,
 	}
 
 	#[derive(Clone)]
@@ -1058,11 +1232,21 @@ mod tests {
 			Self {
 				inner: FaultingKv::default(),
 				reads: Arc::new(AtomicUsize::new(0)),
+				writes: Arc::new(AtomicUsize::new(0)),
+				mutations: Arc::new(AtomicUsize::new(0)),
 			}
 		}
 
 		fn take_reads(&self) -> usize {
 			self.reads.swap(0, Ordering::Relaxed)
+		}
+
+		fn take_io_counts(&self) -> (usize, usize, usize) {
+			(
+				self.reads.swap(0, Ordering::Relaxed),
+				self.writes.swap(0, Ordering::Relaxed),
+				self.mutations.swap(0, Ordering::Relaxed),
+			)
 		}
 	}
 
@@ -1077,6 +1261,8 @@ mod tests {
 		}
 
 		fn write(&self, mutations: &[Mutation], policy: WritePolicy) -> io::Result<()> {
+			self.writes.fetch_add(1, Ordering::Relaxed);
+			self.mutations.fetch_add(mutations.len(), Ordering::Relaxed);
 			KvStore::write(&self.inner, mutations, policy)
 		}
 
@@ -1119,6 +1305,83 @@ mod tests {
 			)
 			.unwrap();
 		FaultingDirectory::with_namespace(store, b"catalog")
+	}
+
+	fn former_format_directory() -> FaultingDirectory {
+		let store = FaultingKv::default();
+		store
+			.write(
+				&[Mutation::Put(format_marker_key(b"catalog"), vec![1])],
+				WritePolicy::WAL_SYNC,
+			)
+			.unwrap();
+		FaultingDirectory::with_namespace(store, b"catalog")
+	}
+
+	fn empty_binding() -> Binding {
+		Binding {
+			object_id: 1,
+			full_chunks: 0,
+			tail_revision: 0,
+			tail_length: 0,
+			visible_length: 0,
+			chunk_high_water: 0,
+			tail_high_water: 0,
+		}
+	}
+
+	fn assert_physical_keys_within_high_water(store: &FaultingKv, namespace: &[u8], path: &Path) {
+		let state = store.state.lock().unwrap();
+		let binding = state
+			.visible
+			.get(&binding_key(namespace, path))
+			.and_then(|entry| entry.value.as_ref())
+			.map(|bytes| decode_binding(bytes).unwrap())
+			.expect("object binding is missing");
+		assert_object_keys_within_high_water(&state.visible, namespace, path, binding.object_id);
+	}
+
+	fn assert_object_keys_within_high_water(
+		entries: &BTreeMap<Vec<u8>, VersionedValue>,
+		namespace: &[u8],
+		path: &Path,
+		object_id: u64,
+	) {
+		let binding = entries
+			.get(&binding_key(namespace, path))
+			.and_then(|entry| entry.value.as_ref())
+			.map(|bytes| decode_binding(bytes).unwrap());
+		let mut chunk_prefix = namespaced_prefix_with_capacity(namespace, KEY_KIND_CHUNK, 8);
+		chunk_prefix.extend_from_slice(&object_id.to_be_bytes());
+		let mut tail_prefix = namespaced_prefix_with_capacity(namespace, KEY_KIND_TAIL, 8);
+		tail_prefix.extend_from_slice(&object_id.to_be_bytes());
+		for (key, value) in entries {
+			if value.value.is_none() {
+				continue;
+			}
+			if let Some(suffix) = key.strip_prefix(chunk_prefix.as_slice()) {
+				let binding = binding.as_ref().expect("recovered chunk has no binding");
+				assert_eq!(binding.object_id, object_id);
+				let chunk = u32::from_be_bytes(suffix.try_into().unwrap());
+				assert!(chunk < binding.chunk_high_water);
+			}
+			if let Some(suffix) = key.strip_prefix(tail_prefix.as_slice()) {
+				let binding = binding.as_ref().expect("recovered tail has no binding");
+				assert_eq!(binding.object_id, object_id);
+				let revision = u64::from_be_bytes(suffix.try_into().unwrap());
+				assert!(revision <= binding.tail_high_water);
+			}
+		}
+	}
+
+	fn assert_every_wal_prefix_respects_high_waters(store: &FaultingKv, namespace: &[u8], path: &Path) {
+		let state = store.state.lock().unwrap();
+		let mut recovered = state.durable.clone();
+		assert_object_keys_within_high_water(&recovered, namespace, path, 1);
+		for (key, entry) in &state.pending_wal {
+			apply_if_newer(&mut recovered, key.clone(), entry.clone());
+			assert_object_keys_within_high_water(&recovered, namespace, path, 1);
+		}
 	}
 
 	#[test]
@@ -1276,9 +1539,25 @@ mod tests {
 		writer.write_all(b"pending").unwrap();
 		store.fail_next_write();
 		assert!(writer.flush().is_err());
+		writer.write_all(b" plus more").unwrap();
 		writer.flush().unwrap();
 		let file = directory.open_read(Path::new("segment")).unwrap();
-		assert_eq!(file.read_bytes().unwrap().as_slice(), b"pending");
+		assert_eq!(file.read_bytes().unwrap().as_slice(), b"pending plus more");
+	}
+
+	#[test]
+	fn applied_but_reported_failed_publication_is_retryable() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(b"pending").unwrap();
+		store.fail_after_next_write();
+		assert!(writer.flush().is_err());
+		writer.write_all(b" plus more").unwrap();
+		writer.flush().unwrap();
+
+		let file = directory.open_read(Path::new("segment")).unwrap();
+		assert_eq!(file.read_bytes().unwrap().as_slice(), b"pending plus more");
 	}
 
 	#[test]
@@ -1435,6 +1714,23 @@ mod tests {
 	}
 
 	#[test]
+	fn every_storage_entry_point_rejects_the_former_directory_format() {
+		fn assert_version_error<T, E: fmt::Display>(result: Result<T, E>) {
+			let error = result.err().expect("former directory format should be rejected");
+			assert!(error.to_string().contains("directory format version 1"));
+		}
+
+		let path = Path::new("meta.json");
+		assert_version_error(former_format_directory().exists(path));
+		assert_version_error(former_format_directory().atomic_read(path));
+		assert_version_error(former_format_directory().atomic_write(path, b"metadata"));
+		assert_version_error(former_format_directory().open_write(path));
+		assert_version_error(former_format_directory().delete(path));
+		assert_version_error(former_format_directory().sync_directory());
+		assert_version_error(former_format_directory().open_read(path));
+	}
+
+	#[test]
 	fn rejects_an_unknown_directory_format() {
 		let store = FaultingKv::default();
 		store
@@ -1449,7 +1745,7 @@ mod tests {
 		let error = FaultingDirectory::with_namespace(store, b"catalog")
 			.exists(Path::new("meta.json"))
 			.unwrap_err();
-		assert!(error.to_string().contains("version 2"));
+		assert!(error.to_string().contains("version 3"));
 	}
 
 	#[test]
@@ -1510,6 +1806,8 @@ mod tests {
 		assert_eq!(binding.full_chunks, 3);
 		assert_eq!(binding.tail_length, 17);
 		assert_eq!(binding.visible_length, bytes.len());
+		assert_eq!(binding.chunk_high_water, CHUNK_RESERVATION_STRIDE);
+		assert_eq!(binding.tail_high_water, binding.tail_revision);
 		assert_eq!(
 			directory
 				.open_read(Path::new("segment"))
@@ -1533,11 +1831,51 @@ mod tests {
 		let binding = decode_binding(&store.get(&binding_key(b"phase0", Path::new("segment"))).unwrap()).unwrap();
 		assert_eq!(binding.full_chunks, 2);
 		assert_eq!(binding.tail_length, 0);
+		assert_eq!(binding.chunk_high_water, CHUNK_RESERVATION_STRIDE);
+		assert_eq!(binding.tail_high_water, binding.tail_revision);
+		assert_eq!(binding.tail_revision, 1);
 		let file = directory.open_read(Path::new("segment")).unwrap();
 		assert_eq!(
 			file.read_bytes_slice(0..CHUNK_SIZE).unwrap().as_slice(),
 			&bytes[..CHUNK_SIZE]
 		);
+	}
+
+	#[test]
+	fn chunk_reservations_amortize_binding_io() {
+		let store = CountingKv::new();
+		let directory = KvDirectory::new(store.clone());
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		store.take_io_counts();
+		writer.write_all(&vec![7; CHUNK_SIZE * 65]).unwrap();
+		writer.flush().unwrap();
+
+		assert_eq!(store.take_io_counts(), (3, 68, 68));
+		let binding = decode_binding(&store.inner.get(&binding_key(b"phase0", Path::new("segment"))).unwrap()).unwrap();
+		assert_eq!(binding.full_chunks, 65);
+		assert_eq!(binding.chunk_high_water, 128);
+		assert_every_wal_prefix_respects_high_waters(&store.inner, b"phase0", Path::new("segment"));
+	}
+
+	#[test]
+	fn physical_keys_stay_within_binding_high_waters_across_reopen() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let path = Path::new("segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(&vec![3; CHUNK_SIZE * 2 + 17]).unwrap();
+		writer.flush().unwrap();
+		writer.write_all(b"next revision").unwrap();
+		writer.flush().unwrap();
+		assert_physical_keys_within_high_water(&store, b"phase0", path);
+
+		directory
+			.atomic_write(Path::new("meta.json"), b"durability barrier")
+			.unwrap();
+		let recovered = store.crash();
+		assert_physical_keys_within_high_water(&recovered, b"phase0", path);
+		let reopened = FaultingDirectory::new(recovered);
+		assert_eq!(reopened.open_read(path).unwrap().len(), CHUNK_SIZE * 2 + 30);
 	}
 
 	#[test]
@@ -1620,16 +1958,49 @@ mod tests {
 	}
 
 	#[test]
+	fn applied_but_reported_failed_chunk_reservation_and_put_are_retryable() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let binding = empty_binding();
+		store
+			.write(
+				&[Mutation::Put(
+					binding_key(b"phase0", Path::new("segment")),
+					encode_binding(&binding),
+				)],
+				WritePolicy::WAL,
+			)
+			.unwrap();
+		let mut writer = KvWriter {
+			store: store.clone(),
+			state: directory.state.clone(),
+			namespace: directory.namespace.clone(),
+			path: PathBuf::from("segment"),
+			binding,
+			tail: vec![7; CHUNK_SIZE],
+			staged_full_chunks: 0,
+			dirty: true,
+			pending_publication: None,
+		};
+
+		store.fail_after_next_write();
+		assert!(writer.flush().is_err());
+		let reserved = decode_binding(&store.get(&binding_key(b"phase0", Path::new("segment"))).unwrap()).unwrap();
+		assert_eq!(reserved.chunk_high_water, CHUNK_RESERVATION_STRIDE);
+		store.fail_after_next_write();
+		assert!(writer.flush().is_err());
+		assert_eq!(store.get(&chunk_key(b"phase0", 1, 0)), Some(vec![7; CHUNK_SIZE]));
+		writer.flush().unwrap();
+
+		let file = directory.open_read(Path::new("segment")).unwrap();
+		assert_eq!(file.read_bytes().unwrap().as_slice(), vec![7; CHUNK_SIZE]);
+	}
+
+	#[test]
 	fn staging_failure_does_not_consume_the_failing_write() {
 		let store = FaultingKv::default();
 		let directory = FaultingDirectory::new(store.clone());
-		let binding = Binding {
-			object_id: 1,
-			full_chunks: 0,
-			tail_revision: 0,
-			tail_length: 0,
-			visible_length: 0,
-		};
+		let binding = empty_binding();
 		store
 			.write(
 				&[Mutation::Put(
@@ -1648,6 +2019,7 @@ mod tests {
 			tail: Vec::new(),
 			staged_full_chunks: 0,
 			dirty: false,
+			pending_publication: None,
 		};
 		let prefix = vec![1; CHUNK_SIZE - 4_096];
 		let suffix = vec![2; 8_192];
@@ -1664,16 +2036,41 @@ mod tests {
 
 	#[test]
 	fn rejects_an_older_binding_format_with_its_version() {
-		let error = decode_binding(&[1]).unwrap_err();
+		let error = decode_binding(&[2; 33]).unwrap_err();
 		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-		assert!(error.to_string().contains("version 1"));
+		assert!(error.to_string().contains("version 2"));
 	}
 
 	#[test]
 	fn distinguishes_a_malformed_current_binding() {
-		let error = decode_binding(&[2; 20]).unwrap_err();
+		let error = decode_binding(&[BINDING_FORMAT_VERSION; 20]).unwrap_err();
 		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 		assert_eq!(error.to_string(), "malformed binding");
+	}
+
+	#[test]
+	fn rejects_binding_high_waters_below_published_state() {
+		let mut chunk = empty_binding();
+		chunk.full_chunks = 1;
+		chunk.visible_length = CHUNK_SIZE;
+		let error = decode_binding(&encode_binding(&chunk)).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert!(error.to_string().contains("high-water is below"));
+
+		let mut tail = empty_binding();
+		tail.tail_revision = 1;
+		let error = decode_binding(&encode_binding(&tail)).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert!(error.to_string().contains("high-water is below"));
+	}
+
+	#[test]
+	fn rejects_binding_high_waters_beyond_the_extent_limit() {
+		let mut binding = empty_binding();
+		binding.chunk_high_water = u32::MAX;
+		let error = decode_binding(&encode_binding(&binding)).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert!(error.to_string().contains("physical extent exceeds"));
 	}
 
 	#[test]
