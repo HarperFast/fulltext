@@ -63,9 +63,10 @@ Pinned `MmapDirectory` source also exposes a reference limitation: its path cach
 same older mmap to a new `open_read()` while a handle to that mmap remains alive, even after the
 writer flushes more bytes. The shared reference test therefore proves writer continuation, old-handle
 immutability, and later visibility after the old handle is released. The Rocks prototype separately
-proves simultaneous old and new binding revisions because its write-once fragments support that
-stronger behavior. The wrapper does not claim Mmap and Rocks have identical raw Directory cache
-semantics; it requires identical observable index, commit, reopen, and search behavior.
+proves simultaneous old and new binding revisions because its write-once chunks and tail revisions
+support that stronger behavior. The wrapper does not claim Mmap and Rocks have identical raw
+Directory cache semantics; it requires identical observable index, commit, reopen, and search
+behavior.
 
 ### rocksdb-js 2.8.0
 
@@ -169,22 +170,28 @@ namespace / index generation
 chunk under its final ordinal with a WAL write while retaining at most one partial chunk. `flush()`
 atomically publishes a new binding and an immutable, revisioned tail. Filling a previously published
 tail creates a full chunk and a later binding revision; it never overwrites bytes visible to an
-existing file handle. A failed or interrupted publication leaves the old binding readable and may
-leave only unreachable chunks or tails for bounded garbage collection.
+existing file handle. Every flush that replaces a partial tail leaves its previous immutable tail
+revision unreachable. A file appended across K such flushes can therefore leave K-1 tails of up to
+`CHUNK_SIZE - 1` bytes, while a failed publication may additionally leave an unpublished tail or
+full chunks. These values remain until the derived-index reclaimer is implemented.
 
 A file handle captures one binding value. It computes a full-chunk key directly from the requested
 offset and reads the versioned tail only when the range intersects it. A range contained in one
 chunk therefore performs one payload lookup regardless of file size; ranges spanning boundaries
 perform one lookup per intersecting chunk. No read walks or fetches preceding payloads.
 
-The host factory must reject transport limits that cannot carry this format. A full-chunk read
-response requires at least `CHUNK_SIZE + 7` bytes for the protocol envelope, and the transport's
-retained-byte budget must cover the encoded request plus that response. The Phase 0 sweep records
-small-read amplification and retained `OwnedBytes` because a slice keeps its complete chunk
-allocation alive; a bounded chunk cache is considered only if those measurements justify it.
+A full-chunk read response requires at least `CHUNK_SIZE + 7` bytes for the protocol envelope, so
+the host store rejects a smaller response budget at construction. Transport admission separately
+accounts for the exact encoded request and reserved response before dispatch. The prototype does
+not claim a universal construction-time transport minimum: namespace and path lengths vary, and
+`atomic_write()` does not yet enforce a metadata size bound. The production factory must bound
+those inputs and validate its aggregate byte budget before this backend is exposed. The Phase 0
+sweep records small-read amplification and retained `OwnedBytes` because a slice keeps its complete
+chunk allocation alive; a bounded chunk cache is considered only if those measurements justify it.
 
-Termination flushes the remaining tail. Deleting removes the binding; immutable chunks and tails
-remain readable through already-open handles and become reclaimable after those handles drain.
+Termination flushes the remaining tail. Deleting removes the binding but leaves every immutable
+chunk and tail behind. They remain readable through already-open handles and become eligible for
+reclamation after those handles drain.
 
 `atomic_write()` stores the complete small value in one RocksDB write batch. It is used for metadata
 such as `meta.json` and `.managed.json`, not large segment output. Issue #11 still owns format

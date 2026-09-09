@@ -366,8 +366,6 @@ const VALUE_PRESENT: u8 = 1;
 const MUTATION_PUT: u8 = 1;
 const MUTATION_DELETE: u8 = 2;
 const READ_RESPONSE_OVERHEAD: usize = 7;
-const MINIMUM_READ_REQUEST_BYTES: usize = 6;
-const MINIMUM_PUT_REQUEST_OVERHEAD: usize = 16;
 
 #[derive(Clone)]
 struct HostKvStore {
@@ -389,20 +387,6 @@ impl HostKvStore {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,
 				format!("host read response budget must be at least {minimum_read_response} bytes"),
-			));
-		}
-		let minimum_read_transport = max_read_response_bytes
-			.checked_add(MINIMUM_READ_REQUEST_BYTES)
-			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host read byte budget overflow"))?;
-		let minimum_write_transport = CHUNK_SIZE
-			.checked_add(MINIMUM_PUT_REQUEST_OVERHEAD)
-			.and_then(|bytes| bytes.checked_add(max_control_response_bytes))
-			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host write byte budget overflow"))?;
-		let minimum_transport_bytes = minimum_read_transport.max(minimum_write_transport);
-		if transport.max_bytes < minimum_transport_bytes {
-			return Err(io::Error::new(
-				io::ErrorKind::InvalidInput,
-				format!("host transport byte budget must be at least {minimum_transport_bytes} bytes"),
 			));
 		}
 		Ok(Self {
@@ -772,6 +756,13 @@ pub fn test_verify_tantivy_on_host_transport(
 					crate::directory_harness::verify_directory_contract(|| {
 						let namespace = format!("host-contract/{run}/{}", case.fetch_add(1, Ordering::Relaxed));
 						KvDirectory::with_namespace(store.clone(), namespace.as_bytes())
+					})
+					.and_then(|_| {
+						let namespace = format!("host-large-file/{run}");
+						crate::directory_harness::verify_large_file(
+							KvDirectory::with_namespace(store.clone(), namespace.as_bytes()),
+							CHUNK_SIZE,
+						)
 					})
 					.and_then(|_| {
 						let namespace = format!("host-lifecycle/{run}");

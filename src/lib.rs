@@ -257,6 +257,12 @@ pub fn phase0_verify_tantivy_on_storage_lease(id: u32) -> boundary::Result<()> {
 			phase0::KvDirectory::with_namespace(lease.clone(), namespace.as_bytes())
 		})
 		.map_err(|error| napi::Error::new("E_STORAGE", error))?;
+		let namespace = format!("phase0-large-file/{run}");
+		directory_harness::verify_large_file(
+			phase0::KvDirectory::with_namespace(lease.clone(), namespace.as_bytes()),
+			phase0::CHUNK_SIZE,
+		)
+		.map_err(|error| napi::Error::new("E_STORAGE", error))?;
 		let namespace = format!("phase0-lifecycle/{run}");
 		directory_harness::verify_tantivy_lifecycle(phase0::KvDirectory::with_namespace(lease, namespace.as_bytes()))
 			.map_err(|error| napi::Error::new("E_STORAGE", error))

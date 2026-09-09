@@ -370,7 +370,7 @@ impl<S: KvStore> FileHandle for KvFileHandle<S> {
 		copied
 			.try_reserve(range.len())
 			.map_err(|_| io::Error::other("requested file range cannot be allocated"))?;
-		let last_full_chunk = last_chunk.min(self.binding.full_chunks as usize - 1);
+		let last_full_chunk = last_chunk.min((self.binding.full_chunks as usize).saturating_sub(1));
 		for chunk in first_chunk..=last_full_chunk {
 			let value = self.read_chunk(chunk)?;
 			let chunk_start = chunk * CHUNK_SIZE;
@@ -773,13 +773,16 @@ impl<S: KvStore> KvWriter<S> {
 			chunk_key(&self.namespace, self.binding.object_id, chunk),
 			std::mem::take(&mut self.tail),
 		);
-		if let Err(error) = self.store.write(std::slice::from_ref(&mutation), WritePolicy::WAL) {
-			let Mutation::Put(_, value) = mutation else {
-				unreachable!();
-			};
+		let result = self.store.write(std::slice::from_ref(&mutation), WritePolicy::WAL);
+		let Mutation::Put(_, mut value) = mutation else {
+			unreachable!();
+		};
+		if let Err(error) = result {
 			self.tail = value;
 			return Err(error);
 		}
+		value.clear();
+		self.tail = value;
 		self.staged_full_chunks += 1;
 		Ok(())
 	}
