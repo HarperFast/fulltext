@@ -458,9 +458,10 @@ impl KvStore for HostKvStore {
 
 	fn write(&self, mutations: &[Mutation], policy: WritePolicy) -> io::Result<()> {
 		let mut request = RequestEncoder::new(OP_WRITE);
+		let requires_sync = policy == WritePolicy::WAL_SYNC;
+		// Harper exposes an atomic WAL batch and a separate database durability barrier.
 		request.u8(match policy {
-			WritePolicy::WAL => 1,
-			WritePolicy::WAL_SYNC => 2,
+			WritePolicy::WAL | WritePolicy::WAL_SYNC => 1,
 			WritePolicy::NO_WAL => 3,
 			_ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid write policy")),
 		});
@@ -479,7 +480,12 @@ impl KvStore for HostKvStore {
 			}
 		}
 		self.request_mutation(request.finish(), self.max_control_response_bytes)?
-			.finish()
+			.finish()?;
+		if requires_sync {
+			// A barrier failure leaves the write outcome known-applied; the caller poisons the generation.
+			self.sync()?;
+		}
+		Ok(())
 	}
 
 	fn sync(&self) -> io::Result<()> {

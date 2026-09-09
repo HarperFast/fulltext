@@ -11,7 +11,7 @@ const mutationDelete = 2;
 const minimumMutationBytes = 5;
 const fallbackError = Buffer.from([protocolVersion, responseError, 0, 0, 0, 0]);
 
-export type HostWritePolicy = 'wal' | 'wal-sync' | 'no-wal';
+export type HostWritePolicy = 'wal' | 'no-wal';
 
 export type HostStorageMutation = { type: 'put'; key: Buffer; value: Buffer } | { type: 'delete'; key: Buffer };
 
@@ -107,7 +107,6 @@ export function createHostStorageHandler(
 
 function decodeWritePolicy(encoded: number): HostWritePolicy {
 	if (encoded === 1) return 'wal';
-	if (encoded === 2) return 'wal-sync';
 	if (encoded === 3) return 'no-wal';
 	throw new Error(`unknown host storage write policy ${encoded}`);
 }

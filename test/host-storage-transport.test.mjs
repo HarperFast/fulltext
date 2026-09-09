@@ -157,9 +157,44 @@ test('KvDirectory and Tantivy operate through the host storage transport', async
 	await verifyTantivy(handle);
 	assert.ok(requests.includes('read'), 'read requests were issued');
 	assert.ok(requests.includes('write:wal'), 'ordinary objects use WAL writes');
-	assert.ok(requests.includes('write:wal-sync'), 'metadata publication uses a synchronous WAL write');
-	assert.ok(requests.includes('sync'), 'directory sync requests were issued');
+	assert.ok(!requests.includes('write:wal-sync'), 'the host is not asked for an unsupported per-write sync primitive');
+	assert.ok(requests.includes('sync'), 'metadata publication and directory sync use explicit durability barriers');
 	assert.ok(entries.size > 0, 'Tantivy state remains in host storage for reopen');
+});
+
+test('a failed durability barrier does not pretend the preceding atomic write rolled back', async (context) => {
+	const entries = new Map();
+	let writes = 0;
+	let syncs = 0;
+	const storage = {
+		read(key) {
+			return entries.get(key.toString('hex'));
+		},
+		write(mutations, policy) {
+			assert.strictEqual(policy, 'wal');
+			writes++;
+			for (const mutation of mutations) {
+				const key = mutation.key.toString('hex');
+				if (mutation.type === 'put') entries.set(key, Buffer.from(mutation.value));
+				else entries.delete(key);
+			}
+		},
+		sync() {
+			if (++syncs === 1) throw new Error('injected durability failure');
+		},
+	};
+	const handler = createHostStorageHandler(storage, {
+		maxMutations: 1_024,
+		maxReadResponseBytes: readResponseBytes,
+		maxControlResponseBytes: controlResponseBytes,
+		maxErrorBytes: controlResponseBytes,
+	});
+	const handle = addon.__testOpenHostTransport(handler, 32, 40 * 1024 * 1024, 5_000);
+	context.after(() => addon.__testCloseHostTransport(handle));
+
+	await assert.rejects(verifyTantivy(handle), /injected durability failure/);
+	assert.ok(writes > 0, 'the atomic WAL write completed before its durability barrier failed');
+	assert.ok(entries.size > 0, 'the transport does not report that applied writes were rolled back');
 });
 
 test('host storage failures cross the native boundary without escaping JavaScript', async (context) => {
@@ -222,6 +257,7 @@ test('host storage handler preserves no-WAL policy and rejects malformed frames'
 
 	assert.deepStrictEqual(handler(Buffer.from([1, 2, 3, 1, 0, 0, 0, 2, 1, 0, 0, 0, 97])), Buffer.from([1, 0]));
 	assert.deepStrictEqual(policies, ['no-wal']);
+	assert.match(decodeHandlerError(handler(Buffer.from([1, 2, 2, 0, 0, 0, 0]))), /unknown.*write policy/);
 	assert.match(decodeHandlerError(handler(Buffer.from([2, 3]))), /unsupported.*protocol version/);
 	assert.match(decodeHandlerError(handler(Buffer.from([1, 1, 4, 0, 0]))), /truncated/);
 });
