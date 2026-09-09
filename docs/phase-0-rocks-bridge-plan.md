@@ -153,32 +153,36 @@ and package-isolation cases still run.
 
 ## Logical object prototype
 
-Phase 0 uses the smallest mapping capable of exercising the Directory semantics. It is not yet the
-production format.
+The first Harper mapping uses fixed-size data chunks and a versioned tail. The chunk size is an
+internal format choice, not a schema or factory option. It remains subject to the benchmark sweep
+before the persisted format is declared stable.
 
 ```text
 namespace / index generation
-  working/<object-id>/fragment/<sequence>     -> immutable flushed bytes
-  object/<object-id>                          -> sealed ordered fragments and total length
-  binding/<logical-path>                      -> object-id and visible length
-  atomic/<logical-path>                       -> complete small-file bytes and revision
-  pending/<object-id>                         -> recovery marker
+  chunk/<object-id>/<ordinal>          -> immutable 256 KiB data chunk
+  tail/<object-id>/<revision>          -> immutable final partial chunk
+  binding/<logical-path>               -> v2 object-id, chunk count, tail revision and visible length
+  atomic/<logical-path>                -> complete small-file bytes
 ```
 
-`open_write()` creates a new object identity and a logical binding with visible length zero. Bytes
-may be buffered only until the next writer flush. A successful flush writes one or more new fragment
-keys and atomically replaces the binding with the complete ordered fragment list and visible length.
-Fragment keys are write-once: an append after flush starts a new fragment even when the preceding
-fragment is smaller than the target chunk size. This is the isolation source for an open handle; a
-handle captures one binding revision, object identity, fragment list, and visible length, so later
-flushes never change any key it may read. Termination flushes and seals the object. Deleting removes
-the binding; object bytes remain available while native handles retain them and become reclaimable
-afterward.
+`open_write()` creates a new object identity and a zero-length binding. The writer stages each full
+chunk under its final ordinal with a WAL write while retaining at most one partial chunk. `flush()`
+atomically publishes a new binding and an immutable, revisioned tail. Filling a previously published
+tail creates a full chunk and a later binding revision; it never overwrites bytes visible to an
+existing file handle. A failed or interrupted publication leaves the old binding readable and may
+leave only unreachable chunks or tails for bounded garbage collection.
 
-`atomic_write()` stores the complete small value and replaces its logical revision in one RocksDB
-write batch. It is used for metadata such as `meta.json` and `.managed.json`, not large segment
-output. Phase 0 verifies the semantic boundary; issue #11 defines the production encoding,
-versioning, garbage collection, and bounded chunk policy.
+A file handle captures one binding value. It computes a full-chunk key directly from the requested
+offset and reads the versioned tail only when the range intersects it. A range contained in one
+chunk therefore performs one payload lookup regardless of file size; ranges spanning boundaries
+perform one lookup per intersecting chunk. No read walks or fetches preceding payloads.
+
+Termination flushes the remaining tail. Deleting removes the binding; immutable chunks and tails
+remain readable through already-open handles and become reclaimable after those handles drain.
+
+`atomic_write()` stores the complete small value in one RocksDB write batch. It is used for metadata
+such as `meta.json` and `.managed.json`, not large segment output. Issue #11 still owns format
+qualification, bounded orphan reclamation and the chunk-size performance sweep before release.
 
 ## Experiment matrix
 
