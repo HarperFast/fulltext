@@ -9,8 +9,8 @@ readiness wait for a complete sweep.
 
 ## Grounding
 
-This plan is written against fulltext main at `b9964b0`, the rebase-merged result of
-[Prevent Harper full-text index key collisions #24](https://github.com/HarperFast/fulltext/pull/24).
+This plan is written against fulltext main at `a982e8a`, the rebase-merged result of
+[Track directory object high-water marks #25](https://github.com/HarperFast/fulltext/pull/25).
 `KvDirectory` stores immutable 256 KiB chunks and revisioned tails. `delete()` currently removes
 only logical bindings, each successful `flush()` can leave the previous tail revision unreachable,
 and a crashed writer can leave staged chunks that no binding ever named. `KvStore` supplies point
@@ -78,11 +78,12 @@ it persists a managed path before calling `open_write()`, and garbage collection
 underlying `delete()` before removing that path from `.managed.json`. A crash-abandoned writer
 therefore remains named by its binding and managed path until it is placed on the reclaim FIFO.
 
-When `flush()` supersedes a non-empty tail, its publication batch appends a tail-only reclaim entry
-for the old revision. This avoids deleting bytes needed by an open handle and prevents an active,
-long-lived logical file from accumulating tail revisions until final deletion. Queue entries are
-the durable consequence of the transition that made the bytes unreachable, not a second source-data
-journal.
+Whole-object deletion already covers every tail revision through `tail_high_water`. Tail-only
+enqueue is deferred to slice 4 and retained only if measurement shows that repeated non-empty tail
+publication materially increases live-index storage before final file deletion. If retained, the
+publication batch appends the exact old revision so bytes cannot be deleted while an earlier handle
+still references them. Queue entries are the durable consequence of the transition that made bytes
+unreachable, not a second source-data journal.
 
 The FIFO is split into a fixed number of shards selected by object id. Each shard has its own head,
 tail, sequence-addressed entries, and enqueue mutex; unrelated publishers do not wait on one global
@@ -94,25 +95,39 @@ the TypeScript handler, and rocksdb-js gain no new primitive.
 
 ### Protect handles and writers
 
-Replace the directory-wide mutation mutex with per-path shared/exclusive state plus a dedicated
-allocator mutex for the read-modify-write object counter and per-shard FIFO-enqueue mutexes. The
-path registry performs an O(1) lookup and never runs a whole-map retain on the indexing or reload
-path. File-handle opens take a shared path gate while reading and registering the immutable binding;
-opens on the same file remain concurrent. Chunk staging, flush, delete, and replacement take the
-exclusive side, preventing delete from capturing a high-water while the old writer creates another
-chunk. A deleted writer is marked retired so a later write cannot stage new payload.
+Replace the directory-wide mutation mutex with per-path lifecycle state, a strided object-id
+allocator, and per-shard FIFO-enqueue mutexes. The allocator durably reserves a fixed range under its
+mutex and hands out ids from that range without storage reads; gaps after failure or restart are safe
+in the `u64` identity space. The path registry
+performs an O(1) lookup and never runs a whole-map retain on the indexing or reload path. In slice 3,
+only `open_write()`, `atomic_write()`, and `delete()` take the path's exclusive lifecycle gate;
+file-handle opens remain unchanged until pin registration lands. A writer owns an atomic retirement
+and in-flight-operation fence. Each physical write registers in flight, rechecks retirement with
+sequentially consistent ordering, issues the storage operation, and releases an RAII claim. Delete
+retires the writer, waits for existing claims to reach their definitive result, then rereads the
+binding before enqueueing its final high-waters. Host mutations are deliberately uncancellable once
+dispatched, so writer retirement uses the same unbounded completion contract instead of inventing
+an unrelated timeout. Closing the host wakes pending operations and releases their claims. No path
+gate is held by chunk staging or publication across a host round trip.
 
 Pins are indexed by object id, not logical path, so delete/recreate cannot hide handles to the prior
 object. A handle owns an `Arc` pin, and drop only decrements the `Arc`. Pin insertion prunes dead weak
 entries above a small fixed threshold, and FIFO visits prune them again. This bounds control-block
 retention during repeated open/drop churn. Writer state is likewise retained through failed and
-unterminated writes. Gates recover poisoned state rather than panicking the writer actor.
+unterminated writes. Gates recover poisoned state rather than panicking the writer actor. Pins land
+with the FIFO consumer in slice 4, where a test can prove that they prevent payload deletion. Harper
+may enable cleanup only after a two-worker test proves that every local search handle for one
+RocksDB-backed generation reaches the same native `DirectoryState`. A process that cannot establish
+that invariant cannot obtain the cleanup owner lease.
 
 Cleanup never holds a path gate or pin-registry lock across storage I/O. A retired object cannot gain
 a new pin because its binding is gone; a tail-only entry can gain no new pin for its old revision
 after the newer binding is published. Whole-object entries match any pin for that object, while
-tail-only entries match only the exact object id and tail revision. If a matching pin remains, the
-entry is rotated to its shard's tail with bounded backoff rather than blocking later garbage.
+tail-only entries match only the exact object id and tail revision. If a matching pin remains,
+cleanup moves the entry to a cleanup-only deferred queue with bounded backoff rather than blocking
+later garbage. Foreground publishers only mutate the ingress tail; cleanup only mutates the ingress
+head and deferred queue. A low-priority cleanup host operation therefore never owns the mutex or
+counter needed by a foreground enqueue.
 
 This process-local pin model is valid only while Harper's derived-index lifecycle guarantees one
 active generation owner. Cleanup requires an explicit owner lease supplied by that lifecycle; the
@@ -120,6 +135,57 @@ production host cannot invoke it without one. Admission checks the lease before 
 loss or close revokes admission, fails the transport before joining, waits for any definitive
 mutation result, and drains the cleanup task. The Directory does not invent a second cross-process
 lock or compare-and-set protocol that the supported storage contract cannot enforce.
+
+### Slice 3 transition rules
+
+Slice 3 adds durable enqueue and writer-lifetime protection, but deliberately does not read or drain
+the reclaim FIFO and does not install unused reader pins. The invariant for this slice is: once a binding transition makes bytes
+unreachable, the same atomic WAL batch records exactly one reclaim entry, and no prior writer can
+stage more bytes for the retired object after that transition begins.
+
+The path registry stores weak references and removes only the requested stale entry during lookup.
+The final path-state drop compares its weak identity under the registry lock before removing its own
+entry, so replacement cannot trigger an ABA removal. The registry is touched once per writer
+lifecycle, atomic-file transition, and deletion, not by chunk staging or file-handle reads. Each
+writer retains the shared `DirectoryState` as well as its path state, so reconstructing a Directory
+while a writer remains open converges on the registry that contains its fence. Each path state
+contains an exclusive lifecycle gate and a weak reference to the active writer, whose object id is
+checked before retirement. Writer storage operations use an RAII in-flight claim; after acquiring it they recheck
+retirement with `SeqCst` ordering immediately before their first dependent store operation. Delete
+retires only the writer whose object id matches the binding, waits for its in-flight claims to reach
+zero, and rereads the binding before constructing the retirement entry. Different paths therefore proceed
+independently except when replenishing the strided object-id allocator or enqueueing onto the same
+reclaim shard.
+
+Each reclaim shard is a zero-based, monotonic FIFO. Its persisted tail is the next unused sequence;
+an absent tail means zero. Foreground enqueue rereads that durable tail under the shard mutex for
+every deletion; it never allocates from a cached value. It also reads the current slot and fails
+`InvalidData` if occupied, exposing pre-existing queue corruption instead of overwriting an entry.
+That point read cannot detect two incorrectly separated `DirectoryState` instances that both observe
+an empty slot before either writes; the canonical-identity and single-owner gates are therefore
+load-bearing correctness requirements, not redundant checks. Enqueue writes the sequence-addressed entry and advances the tail in the same
+deletion batch. Slice 3 entries contain the object id plus both high-waters. The shard count and later
+pin-pruning cadence are internal hard bounds, not customer configuration.
+
+Delete retires a matching writer before issuing its batch because a returned I/O error may still
+mean the batch committed.
+Tantivy 0.26.1 treats `FileDoesNotExist` as a successful garbage-collection retry, so a committed
+delete whose result was lost does not require a path tombstone or another storage primitive.
+An undecodable binding fails deletion with `InvalidData`; Harper marks that derived generation for
+rebuild rather than guessing an object extent or allowing Tantivy to retry it indefinitely.
+A definitively failed delete rereads the binding while it still owns the path lifecycle gate. If the
+same binding remains, the writer fence is reopened and the error is returned; if the binding is gone,
+the atomic enqueue also committed and delete succeeds. An unreadable or unexpected binding keeps the
+writer retired and fails closed. Invalid persisted directory or queue data is a
+generation-corruption signal; slice 4 must surface that terminal health state to Harper before
+production is enabled rather than relying on Tantivy's repeated GC attempt.
+
+Queue writers for one namespace must share one `DirectoryState`. This follows the existing
+`KvStoreIdentity` provider contract, not the transport handle: the identity must represent the live
+RocksDB store incarnation and derived column family. The production host stays disabled until the
+Harper integration proves that two transports for the same generation converge on that identity and
+that only the derived-index owner can write. A test-only transport handle may identify a store only
+when that handle is its sole access path.
 
 ### Reclaim with bounded point operations
 
@@ -145,17 +211,24 @@ silently retries forever or advances past unknown data.
 
 ## Alternatives
 
-| Axis                     | Candidate and disposition                                                                                                                                                                                                                |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Different layer          | RocksDB compaction and Harper log retention cannot see Tantivy handles. `ManagedDirectory` owns logical retirement, while `KvDirectory` owns physical retirement.                                                                        |
-| Discovery                | Prefix enumeration or a dense object-id sweep. `KvStore` exposes no enumeration primitive, and either scan would do work proportional to stored history rather than garbage.                                                             |
-| Managed paths            | Treat Tantivy's `.managed.json` as the discovery source. It names logical paths, not object ids, chunk ordinals, or tail revisions, so delete/recreate cannot recover the retired object's extent.                                       |
-| Bound placement          | Update the binding with every payload, reserve bounded strides in the binding, or add a separate per-object extent key. Strided binding reservation is chosen: it keeps deletion capture atomic in slice 3 without per-chunk host reads. |
-| Different timing         | Delete up to a fixed number of chunks synchronously in `delete()` and enqueue only the remainder. This may help small objects, but it lengthens Tantivy metadata GC and is deferred until measurement shows a net win.                   |
-| Lower-layer range delete | Add a range-tombstone primitive. This expands the frozen Harper storage surface and makes foreground reads pay tombstone checks until compaction in a shared column family, so it is rejected for the first release.                     |
-| Deeper cause             | Record existence in the batch that creates each key and enqueue retirement in the batch that makes it unreachable. This is the chosen foundation.                                                                                        |
-| Do less                  | Reclaim only final object deletion and leave superseded tails until then. Reusing tail keys is invalid because opened handles require immutable revisions; real flush-count measurement remains a gate.                                  |
-| Chosen                   | Binding high-waters plus a transition-fed durable FIFO, with object-id pins and bounded low-priority draining.                                                                                                                           |
+| Axis                     | Candidate and disposition                                                                                                                                                                                                                                                                                                               |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Different layer          | RocksDB compaction and Harper log retention cannot see Tantivy handles. `ManagedDirectory` owns logical retirement, while `KvDirectory` owns physical retirement.                                                                                                                                                                       |
+| Discovery                | Prefix enumeration or a dense object-id sweep. `KvStore` exposes no enumeration primitive, and either scan would do work proportional to stored history rather than garbage.                                                                                                                                                            |
+| Managed paths            | Treat Tantivy's `.managed.json` as the discovery source. It names logical paths, not object ids, chunk ordinals, or tail revisions, so delete/recreate cannot recover the retired object's extent.                                                                                                                                      |
+| Bound placement          | Update the binding with every payload, reserve bounded strides in the binding, or add a separate per-object extent key. Strided binding reservation is chosen: it keeps deletion capture atomic in slice 3 without per-chunk host reads.                                                                                                |
+| Different timing         | Delete up to a fixed number of chunks synchronously in `delete()` and enqueue only the remainder. This may help small objects, but it lengthens Tantivy metadata GC and is deferred until measurement shows a net win.                                                                                                                  |
+| Lower-layer range delete | Add a range-tombstone primitive. This expands the frozen Harper storage surface and makes foreground reads pay tombstone checks until compaction in a shared column family, so it is rejected for the first release.                                                                                                                    |
+| Deeper cause             | Record existence in the batch that creates each key and enqueue retirement in the batch that makes it unreachable. This is the chosen foundation.                                                                                                                                                                                       |
+| Do less                  | Slice 3 enqueues only whole-object deletion. It leaves superseded tails within the object's high-water until final deletion; tail-only enqueue moves to slice 4 and ships only if measured tail accumulation justifies publication-path cost.                                                                                           |
+| Higher-layer rotation    | Rebuild into a fresh Harper generation and drop the old column family. This remains the corruption-recovery path, but routine reclamation would require replaying hundreds of millions of records and would move cleanup outside the standalone library.                                                                                |
+| Reader lifetime          | Process-wide object/revision `Arc` pins are chosen because they exactly model Tantivy handle lifetime without a read-time storage call. A Harper two-worker shared-state test is an enablement gate. A searcher epoch would require a new cross-layer reader API, and a wall-clock grace cannot prove that a reader released the bytes. |
+| Enqueue naming           | An object-id-addressed record requires scanning every allocated id because `KvStore` has no enumeration. Rewriting a tombstone binding under the logical path loses the old object on path reuse. A persisted sharded sequence FIFO is chosen because its point-read cost is proportional to garbage transitions.                       |
+| Writer fence             | Holding a path lock across each chunk write would add lock convoying around an uncancellable host round trip. A per-writer atomic retired/in-flight fence is chosen: delete closes admission and waits before its final binding read, while chunk staging adds no mutex or allocation.                                                  |
+| Object-id allocation     | Updating the counter with every binding creation serializes file creation across a host round trip. The allocator reserves fixed durable strides, reducing that shared operation to one per stride; unused ids after failure or restart are harmless.                                                                                   |
+| Queue-tail reads         | Cache the next sequence and reread only after errors, or point-read it before every enqueue. The durable point read is chosen because slice 3 enqueues only file deletion rather than indexed documents, removes cache recovery state, and is measured explicitly.                                                                      |
+| Cleanup priority         | Cleanup does not rotate through the foreground ingress tail. A cleanup-only deferred queue lets the consumer advance past pinned entries without holding a foreground enqueue mutex or counter across low-priority host I/O.                                                                                                            |
+| Chosen                   | Binding high-waters plus a transition-fed durable FIFO, with object-id pins and bounded low-priority draining.                                                                                                                                                                                                                          |
 
 ## Persistence format and delivery sequence
 
@@ -169,12 +242,12 @@ Then deliver reclamation in reviewable slices:
 1. versioned namespace encoding and format validation;
 2. binding high-waters and atomic updates at chunk staging and flush; update the writer replacement
    guard and in-memory binding together so high-water-only changes cannot look like path replacement;
-3. per-path shared/exclusive state, object-id/revision pins, and atomic sharded-FIFO enqueue at tail
-   supersession and object deletion; key writer retirement by object id so path reuse cannot retire
-   the replacement writer;
-4. bounded FIFO draining, low-priority admission, failure observability, close fencing, crash
-   recovery, and Harper's
-   exclusive-owner integration.
+3. per-path lifecycle state, a strided object-id allocator, an atomic writer fence, and sharded-FIFO
+   enqueue at object deletion; key writer retirement by object id so path reuse cannot retire the
+   replacement writer;
+4. measure and, if justified, add tail-supersession entries; then add object-id/revision pins,
+   bounded FIFO draining and deferred queues, low-priority admission, failure observability, close
+   fencing, crash recovery, and Harper's exclusive-owner integration.
 
 The production Harper package remains disabled until slice 4's lifecycle fence and Harper host-
 storage integration both pass. No native RocksDB storage provider is added to the public library.
@@ -186,6 +259,21 @@ physical keys. Before deletion is introduced in slice 3, every visible or crash-
 tail must fall within its surviving binding's bounds. Tests cover reservation failure and adoption,
 idempotent chunk retry, already-published flush retry, empty-tail bounds, former-format rejection at
 every entry point, decode-time extent limits, and exact reservation I/O counts.
+
+Slice 3 tests the deletion batch directly: object deletion produces one whole-object entry, and a
+confirmed committed delete cannot duplicate or overwrite it on retry. Every enqueue reads the
+persisted shard tail and the target slot, including after reopen. A repeat-count same-path
+writer/delete race proves the `SeqCst` retired/in-flight protocol; different-path deletion and
+different-shard enqueue remain concurrent. A definitively failed delete restores a matching writer,
+while a confirmed committed delete leaves it retired. `CountingKv` fixes the active-writer and
+closed-writer point-read, write-call, and mutation deltas for delete and proves that a covered chunk write adds no read or mutex-backed
+storage operation. Atomic-only deletion neither decodes nor enqueues a binding. Reclaim entries
+round-trip their exact extents, and malformed bindings, entries, and queue tails fail as
+`InvalidData` before they can schedule work. A whole-store audit rejects an entry that names a still
+live object and verifies that every deleted object's physical keys fit its queued high-waters after
+real Tantivy merge and garbage-collection cycles and after crash/reopen. `FaultingKv` models WAL
+recovery at atomic batch boundaries; the Harper integration separately proves that one host write
+request commits as one RocksDB batch.
 
 The completed mapping tests cover repeated flush, delete/recreate with a retained old reader,
 abandoned writers, partial object cleanup, restart during a range and between FIFO entries, namespace
