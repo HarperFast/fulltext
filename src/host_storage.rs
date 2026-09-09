@@ -13,7 +13,7 @@ use napi_derive::napi;
 use tantivy::directory::OwnedBytes;
 
 use crate::boundary;
-use crate::phase0::{KvDirectory, KvStore, KvStoreIdentity, Mutation, WritePolicy};
+use crate::phase0::{KvDirectory, KvStore, KvStoreIdentity, Mutation, WritePolicy, CHUNK_SIZE};
 
 type HostCallback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
 type CompletionCallback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
@@ -365,6 +365,9 @@ const VALUE_MISSING: u8 = 0;
 const VALUE_PRESENT: u8 = 1;
 const MUTATION_PUT: u8 = 1;
 const MUTATION_DELETE: u8 = 2;
+const READ_RESPONSE_OVERHEAD: usize = 7;
+const MINIMUM_READ_REQUEST_BYTES: usize = 6;
+const MINIMUM_PUT_REQUEST_OVERHEAD: usize = 16;
 
 #[derive(Clone)]
 struct HostKvStore {
@@ -380,13 +383,34 @@ impl HostKvStore {
 		identity: KvStoreIdentity,
 		max_read_response_bytes: usize,
 		max_control_response_bytes: usize,
-	) -> Self {
-		Self {
+	) -> io::Result<Self> {
+		let minimum_read_response = CHUNK_SIZE + READ_RESPONSE_OVERHEAD;
+		if max_read_response_bytes < minimum_read_response {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("host read response budget must be at least {minimum_read_response} bytes"),
+			));
+		}
+		let minimum_read_transport = max_read_response_bytes
+			.checked_add(MINIMUM_READ_REQUEST_BYTES)
+			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host read byte budget overflow"))?;
+		let minimum_write_transport = CHUNK_SIZE
+			.checked_add(MINIMUM_PUT_REQUEST_OVERHEAD)
+			.and_then(|bytes| bytes.checked_add(max_control_response_bytes))
+			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host write byte budget overflow"))?;
+		let minimum_transport_bytes = minimum_read_transport.max(minimum_write_transport);
+		if transport.max_bytes < minimum_transport_bytes {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("host transport byte budget must be at least {minimum_transport_bytes} bytes"),
+			));
+		}
+		Ok(Self {
 			transport,
 			identity,
 			max_read_response_bytes,
 			max_control_response_bytes,
-		}
+		})
 	}
 
 	fn request(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
@@ -742,7 +766,7 @@ pub fn test_verify_tantivy_on_host_transport(
 						KvStoreIdentity(1, handle as u64, 1),
 						max_read_response_bytes as usize,
 						max_control_response_bytes as usize,
-					);
+					)?;
 					let run = NEXT_TRANSPORT_HANDLE.fetch_add(1, Ordering::Relaxed);
 					let case = AtomicU32::new(0);
 					crate::directory_harness::verify_directory_contract(|| {

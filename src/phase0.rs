@@ -53,7 +53,7 @@ pub trait KvStore: Clone + Send + Sync + 'static {
 	fn sync(&self) -> io::Result<()>;
 }
 
-const CHUNK_SIZE: usize = 256 * 1024;
+pub(crate) const CHUNK_SIZE: usize = 256 * 1024;
 
 impl Mutation {
 	fn key(&self) -> &[u8] {
@@ -861,12 +861,15 @@ fn encode_binding(binding: &Binding) -> Vec<u8> {
 }
 
 fn decode_binding(bytes: &[u8]) -> io::Result<Binding> {
-	if bytes.len() != 33 || bytes[0] != 2 {
+	if bytes.first().copied() != Some(2) {
 		let version = bytes.first().copied().unwrap_or(0);
 		return Err(io::Error::new(
 			io::ErrorKind::InvalidData,
 			format!("unsupported binding format version {version}"),
 		));
+	}
+	if bytes.len() != 33 {
+		return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed binding"));
 	}
 	let visible_length = usize::try_from(decode_u64(&bytes[25..33])?)
 		.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "binding length exceeds this platform"))?;
@@ -1307,6 +1310,13 @@ mod tests {
 		let error = decode_binding(&[1]).unwrap_err();
 		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 		assert!(error.to_string().contains("version 1"));
+	}
+
+	#[test]
+	fn distinguishes_a_malformed_current_binding() {
+		let error = decode_binding(&[2; 20]).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert_eq!(error.to_string(), "malformed binding");
 	}
 
 	#[test]
