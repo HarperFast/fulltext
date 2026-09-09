@@ -370,8 +370,8 @@ impl<S: KvStore> FileHandle for KvFileHandle<S> {
 		copied
 			.try_reserve(range.len())
 			.map_err(|_| io::Error::other("requested file range cannot be allocated"))?;
-		let last_full_chunk = last_chunk.min((self.binding.full_chunks as usize).saturating_sub(1));
-		for chunk in first_chunk..=last_full_chunk {
+		let full_chunk_limit = last_chunk.saturating_add(1).min(self.binding.full_chunks as usize);
+		for chunk in first_chunk..full_chunk_limit {
 			let value = self.read_chunk(chunk)?;
 			let chunk_start = chunk * CHUNK_SIZE;
 			let start = range.start.saturating_sub(chunk_start);
