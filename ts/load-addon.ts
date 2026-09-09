@@ -24,6 +24,26 @@ interface NativeAddonApi {
 	__testPanic?(id: number): void;
 	__testCheck?(id: number): boolean;
 	__testPoisonNativeHandle?(handle: number): void;
+	__testOpenHostTransport?(
+		handler: (request: Buffer) => Buffer,
+		maxOperations: number,
+		maxBytes: number,
+		readTimeoutMs: number,
+	): number;
+	__testHostRoundTrip?(
+		handle: number,
+		request: Buffer,
+		responseBudget: number,
+		useTimeout: boolean,
+		callback: NativeCallback,
+	): void;
+	__testVerifyTantivyOnHostTransport?(
+		handle: number,
+		maxReadResponseBytes: number,
+		maxControlResponseBytes: number,
+		callback: NativeCallback,
+	): void;
+	__testCloseHostTransport?(handle: number): boolean;
 }
 
 export type NativeCallback = (response: Buffer) => void;
