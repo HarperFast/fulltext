@@ -695,7 +695,6 @@ impl<S: KvStore> Write for KvWriter<S> {
 			.map_err(|_| io::Error::other("writer buffer cannot be allocated"))?;
 		self.tail.extend_from_slice(&bytes[..accepted]);
 		self.dirty = true;
-		self.stage_full_tail()?;
 		Ok(accepted)
 	}
 
@@ -734,7 +733,8 @@ impl<S: KvStore> Write for KvWriter<S> {
 			object_id: self.binding.object_id,
 			full_chunks,
 			tail_revision,
-			tail_length: u32::try_from(self.tail.len()).expect("tail length is bounded by CHUNK_SIZE"),
+			tail_length: u32::try_from(self.tail.len())
+				.map_err(|_| io::Error::other("tail length exceeds its format"))?,
 			visible_length,
 		};
 		let binding = Mutation::Put(binding_key(&self.namespace, &self.path), encode_binding(&next));
@@ -828,17 +828,25 @@ fn prefixed_path(prefix: &[u8], path: &Path) -> Vec<u8> {
 }
 
 fn chunk_key(namespace: &[u8], object_id: u64, chunk: u32) -> Vec<u8> {
-	let mut key = namespaced_prefix(namespace, b"chunk/");
+	let mut key = namespaced_prefix_with_capacity(namespace, b"chunk/", 12);
 	key.extend_from_slice(&object_id.to_be_bytes());
 	key.extend_from_slice(&chunk.to_be_bytes());
 	key
 }
 
 fn tail_key(namespace: &[u8], object_id: u64, revision: u64) -> Vec<u8> {
-	let mut key = namespaced_prefix(namespace, b"tail/");
+	let mut key = namespaced_prefix_with_capacity(namespace, b"tail/", 16);
 	key.extend_from_slice(&object_id.to_be_bytes());
 	key.extend_from_slice(&revision.to_be_bytes());
 	key
+}
+
+fn namespaced_prefix_with_capacity(namespace: &[u8], suffix: &[u8], additional: usize) -> Vec<u8> {
+	let mut prefix = Vec::with_capacity(namespace.len() + suffix.len() + 1 + additional);
+	prefix.extend_from_slice(namespace);
+	prefix.push(b'/');
+	prefix.extend_from_slice(suffix);
+	prefix
 }
 
 fn encode_binding(binding: &Binding) -> Vec<u8> {
@@ -854,7 +862,11 @@ fn encode_binding(binding: &Binding) -> Vec<u8> {
 
 fn decode_binding(bytes: &[u8]) -> io::Result<Binding> {
 	if bytes.len() != 33 || bytes[0] != 2 {
-		return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid binding"));
+		let version = bytes.first().copied().unwrap_or(0);
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("unsupported binding format version {version}"),
+		));
 	}
 	let visible_length = usize::try_from(decode_u64(&bytes[25..33])?)
 		.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "binding length exceeds this platform"))?;
@@ -1112,7 +1124,7 @@ mod tests {
 	}
 
 	#[test]
-	fn file_handle_reads_across_chunk_boundaries() {
+	fn file_handle_reads_across_flush_boundaries() {
 		let directory = FaultingDirectory::new(FaultingKv::default());
 		let mut writer = directory.open_write(Path::new("segment")).unwrap();
 		writer.write_all(b"first").unwrap();
@@ -1150,6 +1162,25 @@ mod tests {
 	}
 
 	#[test]
+	fn exact_chunk_multiple_has_no_tail_and_reads_its_boundary() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let bytes = vec![7; CHUNK_SIZE * 2];
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(&bytes).unwrap();
+		writer.flush().unwrap();
+
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", Path::new("segment"))).unwrap()).unwrap();
+		assert_eq!(binding.full_chunks, 2);
+		assert_eq!(binding.tail_length, 0);
+		let file = directory.open_read(Path::new("segment")).unwrap();
+		assert_eq!(
+			file.read_bytes_slice(0..CHUNK_SIZE).unwrap().as_slice(),
+			&bytes[..CHUNK_SIZE]
+		);
+	}
+
+	#[test]
 	fn range_reads_fetch_only_intersecting_chunks() {
 		let store = CountingKv::new();
 		let directory = KvDirectory::new(store.clone());
@@ -1170,6 +1201,14 @@ mod tests {
 		);
 		assert_eq!(store.take_reads(), 1);
 
+		let start = CHUNK_SIZE / 2;
+		let end = CHUNK_SIZE * 2 + 100;
+		assert_eq!(
+			file.read_bytes_slice(start..end).unwrap().as_slice(),
+			&bytes[start..end]
+		);
+		assert_eq!(store.take_reads(), 3);
+
 		let start = CHUNK_SIZE * 4 - 11;
 		let end = CHUNK_SIZE * 4 + 17;
 		assert_eq!(
@@ -1180,13 +1219,34 @@ mod tests {
 	}
 
 	#[test]
-	fn failed_full_chunk_staging_can_be_retried() {
+	fn filling_a_published_tail_does_not_change_an_open_handle() {
+		let directory = FaultingDirectory::new(FaultingKv::default());
+		let first_bytes = vec![3; CHUNK_SIZE - 17];
+		let appended = vec![5; 34];
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(&first_bytes).unwrap();
+		writer.flush().unwrap();
+		let first = directory.open_read(Path::new("segment")).unwrap();
+
+		writer.write_all(&appended).unwrap();
+		writer.flush().unwrap();
+		let second = directory.open_read(Path::new("segment")).unwrap();
+		assert_eq!(first.read_bytes().unwrap().as_slice(), first_bytes);
+		assert_eq!(
+			second.read_bytes().unwrap().as_slice(),
+			[first_bytes, appended].concat()
+		);
+	}
+
+	#[test]
+	fn failed_full_chunk_staging_can_be_retried_during_flush() {
 		let store = FaultingKv::default();
 		let directory = FaultingDirectory::new(store.clone());
 		let bytes = vec![7; CHUNK_SIZE];
 		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(&bytes).unwrap();
 		store.fail_next_write();
-		assert!(writer.write_all(&bytes).is_err());
+		assert!(writer.flush().is_err());
 		writer.flush().unwrap();
 		assert_eq!(
 			directory
@@ -1197,6 +1257,56 @@ mod tests {
 				.as_slice(),
 			bytes
 		);
+	}
+
+	#[test]
+	fn staging_failure_does_not_consume_the_failing_write() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let binding = Binding {
+			object_id: 1,
+			full_chunks: 0,
+			tail_revision: 0,
+			tail_length: 0,
+			visible_length: 0,
+		};
+		store
+			.write(
+				&[Mutation::Put(
+					binding_key(b"phase0", Path::new("segment")),
+					encode_binding(&binding),
+				)],
+				WritePolicy::WAL,
+			)
+			.unwrap();
+		let mut writer = KvWriter {
+			store,
+			state: directory.state.clone(),
+			namespace: directory.namespace.clone(),
+			path: PathBuf::from("segment"),
+			binding,
+			tail: Vec::new(),
+			staged_full_chunks: 0,
+			dirty: false,
+		};
+		let prefix = vec![1; CHUNK_SIZE - 4_096];
+		let suffix = vec![2; 8_192];
+		assert_eq!(writer.write(&prefix).unwrap(), prefix.len());
+		writer.store.fail_next_write();
+		assert_eq!(writer.write(&suffix).unwrap(), 4_096);
+		assert!(writer.write(&suffix[4_096..]).is_err());
+		assert_eq!(writer.write(&suffix[4_096..]).unwrap(), 4_096);
+		writer.flush().unwrap();
+
+		let file = directory.open_read(Path::new("segment")).unwrap();
+		assert_eq!(file.read_bytes().unwrap().as_slice(), [prefix, suffix].concat());
+	}
+
+	#[test]
+	fn rejects_an_older_binding_format_with_its_version() {
+		let error = decode_binding(&[1]).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert!(error.to_string().contains("version 1"));
 	}
 
 	#[test]

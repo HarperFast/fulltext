@@ -177,6 +177,12 @@ offset and reads the versioned tail only when the range intersects it. A range c
 chunk therefore performs one payload lookup regardless of file size; ranges spanning boundaries
 perform one lookup per intersecting chunk. No read walks or fetches preceding payloads.
 
+The host factory must reject transport limits that cannot carry this format. A full-chunk read
+response requires at least `CHUNK_SIZE + 7` bytes for the protocol envelope, and the transport's
+retained-byte budget must cover the encoded request plus that response. The Phase 0 sweep records
+small-read amplification and retained `OwnedBytes` because a slice keeps its complete chunk
+allocation alive; a bounded chunk cache is considered only if those measurements justify it.
+
 Termination flushes the remaining tail. Deleting removes the binding; immutable chunks and tails
 remain readable through already-open handles and become reclaimable after those handles drain.
 
