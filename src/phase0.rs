@@ -82,7 +82,7 @@ struct State {
 	next_sequence: u64,
 	visible: BTreeMap<Vec<u8>, VersionedValue>,
 	durable: BTreeMap<Vec<u8>, VersionedValue>,
-	pending_wal: Vec<(Vec<u8>, VersionedValue)>,
+	pending_wal: Vec<Vec<(Vec<u8>, VersionedValue)>>,
 	fail_next_write: bool,
 	fail_after_next_write: bool,
 	fail_next_flush: bool,
@@ -141,6 +141,7 @@ impl FaultingKv {
 			return Err(io::Error::other("injected write failure"));
 		}
 		let fail_after_write = std::mem::take(&mut state.fail_after_next_write);
+		let mut wal_batch = Vec::with_capacity(mutations.len());
 		for mutation in mutations {
 			state.next_sequence += 1;
 			let entry = VersionedValue {
@@ -150,13 +151,18 @@ impl FaultingKv {
 			let key = mutation.key().to_vec();
 			state.visible.insert(key.clone(), entry.clone());
 			if policy.wal_enabled {
-				state.pending_wal.push((key, entry));
+				wal_batch.push((key, entry));
 			}
+		}
+		if !wal_batch.is_empty() {
+			state.pending_wal.push(wal_batch);
 		}
 		if policy.sync {
 			let pending = std::mem::take(&mut state.pending_wal);
-			for (key, entry) in pending {
-				apply_if_newer(&mut state.durable, key, entry);
+			for batch in pending {
+				for (key, entry) in batch {
+					apply_if_newer(&mut state.durable, key, entry);
+				}
 			}
 		}
 		if fail_after_write {
@@ -1378,8 +1384,10 @@ mod tests {
 		let state = store.state.lock().unwrap();
 		let mut recovered = state.durable.clone();
 		assert_object_keys_within_high_water(&recovered, namespace, path, 1);
-		for (key, entry) in &state.pending_wal {
-			apply_if_newer(&mut recovered, key.clone(), entry.clone());
+		for batch in &state.pending_wal {
+			for (key, entry) in batch {
+				apply_if_newer(&mut recovered, key.clone(), entry.clone());
+			}
 			assert_object_keys_within_high_water(&recovered, namespace, path, 1);
 		}
 	}
@@ -1847,13 +1855,14 @@ mod tests {
 		let directory = KvDirectory::new(store.clone());
 		let mut writer = directory.open_write(Path::new("segment")).unwrap();
 		store.take_io_counts();
-		writer.write_all(&vec![7; CHUNK_SIZE * 65]).unwrap();
+		writer.write_all(&vec![7; CHUNK_SIZE * 65 + 17]).unwrap();
 		writer.flush().unwrap();
 
-		assert_eq!(store.take_io_counts(), (3, 68, 68));
+		assert_eq!(store.take_io_counts(), (3, 68, 69));
 		let binding = decode_binding(&store.inner.get(&binding_key(b"phase0", Path::new("segment"))).unwrap()).unwrap();
 		assert_eq!(binding.full_chunks, 65);
 		assert_eq!(binding.chunk_high_water, 128);
+		assert_eq!(binding.tail_length, 17);
 		assert_every_wal_prefix_respects_high_waters(&store.inner, b"phase0", Path::new("segment"));
 	}
 
