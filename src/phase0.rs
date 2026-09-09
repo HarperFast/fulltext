@@ -395,7 +395,7 @@ impl WriterFence {
 	}
 
 	fn release(&self) {
-		if self.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+		if self.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 && self.retired.load(Ordering::SeqCst) {
 			let _waiting = self.waiting.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 			self.idle.notify_all();
 		}
@@ -2296,6 +2296,24 @@ mod tests {
 
 		assert_eq!(claiming.join().unwrap().unwrap_err().kind(), io::ErrorKind::NotFound);
 		assert_eq!(fence.in_flight.load(Ordering::SeqCst), 0);
+	}
+
+	#[test]
+	fn active_writer_release_does_not_take_the_retirement_mutex() {
+		let fence = Arc::new(WriterFence::new(1));
+		let waiting = fence.waiting.lock().unwrap();
+		let releasing_fence = fence.clone();
+		let (completed, completion) = std::sync::mpsc::channel();
+		let releasing = std::thread::spawn(move || {
+			drop(releasing_fence.claim().unwrap());
+			completed.send(()).unwrap();
+		});
+
+		completion
+			.recv_timeout(Duration::from_secs(5))
+			.expect("active writer release took the retirement mutex");
+		drop(waiting);
+		releasing.join().unwrap();
 	}
 
 	#[test]
