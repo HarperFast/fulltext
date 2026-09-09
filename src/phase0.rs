@@ -4,7 +4,7 @@ use std::io;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,7 @@ pub enum Mutation {
 	Delete(Vec<u8>),
 }
 
+/// Identifies one storage incarnation; providers must mint a new value after close, restore, or replacement.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct KvStoreIdentity(pub u64, pub u64, pub u64);
 
@@ -237,6 +238,7 @@ fn apply_if_newer(entries: &mut BTreeMap<Vec<u8>, VersionedValue>, key: Vec<u8>,
 pub struct KvDirectory<S> {
 	store: S,
 	namespace: Arc<[u8]>,
+	format: Arc<FormatValidation>,
 	state: Arc<DirectoryState>,
 }
 
@@ -263,6 +265,24 @@ struct DirectoryIdentity {
 }
 
 static DIRECTORY_STATES: OnceLock<Mutex<HashMap<DirectoryIdentity, Weak<DirectoryState>>>> = OnceLock::new();
+
+struct FormatValidation {
+	state: AtomicU8,
+}
+
+impl Default for FormatValidation {
+	fn default() -> Self {
+		Self {
+			state: AtomicU8::new(FORMAT_UNKNOWN),
+		}
+	}
+}
+
+impl FormatValidation {
+	fn record(&self, state: u8) {
+		self.state.fetch_max(state, Ordering::AcqRel);
+	}
+}
 
 impl<S> fmt::Debug for KvDirectory<S> {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -298,14 +318,33 @@ impl<S: KvStore> KvDirectory<S> {
 		Self {
 			store,
 			namespace: Arc::from(namespace),
+			format: Arc::new(FormatValidation::default()),
 			state,
 		}
+	}
+
+	fn ensure_format(&self, create: bool) -> io::Result<()> {
+		let state = self.format.state.load(Ordering::Acquire);
+		if state == FORMAT_PRESENT {
+			return Ok(());
+		}
+		if state == FORMAT_ABSENT && !create {
+			if let Some(state) = read_format_marker(&self.store, &format_marker_key(&self.namespace))? {
+				self.format.record(state);
+			}
+			return Ok(());
+		}
+		let state = validate_format(&self.store, &self.namespace, create)?;
+		self.format.record(state);
+		Ok(())
 	}
 
 	fn read_binding(&self, path: &Path) -> Result<Binding, OpenReadError>
 	where
 		S: KvStore,
 	{
+		self.ensure_format(false)
+			.map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))?;
 		let bytes = self
 			.store
 			.read(&binding_key(&self.namespace, path))
@@ -456,6 +495,10 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 	}
 
 	fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+		self.ensure_format(false).map_err(|error| DeleteError::IoError {
+			io_error: Arc::new(error),
+			filepath: path.to_path_buf(),
+		})?;
 		let _mutation = self.state.mutation.lock().unwrap();
 		let binding = binding_key(&self.namespace, path);
 		let atomic = atomic_key(&self.namespace, path);
@@ -487,6 +530,8 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 	}
 
 	fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+		self.ensure_format(false)
+			.map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))?;
 		Ok(self
 			.store
 			.read(&binding_key(&self.namespace, path))
@@ -501,6 +546,8 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 
 	fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
 		let _mutation = self.state.mutation.lock().unwrap();
+		self.ensure_format(true)
+			.map_err(|error| OpenWriteError::wrap_io_error(error, path.to_path_buf()))?;
 		let key = binding_key(&self.namespace, path);
 		if self
 			.store
@@ -555,6 +602,8 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 	}
 
 	fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+		self.ensure_format(false)
+			.map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))?;
 		self.store
 			.read(&atomic_key(&self.namespace, path))
 			.map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))?
@@ -565,6 +614,7 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 	fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
 		{
 			let _mutation = self.state.mutation.lock().unwrap();
+			self.ensure_format(true)?;
 			self.store.write(
 				&[Mutation::Put(atomic_key(&self.namespace, path), data.to_vec())],
 				WritePolicy::WAL_SYNC,
@@ -577,6 +627,7 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 	}
 
 	fn sync_directory(&self) -> io::Result<()> {
+		self.ensure_format(false)?;
 		self.store.sync()
 	}
 
@@ -804,22 +855,104 @@ struct Binding {
 }
 
 fn counter_key(namespace: &[u8]) -> Vec<u8> {
-	namespaced_prefix(namespace, b"counter")
+	namespaced_prefix(namespace, KEY_KIND_COUNTER)
 }
 
 fn binding_key(namespace: &[u8], path: &Path) -> Vec<u8> {
-	prefixed_path(&namespaced_prefix(namespace, b"binding/"), path)
+	prefixed_path(&namespaced_prefix(namespace, KEY_KIND_BINDING), path)
 }
 
 fn atomic_key(namespace: &[u8], path: &Path) -> Vec<u8> {
-	prefixed_path(&namespaced_prefix(namespace, b"atomic/"), path)
+	prefixed_path(&namespaced_prefix(namespace, KEY_KIND_ATOMIC), path)
 }
 
-fn namespaced_prefix(namespace: &[u8], suffix: &[u8]) -> Vec<u8> {
-	let mut prefix = Vec::with_capacity(namespace.len() + suffix.len() + 1);
+const KEY_FORMAT_VERSION: u8 = 1;
+const KEY_KIND_COUNTER: u8 = 1;
+const KEY_KIND_BINDING: u8 = 2;
+const KEY_KIND_ATOMIC: u8 = 3;
+const KEY_KIND_CHUNK: u8 = 4;
+const KEY_KIND_TAIL: u8 = 5;
+const KEY_PREFIX: &[u8; 4] = b"HFTK";
+const FORMAT_MARKER_PREFIX: &[u8; 4] = b"HFTM";
+const FORMAT_UNKNOWN: u8 = 0;
+const FORMAT_ABSENT: u8 = 1;
+const FORMAT_PRESENT: u8 = 2;
+
+fn namespaced_prefix(namespace: &[u8], kind: u8) -> Vec<u8> {
+	namespaced_prefix_with_capacity(namespace, kind, 0)
+}
+
+fn format_marker_key(namespace: &[u8]) -> Vec<u8> {
+	let mut key = Vec::with_capacity(FORMAT_MARKER_PREFIX.len() + 8 + namespace.len());
+	key.extend_from_slice(FORMAT_MARKER_PREFIX);
+	key.extend_from_slice(&(namespace.len() as u64).to_be_bytes());
+	key.extend_from_slice(namespace);
+	key
+}
+
+fn validate_format<S: KvStore>(store: &S, namespace: &[u8], create: bool) -> io::Result<u8> {
+	let marker = format_marker_key(namespace);
+	if let Some(state) = read_format_marker(store, &marker)? {
+		return Ok(state);
+	}
+	for legacy_key in legacy_sentinel_keys(namespace) {
+		if store.read(&legacy_key)?.is_some() {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"the namespace contains the unsupported prototype directory format",
+			));
+		}
+	}
+	if !create {
+		return Ok(FORMAT_ABSENT);
+	}
+	store.write(
+		&[Mutation::Put(marker, vec![KEY_FORMAT_VERSION])],
+		WritePolicy::WAL_SYNC,
+	)?;
+	Ok(FORMAT_PRESENT)
+}
+
+fn read_format_marker<S: KvStore>(store: &S, marker: &[u8]) -> io::Result<Option<u8>> {
+	let Some(value) = store.read(marker)? else {
+		return Ok(None);
+	};
+	match value.as_slice() {
+		[KEY_FORMAT_VERSION] => Ok(Some(FORMAT_PRESENT)),
+		[version] => Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("unsupported directory format version {version}"),
+		)),
+		_ => Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			"malformed directory format marker",
+		)),
+	}
+}
+
+fn legacy_sentinel_keys(namespace: &[u8]) -> [Vec<u8>; 3] {
+	[
+		legacy_namespaced_key(namespace, b"counter"),
+		legacy_namespaced_key(namespace, b"atomic/.managed.json"),
+		legacy_namespaced_key(namespace, b"atomic/meta.json"),
+	]
+}
+
+fn legacy_namespaced_key(namespace: &[u8], suffix: &[u8]) -> Vec<u8> {
+	let mut key = Vec::with_capacity(namespace.len() + suffix.len() + 1);
+	key.extend_from_slice(namespace);
+	key.push(b'/');
+	key.extend_from_slice(suffix);
+	key
+}
+
+fn namespaced_prefix_with_capacity(namespace: &[u8], kind: u8, additional: usize) -> Vec<u8> {
+	let mut prefix = Vec::with_capacity(KEY_PREFIX.len() + 10 + namespace.len() + additional);
+	prefix.extend_from_slice(KEY_PREFIX);
+	prefix.push(KEY_FORMAT_VERSION);
+	prefix.extend_from_slice(&(namespace.len() as u64).to_be_bytes());
 	prefix.extend_from_slice(namespace);
-	prefix.push(b'/');
-	prefix.extend_from_slice(suffix);
+	prefix.push(kind);
 	prefix
 }
 
@@ -831,25 +964,17 @@ fn prefixed_path(prefix: &[u8], path: &Path) -> Vec<u8> {
 }
 
 fn chunk_key(namespace: &[u8], object_id: u64, chunk: u32) -> Vec<u8> {
-	let mut key = namespaced_prefix_with_capacity(namespace, b"chunk/", 12);
+	let mut key = namespaced_prefix_with_capacity(namespace, KEY_KIND_CHUNK, 12);
 	key.extend_from_slice(&object_id.to_be_bytes());
 	key.extend_from_slice(&chunk.to_be_bytes());
 	key
 }
 
 fn tail_key(namespace: &[u8], object_id: u64, revision: u64) -> Vec<u8> {
-	let mut key = namespaced_prefix_with_capacity(namespace, b"tail/", 16);
+	let mut key = namespaced_prefix_with_capacity(namespace, KEY_KIND_TAIL, 16);
 	key.extend_from_slice(&object_id.to_be_bytes());
 	key.extend_from_slice(&revision.to_be_bytes());
 	key
-}
-
-fn namespaced_prefix_with_capacity(namespace: &[u8], suffix: &[u8], additional: usize) -> Vec<u8> {
-	let mut prefix = Vec::with_capacity(namespace.len() + suffix.len() + 1 + additional);
-	prefix.extend_from_slice(namespace);
-	prefix.push(b'/');
-	prefix.extend_from_slice(suffix);
-	prefix
 }
 
 fn encode_binding(binding: &Binding) -> Vec<u8> {
@@ -922,6 +1047,12 @@ mod tests {
 		reads: Arc<AtomicUsize>,
 	}
 
+	#[derive(Clone)]
+	struct FixedIdentityKv {
+		inner: FaultingKv,
+		identity: KvStoreIdentity,
+	}
+
 	impl CountingKv {
 		fn new() -> Self {
 			Self {
@@ -954,8 +1085,40 @@ mod tests {
 		}
 	}
 
+	impl KvStore for FixedIdentityKv {
+		fn identity(&self) -> KvStoreIdentity {
+			self.identity
+		}
+
+		fn read(&self, key: &[u8]) -> io::Result<Option<OwnedBytes>> {
+			KvStore::read(&self.inner, key)
+		}
+
+		fn write(&self, mutations: &[Mutation], policy: WritePolicy) -> io::Result<()> {
+			KvStore::write(&self.inner, mutations, policy)
+		}
+
+		fn sync(&self) -> io::Result<()> {
+			KvStore::sync(&self.inner)
+		}
+	}
+
 	fn put(key: &[u8], value: &[u8]) -> Mutation {
 		Mutation::Put(key.to_vec(), value.to_vec())
+	}
+
+	fn prototype_directory() -> FaultingDirectory {
+		let store = FaultingKv::default();
+		store
+			.write(
+				&[Mutation::Put(
+					legacy_namespaced_key(b"catalog", b"counter"),
+					1_u64.to_be_bytes().to_vec(),
+				)],
+				WritePolicy::WAL_SYNC,
+			)
+			.unwrap();
+		FaultingDirectory::with_namespace(store, b"catalog")
 	}
 
 	#[test]
@@ -1127,6 +1290,197 @@ mod tests {
 		second.atomic_write(Path::new("meta.json"), b"two").unwrap();
 		assert_eq!(first.atomic_read(Path::new("meta.json")).unwrap(), b"one");
 		assert_eq!(second.atomic_read(Path::new("meta.json")).unwrap(), b"two");
+	}
+
+	#[test]
+	fn namespace_and_path_delimiters_cannot_alias() {
+		let first = binding_key(b"a", Path::new("b/binding/x"));
+		let second = binding_key(b"a/binding/b", Path::new("x"));
+		assert_ne!(first, second);
+		assert_ne!(binding_key(b"a", Path::new("x")), atomic_key(b"a", Path::new("x")));
+	}
+
+	#[test]
+	fn format_marker_is_durable_and_reusable() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::with_namespace(store.clone(), b"catalog");
+		assert!(!directory.exists(Path::new("missing")).unwrap());
+		assert_eq!(store.get(&format_marker_key(b"catalog")), None);
+		directory.atomic_write(Path::new("meta.json"), b"metadata").unwrap();
+		assert_eq!(
+			store.get_durable(&format_marker_key(b"catalog")),
+			Some(vec![KEY_FORMAT_VERSION])
+		);
+		let reopened = FaultingDirectory::with_namespace(store.crash(), b"catalog");
+		assert_eq!(reopened.atomic_read(Path::new("meta.json")).unwrap(), b"metadata");
+	}
+
+	#[test]
+	fn format_initialization_failure_is_returned_and_retryable() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::with_namespace(store.clone(), b"catalog");
+		store.fail_next_write();
+		assert!(directory.atomic_write(Path::new("meta.json"), b"metadata").is_err());
+		assert_eq!(store.get(&format_marker_key(b"catalog")), None);
+		directory.atomic_write(Path::new("meta.json"), b"metadata").unwrap();
+		assert_eq!(directory.atomic_read(Path::new("meta.json")).unwrap(), b"metadata");
+	}
+
+	#[test]
+	fn absent_marker_is_revalidated_on_later_reads() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::with_namespace(store.clone(), b"catalog");
+		assert!(!directory.exists(Path::new("meta.json")).unwrap());
+		store
+			.write(
+				&[Mutation::Put(
+					format_marker_key(b"catalog"),
+					vec![KEY_FORMAT_VERSION + 1],
+				)],
+				WritePolicy::WAL_SYNC,
+			)
+			.unwrap();
+		assert!(directory.exists(Path::new("meta.json")).is_err());
+	}
+
+	#[test]
+	fn clean_absent_format_rechecks_only_the_marker() {
+		let store = CountingKv::new();
+		let directory = KvDirectory::with_namespace(store.clone(), b"catalog");
+		assert!(!directory.exists(Path::new("meta.json")).unwrap());
+		assert_eq!(store.take_reads(), 6);
+		assert!(!directory.exists(Path::new("meta.json")).unwrap());
+		assert_eq!(store.take_reads(), 3);
+	}
+
+	#[test]
+	fn format_state_never_moves_backward() {
+		let format = FormatValidation::default();
+		format.record(FORMAT_PRESENT);
+		format.record(FORMAT_ABSENT);
+		assert_eq!(format.state.load(Ordering::Acquire), FORMAT_PRESENT);
+	}
+
+	#[test]
+	fn reconstructed_store_revalidates_a_reused_identity() {
+		let identity = KvStoreIdentity(7, 8, 9);
+		let first_store = FixedIdentityKv {
+			inner: FaultingKv::default(),
+			identity,
+		};
+		let first = KvDirectory::with_namespace(first_store, b"catalog");
+		first.atomic_write(Path::new("meta.json"), b"metadata").unwrap();
+
+		let replacement = FaultingKv::default();
+		replacement
+			.write(
+				&[Mutation::Put(
+					legacy_namespaced_key(b"catalog", b"counter"),
+					1_u64.to_be_bytes().to_vec(),
+				)],
+				WritePolicy::WAL_SYNC,
+			)
+			.unwrap();
+		let second = KvDirectory::with_namespace(
+			FixedIdentityKv {
+				inner: replacement,
+				identity,
+			},
+			b"catalog",
+		);
+		assert!(second.exists(Path::new("meta.json")).is_err());
+	}
+
+	#[test]
+	fn rejects_the_prototype_key_format() {
+		for sentinel in [b"counter".as_slice(), b"atomic/.managed.json", b"atomic/meta.json"] {
+			let store = FaultingKv::default();
+			store
+				.write(
+					&[Mutation::Put(
+						legacy_namespaced_key(b"catalog", sentinel),
+						b"prototype".to_vec(),
+					)],
+					WritePolicy::WAL_SYNC,
+				)
+				.unwrap();
+			let directory = FaultingDirectory::with_namespace(store, b"catalog");
+			let error = directory.exists(Path::new("meta.json")).unwrap_err();
+			let OpenReadError::IoError { io_error, .. } = error else {
+				panic!("prototype format did not return an I/O error");
+			};
+			assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+			assert!(io_error.to_string().contains("prototype directory format"));
+		}
+	}
+
+	#[test]
+	fn every_storage_entry_point_rejects_the_prototype_format() {
+		fn assert_prototype_error<T, E: fmt::Display>(result: Result<T, E>) {
+			let error = result.err().expect("prototype format should be rejected");
+			assert!(
+				error.to_string().contains("prototype directory format"),
+				"unexpected error: {error}"
+			);
+		}
+
+		let path = Path::new("meta.json");
+		assert_prototype_error(prototype_directory().exists(path));
+		assert_prototype_error(prototype_directory().atomic_read(path));
+		assert_prototype_error(prototype_directory().atomic_write(path, b"metadata"));
+		assert_prototype_error(prototype_directory().open_write(path));
+		assert_prototype_error(prototype_directory().delete(path));
+		assert_prototype_error(prototype_directory().sync_directory());
+		assert_prototype_error(prototype_directory().open_read(path));
+	}
+
+	#[test]
+	fn rejects_an_unknown_directory_format() {
+		let store = FaultingKv::default();
+		store
+			.write(
+				&[Mutation::Put(
+					format_marker_key(b"catalog"),
+					vec![KEY_FORMAT_VERSION + 1],
+				)],
+				WritePolicy::WAL_SYNC,
+			)
+			.unwrap();
+		let error = FaultingDirectory::with_namespace(store, b"catalog")
+			.exists(Path::new("meta.json"))
+			.unwrap_err();
+		assert!(error.to_string().contains("version 2"));
+	}
+
+	#[test]
+	fn rejects_malformed_directory_format_markers() {
+		for value in [Vec::new(), vec![KEY_FORMAT_VERSION, 0]] {
+			let store = FaultingKv::default();
+			store
+				.write(
+					&[Mutation::Put(format_marker_key(b"catalog"), value)],
+					WritePolicy::WAL_SYNC,
+				)
+				.unwrap();
+			let error = FaultingDirectory::with_namespace(store, b"catalog")
+				.exists(Path::new("meta.json"))
+				.unwrap_err();
+			assert!(error.to_string().contains("malformed directory format marker"));
+		}
+	}
+
+	#[test]
+	fn independent_directories_converge_on_one_format() {
+		let store = FaultingKv::default();
+		let first = FaultingDirectory::with_namespace(store.clone(), b"catalog");
+		let second = FaultingDirectory::with_namespace(store.clone(), b"catalog");
+		let first_write = std::thread::spawn(move || first.atomic_write(Path::new("one"), b"one"));
+		let second_write = std::thread::spawn(move || second.atomic_write(Path::new("two"), b"two"));
+		first_write.join().unwrap().unwrap();
+		second_write.join().unwrap().unwrap();
+		let directory = FaultingDirectory::with_namespace(store, b"catalog");
+		assert_eq!(directory.atomic_read(Path::new("one")).unwrap(), b"one");
+		assert_eq!(directory.atomic_read(Path::new("two")).unwrap(), b"two");
 	}
 
 	#[test]

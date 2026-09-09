@@ -160,11 +160,30 @@ before the persisted format is declared stable.
 
 ```text
 namespace / index generation
-  chunk/<object-id>/<ordinal>          -> immutable 256 KiB data chunk
-  tail/<object-id>/<revision>          -> immutable final partial chunk
-  binding/<logical-path>               -> v2 object-id, chunk count, tail revision and visible length
-  atomic/<logical-path>                -> complete small-file bytes
+  format marker kind                   -> directory key-format version
+  chunk kind: object-id, ordinal       -> immutable 256 KiB data chunk
+  tail kind: object-id, revision       -> immutable final partial chunk
+  binding kind: logical path           -> v2 object-id, chunk count, tail revision and visible length
+  atomic kind: logical path            -> complete small-file bytes
 ```
+
+The keyspace uses a fixed magic, format version, length-prefixed namespace, and one-byte key-kind
+tag before kind-specific bytes. Namespace and path delimiters therefore cannot alias another
+index's keys. An unversioned, length-prefixed format-marker key records the active key version so a
+future implementation detects an unsupported format instead of opening an empty parallel keyspace.
+The unreleased delimiter-based prototype is rejected when its counter or known atomic metadata
+sentinels exist; it is rebuilt rather than migrated. Read-only access validates but does not create
+the marker, while the first write creates it durably before any payload. The sentinel check is a
+prototype guard, not a general mixed-keyspace detector: backup restore replaces a closed generation
+and its storage incarnation rather than merging bytes into a live namespace. After one clean
+marker-less probe, read-only calls continue checking the marker but do not repeat the prototype
+sentinel reads.
+
+A key-format version change requires dropping the old namespace storage and rebuilding the derived
+generation from Harper source data; changing the version prefix alone would strand old payload.
+New logical key kinds, including reclamation metadata, receive new kind tags under the existing key
+version. A storage provider must also change `KvStoreIdentity` whenever close, restore, or column-
+family replacement can change the bytes behind an identity.
 
 `open_write()` creates a new object identity and a zero-length binding. The writer stages each full
 chunk under its final ordinal with a WAL write while retaining at most one partial chunk. `flush()`

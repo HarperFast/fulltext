@@ -27,8 +27,8 @@ of `npm pack` into a temporary consumer project.
 
 - Keep search, indexing, scheduling, and lifecycle behavior shared across storage backends.
 - Keep backend choice explicit; do not introduce automatic fallback.
-- Do not link RocksDB into this addon. The future Rocks backend must use the versioned lease owned
-  by rocksdb-js.
+- Do not link RocksDB into this addon. Harper storage uses the bounded host transport and
+  Harper-owned RocksDB operations; the historical rocksdb-js lease remains test-only.
 - Do not expose generated Node-API declarations as the public TypeScript API.
 - Keep CPU and sustained I/O work off the Node.js event loop. The promise-shaped capability call may
   synchronously load the addon once; no search, indexing, commit, or storage operation gets that
