@@ -1448,6 +1448,7 @@ fn encode_reclaim_entry(entry: &ReclaimEntry) -> io::Result<Vec<u8>> {
 	Ok(bytes)
 }
 
+#[cfg(test)]
 fn decode_reclaim_entry(bytes: &[u8]) -> io::Result<ReclaimEntry> {
 	if bytes.first().copied() != Some(RECLAIM_ENTRY_FORMAT_VERSION) {
 		let version = bytes.first().copied().unwrap_or(0);
