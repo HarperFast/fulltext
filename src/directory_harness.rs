@@ -212,6 +212,50 @@ where
 	verify_query_count(&reopened, body, "shoes", 1)
 }
 
+pub fn verify_large_file<D>(directory: D, chunk_size: usize) -> Result<(), String>
+where
+	D: Directory,
+{
+	let length = chunk_size
+		.checked_mul(2)
+		.and_then(|length| length.checked_add(17))
+		.ok_or_else(|| "large-file test length overflowed".to_owned())?;
+	let bytes = (0..length).map(|offset| (offset % 251) as u8).collect::<Vec<_>>();
+	let path = Path::new("large-file");
+	let mut writer = directory.open_write(path).map_err(|error| error.to_string())?;
+	writer.write_all(&bytes).map_err(|error| error.to_string())?;
+	writer.terminate().map_err(|error| error.to_string())?;
+
+	let file = directory.open_read(path).map_err(|error| error.to_string())?;
+	let full_chunk = file
+		.slice(0..chunk_size)
+		.read_bytes()
+		.map_err(|error| error.to_string())?;
+	if full_chunk.as_slice() != &bytes[..chunk_size] {
+		return Err("large-file full chunk returned unexpected bytes".to_owned());
+	}
+	let range_start = chunk_size
+		.checked_sub(13)
+		.ok_or_else(|| "large-file test chunk size is too small".to_owned())?;
+	let range = range_start..chunk_size + 19;
+	let crossing = file
+		.slice(range.clone())
+		.read_bytes()
+		.map_err(|error| error.to_string())?;
+	if crossing.as_slice() != &bytes[range] {
+		return Err("large-file boundary range returned unexpected bytes".to_owned());
+	}
+	let range = length - 30..length;
+	let tail_crossing = file
+		.slice(range.clone())
+		.read_bytes()
+		.map_err(|error| error.to_string())?;
+	if tail_crossing.as_slice() != &bytes[range] {
+		return Err("large-file tail boundary range returned unexpected bytes".to_owned());
+	}
+	Ok(())
+}
+
 fn verify_query_count(
 	index: &Index,
 	field: tantivy::schema::Field,
@@ -740,6 +784,11 @@ mod tests {
 	#[test]
 	fn mmap_directory_supports_a_real_tantivy_lifecycle() {
 		verify_tantivy_lifecycle(MmapDirectory::create_from_tempdir().unwrap()).unwrap();
+	}
+
+	#[test]
+	fn mmap_directory_supports_large_file_ranges() {
+		verify_large_file(MmapDirectory::create_from_tempdir().unwrap(), 256 * 1024).unwrap();
 	}
 
 	#[test]

@@ -162,6 +162,25 @@ test('KvDirectory and Tantivy operate through the host storage transport', async
 	assert.ok(entries.size > 0, 'Tantivy state remains in host storage for reopen');
 });
 
+test('host directory rejects a read budget that cannot carry one full chunk', async (context) => {
+	const maxReadResponseBytes = 256 * 1024;
+	const storage = {
+		read() {},
+		write() {},
+		sync() {},
+	};
+	const handler = createHostStorageHandler(storage, {
+		maxMutations: 2,
+		maxReadResponseBytes,
+		maxControlResponseBytes: controlResponseBytes,
+		maxErrorBytes: controlResponseBytes,
+	});
+	const handle = addon.__testOpenHostTransport(handler, 4, 2 * 1024 * 1024, 1_000);
+	context.after(() => addon.__testCloseHostTransport(handle));
+
+	await assert.rejects(verifyTantivy(handle, maxReadResponseBytes), /must be at least 262151 bytes/);
+});
+
 test('a failed durability barrier does not pretend the preceding atomic write rolled back', async (context) => {
 	const entries = new Map();
 	let writes = 0;
@@ -274,9 +293,9 @@ function roundTrip(handle, request, responseBudget = 128, useTimeout = true) {
 	});
 }
 
-function verifyTantivy(handle) {
+function verifyTantivy(handle, maxReadResponseBytes = readResponseBytes) {
 	return new Promise((resolve, reject) => {
-		addon.__testVerifyTantivyOnHostTransport(handle, readResponseBytes, controlResponseBytes, (encoded) => {
+		addon.__testVerifyTantivyOnHostTransport(handle, maxReadResponseBytes, controlResponseBytes, (encoded) => {
 			if (encoded[0] === 0) {
 				resolve();
 			} else {

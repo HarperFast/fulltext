@@ -63,9 +63,10 @@ Pinned `MmapDirectory` source also exposes a reference limitation: its path cach
 same older mmap to a new `open_read()` while a handle to that mmap remains alive, even after the
 writer flushes more bytes. The shared reference test therefore proves writer continuation, old-handle
 immutability, and later visibility after the old handle is released. The Rocks prototype separately
-proves simultaneous old and new binding revisions because its write-once fragments support that
-stronger behavior. The wrapper does not claim Mmap and Rocks have identical raw Directory cache
-semantics; it requires identical observable index, commit, reopen, and search behavior.
+proves simultaneous old and new binding revisions because its write-once chunks and tail revisions
+support that stronger behavior. The wrapper does not claim Mmap and Rocks have identical raw
+Directory cache semantics; it requires identical observable index, commit, reopen, and search
+behavior.
 
 ### rocksdb-js 2.8.0
 
@@ -153,32 +154,48 @@ and package-isolation cases still run.
 
 ## Logical object prototype
 
-Phase 0 uses the smallest mapping capable of exercising the Directory semantics. It is not yet the
-production format.
+The first Harper mapping uses fixed-size data chunks and a versioned tail. The chunk size is an
+internal format choice, not a schema or factory option. It remains subject to the benchmark sweep
+before the persisted format is declared stable.
 
 ```text
 namespace / index generation
-  working/<object-id>/fragment/<sequence>     -> immutable flushed bytes
-  object/<object-id>                          -> sealed ordered fragments and total length
-  binding/<logical-path>                      -> object-id and visible length
-  atomic/<logical-path>                       -> complete small-file bytes and revision
-  pending/<object-id>                         -> recovery marker
+  chunk/<object-id>/<ordinal>          -> immutable 256 KiB data chunk
+  tail/<object-id>/<revision>          -> immutable final partial chunk
+  binding/<logical-path>               -> v2 object-id, chunk count, tail revision and visible length
+  atomic/<logical-path>                -> complete small-file bytes
 ```
 
-`open_write()` creates a new object identity and a logical binding with visible length zero. Bytes
-may be buffered only until the next writer flush. A successful flush writes one or more new fragment
-keys and atomically replaces the binding with the complete ordered fragment list and visible length.
-Fragment keys are write-once: an append after flush starts a new fragment even when the preceding
-fragment is smaller than the target chunk size. This is the isolation source for an open handle; a
-handle captures one binding revision, object identity, fragment list, and visible length, so later
-flushes never change any key it may read. Termination flushes and seals the object. Deleting removes
-the binding; object bytes remain available while native handles retain them and become reclaimable
-afterward.
+`open_write()` creates a new object identity and a zero-length binding. The writer stages each full
+chunk under its final ordinal with a WAL write while retaining at most one partial chunk. `flush()`
+atomically publishes a new binding and an immutable, revisioned tail. Filling a previously published
+tail creates a full chunk and a later binding revision; it never overwrites bytes visible to an
+existing file handle. Every flush that replaces a partial tail leaves its previous immutable tail
+revision unreachable. A file appended across K such flushes can therefore leave K-1 tails of up to
+`CHUNK_SIZE - 1` bytes, while a failed publication may additionally leave an unpublished tail or
+full chunks. These values remain until the derived-index reclaimer is implemented.
 
-`atomic_write()` stores the complete small value and replaces its logical revision in one RocksDB
-write batch. It is used for metadata such as `meta.json` and `.managed.json`, not large segment
-output. Phase 0 verifies the semantic boundary; issue #11 defines the production encoding,
-versioning, garbage collection, and bounded chunk policy.
+A file handle captures one binding value. It computes a full-chunk key directly from the requested
+offset and reads the versioned tail only when the range intersects it. A range contained in one
+chunk therefore performs one payload lookup regardless of file size; ranges spanning boundaries
+perform one lookup per intersecting chunk. No read walks or fetches preceding payloads.
+
+A full-chunk read response requires at least `CHUNK_SIZE + 7` bytes for the protocol envelope, so
+the host store rejects a smaller response budget at construction. Transport admission separately
+accounts for the exact encoded request and reserved response before dispatch. The prototype does
+not claim a universal construction-time transport minimum: namespace and path lengths vary, and
+`atomic_write()` does not yet enforce a metadata size bound. The production factory must bound
+those inputs and validate its aggregate byte budget before this backend is exposed. The Phase 0
+sweep records small-read amplification and retained `OwnedBytes` because a slice keeps its complete
+chunk allocation alive; a bounded chunk cache is considered only if those measurements justify it.
+
+Termination flushes the remaining tail. Deleting removes the binding but leaves every immutable
+chunk and tail behind. They remain readable through already-open handles and become eligible for
+reclamation after those handles drain.
+
+`atomic_write()` stores the complete small value in one RocksDB write batch. It is used for metadata
+such as `meta.json` and `.managed.json`, not large segment output. Issue #11 still owns format
+qualification, bounded orphan reclamation and the chunk-size performance sweep before release.
 
 ## Experiment matrix
 
