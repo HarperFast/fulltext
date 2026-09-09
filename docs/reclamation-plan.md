@@ -279,6 +279,15 @@ real Tantivy merge and garbage-collection cycles and after crash/reopen. `Faulti
 recovery at atomic batch boundaries; the Harper integration separately proves that one host write
 request commits as one RocksDB batch.
 
+The dependency-free `kv_directory` release benchmark compares the merged slice-2 baseline with this
+slice through Tantivy's buffered `WritePtr`, rather than calling the fence directly. It reports
+sample p50/p95/p99 and aggregate throughput for caller write sizes, empty and dirty flushes, chunk
+publication, deletion with closed and active writers, and distinct-file concurrency. The
+empty-flush case isolates the per-call retirement-fence cost; the buffered cases show how Tantivy's
+writer amortizes it in practice. Results are versioned JSON labeled by revision. Shared CI runs a
+correctness smoke with no timing threshold; performance decisions use alternating runs on one fixed
+host.
+
 The completed mapping tests cover repeated flush, delete/recreate with a retained old reader,
 abandoned writers, partial object cleanup, restart during a range and between FIFO entries, namespace
 isolation, concurrent `open_write()` on distinct paths, and cleanup concurrent with Tantivy merge

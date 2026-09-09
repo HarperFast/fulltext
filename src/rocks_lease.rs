@@ -13,7 +13,9 @@ use crate::phase0::{KvStore, Mutation, WritePolicy};
 const LEASE_MAGIC: u64 = 0x4852_4653_544c_5331;
 const ABI_MAJOR: u32 = 1;
 const ABI_MINOR: u32 = 0;
+#[cfg(feature = "node-api")]
 const TYPE_TAG_LOWER: u64 = 0x72f7_ab4f_5277_4465;
+#[cfg(feature = "node-api")]
 const TYPE_TAG_UPPER: u64 = 0xb654_680e_7e1e_4db9;
 const CAP_GET_OWNED: u64 = 1 << 0;
 const CAP_WRITE_BATCH: u64 = 1 << 1;
