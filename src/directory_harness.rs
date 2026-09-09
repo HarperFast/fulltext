@@ -245,6 +245,14 @@ where
 	if crossing.as_slice() != &bytes[range] {
 		return Err("large-file boundary range returned unexpected bytes".to_owned());
 	}
+	let range = length - 30..length;
+	let tail_crossing = file
+		.slice(range.clone())
+		.read_bytes()
+		.map_err(|error| error.to_string())?;
+	if tail_crossing.as_slice() != &bytes[range] {
+		return Err("large-file tail boundary range returned unexpected bytes".to_owned());
+	}
 	Ok(())
 }
 
@@ -776,6 +784,11 @@ mod tests {
 	#[test]
 	fn mmap_directory_supports_a_real_tantivy_lifecycle() {
 		verify_tantivy_lifecycle(MmapDirectory::create_from_tempdir().unwrap()).unwrap();
+	}
+
+	#[test]
+	fn mmap_directory_supports_large_file_ranges() {
+		verify_large_file(MmapDirectory::create_from_tempdir().unwrap(), 256 * 1024).unwrap();
 	}
 
 	#[test]
