@@ -281,13 +281,61 @@ stale empty hint. A namespace proven absent after bounded format validation retu
 the default read budget covers format validation plus one cold 64-shard sweep for a present
 namespace.
 
-Cleanup runs on a dedicated native task, not the JavaScript service thread or writer actor. Host
-callbacks still execute on JavaScript, so cleanup has a low-priority admission class that cannot
-take the last foreground transport slot. Each admission bounds point reads, delete mutations,
-request bytes, and elapsed time checked between storage operations. One admitted synchronous host
-operation cannot be canceled and may exceed the elapsed budget. Panics are caught at the task
-boundary; terminal failure, queue depth, pinned skips, and no-progress state are observable by
-Harper instead of silently disabling reclamation.
+Cleanup runs on one dedicated native task per index, not the JavaScript service thread or writer
+actor. The task receives a low-priority clone of the foreground `HostKvStore`; the clone changes
+only an internal admission-class field and retains the exact `KvStoreIdentity`, transport, and
+namespace. Constructing a second identity for cleanup would split `DirectoryState`, hide foreground
+reader pins from the reclaimer, and is rejected by an end-to-end retained-reader test. Priority is
+not added to `KvStore`, the host protocol, or JavaScript storage operations.
+
+The production topology gives each open index generation one `HostTransport`; multiple indexes own
+independent transports and native tasks. The transport enforces separate operation and byte ceilings
+for low-priority work. Cleanup may have exactly one operation in flight, leaving
+`max_operations - 1` slots for the index's configured foreground concurrency, and may use only the
+byte ceiling left after its configured foreground reserve. The owner derives that reserve from the
+fixed chunk size, bounded directory-key encoding, configured read/control response limits, and the
+index's worker limits. Cleanup admission is enabled only when the low-priority view is requested, at
+which point validation rejects a transport that cannot hold its foreground reserve, the configured
+bounded read and mutation request sizes, and the store's read/control response reservations; small
+transports used without cleanup retain their current behavior.
+
+Cleanup-directory construction derives the read-request bound from its namespace and the format key
+high-water, so a store view cannot be paired with a different namespace after sizing. The
+low-priority store retains both request bounds and rejects an encoded cleanup request that exceeds
+either one before transport admission; these are enforced limits rather than sizing hints.
+
+A statically valid cleanup request that does not fit current occupancy returns `WouldBlock` without
+joining the condition-variable wait queue. Permanent configuration and request-size failures are
+classified before occupancy so they cannot masquerade as healthy deferral. Once dispatched, a
+mutation still waits for a definitive host result because canceling an
+unknown write outcome would violate queue progress atomicity. `WouldBlock` from this explicit
+admission path is reported as deferred work; a threadsafe-function queue-full result is an accounting
+failure and closes the transport rather than masquerading as deferral. `BrokenPipe` after close is
+reported as shutdown, while malformed persisted data remains terminal generation corruption.
+
+Host callbacks still execute FIFO on JavaScript, so capacity headroom guarantees foreground
+admission but not foreground latency. Cleanup therefore has one in-flight host operation, and the
+task constructs each `ReclaimBudget` with per-admission mutation and encoded-request caps below the
+directory format's hard 512-mutation and 64 KiB limits. The directory builds batches against that
+budget; the transport does not reject a batch after it has been built. The production budget is
+selected from the JavaScript-handler and Harper RocksDB batch-latency benchmark before cleanup is
+enabled, then remains internal runtime policy rather than customer schema. On fixed hardware, three
+alternating runs must show no more than 5% foreground directory-operation p99 regression with
+sustained cleanup, and the catalog search benchmark must remain below the 50 ms p99 objective. If no
+measured budget meets both gates, cleanup moves to a separate host callback channel before release.
+Harper may additionally trigger admissions during idle periods, but higher-layer timing is an
+optimization rather than the correctness boundary.
+
+Each cleanup admission also bounds total point reads, delete mutations, request bytes, and elapsed
+time checked between storage operations. One admitted synchronous host operation cannot be canceled
+and may finish after the elapsed target. A foreground read that times out stops waiting but its
+operation and byte reservation remain charged until the already-dispatched callback completes or
+the transport closes; the environment cleanup hook closes the transport before its callback is
+dropped. Admission timeout and post-dispatch response timeout have distinct messages, and abandoned
+waiter count plus still-charged operations and bytes are included in transport health. Cleanup cannot
+consume capacity that is still live but no longer has a waiting caller. Panics are caught at the task
+boundary. Terminal failure, queue depth, pinned skips, transport deferrals, no-progress state, and
+the last terminal error are observable by Harper instead of silently disabling reclamation.
 
 Binding, queue-entry, and progress decoding validates versions, lengths, numeric ranges, and a
 configured maximum total extent before allocating or scheduling work. An undecodable binding is not
@@ -319,6 +367,13 @@ generation from source data instead of masking the broken atomicity invariant.
 | Object-id allocation     | Updating the counter with every binding creation serializes file creation across a host round trip. The allocator reserves fixed durable strides, reducing that shared operation to one per stride; unused ids after failure or restart are harmless.                                                                                                                                                                                          |
 | Queue-tail reads         | Cache the next sequence and reread only after errors, or point-read it before every enqueue. The durable point read is chosen because slice 3 enqueues only file deletion rather than indexed documents, removes cache recovery state, and is measured explicitly.                                                                                                                                                                             |
 | Cleanup priority         | Cleanup leaves pinned entries durable and skips them with a process-local sequence cursor. Later entries may complete out of order, while the durable head advances only across observed holes. This lets the consumer advance without a second persistent queue or holding a foreground enqueue mutex or counter across low-priority host I/O.                                                                                                |
+| Transport admission      | A priority field on a same-identity `HostKvStore` clone is chosen over a `KvStore` method or thread-local state. The shared transport owns both operation and byte accounting, low-priority work fails fast rather than waiting, and one foreground operation plus its maximum byte reservation remains available. This keeps the storage protocol frozen and prevents a cleanup-only store from splitting reader-pin state.                   |
+| Separate callback queue  | A second cleanup `ThreadsafeFunction` would isolate native admission queues but still executes on the same JavaScript event loop and adds another host lifecycle contract. It is retained as the fallback only if measured per-call caps on the shared queue cannot meet foreground p99.                                                                                                                                                       |
+| Higher-layer scheduling  | Harper may request cleanup when its own load is low, but it cannot observe all native and host callback arrivals and the standalone library cannot depend on Harper's scheduler. Idle-time triggering may reduce contention but cannot replace transport-enforced headroom.                                                                                                                                                                    |
+| Accept and detect        | Fair admission followed by disabling cleanup after latency rises reacts only after foreground work has already queued behind an uncancellable mutation. Metrics remain required, but detection alone is rejected as the protection mechanism.                                                                                                                                                                                                  |
+| Cleanup work unit        | One in-flight cleanup operation plus measured mutation and encoded-request caps is chosen. The existing 512-mutation and 64 KiB values remain format safety ceilings, not latency targets; production defaults are fixed only after benchmarking the JavaScript handler and Harper RocksDB batch together.                                                                                                                                     |
+| External RocksDB drain   | Harper could interpret and drain the FIFO without native transport round trips, but Harper cannot see the process-local reader pins that protect open Tantivy slices. An external drainer could therefore delete bytes beneath a live handle and is rejected.                                                                                                                                                                                  |
+| Foreground piggyback     | Spending a small reclamation budget after each foreground publication would rate cleanup with garbage creation and avoid a second admission class. It puts uncancellable cleanup writes directly on the writer actor's latency path and cannot drain an idle backlog, so it is rejected.                                                                                                                                                       |
 | Chosen                   | Binding high-waters plus one transition-fed durable FIFO per shard, sequence-keyed progress, object-id pins, and bounded low-priority draining.                                                                                                                                                                                                                                                                                                |
 
 ## Persistence format and delivery sequence
@@ -339,9 +394,12 @@ Then deliver reclamation in reviewable slices:
 4. add object-id/revision reader pins and coordinate registration with deletion through the
    hash-sharded registration fence;
 5. add bounded sparse FIFO draining and its synchronous admission API;
-6. add low-priority scheduling, failure observability, close fencing, crash recovery, and Harper's
-   exclusive-owner integration. Measure tail accumulation and add tail-supersession entries only if
-   that data justifies publication-path cost.
+6. first add priority-aware operation and byte admission to the existing host transport, including
+   same-identity store views, fail-fast cleanup admission, live timeout accounting, and the
+   JavaScript/RocksDB batch-latency measurement that fixes the per-call caps; then add the dedicated
+   cleanup task, failure observability, and close fencing; finally wire Harper's exclusive-owner and
+   crash-recovery lifecycle. Measure tail accumulation and add tail-supersession entries only if that
+   data justifies publication-path cost.
 
 The production Harper package remains disabled until the cleanup lifecycle fence and Harper host-
 storage integration both pass. No native RocksDB storage provider is added to the public library.
@@ -415,11 +473,27 @@ Efficacy is measured as well as safety: after repeated real Tantivy merge/delete
 key count and payload bytes must return to a bound proportional to the live index rather than bytes
 ever written. `CountingKv` asserts per-entry point-read and mutation cost does not grow with object
 ids ever allocated, plus request-byte and time-admission bounds. Measure real Tantivy tail revisions
-per file before retaining the tail-only path. Add a hot-path regression test showing a foreground
-read still gains transport capacity while cleanup waits, plus open/drop churn that keeps weak-pin
-memory bounded. The same reclamation harness runs through host transport; Harper separately verifies
-owner loss with a second worker, close drain, cleanup health reporting, backup/restore, and
-derived-index replay coordination.
+per file before retaining the tail-only path. The transport suite fills cleanup-eligible operation
+slots and bytes independently and proves that one maximum foreground reservation still admits. It
+also proves that an unsatisfiable cleanup reservation fails immediately, a timed-out foreground
+callback remains charged until completion, close wakes an admission waiter, and worker teardown
+removes a transport while foreground and cleanup reservations are charged. Teardown of a dispatched
+low-priority callback moves with the dedicated cleanup task that creates that callback.
+
+The same reclamation harness runs through foreground and low-priority views of one host transport.
+It verifies identical `KvStoreIdentity`, retained-reader protection across those views, and physical
+removal of both pinned-then-released and immediately reclaimable object payloads. Durable resume
+after interruption is added with the dedicated cleanup task. A latency benchmark measures
+foreground reads while cleanup issues one host operation at each candidate mutation/request cap;
+capacity-only assertions do not qualify the shared callback queue. Open/drop churn separately keeps
+weak-pin memory bounded. Harper verifies owner loss with a second worker, close drain, cleanup health
+reporting, backup/restore, and derived-index replay coordination.
+
+Priority-selection hooks remain test-only and absent from the packed release artifact. The existing
+single-slot timeout test is rewritten for conservative accounting: a second request cannot reuse the
+timed-out request's charge until the callback finishes, and admission versus response timeout text is
+asserted separately. Environment teardown proves the async cleanup hook closes and removes a
+transport while both admission classes are charged.
 
 The FIFO tests include parallel enqueue on different shards, sequence/batch failure, pinned-entry
 skip cost, out-of-order completion and bounded head compaction, corrupt binding and entry handling,

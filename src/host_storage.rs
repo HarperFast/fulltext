@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io;
+use std::io::Write as IoWrite;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
@@ -10,10 +12,13 @@ use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, JsBuffer, JsFunction, JsUnknown, Status};
 use napi_derive::napi;
-use tantivy::directory::OwnedBytes;
+use tantivy::directory::{Directory, OwnedBytes, TerminatingWrite};
 
 use crate::boundary;
-use crate::phase0::{KvDirectory, KvStore, KvStoreIdentity, Mutation, WritePolicy, CHUNK_SIZE};
+use crate::phase0::{
+	reclaim_read_key_bytes, KvDirectory, KvStore, KvStoreIdentity, Mutation, ReclaimBudget, WritePolicy, CHUNK_SIZE,
+	RECLAIM_MAX_BATCH_REQUEST_BYTES,
+};
 
 type HostCallback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
 type CompletionCallback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
@@ -26,6 +31,7 @@ struct HostTransport {
 	state: Mutex<TransportState>,
 	capacity: Condvar,
 	next_request_id: AtomicU64,
+	abandoned_waiters: AtomicU64,
 	max_operations: usize,
 	max_bytes: usize,
 	read_timeout: Duration,
@@ -36,12 +42,28 @@ struct TransportState {
 	closed: Option<String>,
 	operations: usize,
 	bytes: usize,
+	cleanup_operations: usize,
+	cleanup_bytes: usize,
+	cleanup_capacity: Option<CleanupCapacity>,
 	pending: HashMap<u64, PendingRequest>,
 }
 
 struct PendingRequest {
 	retained_bytes: usize,
+	class: AdmissionClass,
 	response: Weak<ResponseSlot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionClass {
+	Foreground,
+	Cleanup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CleanupCapacity {
+	foreground_reserved_bytes: usize,
+	max_bytes: usize,
 }
 
 struct ResponseSlot {
@@ -78,6 +100,7 @@ impl HostTransport {
 			state: Mutex::new(TransportState::default()),
 			capacity: Condvar::new(),
 			next_request_id: AtomicU64::new(1),
+			abandoned_waiters: AtomicU64::new(0),
 			max_operations,
 			max_bytes,
 			read_timeout,
@@ -90,6 +113,7 @@ impl HostTransport {
 		request: Vec<u8>,
 		response_budget: usize,
 		deadline: Option<Instant>,
+		class: AdmissionClass,
 	) -> io::Result<Vec<u8>> {
 		let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
 		if request_id == 0 {
@@ -97,7 +121,7 @@ impl HostTransport {
 			return Err(io::Error::other("host storage request id space exhausted"));
 		}
 		let response = Arc::new(ResponseSlot::new());
-		self.admit(request_id, request.len(), response_budget, &response, deadline)?;
+		self.admit(request_id, request.len(), response_budget, &response, deadline, class)?;
 
 		let transport = Arc::downgrade(self);
 		let callback_response = response.clone();
@@ -127,23 +151,23 @@ impl HostTransport {
 			},
 		);
 		if status != Status::Ok {
-			self.complete(
-				request_id,
-				Err(io::Error::new(
-					io::ErrorKind::WouldBlock,
-					format!("host storage callback rejected request: {status:?}"),
-				)),
-			);
+			if status == Status::Closing {
+				self.fail(io::ErrorKind::BrokenPipe, "host storage transport is closed");
+			} else {
+				self.fail(
+					io::ErrorKind::Other,
+					&format!("host storage callback rejected an admitted request: {status:?}"),
+				);
+			}
 		}
 
 		if let Some(result) = response.wait(deadline) {
 			return result;
 		}
-		self.release(request_id);
-		let _ = response.take();
+		self.abandoned_waiters.fetch_add(1, Ordering::Relaxed);
 		Err(io::Error::new(
 			io::ErrorKind::TimedOut,
-			"host storage request timed out",
+			"host storage response timed out",
 		))
 	}
 
@@ -158,6 +182,7 @@ impl HostTransport {
 		response_bytes: usize,
 		response: &Arc<ResponseSlot>,
 		deadline: Option<Instant>,
+		class: AdmissionClass,
 	) -> io::Result<()> {
 		let retained_bytes = request_bytes
 			.checked_add(response_bytes)
@@ -173,8 +198,14 @@ impl HostTransport {
 			if let Some(error) = &state.closed {
 				return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
 			}
-			if state.operations < self.max_operations && state.bytes.saturating_add(retained_bytes) <= self.max_bytes {
+			if self.has_capacity(&state, retained_bytes, class)? {
 				break;
+			}
+			if class == AdmissionClass::Cleanup {
+				return Err(io::Error::new(
+					io::ErrorKind::WouldBlock,
+					"low-priority host storage capacity is unavailable",
+				));
 			}
 			state = match deadline {
 				Some(deadline) => {
@@ -182,7 +213,7 @@ impl HostTransport {
 					if remaining.is_zero() {
 						return Err(io::Error::new(
 							io::ErrorKind::TimedOut,
-							"host storage request timed out",
+							"host storage admission timed out",
 						));
 					}
 					let (state, wait) = self
@@ -192,7 +223,7 @@ impl HostTransport {
 					if wait.timed_out() {
 						return Err(io::Error::new(
 							io::ErrorKind::TimedOut,
-							"host storage request timed out",
+							"host storage admission timed out",
 						));
 					}
 					state
@@ -205,14 +236,86 @@ impl HostTransport {
 		}
 		state.operations += 1;
 		state.bytes += retained_bytes;
+		if class == AdmissionClass::Cleanup {
+			state.cleanup_operations += 1;
+			state.cleanup_bytes += retained_bytes;
+		}
 		state.pending.insert(
 			request_id,
 			PendingRequest {
 				retained_bytes,
+				class,
 				response: Arc::downgrade(response),
 			},
 		);
 		Ok(())
+	}
+
+	fn has_capacity(&self, state: &TransportState, retained_bytes: usize, class: AdmissionClass) -> io::Result<bool> {
+		let cleanup_capacity = if class == AdmissionClass::Cleanup {
+			let capacity = state.cleanup_capacity.ok_or_else(|| {
+				io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"low-priority host storage admission is not configured",
+				)
+			})?;
+			if retained_bytes > capacity.max_bytes {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"low-priority host storage reservation exceeds its byte limit",
+				));
+			}
+			Some(capacity)
+		} else {
+			None
+		};
+		if state.operations >= self.max_operations || state.bytes.saturating_add(retained_bytes) > self.max_bytes {
+			return Ok(false);
+		}
+		let Some(capacity) = cleanup_capacity else {
+			return Ok(true);
+		};
+		Ok(state.cleanup_operations == 0
+			&& state.cleanup_bytes.saturating_add(retained_bytes) <= capacity.max_bytes
+			&& state
+				.bytes
+				.saturating_add(retained_bytes)
+				.saturating_add(capacity.foreground_reserved_bytes)
+				<= self.max_bytes)
+	}
+
+	fn configure_cleanup(&self, foreground_reserved_bytes: usize, max_cleanup_bytes: usize) -> io::Result<()> {
+		if self.max_operations < 2 || foreground_reserved_bytes == 0 || max_cleanup_bytes == 0 {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"low-priority host storage requires two operation slots and positive byte limits",
+			));
+		}
+		if foreground_reserved_bytes
+			.checked_add(max_cleanup_bytes)
+			.is_none_or(|required| required > self.max_bytes)
+		{
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"host storage byte capacity cannot hold foreground headroom and one cleanup request",
+			));
+		}
+		let capacity = CleanupCapacity {
+			foreground_reserved_bytes,
+			max_bytes: max_cleanup_bytes,
+		};
+		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		match state.cleanup_capacity {
+			Some(existing) if existing != capacity => Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"host storage cleanup capacity is already configured differently",
+			)),
+			Some(_) => Ok(()),
+			None => {
+				state.cleanup_capacity = Some(capacity);
+				Ok(())
+			}
+		}
 	}
 
 	fn complete(&self, request_id: u64, result: io::Result<Vec<u8>>) {
@@ -221,10 +324,14 @@ impl HostTransport {
 			let Some(pending) = state.pending.remove(&request_id) else {
 				return;
 			};
-			if state.operations == 0 || state.bytes < pending.retained_bytes {
+			let cleanup_underflow = pending.class == AdmissionClass::Cleanup
+				&& (state.cleanup_operations == 0 || state.cleanup_bytes < pending.retained_bytes);
+			if state.operations == 0 || state.bytes < pending.retained_bytes || cleanup_underflow {
 				state.closed = Some("host storage transport accounting failed".to_owned());
 				state.operations = 0;
 				state.bytes = 0;
+				state.cleanup_operations = 0;
+				state.cleanup_bytes = 0;
 				let remaining = std::mem::take(&mut state.pending);
 				drop(state);
 				self.capacity.notify_all();
@@ -242,25 +349,15 @@ impl HostTransport {
 			let response = pending.response.upgrade();
 			state.operations -= 1;
 			state.bytes -= pending.retained_bytes;
+			if pending.class == AdmissionClass::Cleanup {
+				state.cleanup_operations -= 1;
+				state.cleanup_bytes -= pending.retained_bytes;
+			}
 			self.capacity.notify_all();
 			response
 		};
 		if let Some(response) = response {
 			response.complete(result);
-		}
-	}
-
-	fn release(&self, request_id: u64) {
-		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-		if let Some(pending) = state.pending.remove(&request_id) {
-			if state.operations == 0 || state.bytes < pending.retained_bytes {
-				drop(state);
-				self.fail(io::ErrorKind::Other, "host storage transport accounting failed");
-				return;
-			}
-			state.operations -= 1;
-			state.bytes -= pending.retained_bytes;
-			self.capacity.notify_all();
 		}
 	}
 
@@ -272,6 +369,8 @@ impl HostTransport {
 			}
 			state.operations = 0;
 			state.bytes = 0;
+			state.cleanup_operations = 0;
+			state.cleanup_bytes = 0;
 			std::mem::take(&mut state.pending)
 		};
 		self.capacity.notify_all();
@@ -326,13 +425,6 @@ impl ResponseSlot {
 		}
 		slot.take()
 	}
-
-	fn take(&self) -> Option<io::Result<Vec<u8>>> {
-		self.result
-			.lock()
-			.unwrap_or_else(|poisoned| poisoned.into_inner())
-			.take()
-	}
 }
 
 fn response_bytes(value: JsUnknown, max_bytes: usize) -> io::Result<Vec<u8>> {
@@ -365,7 +457,40 @@ const VALUE_MISSING: u8 = 0;
 const VALUE_PRESENT: u8 = 1;
 const MUTATION_PUT: u8 = 1;
 const MUTATION_DELETE: u8 = 2;
+const HOST_PROTOCOL_HEADER_BYTES: usize = 2;
+const HOST_LENGTH_PREFIX_BYTES: usize = 4;
 const READ_RESPONSE_OVERHEAD: usize = 7;
+
+fn host_read_request_bytes(key_bytes: usize) -> io::Result<usize> {
+	key_bytes
+		.checked_add(HOST_PROTOCOL_HEADER_BYTES + HOST_LENGTH_PREFIX_BYTES)
+		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host read request size overflow"))
+}
+
+fn minimum_cleanup_reservation(
+	max_read_response_bytes: usize,
+	max_control_response_bytes: usize,
+	max_read_request_bytes: usize,
+	max_mutation_request_bytes: usize,
+) -> io::Result<usize> {
+	let read = max_read_response_bytes
+		.checked_add(max_read_request_bytes)
+		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cleanup read reservation overflow"))?;
+	let write = max_control_response_bytes
+		.checked_add(max_mutation_request_bytes.min(RECLAIM_MAX_BATCH_REQUEST_BYTES))
+		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cleanup write reservation overflow"))?;
+	Ok(read.max(write))
+}
+
+fn validate_cleanup_request(request_bytes: usize, limit: Option<usize>, operation: &str) -> io::Result<()> {
+	if limit.is_some_and(|limit| request_bytes > limit) {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			format!("low-priority host storage {operation} request exceeds its byte limit"),
+		));
+	}
+	Ok(())
+}
 
 #[derive(Clone)]
 struct HostKvStore {
@@ -373,6 +498,9 @@ struct HostKvStore {
 	identity: KvStoreIdentity,
 	max_read_response_bytes: usize,
 	max_control_response_bytes: usize,
+	max_cleanup_read_request_bytes: Option<usize>,
+	max_cleanup_mutation_request_bytes: Option<usize>,
+	class: AdmissionClass,
 }
 
 impl HostKvStore {
@@ -394,10 +522,61 @@ impl HostKvStore {
 			identity,
 			max_read_response_bytes,
 			max_control_response_bytes,
+			max_cleanup_read_request_bytes: None,
+			max_cleanup_mutation_request_bytes: None,
+			class: AdmissionClass::Foreground,
 		})
 	}
 
+	fn minimum_cleanup_bytes(&self, namespace: &[u8], budget: ReclaimBudget) -> io::Result<usize> {
+		minimum_cleanup_reservation(
+			self.max_read_response_bytes,
+			self.max_control_response_bytes,
+			host_read_request_bytes(reclaim_read_key_bytes(namespace))?,
+			budget.max_request_bytes,
+		)
+	}
+
+	fn cleanup_directory(
+		&self,
+		namespace: &[u8],
+		foreground_reserved_bytes: usize,
+		max_cleanup_bytes: usize,
+		budget: ReclaimBudget,
+	) -> io::Result<KvDirectory<Self>> {
+		let max_read_request_bytes = host_read_request_bytes(reclaim_read_key_bytes(namespace))?;
+		let max_mutation_request_bytes = budget.max_request_bytes.min(RECLAIM_MAX_BATCH_REQUEST_BYTES);
+		if max_read_request_bytes == 0 || max_mutation_request_bytes == 0 {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"low-priority host storage request limits must be positive",
+			));
+		}
+		let minimum_reservation = minimum_cleanup_reservation(
+			self.max_read_response_bytes,
+			self.max_control_response_bytes,
+			max_read_request_bytes,
+			max_mutation_request_bytes,
+		)?;
+		if max_cleanup_bytes < minimum_reservation {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("low-priority host storage byte limit must be at least {minimum_reservation} bytes"),
+			));
+		}
+		self.transport
+			.configure_cleanup(foreground_reserved_bytes, max_cleanup_bytes)?;
+		let store = Self {
+			class: AdmissionClass::Cleanup,
+			max_cleanup_read_request_bytes: Some(max_read_request_bytes),
+			max_cleanup_mutation_request_bytes: Some(max_mutation_request_bytes),
+			..self.clone()
+		};
+		Ok(KvDirectory::with_namespace(store, namespace))
+	}
+
 	fn request(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
+		validate_cleanup_request(request.len(), self.max_cleanup_read_request_bytes, "read")?;
 		// Read deadlines cover admission and host execution; a timed-out read has no storage side effect.
 		let deadline = Instant::now()
 			.checked_add(self.transport.read_timeout)
@@ -406,6 +585,7 @@ impl HostKvStore {
 	}
 
 	fn request_mutation(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
+		validate_cleanup_request(request.len(), self.max_cleanup_mutation_request_bytes, "mutation")?;
 		// A dispatched JavaScript mutation cannot be canceled, so wait for its definitive result.
 		self.request_with_deadline(request, response_budget, None)
 	}
@@ -416,7 +596,9 @@ impl HostKvStore {
 		response_budget: usize,
 		deadline: Option<Instant>,
 	) -> io::Result<ResponseDecoder> {
-		let response = self.transport.round_trip(request, response_budget, deadline)?;
+		let response = self
+			.transport
+			.round_trip(request, response_budget, deadline, self.class)?;
 		let mut decoder = ResponseDecoder::new(response);
 		if decoder.u8()? != HOST_PROTOCOL_VERSION {
 			return Err(io::Error::new(
@@ -704,6 +886,7 @@ pub fn test_host_round_trip(
 	request: Buffer,
 	response_budget: u32,
 	use_timeout: bool,
+	low_priority: bool,
 	callback: JsFunction,
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
@@ -718,12 +901,120 @@ pub fn test_host_round_trip(
 			.spawn(move || {
 				let result = test_thread_result(|| {
 					let deadline = use_timeout.then(|| Instant::now() + transport.read_timeout);
-					transport.round_trip(request, response_budget as usize, deadline)
+					transport.round_trip(
+						request,
+						response_budget as usize,
+						deadline,
+						if low_priority {
+							AdmissionClass::Cleanup
+						} else {
+							AdmissionClass::Foreground
+						},
+					)
 				});
 				let _ = completion.call(result, ThreadsafeFunctionCallMode::NonBlocking);
 			})
 			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
 		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testConfigureHostTransportCleanup")]
+pub fn test_configure_host_transport_cleanup(
+	handle: u32,
+	foreground_reserved_bytes: u32,
+	max_cleanup_bytes: u32,
+) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		registry()
+			.get(&handle)
+			.cloned()
+			.ok_or_else(|| napi::Error::new("E_CLOSED", "unknown or closed host storage transport"))?
+			.configure_cleanup(foreground_reserved_bytes as usize, max_cleanup_bytes as usize)
+			.map_err(|error| napi::Error::new("E_INVALID_ARGUMENT", error.to_string()))
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testHostTransportStats")]
+pub fn test_host_transport_stats(handle: u32) -> boundary::Result<Vec<String>> {
+	boundary::run_stateless(|| {
+		let transport = registry()
+			.get(&handle)
+			.cloned()
+			.ok_or_else(|| napi::Error::new("E_CLOSED", "unknown or closed host storage transport"))?;
+		let state = transport.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		Ok(vec![
+			state.operations.to_string(),
+			state.bytes.to_string(),
+			state.cleanup_operations.to_string(),
+			state.cleanup_bytes.to_string(),
+			transport.abandoned_waiters.load(Ordering::Relaxed).to_string(),
+		])
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testHoldHostTransportCapacity")]
+pub fn test_hold_host_transport_capacity(
+	handle: u32,
+	request_bytes: u32,
+	response_bytes: u32,
+	low_priority: bool,
+) -> boundary::Result<String> {
+	boundary::run_stateless(|| {
+		let transport = registry()
+			.get(&handle)
+			.cloned()
+			.ok_or_else(|| napi::Error::new("E_CLOSED", "unknown or closed host storage transport"))?;
+		let request_id = transport.next_request_id.fetch_add(1, Ordering::Relaxed);
+		if request_id == 0 {
+			return Err(napi::Error::new(
+				"E_NATIVE_FAILURE",
+				"host storage request id space exhausted",
+			));
+		}
+		let response = Arc::new(ResponseSlot::new());
+		transport
+			.admit(
+				request_id,
+				request_bytes as usize,
+				response_bytes as usize,
+				&response,
+				Some(Instant::now()),
+				if low_priority {
+					AdmissionClass::Cleanup
+				} else {
+					AdmissionClass::Foreground
+				},
+			)
+			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
+		Ok(request_id.to_string())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testReleaseHostTransportCapacity")]
+pub fn test_release_host_transport_capacity(handle: u32, request_id: String) -> boundary::Result<bool> {
+	boundary::run_stateless(|| {
+		let transport = registry()
+			.get(&handle)
+			.cloned()
+			.ok_or_else(|| napi::Error::new("E_CLOSED", "unknown or closed host storage transport"))?;
+		let request_id = request_id
+			.parse()
+			.map_err(|_| napi::Error::new("E_INVALID_ARGUMENT", "invalid host storage request id"))?;
+		let exists = transport
+			.state
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.pending
+			.contains_key(&request_id);
+		if exists {
+			transport.complete(request_id, Ok(Vec::new()));
+		}
+		Ok(exists)
 	})?
 }
 
@@ -782,6 +1073,106 @@ pub fn test_verify_tantivy_on_host_transport(
 }
 
 #[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testReclaimOnHostTransport")]
+pub fn test_reclaim_on_host_transport(
+	handle: u32,
+	max_read_response_bytes: u32,
+	max_control_response_bytes: u32,
+	callback: JsFunction,
+) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		let transport = registry()
+			.get(&handle)
+			.cloned()
+			.ok_or_else(|| napi::Error::new("E_CLOSED", "unknown or closed host storage transport"))?;
+		let completion = completion(callback)?;
+		thread::Builder::new()
+			.name(format!("fulltext-host-reclaim-test-{handle}"))
+			.spawn(move || {
+				let result = test_thread_result(|| {
+					let store = HostKvStore::new(
+						transport,
+						KvStoreIdentity(1, handle as u64, 1),
+						max_read_response_bytes as usize,
+						max_control_response_bytes as usize,
+					)?;
+					let foreground_reserved_bytes = (max_read_response_bytes as usize)
+						.checked_add(max_control_response_bytes as usize)
+						.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "foreground reserve overflow"))?;
+					let budget = ReclaimBudget {
+						max_point_reads: 1_024,
+						max_mutations: 4_096,
+						max_request_bytes: 1024 * 1024,
+						max_elapsed: Duration::from_secs(5),
+					};
+					let run = NEXT_TRANSPORT_HANDLE.fetch_add(1, Ordering::Relaxed);
+					let namespace = format!("host-reclaim/{run}");
+					let max_cleanup_bytes = store.minimum_cleanup_bytes(namespace.as_bytes(), budget)?;
+					if store
+						.cleanup_directory(
+							namespace.as_bytes(),
+							foreground_reserved_bytes,
+							max_cleanup_bytes - 1,
+							budget,
+						)
+						.is_ok()
+					{
+						return Err(io::Error::other("undersized cleanup storage view was accepted"));
+					}
+					let cleanup = store.cleanup_directory(
+						namespace.as_bytes(),
+						foreground_reserved_bytes,
+						max_cleanup_bytes,
+						budget,
+					)?;
+					let foreground = KvDirectory::with_namespace(store, namespace.as_bytes());
+					let payload = vec![7_u8; CHUNK_SIZE + 17];
+					for path in ["pinned", "unpinned"] {
+						let path = Path::new(path);
+						let mut writer = foreground
+							.open_write(path)
+							.map_err(|error| io::Error::other(error.to_string()))?;
+						writer.write_all(&payload)?;
+						writer.terminate()?;
+					}
+					let pinned = foreground
+						.open_read(Path::new("pinned"))
+						.map_err(|error| io::Error::other(error.to_string()))?;
+					for path in ["pinned", "unpinned"] {
+						foreground
+							.delete(Path::new(path))
+							.map_err(|error| io::Error::other(error.to_string()))?;
+					}
+					let first = cleanup.reclaim(budget)?;
+					if first.entries_reclaimed == 0 || first.pinned_skips == 0 {
+						return Err(io::Error::other(
+							"host reclamation did not reclaim an unpinned object while preserving a pinned object",
+						));
+					}
+					drop(pinned);
+					let second = cleanup.reclaim(budget)?;
+					if second.entries_reclaimed == 0 || second.has_more {
+						return Err(io::Error::other(
+							"host reclamation did not drain after the retained reader closed",
+						));
+					}
+					Ok(format!(
+						"{},{},{},{}",
+						first.entries_reclaimed + second.entries_reclaimed,
+						first.pinned_skips,
+						first.payload_delete_mutations + second.payload_delete_mutations,
+						payload.len() * 2
+					)
+					.into_bytes())
+				});
+				let _ = completion.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+			})
+			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
+		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
 #[napi(catch_unwind, skip_typescript, js_name = "__testCloseHostTransport")]
 pub fn test_close_host_transport(handle: u32) -> boundary::Result<bool> {
 	boundary::run_stateless(|| {
@@ -798,7 +1189,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn closing_wakes_every_pending_request() {
+	fn response_slot_returns_a_close_error() {
 		let response = Arc::new(ResponseSlot::new());
 		response.complete(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
 		assert_eq!(
@@ -813,5 +1204,28 @@ mod tests {
 		response.complete(Ok(vec![1]));
 		response.complete(Ok(vec![2]));
 		assert_eq!(response.wait(Some(Instant::now())).unwrap().unwrap(), vec![1]);
+	}
+
+	#[test]
+	fn cleanup_reservation_covers_reads_and_bounded_writes() {
+		assert_eq!(minimum_cleanup_reservation(100, 10, 6, 20).unwrap(), 106);
+		assert_eq!(minimum_cleanup_reservation(10, 100, 6, 20).unwrap(), 120);
+		assert_eq!(
+			minimum_cleanup_reservation(10, 100, 6, usize::MAX).unwrap(),
+			100 + RECLAIM_MAX_BATCH_REQUEST_BYTES
+		);
+		assert_eq!(reclaim_read_key_bytes(b""), 30);
+		assert_eq!(reclaim_read_key_bytes(b"index"), 35);
+		assert_eq!(host_read_request_bytes(reclaim_read_key_bytes(b"")).unwrap(), 36);
+		assert_eq!(host_read_request_bytes(reclaim_read_key_bytes(b"index")).unwrap(), 41);
+		assert!(minimum_cleanup_reservation(usize::MAX, 10, 6, 20).is_err());
+		assert!(minimum_cleanup_reservation(10, usize::MAX, 6, 20).is_err());
+	}
+
+	#[test]
+	fn cleanup_request_limits_are_enforced() {
+		assert!(validate_cleanup_request(6, Some(6), "read").is_ok());
+		assert!(validate_cleanup_request(7, Some(6), "read").is_err());
+		assert!(validate_cleanup_request(usize::MAX, None, "read").is_ok());
 	}
 }

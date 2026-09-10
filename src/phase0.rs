@@ -93,6 +93,11 @@ pub trait KvStore: Clone + Send + Sync + 'static {
 
 pub(crate) const CHUNK_SIZE: usize = 256 * 1024;
 
+pub(crate) fn reclaim_read_key_bytes(namespace: &[u8]) -> usize {
+	// Tail objects have the longest key read by reclamation.
+	tail_key(namespace, u64::MAX, u64::MAX).len()
+}
+
 impl Mutation {
 	fn key(&self) -> &[u8] {
 		match self {
@@ -2157,7 +2162,7 @@ const RECLAIM_ENTRY_WHOLE_OBJECT: u8 = 1;
 const RECLAIM_SHARD_COUNT: usize = 64;
 const _: () = assert!(RECLAIM_SHARD_COUNT <= u64::BITS as usize);
 const RECLAIM_MAX_BATCH_MUTATIONS: usize = 512;
-const RECLAIM_MAX_BATCH_REQUEST_BYTES: usize = 64 * 1024;
+pub(crate) const RECLAIM_MAX_BATCH_REQUEST_BYTES: usize = 64 * 1024;
 const READER_REGISTRATION_SHARD_COUNT: usize = 256;
 const KEY_KIND_COUNTER: u8 = 1;
 const KEY_KIND_BINDING: u8 = 2;

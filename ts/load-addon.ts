@@ -35,9 +35,25 @@ interface NativeAddonApi {
 		request: Buffer,
 		responseBudget: number,
 		useTimeout: boolean,
+		lowPriority: boolean,
 		callback: NativeCallback,
 	): void;
+	__testConfigureHostTransportCleanup?(handle: number, foregroundReservedBytes: number, maxCleanupBytes: number): void;
+	__testHostTransportStats?(handle: number): string[];
+	__testHoldHostTransportCapacity?(
+		handle: number,
+		requestBytes: number,
+		responseBytes: number,
+		lowPriority: boolean,
+	): string;
+	__testReleaseHostTransportCapacity?(handle: number, requestId: string): boolean;
 	__testVerifyTantivyOnHostTransport?(
+		handle: number,
+		maxReadResponseBytes: number,
+		maxControlResponseBytes: number,
+		callback: NativeCallback,
+	): void;
+	__testReclaimOnHostTransport?(
 		handle: number,
 		maxReadResponseBytes: number,
 		maxControlResponseBytes: number,
