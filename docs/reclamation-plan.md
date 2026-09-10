@@ -139,7 +139,9 @@ readers that started before publication have either registered or exited; it is 
 substitution. Conversely, a stalled colliding reader can hold deletion behind its binding read;
 because deletion already owns that path's lifecycle gate, this can also delay an `open_write()` for
 the path being deleted. The host transport's definitive-completion contract bounds this only when
-the host operation completes or the transport closes.
+the host operation completes or the transport closes. The initial 256-shard count bounds memory and
+keeps collision probability low; it is not yet validated against Harper host-read p99 and must be
+measured before cleanup is enabled.
 
 Cleanup never holds a path gate or pin-registry lock across storage I/O. A retired object cannot
 gain a new pin because its binding is gone. Before tail-only reclamation is enabled, publication of
@@ -319,7 +321,8 @@ revision. Shared CI runs a correctness smoke with no timing threshold; performan
 alternating runs on one fixed host. The deterministic benchmark store removes RocksDB and Node
 transport variance, permits concurrent point reads, and serializes writes. Read-open concurrency
 therefore isolates registration contention, while write concurrency detects directory-coordination
-regressions; neither predicts RocksDB scaling.
+regressions; neither predicts RocksDB scaling. The `-rw-` read-open case names begin a new comparison
+series because the earlier cases used the serialized fault-injection store.
 
 The completed mapping tests cover repeated flush, delete/recreate with a retained old reader,
 abandoned writers, partial object cleanup, restart during a range and between FIFO entries, namespace

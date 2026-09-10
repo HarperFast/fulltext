@@ -50,7 +50,7 @@ impl Default for BenchmarkKv {
 
 impl KvStore for BenchmarkKv {
 	fn identity(&self) -> KvStoreIdentity {
-		KvStoreIdentity(0, self.identity, 0)
+		KvStoreIdentity(1, self.identity, 0)
 	}
 
 	fn read(&self, key: &[u8]) -> io::Result<Option<OwnedBytes>> {
@@ -257,14 +257,16 @@ fn main() -> io::Result<()> {
 	)?);
 	for threads in [1, 2, 4, 8] {
 		results.push(measure_case(
-			format!("concurrent-open-read-{threads}t"),
+			format!("concurrent-open-read-rw-{threads}t"),
 			"open-read",
 			threads,
 			&arguments,
 			concurrent_open_read_case(threads, arguments.smoke, false),
 		)?);
+	}
+	for threads in [2, 4, 8] {
 		results.push(measure_case(
-			format!("concurrent-shared-open-read-{threads}t"),
+			format!("concurrent-shared-open-read-rw-{threads}t"),
 			"open-read",
 			threads,
 			&arguments,
@@ -615,6 +617,7 @@ fn concurrent_open_read_case(
 		let elapsed_nanoseconds = std::thread::scope(|scope| -> io::Result<u128> {
 			let mut handles = Vec::with_capacity(threads);
 			for (thread, thread_paths) in paths.into_iter().enumerate() {
+				let opened = Vec::with_capacity(thread_paths.len());
 				let directory = directory.clone();
 				let worker_start_gate = start_gate.clone();
 				let remaining = remaining.clone();
@@ -625,8 +628,8 @@ fn concurrent_open_read_case(
 						let Some(started) = worker_start_gate.wait() else {
 							return Ok(Vec::new());
 						};
-						let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-							let mut opened = Vec::with_capacity(thread_paths.len());
+						let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+							let mut opened = opened;
 							for path in thread_paths {
 								opened.push(
 									directory

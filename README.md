@@ -104,7 +104,8 @@ at one, two, four, and eight threads. It reports percentiles across per-sample m
 uses a deterministic in-memory store to isolate directory coordination from RocksDB and Node
 transport costs. The store permits concurrent point reads but serializes writes, so read-open cases
 isolate registration contention while write cases detect coordination regressions; neither predicts
-RocksDB scaling.
+RocksDB scaling. The `-rw-` read-open case names establish a new comparison series and must not be
+compared with results from the earlier serialized-store cases.
 Compare two optimized builds on the same quiet host; records include the Git revision and dirty
 state, while `--revision` can add a run label and `--samples` and `--warmup` control the run. CI
 executes only `--smoke`, whose timings are not comparable to a full run, and applies no timing
