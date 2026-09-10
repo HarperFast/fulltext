@@ -9,13 +9,13 @@ readiness wait for a complete sweep.
 
 ## Grounding
 
-This plan is written against fulltext main at `a982e8a`, the rebase-merged result of
-[Track directory object high-water marks #25](https://github.com/HarperFast/fulltext/pull/25).
-`KvDirectory` stores immutable 256 KiB chunks and revisioned tails. `delete()` currently removes
-only logical bindings, each successful `flush()` can leave the previous tail revision unreachable,
-and a crashed writer can leave staged chunks that no binding ever named. `KvStore` supplies point
-read, atomic batch write, and sync, but no key enumeration. Harper PR #2535 supplies the same narrow
-storage shape from Harper-owned RocksDB.
+This plan is written against fulltext main at `36d96e3`, the rebase-merged result of
+[Enqueue deleted directory objects for reclamation #26](https://github.com/HarperFast/fulltext/pull/26).
+`KvDirectory` stores immutable 256 KiB chunks and revisioned tails. `delete()` atomically removes a
+logical binding and enqueues the object's derivable physical extent, but no consumer deletes those
+payloads yet. Each successful `flush()` can leave the previous tail revision unreachable. `KvStore`
+supplies point read, atomic batch write, and sync, but no key enumeration. Harper PR #2535 supplies
+the same narrow storage shape from Harper-owned RocksDB.
 
 Tantivy's `ManagedDirectory` decides when a logical file name is retired. `KvDirectory` owns the
 physical object behind that name and the lifetime of opened handles. Harper's derived-index runtime
@@ -118,8 +118,11 @@ object. A handle owns an `Arc` pin, and drop only decrements the `Arc`. Pin inse
 entries above a small fixed threshold, and FIFO visits prune them again. This bounds control-block
 retention during repeated open/drop churn. Writer state is likewise retained through failed and
 unterminated writes. Gates recover poisoned state rather than panicking the writer actor. Pins land
-with the FIFO consumer in slice 4, where a test can prove that they prevent payload deletion. Harper
-may enable cleanup only after a two-worker test proves that every local search handle for one
+in the first slice 4 unit before the FIFO consumer. A handle reads its binding and registers the pin
+under the existing per-path lifecycle gate. Deletion uses the same gate, so it either observes a
+registered pin or removes the binding before a later open can read it. This preserves one storage
+read per handle open and adds no cross-path coordination. The consumer follows only after these
+lifetime rules are independently covered. Harper may enable cleanup only after a two-worker test proves that every local search handle for one
 RocksDB-backed generation reaches the same native `DirectoryState`. A process that cannot establish
 that invariant cannot obtain the cleanup owner lease.
 
@@ -248,11 +251,13 @@ Then deliver reclamation in reviewable slices:
 3. per-path lifecycle state, a strided object-id allocator, an atomic writer fence, and sharded-FIFO
    enqueue at object deletion; key writer retirement by object id so path reuse cannot retire the
    replacement writer;
-4. measure and, if justified, add tail-supersession entries; then add object-id/revision pins,
-   bounded FIFO draining and deferred queues, low-priority admission, failure observability, close
-   fencing, crash recovery, and Harper's exclusive-owner integration.
+4. add object-id/revision reader pins and coordinate registration with deletion through the
+   per-path lifecycle gate;
+5. measure and, if justified, add tail-supersession entries; then add bounded FIFO draining and
+   deferred queues, low-priority admission, failure observability, close fencing, crash recovery, and
+   Harper's exclusive-owner integration.
 
-The production Harper package remains disabled until slice 4's lifecycle fence and Harper host-
+The production Harper package remains disabled until the cleanup lifecycle fence and Harper host-
 storage integration both pass. No native RocksDB storage provider is added to the public library.
 
 ## Verification
@@ -279,12 +284,13 @@ real Tantivy merge and garbage-collection cycles and after crash/reopen. `Faulti
 recovery at atomic batch boundaries; the Harper integration separately proves that one host write
 request commits as one RocksDB batch.
 
-The dependency-free `kv_directory` release benchmark compares the merged slice-2 baseline with this
-slice through Tantivy's buffered `WritePtr`, rather than calling the fence directly. It reports
-per-sample-mean p50/p95/p99 and aggregate throughput for caller write sizes, empty and dirty flushes, chunk
-publication, deletion with closed and active writers, and distinct-file concurrency. The
+The dependency-free `kv_directory` release benchmark compares adjacent merged slices through
+Tantivy's public directory interfaces. It reports per-sample-mean p50/p95/p99 and aggregate
+throughput for caller write sizes, empty and dirty flushes, chunk publication, deletion with closed
+and active writers, retained and churned read-handle opens, and distinct-file concurrency. The
 empty-flush case isolates the per-call retirement-fence cost; the buffered cases show how Tantivy's
-writer amortizes it in practice. Results are versioned JSON labeled by revision. Shared CI runs a
+writer amortizes it in practice. Retained handles measure registration growth, while churned handles
+exercise weak-pin pruning. Results are versioned JSON labeled by revision. Shared CI runs a
 correctness smoke with no timing threshold; performance decisions use alternating runs on one fixed
 host. The deterministic Phase 0 store removes RocksDB and Node transport variance but serializes
 access, so its concurrency results detect directory-coordination regressions rather than predicting

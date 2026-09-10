@@ -19,6 +19,7 @@ const MIN_WRITE_OPERATIONS_PER_SAMPLE: usize = 256;
 const CHUNK_BYTES: usize = 256 * 1024;
 const STORAGE_OPERATIONS_PER_SAMPLE: usize = 64;
 const EMPTY_FLUSHES_PER_SAMPLE: usize = 10_000;
+const OPEN_READS_PER_SAMPLE: usize = 10_000;
 const CONCURRENT_BYTES_PER_FILE: usize = 4 * 1024;
 const CONCURRENT_FILES_PER_THREAD: usize = 64;
 
@@ -184,6 +185,20 @@ fn main() -> io::Result<()> {
 		1,
 		&arguments,
 		delete_case(true, arguments.smoke),
+	)?);
+	results.push(measure_case(
+		"open-read-retained".to_owned(),
+		"open-read",
+		1,
+		&arguments,
+		open_read_case(true, arguments.smoke),
+	)?);
+	results.push(measure_case(
+		"open-read-churn".to_owned(),
+		"open-read",
+		1,
+		&arguments,
+		open_read_case(false, arguments.smoke),
 	)?);
 
 	for threads in [1, 2, 4, 8] {
@@ -448,6 +463,48 @@ fn delete_case(active_writer: bool, smoke: bool) -> impl FnMut(usize) -> io::Res
 		}
 		let elapsed_nanoseconds = started.elapsed().as_nanos();
 		drop(active_writers);
+		Ok(Sample {
+			elapsed_nanoseconds,
+			operations: operations as u64,
+			bytes: 0,
+		})
+	}
+}
+
+fn open_read_case(retain_handles: bool, smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
+	move |sample| {
+		let directory = FaultingDirectory::new(FaultingKv::default());
+		let operations = if smoke {
+			4
+		} else if retain_handles {
+			STORAGE_OPERATIONS_PER_SAMPLE
+		} else {
+			OPEN_READS_PER_SAMPLE
+		};
+		let file_count = if retain_handles { operations } else { 1 };
+		let mut paths = Vec::with_capacity(file_count);
+		for file in 0..file_count {
+			let path = format!("open-read-{retain_handles}-{sample}-{file}");
+			let mut writer = open_writer(&directory, Path::new(&path))?;
+			writer.write_all(b"contents")?;
+			writer.terminate()?;
+			paths.push(path);
+		}
+		let mut handles = Vec::with_capacity(if retain_handles { operations } else { 1 });
+		let started = Instant::now();
+		for operation in 0..operations {
+			let path = &paths[operation % file_count];
+			let handle = directory
+				.open_read(Path::new(path))
+				.map_err(|error| io::Error::other(error.to_string()))?;
+			if retain_handles {
+				handles.push(handle);
+			} else {
+				black_box(handle);
+			}
+		}
+		let elapsed_nanoseconds = started.elapsed().as_nanos();
+		black_box(handles);
 		Ok(Sample {
 			elapsed_nanoseconds,
 			operations: operations as u64,
