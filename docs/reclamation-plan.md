@@ -87,9 +87,11 @@ unreachable, not a second source-data journal.
 
 The FIFO is split into a fixed number of shards selected by object id. Each shard has its own head,
 tail, sequence-addressed entries, and enqueue mutex; unrelated publishers do not wait on one global
-host mutation. Enqueue and tail advance share the binding publication or deletion batch. Dequeue
-progress and payload deletes share one WAL-only batch; final entry deletion and head advance share
-one WAL-only batch. Missing payload keys are normal, and all operations are idempotent after crash.
+host mutation. Enqueue and tail advance share the binding publication or deletion batch. Progress
+is keyed by the entry sequence, and progress advancement shares one WAL-only batch with the payload
+deletes it represents. Final payload deletion, progress deletion, entry deletion, and any head
+advance likewise share one WAL-only batch. Missing payload keys are normal, and all operations are
+idempotent after crash.
 Reclamation uses only existing point reads and atomic batch writes, so `KvStore`, the host protocol,
 the TypeScript handler, and rocksdb-js gain no new primitive.
 
@@ -148,11 +150,13 @@ gain a new pin because its binding is gone. Before tail-only reclamation is enab
 the newer binding and its superseded-tail entry must take the exclusive side of the same
 registration fence used by deletion. That prevents a reader from registering the old revision
 after publication. Whole-object entries match any pin for that object, while tail-only entries
-match only the exact object id and tail revision. If a matching pin remains, cleanup moves the entry
-to a cleanup-only deferred queue with bounded backoff rather than blocking later garbage.
-Foreground publishers only mutate the ingress tail; cleanup only mutates the ingress head and
-deferred queue. A low-priority cleanup host operation therefore never owns the mutex or counter
-needed by a foreground enqueue.
+match only the exact object id and tail revision. If a matching pin remains, cleanup leaves the
+durable entry in place and advances a process-local scan cursor to later sequence-addressed entries.
+Completed later entries become holes in the FIFO. The durable head advances only across missing
+entries and stops at the oldest retained or partially processed entry. Foreground publishers mutate
+only the tail, so a low-priority cleanup host operation never owns the mutex or counter needed by a
+foreground enqueue. Restart discards the scan cursor together with the process-local pins; cleanup
+then resumes from the durable head without persisting a stale reason for deferral.
 
 This process-local pin model is valid only while Harper's derived-index lifecycle guarantees one
 active generation owner. Cleanup requires an explicit owner lease supplied by that lifecycle; the
@@ -216,36 +220,49 @@ when that handle is its sole access path.
 
 The worker point-reads only the FIFO head, its current entry, and bounded progress. A whole-object
 entry deletes derived chunk and tail ranges over as many batches as necessary. A tail-only entry
-deletes one derived key. A pinned entry rotates behind other work; repeated rotations are rate-limited
-and surface a blocked-reclamation health state rather than consuming the JavaScript service thread.
+deletes one derived key. A pinned entry is skipped in memory for the current admission, while later
+sequence-addressed entries in the same shard remain eligible. Each starting sequence is examined at
+most once per admission, and a pass that finds only pinned work reports a blocked-reclamation state
+rather than consuming the JavaScript service thread.
 Cleanup cost is proportional to garbage queued, never to object ids or records ever created.
 
 The first consumer-core unit remains synchronous and available only through the experimental Rust
-`phase0` surface. It adds an ingress head and one progress record per shard. Progress contains the
-next chunk ordinal and next tail revision for the current head entry. Every payload-deletion batch
-also persists the resulting progress; the batch that removes the final payload keys deletes the
-entry and advances the head instead. A crash can therefore repeat deletes, which are idempotent, but
-cannot recover a cursor beyond bytes that may still exist. The cursor is independent of the queue
-entry so the immutable entry remains identical when it moves between queues.
+`phase0` surface. It adds one persisted head per shard and keys progress by shard and entry sequence.
+Progress contains the next chunk ordinal and next tail revision for that exact entry. Every
+payload-deletion batch also persists the resulting progress; the final batch removes the entry and
+its progress and advances the head when it completes the current head. A crash can therefore repeat
+deletes, which are idempotent, but cannot recover a cursor beyond bytes that may still exist or
+apply one entry's cursor to another entry.
 
-Each shard also receives a cleanup-only deferred FIFO with its own head, tail, entries, and progress.
-When an ingress head is pinned, one atomic batch appends that immutable entry to the deferred tail,
-advances the deferred tail, removes the ingress entry, and advances the ingress head. Foreground
-enqueue never reads or mutates deferred state. Deferred processing snapshots its starting depth and
-examines each of those entries at most once per admission. An unpinned entry is reclaimed normally;
-a pinned entry moves to the deferred tail only when another entry follows it. A sole pinned entry is
-left in place. This prevents one retained handle from blocking later garbage without letting one
-admission cycle the same pinned entry indefinitely. The result reports pinned rotations and whether
-the remaining queue made no deletion progress; the later background-task unit owns retry timing and
+The consumer snapshots each visited shard's tail and examines each starting sequence at most once
+per admission. A pinned entry remains durable while a process-local cursor moves to the next
+sequence. An unpinned later entry may complete out of order, leaving a missing slot. When the oldest
+entry completes, bounded point reads advance the durable head across consecutive holes. This
+prevents one retained handle from blocking later garbage without adding another durable queue,
+copying entries, or sharing foreground tail state. The result reports pinned skips and whether the
+remaining queue made no deletion progress; the later background-task unit owns retry timing and
 health thresholds.
 
-One process-local consumer mutex and round-robin shard cursor live in `DirectoryState`. They
-serialize cleanup for one storage identity and namespace without coordinating different indexes,
-and prevent a small budget from always starting at shard zero. The call accepts hard limits for
+Reclaim entries add the published full-chunk count alongside the existing high-waters. Published
+chunks are a known contiguous prefix and are deleted directly. Any staged chunks between the
+published count and the reserved high-water are probed in order and deletion stops at the first
+missing chunk; writer staging is contiguous, so no later chunk can exist. This avoids writing up to
+63 unnecessary RocksDB tombstones for every retired object while preserving discovery of a writer's
+unpublished staged prefix. Tail revisions remain bounded blind deletes because an empty-tail flush
+can make their physical presence sparse.
+
+One process-local consumer mutex, round-robin shard cursor, and lazy per-shard head/tail hints live
+in `DirectoryState`. They serialize cleanup for one storage identity and namespace without coordinating different indexes,
+prevent a small budget from always starting at shard zero, and make repeated empty admissions avoid
+host reads after a shard has been observed empty. Enqueue invalidates or advances the corresponding
+hint after its definitive result. The call accepts hard limits for
 point reads, batch mutations, encoded mutation bytes, and elapsed work. It starts an operation only
 when that operation fits the remaining count and byte limits, and checks elapsed time between host
 operations. A synchronous operation already admitted to the host remains uncancellable and may
-finish after the elapsed target. This unit does not create a thread, reserve host-transport capacity,
+finish after the elapsed target. Limits that cannot admit the smallest legal cleanup step are
+rejected rather than reported as no progress. Invalid persisted queue data returns a distinct
+terminal result for the affected shard so a caller cannot hot-loop it as ordinary blocked work.
+This unit does not create a thread, reserve host-transport capacity,
 accept an owner lease, expose Node.js API, or enable Harper cleanup; those lifecycle and admission
 rules remain the next unit.
 
@@ -254,7 +271,7 @@ callbacks still execute on JavaScript, so cleanup has a low-priority admission c
 take the last foreground transport slot. Each admission bounds point reads, delete mutations,
 request bytes, and elapsed time checked between storage operations. One admitted synchronous host
 operation cannot be canceled and may exceed the elapsed budget. Panics are caught at the task
-boundary; terminal failure, queue depth, pinned rotations, and no-progress state are observable by
+boundary; terminal failure, queue depth, pinned skips, and no-progress state are observable by
 Harper instead of silently disabling reclamation.
 
 Binding, queue-entry, and progress decoding validates versions, lengths, numeric ranges, and a
@@ -268,7 +285,7 @@ silently retries forever or advances past unknown data.
 | Axis                     | Candidate and disposition                                                                                                                                                                                                                                                                                                               |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Different layer          | RocksDB compaction and Harper log retention cannot see Tantivy handles. `ManagedDirectory` owns logical retirement, while `KvDirectory` owns physical retirement.                                                                                                                                                                       |
-| Discovery                | Prefix enumeration or a dense object-id sweep. `KvStore` exposes no enumeration primitive, and either scan would do work proportional to stored history rather than garbage.                                                                                                                                                            |
+| Discovery                | Payload-prefix enumeration or a dense object-id sweep. The Directory's frozen `KvStore` and host transport expose no enumeration primitive. `RocksLease::scan_page` sits outside that contract and returns values, so using it for 256 KiB payload discovery would transfer the object being reclaimed and would not support the standalone host transport. Either scan would also do work proportional to stored history rather than garbage. |
 | Managed paths            | Treat Tantivy's `.managed.json` as the discovery source. It names logical paths, not object ids, chunk ordinals, or tail revisions, so delete/recreate cannot recover the retired object's extent.                                                                                                                                      |
 | Bound placement          | Update the binding with every payload, reserve bounded strides in the binding, or add a separate per-object extent key. Strided binding reservation is chosen: it keeps deletion capture atomic in slice 3 without per-chunk host reads.                                                                                                |
 | Different timing         | Delete up to a fixed number of chunks synchronously in `delete()` and enqueue only the remainder. This may help small objects, but it lengthens Tantivy metadata GC and is deferred until measurement shows a net win.                                                                                                                  |
@@ -281,8 +298,8 @@ silently retries forever or advances past unknown data.
 | Writer fence             | Holding a path lock across each chunk write would add lock convoying around an uncancellable host round trip. A per-writer atomic retired/in-flight fence is chosen: delete closes admission and waits before its final binding read, while chunk staging adds no mutex or allocation.                                                  |
 | Object-id allocation     | Updating the counter with every binding creation serializes file creation across a host round trip. The allocator reserves fixed durable strides, reducing that shared operation to one per stride; unused ids after failure or restart are harmless.                                                                                   |
 | Queue-tail reads         | Cache the next sequence and reread only after errors, or point-read it before every enqueue. The durable point read is chosen because slice 3 enqueues only file deletion rather than indexed documents, removes cache recovery state, and is measured explicitly.                                                                      |
-| Cleanup priority         | Cleanup does not rotate through the foreground ingress tail. A cleanup-only deferred queue lets the consumer advance past pinned entries without holding a foreground enqueue mutex or counter across low-priority host I/O.                                                                                                            |
-| Chosen                   | Binding high-waters plus a transition-fed durable FIFO, with object-id pins and bounded low-priority draining.                                                                                                                                                                                                                          |
+| Cleanup priority         | Cleanup leaves pinned entries durable and skips them with a process-local sequence cursor. Later entries may complete out of order, while the durable head advances only across observed holes. This lets the consumer advance without a second persistent queue or holding a foreground enqueue mutex or counter across low-priority host I/O. |
+| Chosen                   | Binding high-waters plus one transition-fed durable FIFO per shard, sequence-keyed progress, object-id pins, and bounded low-priority draining.                                                                                                                                                                                          |
 
 ## Persistence format and delivery sequence
 
@@ -301,8 +318,8 @@ Then deliver reclamation in reviewable slices:
    replacement writer;
 4. add object-id/revision reader pins and coordinate registration with deletion through the
    hash-sharded registration fence;
-5. measure and, if justified, add tail-supersession entries; then add bounded FIFO draining and
-   deferred queues, low-priority admission, failure observability, close fencing, crash recovery, and
+5. measure and, if justified, add tail-supersession entries; then add bounded sparse FIFO draining,
+   low-priority admission, failure observability, close fencing, crash recovery, and
    Harper's exclusive-owner integration.
 
 The production Harper package remains disabled until the cleanup lifecycle fence and Harper host-
@@ -359,7 +376,7 @@ abandoned writers, partial object cleanup, restart during a range and between FI
 isolation, concurrent `open_write()` on distinct paths, and cleanup concurrent with Tantivy merge
 completion. A deterministic hook forces the binding-read/pin-register race. Failure injection
 covers staging and high-water updates, publication and tail enqueue, object retirement and enqueue,
-payload deletion, progress updates, rotation, and head advance; every crash/reopen result must expose
+payload deletion, progress updates, out-of-order completion, and head advance; every crash/reopen result must expose
 the old complete binding, the new complete binding, or logical absence—never a reference to missing
 bytes.
 
@@ -374,7 +391,8 @@ owner loss with a second worker, close drain, cleanup health reporting, backup/r
 derived-index replay coordination.
 
 The FIFO tests include parallel enqueue on different shards, sequence/batch failure, pinned-entry
-rotation cost, corrupt binding and entry handling, independent namespaces on one store, and a
+skip cost, out-of-order completion and bounded head compaction, corrupt binding and entry handling,
+independent namespaces on one store, and a
 numeric post-drain bound. Host tests drain to quiescence, assert at least one entry was reclaimed,
 and run foreground reads with cleanup occupying every cleanup-eligible transport slot.
 
