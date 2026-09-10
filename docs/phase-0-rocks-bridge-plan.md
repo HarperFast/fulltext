@@ -165,6 +165,9 @@ namespace / index generation
   tail kind: object-id, revision       -> immutable final partial chunk
   binding kind: logical path           -> v3 object-id, published state and physical-key high-waters
   atomic kind: logical path            -> complete small-file bytes
+  reclaim tail/head kinds: shard       -> next enqueue sequence / oldest retained sequence
+  reclaim entry kind: shard, sequence  -> v2 retired object identity, published chunks and high-waters
+  reclaim progress: shard, sequence    -> next chunk ordinal and tail revision
 ```
 
 The keyspace uses a fixed magic, format version, length-prefixed namespace, and one-byte key-kind
@@ -181,7 +184,9 @@ sentinel reads.
 
 A key-format version change requires dropping the old namespace storage and rebuilding the derived
 generation from Harper source data; changing the version prefix alone would strand old payload.
-New logical key kinds, including reclamation metadata, receive new kind tags under the existing key
+The consumer advances the unreleased directory key format to v3 because reclaim entry v2 adds the
+published chunk count and introduces sequence-keyed progress. The former v2 prototype is rejected
+rather than partially interpreted. New logical key kinds receive distinct kind tags under that
 version. A storage provider must also change `KvStoreIdentity` whenever close, restore, or column-
 family replacement can change the bytes behind an identity.
 
