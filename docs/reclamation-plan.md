@@ -307,7 +307,8 @@ Slice 4 tests object and exact-revision pin counts, delete/recreate identity, th
 pin-registration race, shared state across independently constructed directories, handle-owned
 state lifetime, one storage read per open, bounded open/drop churn, and reader independence from
 writer retirement. The release benchmark adds retained and churned opens plus shared- and
-distinct-file concurrency at one, two, four, and eight threads.
+distinct-file concurrency. Distinct-file cases run at one, two, four, and eight threads; shared-file
+cases start at two threads.
 
 The dependency-free `kv_directory` release benchmark compares adjacent merged slices through
 Tantivy's public directory interfaces. It reports per-sample-mean p50/p95/p99 and aggregate
