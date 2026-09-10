@@ -98,14 +98,18 @@ upserts include delete terms. CI runs only the correctness smoke profile; timing
 require controlled hardware.
 
 The `kv-directory` benchmark measures the caller-visible buffered write path, empty and dirty
-flushes, 256 KiB chunk publication, closed- and active-writer deletion, and distinct-file
-concurrency at one, two, four, and eight threads. It reports percentiles across per-sample mean
-latencies and uses the deterministic in-memory Phase 0 store to isolate directory coordination from
-RocksDB and Node transport costs. That store serializes access, so the concurrency cases detect
-coordination regressions but do not predict RocksDB scaling. Compare two optimized builds on the
-same quiet host; records include the Git revision and dirty state, while `--revision` can add a run
-label and `--samples` and `--warmup` control the run. CI executes only `--smoke`, whose timings are
-not comparable to a full run, and applies no timing threshold.
+flushes, 256 KiB chunk publication, closed- and active-writer deletion, retained and churned read
+handle opens, distinct-file read-open and write concurrency at one, two, four, and eight threads,
+and shared-file read-open concurrency at two, four, and eight threads. It reports percentiles across
+per-sample mean latencies and uses a deterministic in-memory store to isolate directory coordination
+from RocksDB and Node transport costs. The store permits concurrent point reads but serializes
+writes, so read-open cases isolate registration contention while write cases detect coordination
+regressions; neither predicts RocksDB scaling. The `-rw-` read-open case names establish a new
+comparison series and must not be compared with results from the earlier serialized-store cases.
+Compare two optimized builds on the same quiet host; records include the Git revision and dirty
+state, while `--revision` can add a run label and `--samples` and `--warmup` control the run. CI
+executes only `--smoke`, whose timings are not comparable to a full run, and applies no timing
+threshold.
 
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.

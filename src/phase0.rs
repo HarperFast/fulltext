@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -264,6 +265,8 @@ pub type FaultingDirectory = KvDirectory<FaultingKv>;
 struct DirectoryState {
 	allocator: Mutex<ObjectIdAllocator>,
 	paths: Arc<PathRegistry>,
+	reader_pins: Arc<ReaderPinRegistry>,
+	reader_registration_shards: [RwLock<()>; READER_REGISTRATION_SHARD_COUNT],
 	reclaim_shards: [Mutex<()>; RECLAIM_SHARD_COUNT],
 	locks: Mutex<DirectoryLocks>,
 	locks_changed: Condvar,
@@ -302,6 +305,43 @@ struct WriterFence {
 
 struct WriterClaim<'a> {
 	fence: &'a WriterFence,
+}
+
+struct ReaderPinRegistry {
+	shards: [Mutex<HashMap<u64, Weak<ObjectReaderPins>>>; RECLAIM_SHARD_COUNT],
+}
+
+struct ObjectReaderPins {
+	object_id: u64,
+	registry: Weak<ReaderPinRegistry>,
+	state: Mutex<ObjectReaderPinState>,
+}
+
+#[derive(Default)]
+struct ObjectReaderPinState {
+	total: usize,
+	revisions: ReaderRevisions,
+}
+
+#[derive(Default)]
+enum ReaderRevisions {
+	#[default]
+	None,
+	One(u64, usize),
+	Many(HashMap<u64, usize>),
+}
+
+struct ReaderPin {
+	object: Arc<ObjectReaderPins>,
+	tail_revision: u64,
+}
+
+impl Default for ReaderPinRegistry {
+	fn default() -> Self {
+		Self {
+			shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+		}
+	}
 }
 
 #[derive(Default)]
@@ -408,6 +448,173 @@ impl Drop for WriterClaim<'_> {
 	}
 }
 
+impl ReaderPinRegistry {
+	fn register(self: &Arc<Self>, binding: &Binding) -> io::Result<ReaderPin> {
+		let shard = usize::from(reclaim_shard(binding.object_id));
+		let object = {
+			let mut objects = self.shards[shard]
+				.lock()
+				.unwrap_or_else(|poisoned| poisoned.into_inner());
+			objects
+				.get(&binding.object_id)
+				.and_then(Weak::upgrade)
+				.unwrap_or_else(|| {
+					let object = Arc::new(ObjectReaderPins {
+						object_id: binding.object_id,
+						registry: Arc::downgrade(self),
+						state: Mutex::new(ObjectReaderPinState::default()),
+					});
+					objects.insert(binding.object_id, Arc::downgrade(&object));
+					object
+				})
+		};
+		let mut state = object.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		let total = state
+			.total
+			.checked_add(1)
+			.ok_or_else(|| io::Error::other("reader pin count exhausted"))?;
+		state.revisions.increment(binding.tail_revision)?;
+		state.total = total;
+		drop(state);
+		Ok(ReaderPin {
+			object,
+			tail_revision: binding.tail_revision,
+		})
+	}
+
+	#[cfg(test)]
+	fn is_pinned(&self, object_id: u64, tail_revision: Option<u64>) -> bool {
+		let shard = usize::from(reclaim_shard(object_id));
+		let objects = self.shards[shard]
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let Some(object) = objects.get(&object_id).and_then(Weak::upgrade) else {
+			return false;
+		};
+		drop(objects);
+		let state = object.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		tail_revision.map_or(state.total != 0, |revision| state.revisions.contains(revision))
+	}
+}
+
+impl ReaderRevisions {
+	fn increment(&mut self, tail_revision: u64) -> io::Result<()> {
+		match self {
+			Self::None => *self = Self::One(tail_revision, 1),
+			Self::One(revision, count) if *revision == tail_revision => {
+				*count = count
+					.checked_add(1)
+					.ok_or_else(|| io::Error::other("reader revision pin count exhausted"))?;
+			}
+			Self::One(revision, count) => {
+				let mut revisions = HashMap::with_capacity(2);
+				revisions.insert(*revision, *count);
+				revisions.insert(tail_revision, 1);
+				*self = Self::Many(revisions);
+			}
+			Self::Many(revisions) => {
+				let count = revisions.get(&tail_revision).copied().unwrap_or(0);
+				revisions.insert(
+					tail_revision,
+					count
+						.checked_add(1)
+						.ok_or_else(|| io::Error::other("reader revision pin count exhausted"))?,
+				);
+			}
+		}
+		Ok(())
+	}
+
+	#[cfg(test)]
+	fn contains(&self, tail_revision: u64) -> bool {
+		match self {
+			Self::None => false,
+			Self::One(revision, count) => *revision == tail_revision && *count != 0,
+			Self::Many(revisions) => revisions.get(&tail_revision).is_some_and(|count| *count != 0),
+		}
+	}
+
+	fn decrement(&mut self, tail_revision: u64) -> bool {
+		match self {
+			Self::None => false,
+			Self::One(revision, count) if *revision == tail_revision && *count > 1 => {
+				*count -= 1;
+				true
+			}
+			Self::One(revision, count) if *revision == tail_revision && *count == 1 => {
+				*self = Self::None;
+				true
+			}
+			Self::One(_, _) => false,
+			Self::Many(revisions) => {
+				let remove = match revisions.get_mut(&tail_revision) {
+					Some(count) if *count > 1 => {
+						*count -= 1;
+						false
+					}
+					Some(count) if *count == 1 => true,
+					_ => return false,
+				};
+				if remove {
+					revisions.remove(&tail_revision);
+				}
+				let remaining = if revisions.len() == 1 {
+					revisions.iter().next().map(|(revision, count)| (*revision, *count))
+				} else {
+					None
+				};
+				if let Some((revision, count)) = remaining {
+					*self = Self::One(revision, count);
+				}
+				true
+			}
+		}
+	}
+}
+
+impl Drop for ReaderPin {
+	fn drop(&mut self) {
+		let mut state = self
+			.object
+			.state
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		debug_assert!(
+			state.total != 0 || std::thread::panicking(),
+			"reader object pin count is missing"
+		);
+		if state.total == 0 {
+			return;
+		}
+		let revision_found = state.revisions.decrement(self.tail_revision);
+		debug_assert!(
+			revision_found || std::thread::panicking(),
+			"reader revision pin count is missing"
+		);
+		if revision_found {
+			state.total -= 1;
+		}
+	}
+}
+
+impl Drop for ObjectReaderPins {
+	fn drop(&mut self) {
+		let Some(registry) = self.registry.upgrade() else {
+			return;
+		};
+		let shard = usize::from(reclaim_shard(self.object_id));
+		let mut objects = registry.shards[shard]
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		if objects
+			.get(&self.object_id)
+			.is_some_and(|object| std::ptr::eq(object.as_ptr(), self))
+		{
+			objects.remove(&self.object_id);
+		}
+	}
+}
+
 fn writer_retired_error() -> io::Error {
 	io::Error::new(io::ErrorKind::NotFound, "file was deleted while its writer was open")
 }
@@ -462,6 +669,8 @@ impl<S: KvStore> KvDirectory<S> {
 			let state = Arc::new(DirectoryState {
 				allocator: Mutex::new(ObjectIdAllocator::default()),
 				paths: Arc::new(PathRegistry::default()),
+				reader_pins: Arc::new(ReaderPinRegistry::default()),
+				reader_registration_shards: std::array::from_fn(|_| RwLock::new(())),
 				reclaim_shards: std::array::from_fn(|_| Mutex::new(())),
 				locks: Mutex::new(DirectoryLocks::default()),
 				locks_changed: Condvar::new(),
@@ -569,6 +778,25 @@ impl<S: KvStore> KvDirectory<S> {
 			Mutation::Put(tail_key, next.to_be_bytes().to_vec()),
 		])
 	}
+
+	fn pinned_binding(
+		&self,
+		path: &Path,
+		after_binding_read: impl FnOnce(),
+	) -> Result<(Binding, ReaderPin), OpenReadError> {
+		let registration = self.state.reader_registration_shards[reader_registration_shard(path)]
+			.read()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let binding = self.read_binding(path)?;
+		after_binding_read();
+		let pin = self
+			.state
+			.reader_pins
+			.register(&binding)
+			.map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))?;
+		drop(registration);
+		Ok((binding, pin))
+	}
 }
 
 struct KvFileHandle<S> {
@@ -576,6 +804,8 @@ struct KvFileHandle<S> {
 	namespace: Arc<[u8]>,
 	path: PathBuf,
 	binding: Binding,
+	_state: Arc<DirectoryState>,
+	_pin: ReaderPin,
 }
 
 impl<S> fmt::Debug for KvFileHandle<S> {
@@ -703,11 +933,14 @@ impl Drop for KvDirectoryLock {
 
 impl<S: KvStore> Directory for KvDirectory<S> {
 	fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+		let (binding, pin) = self.pinned_binding(path, || {})?;
 		Ok(Arc::new(KvFileHandle {
 			store: self.store.clone(),
 			namespace: self.namespace.clone(),
 			path: path.to_path_buf(),
-			binding: self.read_binding(path)?,
+			binding,
+			_state: self.state.clone(),
+			_pin: pin,
 		}))
 	}
 
@@ -788,7 +1021,13 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 		};
 		mutations.push(Mutation::Delete(binding_key.clone()));
 		mutations.push(Mutation::Delete(atomic_key));
-		match self.store.write(&mutations, WritePolicy::WAL) {
+		let write_result = {
+			let _reader_registration = self.state.reader_registration_shards[reader_registration_shard(path)]
+				.write()
+				.unwrap_or_else(|poisoned| poisoned.into_inner());
+			self.store.write(&mutations, WritePolicy::WAL)
+		};
+		match write_result {
 			Ok(()) => {
 				lifecycle.writer = None;
 				Ok(())
@@ -1289,6 +1528,7 @@ const MAX_OBJECT_EXTENT_BYTES: u128 = 1 << 40;
 const RECLAIM_ENTRY_FORMAT_VERSION: u8 = 1;
 const RECLAIM_ENTRY_WHOLE_OBJECT: u8 = 1;
 const RECLAIM_SHARD_COUNT: usize = 64;
+const READER_REGISTRATION_SHARD_COUNT: usize = 256;
 const KEY_KIND_COUNTER: u8 = 1;
 const KEY_KIND_BINDING: u8 = 2;
 const KEY_KIND_ATOMIC: u8 = 3;
@@ -1416,6 +1656,12 @@ fn reclaim_entry_key(namespace: &[u8], shard: u8, sequence: u64) -> Vec<u8> {
 
 fn reclaim_shard(object_id: u64) -> u8 {
 	(object_id % RECLAIM_SHARD_COUNT as u64) as u8
+}
+
+fn reader_registration_shard(path: &Path) -> usize {
+	let mut hasher = DefaultHasher::new();
+	path.hash(&mut hasher);
+	(hasher.finish() % READER_REGISTRATION_SHARD_COUNT as u64) as usize
 }
 
 fn encode_binding(binding: &Binding) -> Vec<u8> {
@@ -2066,6 +2312,193 @@ mod tests {
 	}
 
 	#[test]
+	fn open_handles_pin_their_object_and_tail_revision() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let path = Path::new("segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(b"first").unwrap();
+		writer.flush().unwrap();
+		let first_binding = decode_binding(&store.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+		let first = directory.open_read(path).unwrap();
+		assert!(directory.state.reader_pins.is_pinned(first_binding.object_id, None));
+		assert!(directory
+			.state
+			.reader_pins
+			.is_pinned(first_binding.object_id, Some(first_binding.tail_revision)));
+
+		directory.delete(path).unwrap();
+		let mut replacement = directory.open_write(path).unwrap();
+		replacement.write_all(b"second").unwrap();
+		replacement.flush().unwrap();
+		let second_binding = decode_binding(&store.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+		let second = directory.open_read(path).unwrap();
+		assert_ne!(first_binding.object_id, second_binding.object_id);
+		assert!(directory.state.reader_pins.is_pinned(first_binding.object_id, None));
+		assert!(directory.state.reader_pins.is_pinned(second_binding.object_id, None));
+
+		drop(first);
+		assert!(!directory.state.reader_pins.is_pinned(first_binding.object_id, None));
+		assert!(directory.state.reader_pins.is_pinned(second_binding.object_id, None));
+		drop(second);
+		assert!(!directory.state.reader_pins.is_pinned(second_binding.object_id, None));
+	}
+
+	#[test]
+	fn revision_pins_are_independent_within_one_object() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let path = Path::new("segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(b"first").unwrap();
+		writer.flush().unwrap();
+		let first_binding = decode_binding(&store.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+		let first = directory.open_read(path).unwrap();
+
+		writer.write_all(b" second").unwrap();
+		writer.flush().unwrap();
+		let second_binding = decode_binding(&store.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+		let second = directory.open_read(path).unwrap();
+		assert_eq!(first_binding.object_id, second_binding.object_id);
+		assert_ne!(first_binding.tail_revision, second_binding.tail_revision);
+		assert!(directory
+			.state
+			.reader_pins
+			.is_pinned(first_binding.object_id, Some(first_binding.tail_revision)));
+		assert!(directory
+			.state
+			.reader_pins
+			.is_pinned(second_binding.object_id, Some(second_binding.tail_revision)));
+
+		drop(second);
+		assert!(directory.state.reader_pins.is_pinned(first_binding.object_id, None));
+		assert!(directory
+			.state
+			.reader_pins
+			.is_pinned(first_binding.object_id, Some(first_binding.tail_revision)));
+		assert!(!directory
+			.state
+			.reader_pins
+			.is_pinned(second_binding.object_id, Some(second_binding.tail_revision)));
+		drop(first);
+		assert!(!directory.state.reader_pins.is_pinned(first_binding.object_id, None));
+	}
+
+	#[test]
+	fn binding_read_and_pin_registration_complete_before_delete() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let path = Path::new("segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(b"contents").unwrap();
+		writer.flush().unwrap();
+		drop(writer);
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+		let (binding_read, allow_delete) = std::sync::mpsc::sync_channel(0);
+		let (delete_started, deletion_entered) = std::sync::mpsc::sync_channel(0);
+		let (deletion_completed, deleted) = std::sync::mpsc::channel();
+		let deleting_directory = directory.clone();
+		let deletion = std::thread::spawn(move || {
+			allow_delete.recv().unwrap();
+			delete_started.send(()).unwrap();
+			let result = deleting_directory.delete(path);
+			deletion_completed.send(()).unwrap();
+			result
+		});
+
+		let (opened, pin) = directory
+			.pinned_binding(path, || {
+				binding_read.send(()).unwrap();
+				deletion_entered.recv().unwrap();
+				assert!(deleted.recv_timeout(Duration::from_millis(50)).is_err());
+			})
+			.unwrap();
+		deletion.join().unwrap().unwrap();
+
+		assert_eq!(opened, binding);
+		assert!(directory.state.reader_pins.is_pinned(binding.object_id, None));
+		assert!(!directory.exists(path).unwrap());
+		drop(pin);
+		assert!(!directory.state.reader_pins.is_pinned(binding.object_id, None));
+	}
+
+	#[test]
+	fn independently_constructed_directories_share_reader_pins() {
+		let store = FaultingKv::default();
+		let first = FaultingDirectory::new(store.clone());
+		let second = FaultingDirectory::new(store.clone());
+		let path = Path::new("segment");
+		let mut writer = first.open_write(path).unwrap();
+		writer.write_all(b"contents").unwrap();
+		writer.flush().unwrap();
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+		let handle = first.open_read(path).unwrap();
+
+		assert!(second.state.reader_pins.is_pinned(binding.object_id, None));
+		drop(handle);
+		assert!(!second.state.reader_pins.is_pinned(binding.object_id, None));
+	}
+
+	#[test]
+	fn open_handle_keeps_the_canonical_directory_state_alive() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let path = Path::new("segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(b"contents").unwrap();
+		writer.flush().unwrap();
+		drop(writer);
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+		let state = Arc::downgrade(&directory.state);
+		let handle = directory.open_read(path).unwrap();
+		drop(directory);
+
+		let retained = state.upgrade().unwrap();
+		let reopened = FaultingDirectory::new(store);
+		assert!(Arc::ptr_eq(&retained, &reopened.state));
+		assert!(reopened.state.reader_pins.is_pinned(binding.object_id, None));
+		drop(handle);
+		assert!(!reopened.state.reader_pins.is_pinned(binding.object_id, None));
+	}
+
+	#[test]
+	fn open_read_adds_no_storage_operation_for_pin_registration() {
+		let store = CountingKv::new();
+		let directory = KvDirectory::new(store.clone());
+		let path = Path::new("segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(b"contents").unwrap();
+		writer.flush().unwrap();
+		store.take_io_counts();
+
+		let handle = directory.open_read(path).unwrap();
+
+		assert_eq!(store.take_io_counts(), (1, 0, 0));
+		drop(handle);
+	}
+
+	#[test]
+	fn open_drop_churn_bounds_retained_weak_pins() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let path = Path::new("segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(b"contents").unwrap();
+		writer.flush().unwrap();
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+
+		for _ in 0..256 {
+			drop(directory.open_read(path).unwrap());
+		}
+
+		let shard = usize::from(reclaim_shard(binding.object_id));
+		let objects = directory.state.reader_pins.shards[shard]
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		assert!(!objects.contains_key(&binding.object_id));
+	}
+
+	#[test]
 	fn independently_constructed_directories_share_writer_locks() {
 		let store = FaultingKv::default();
 		let first = FaultingDirectory::new(store.clone());
@@ -2377,6 +2810,52 @@ mod tests {
 	}
 
 	#[test]
+	fn open_read_does_not_wait_for_writer_retirement() {
+		let store = BlockingKv::new();
+		let directory = KvDirectory::new(store.clone());
+		let path = Path::new("segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(b"first").unwrap();
+		writer.flush().unwrap();
+		writer.write_all(b" second").unwrap();
+		let fence = directory
+			.state
+			.paths
+			.state(path)
+			.lifecycle
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.writer
+			.as_ref()
+			.and_then(Weak::upgrade)
+			.unwrap();
+		store.arm_next_write();
+		let helper_store = store.clone();
+		let deleting_directory = directory.clone();
+		let reading_directory = directory.clone();
+		let helper = std::thread::spawn(move || {
+			assert!(
+				helper_store.wait_until_blocked(),
+				"write did not reach the test barrier"
+			);
+			let deletion = std::thread::spawn(move || deleting_directory.delete(path));
+			assert!(wait_for_retirement(&fence), "delete did not retire the writer");
+			let (opened, received) = std::sync::mpsc::channel();
+			let reading = std::thread::spawn(move || opened.send(reading_directory.open_read(path)).unwrap());
+			let handle = received.recv_timeout(Duration::from_secs(5));
+			helper_store.release_write();
+			let handle = handle.expect("read waited for writer retirement").unwrap();
+			deletion.join().unwrap().unwrap();
+			reading.join().unwrap();
+			handle
+		});
+
+		writer.flush().unwrap();
+		let handle = helper.join().unwrap();
+		assert_eq!(handle.read_bytes().unwrap().as_slice(), b"first");
+	}
+
+	#[test]
 	fn delete_waits_for_in_flight_chunk_storage() {
 		let store = BlockingKv::new();
 		let directory = KvDirectory::new(store.clone());
@@ -2434,6 +2913,10 @@ mod tests {
 		assert_ne!(
 			reclaim_shard(first_binding.object_id),
 			reclaim_shard(second_binding.object_id)
+		);
+		assert_ne!(
+			reader_registration_shard(Path::new("first")),
+			reader_registration_shard(Path::new("second"))
 		);
 		store.arm_next_write();
 

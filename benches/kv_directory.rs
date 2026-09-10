@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::hint::black_box;
@@ -5,22 +6,77 @@ use std::io;
 use std::io::Write as IoWrite;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use harper_fulltext::phase0::{FaultingDirectory, FaultingKv};
+use harper_fulltext::phase0::{
+	FaultingDirectory, FaultingKv, KvDirectory, KvStore, KvStoreIdentity, Mutation, WritePolicy,
+};
 use harper_fulltext::TANTIVY_VERSION;
-use tantivy::directory::{Directory, TerminatingWrite, WritePtr};
+use tantivy::directory::{Directory, OwnedBytes, TerminatingWrite, WritePtr};
 
 const WRITE_BYTES_PER_SAMPLE: usize = 128 * 1024;
 const MIN_WRITE_OPERATIONS_PER_SAMPLE: usize = 256;
 const CHUNK_BYTES: usize = 256 * 1024;
 const STORAGE_OPERATIONS_PER_SAMPLE: usize = 64;
 const EMPTY_FLUSHES_PER_SAMPLE: usize = 10_000;
+const RETAINED_OPEN_READS_PER_SAMPLE: usize = 1_024;
+const OPEN_READS_PER_SAMPLE: usize = 10_000;
 const CONCURRENT_BYTES_PER_FILE: usize = 4 * 1024;
 const CONCURRENT_FILES_PER_THREAD: usize = 64;
+
+static NEXT_BENCHMARK_KV_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct BenchmarkKv {
+	identity: u64,
+	values: Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>,
+}
+
+type BenchmarkDirectory = KvDirectory<BenchmarkKv>;
+
+impl Default for BenchmarkKv {
+	fn default() -> Self {
+		let identity = NEXT_BENCHMARK_KV_IDENTITY.fetch_add(1, Ordering::Relaxed);
+		assert_ne!(identity, 0, "benchmark store identity space exhausted");
+		Self {
+			identity,
+			values: Arc::new(RwLock::new(BTreeMap::new())),
+		}
+	}
+}
+
+impl KvStore for BenchmarkKv {
+	fn identity(&self) -> KvStoreIdentity {
+		KvStoreIdentity(1, self.identity, 0)
+	}
+
+	fn read(&self, key: &[u8]) -> io::Result<Option<OwnedBytes>> {
+		let values = self.values.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+		Ok(values.get(key).cloned().map(OwnedBytes::new))
+	}
+
+	fn write(&self, mutations: &[Mutation], _policy: WritePolicy) -> io::Result<()> {
+		let mut values = self.values.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+		for mutation in mutations {
+			match mutation {
+				Mutation::Put(key, value) => {
+					values.insert(key.clone(), value.clone());
+				}
+				Mutation::Delete(key) => {
+					values.remove(key);
+				}
+			}
+		}
+		Ok(())
+	}
+
+	fn sync(&self) -> io::Result<()> {
+		Ok(())
+	}
+}
 
 struct Arguments {
 	samples: usize,
@@ -185,6 +241,38 @@ fn main() -> io::Result<()> {
 		&arguments,
 		delete_case(true, arguments.smoke),
 	)?);
+	results.push(measure_case(
+		"open-read-retained".to_owned(),
+		"open-read",
+		1,
+		&arguments,
+		open_read_case(true, arguments.smoke),
+	)?);
+	results.push(measure_case(
+		"open-read-churn".to_owned(),
+		"open-read",
+		1,
+		&arguments,
+		open_read_case(false, arguments.smoke),
+	)?);
+	for threads in [1, 2, 4, 8] {
+		results.push(measure_case(
+			format!("concurrent-open-read-rw-{threads}t"),
+			"open-read",
+			threads,
+			&arguments,
+			concurrent_open_read_case(threads, arguments.smoke, false),
+		)?);
+	}
+	for threads in [2, 4, 8] {
+		results.push(measure_case(
+			format!("concurrent-shared-open-read-rw-{threads}t"),
+			"open-read",
+			threads,
+			&arguments,
+			concurrent_open_read_case(threads, arguments.smoke, true),
+		)?);
+	}
 
 	for threads in [1, 2, 4, 8] {
 		results.push(measure_case(
@@ -456,6 +544,143 @@ fn delete_case(active_writer: bool, smoke: bool) -> impl FnMut(usize) -> io::Res
 	}
 }
 
+fn open_read_case(retain_handles: bool, smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
+	move |sample| {
+		let directory = FaultingDirectory::new(FaultingKv::default());
+		let operations = if smoke {
+			4
+		} else if retain_handles {
+			RETAINED_OPEN_READS_PER_SAMPLE
+		} else {
+			OPEN_READS_PER_SAMPLE
+		};
+		let file_count = if retain_handles { operations } else { 1 };
+		let mut paths = Vec::with_capacity(file_count);
+		for file in 0..file_count {
+			let path = format!("open-read-{retain_handles}-{sample}-{file}");
+			let mut writer = open_writer(&directory, Path::new(&path))?;
+			writer.write_all(b"contents")?;
+			writer.terminate()?;
+			paths.push(path);
+		}
+		let mut handles = Vec::with_capacity(if retain_handles { operations } else { 1 });
+		let started = Instant::now();
+		for operation in 0..operations {
+			let path = &paths[operation % file_count];
+			let handle = directory
+				.open_read(Path::new(path))
+				.map_err(|error| io::Error::other(error.to_string()))?;
+			if retain_handles {
+				handles.push(handle);
+			} else {
+				black_box(handle);
+			}
+		}
+		let elapsed_nanoseconds = started.elapsed().as_nanos();
+		black_box(handles);
+		Ok(Sample {
+			elapsed_nanoseconds,
+			operations: operations as u64,
+			bytes: 0,
+		})
+	}
+}
+
+fn concurrent_open_read_case(
+	threads: usize,
+	smoke: bool,
+	shared_paths: bool,
+) -> impl FnMut(usize) -> io::Result<Sample> {
+	let files_per_thread = if smoke { 2 } else { CONCURRENT_FILES_PER_THREAD };
+	move |sample| {
+		let directory = BenchmarkDirectory::new(BenchmarkKv::default());
+		let mut paths = Vec::with_capacity(threads);
+		let path_groups = if shared_paths { 1 } else { threads };
+		for thread in 0..path_groups {
+			let mut thread_paths = Vec::with_capacity(files_per_thread);
+			for file in 0..files_per_thread {
+				let path = format!("concurrent-open-read-{shared_paths}-{sample}-{thread}-{file}");
+				let mut writer = open_writer(&directory, Path::new(&path))?;
+				writer.write_all(b"contents")?;
+				writer.terminate()?;
+				thread_paths.push(path);
+			}
+			paths.push(thread_paths);
+		}
+		if shared_paths {
+			let shared = paths[0].clone();
+			paths.resize_with(threads, || shared.clone());
+		}
+		let start_gate = Arc::new(StartGate::new());
+		let remaining = Arc::new(AtomicUsize::new(threads));
+		let (completion, completed) = mpsc::sync_channel(1);
+		let elapsed_nanoseconds = std::thread::scope(|scope| -> io::Result<u128> {
+			let mut handles = Vec::with_capacity(threads);
+			for (thread, thread_paths) in paths.into_iter().enumerate() {
+				let opened = Vec::with_capacity(thread_paths.len());
+				let directory = directory.clone();
+				let worker_start_gate = start_gate.clone();
+				let remaining = remaining.clone();
+				let completion = completion.clone();
+				let handle = std::thread::Builder::new()
+					.name(format!("kv-directory-open-read-benchmark-{thread}"))
+					.spawn_scoped(scope, move || {
+						let Some(started) = worker_start_gate.wait() else {
+							return Ok(Vec::new());
+						};
+						let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+							let mut opened = opened;
+							for path in thread_paths {
+								opened.push(
+									directory
+										.open_read(Path::new(&path))
+										.map_err(|error| io::Error::other(error.to_string()))?,
+								);
+							}
+							black_box(&opened);
+							Ok::<_, io::Error>(opened)
+						}))
+						.unwrap_or_else(|_| Err(io::Error::other("benchmark worker panicked")));
+						if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+							let _ = completion.send(started.elapsed().as_nanos());
+						}
+						result
+					});
+				match handle {
+					Ok(handle) => handles.push(handle),
+					Err(error) => {
+						start_gate.cancel();
+						for handle in handles {
+							handle
+								.join()
+								.map_err(|_| io::Error::other("benchmark worker panicked"))??;
+						}
+						return Err(error);
+					}
+				}
+			}
+			start_gate.start(threads);
+			drop(completion);
+			let elapsed_nanoseconds = completed
+				.recv()
+				.map_err(|_| io::Error::other("benchmark workers did not report completion"))?;
+			for handle in handles {
+				let opened = handle
+					.join()
+					.map_err(|_| io::Error::other("benchmark worker panicked"))??;
+				black_box(opened);
+			}
+			Ok(elapsed_nanoseconds)
+		})?;
+		let operations = threads * files_per_thread;
+		Ok(Sample {
+			elapsed_nanoseconds,
+			operations: operations as u64,
+			bytes: 0,
+		})
+	}
+}
+
 fn concurrent_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
 	let files_per_thread = if smoke { 2 } else { CONCURRENT_FILES_PER_THREAD };
 	move |sample| {
@@ -528,7 +753,7 @@ fn concurrent_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Resu
 	}
 }
 
-fn open_writer(directory: &FaultingDirectory, path: &Path) -> io::Result<WritePtr> {
+fn open_writer(directory: &impl Directory, path: &Path) -> io::Result<WritePtr> {
 	directory
 		.open_write(path)
 		.map_err(|error| io::Error::other(error.to_string()))
