@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 use std::io;
+#[cfg(feature = "test-panic")]
 use std::io::Write as IoWrite;
+#[cfg(feature = "test-panic")]
 use std::panic::{catch_unwind, AssertUnwindSafe};
+#[cfg(feature = "test-panic")]
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(feature = "test-panic")]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+#[cfg(feature = "test-panic")]
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,22 +18,42 @@ use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, JsBuffer, JsFunction, JsUnknown, Status};
 use napi_derive::napi;
-use tantivy::directory::{Directory, OwnedBytes, TerminatingWrite};
+use tantivy::directory::OwnedBytes;
+#[cfg(feature = "test-panic")]
+use tantivy::directory::{Directory, TerminatingWrite};
 
 use crate::boundary;
-use crate::phase0::{
-	reclaim_read_key_bytes, KvDirectory, KvStore, KvStoreIdentity, Mutation, ReclaimBudget, WritePolicy, CHUNK_SIZE,
-	RECLAIM_MAX_BATCH_REQUEST_BYTES,
-};
+#[cfg(feature = "test-panic")]
+use crate::phase0::ReclaimBudget;
+#[cfg(any(feature = "test-panic", all(test, feature = "host-storage")))]
+use crate::phase0::{reclaim_read_key_bytes, RECLAIM_MAX_BATCH_REQUEST_BYTES};
+use crate::phase0::{KvDirectory, KvStore, KvStoreIdentity, Mutation, WritePolicy, CHUNK_SIZE};
+use crate::protocol::HostOpenConfig;
 
-type HostCallback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
+#[cfg(feature = "test-panic")]
 type CompletionCallback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
 
+#[cfg(feature = "test-panic")]
 static NEXT_TRANSPORT_HANDLE: AtomicU32 = AtomicU32::new(1);
+static NEXT_TRANSPORT_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "test-panic")]
 static HOST_TRANSPORTS: OnceLock<Mutex<HashMap<u32, Arc<HostTransport>>>> = OnceLock::new();
+const TRANSPORT_SHARDS: usize = 64;
+type TransportRegistry = HashMap<u64, Weak<HostTransport>>;
+type TransportShards = [Mutex<TransportRegistry>; TRANSPORT_SHARDS];
+static TRANSPORTS: OnceLock<TransportShards> = OnceLock::new();
 
-struct HostTransport {
-	handler: HostCallback,
+struct HostDispatch {
+	// napi 2.16 can abandon queued TSFN data during environment teardown, so keep this payload fixed-size.
+	transport_id: u64,
+	request_id: u64,
+}
+
+type HostCallback = ThreadsafeFunction<HostDispatch, ErrorStrategy::Fatal>;
+
+pub(crate) struct HostTransport {
+	id: u64,
+	handler: Mutex<Option<HostCallback>>,
 	state: Mutex<TransportState>,
 	capacity: Condvar,
 	next_request_id: AtomicU64,
@@ -50,7 +76,10 @@ struct TransportState {
 
 struct PendingRequest {
 	retained_bytes: usize,
+	response_budget: usize,
 	class: AdmissionClass,
+	entered: bool,
+	request: Option<Vec<u8>>,
 	response: Weak<ResponseSlot>,
 }
 
@@ -87,16 +116,28 @@ impl HostTransport {
 		}
 		// Production construction must supply the total callback created by createHostStorageHandler.
 		let mut handler = handler
-			.create_threadsafe_function::<Vec<u8>, Buffer, _, ErrorStrategy::Fatal>(
+			.create_threadsafe_function::<HostDispatch, Buffer, _, ErrorStrategy::Fatal>(
 				max_operations,
-				|context: ThreadSafeCallContext<Vec<u8>>| Ok(vec![Buffer::from(context.value)]),
+				|context: ThreadSafeCallContext<HostDispatch>| {
+					let Some(request) = registered_transport(context.value.transport_id)
+						.and_then(|transport| transport.begin(context.value.request_id))
+					else {
+						return Ok(vec![Buffer::default(), Buffer::default()]);
+					};
+					let mut dispatch_id = Vec::with_capacity(16);
+					dispatch_id.extend_from_slice(&context.value.transport_id.to_le_bytes());
+					dispatch_id.extend_from_slice(&context.value.request_id.to_le_bytes());
+					Ok(vec![Buffer::from(dispatch_id), Buffer::from(request)])
+				},
 			)
 			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
 		handler
 			.unref(env)
 			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
 		Ok(Self {
-			handler,
+			id: next_id(&NEXT_TRANSPORT_ID, "host storage transport")
+				.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?,
+			handler: Mutex::new(Some(handler)),
 			state: Mutex::new(TransportState::default()),
 			capacity: Condvar::new(),
 			next_request_id: AtomicU64::new(1),
@@ -115,41 +156,24 @@ impl HostTransport {
 		deadline: Option<Instant>,
 		class: AdmissionClass,
 	) -> io::Result<Vec<u8>> {
-		let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-		if request_id == 0 {
-			self.fail(io::ErrorKind::Other, "host storage request id space exhausted");
-			return Err(io::Error::other("host storage request id space exhausted"));
-		}
+		let request_id = next_id(&self.next_request_id, "host storage request")?;
 		let response = Arc::new(ResponseSlot::new());
-		self.admit(request_id, request.len(), response_budget, &response, deadline, class)?;
-
-		let transport = Arc::downgrade(self);
-		let callback_response = response.clone();
-		let max_response_bytes = response_budget;
-		let status = self.handler.call_with_return_value::<JsUnknown, _>(
-			request,
-			ThreadsafeFunctionCallMode::NonBlocking,
-			move |value| {
-				let completed = catch_unwind(AssertUnwindSafe(|| {
-					let result = response_bytes(value, max_response_bytes);
-					if let Some(transport) = transport.upgrade() {
-						transport.complete(request_id, result);
-					} else {
-						callback_response.complete(Err(io::Error::new(
-							io::ErrorKind::BrokenPipe,
-							"host storage transport was released",
-						)));
-					}
-				}));
-				if completed.is_err() {
-					if let Some(transport) = transport.upgrade() {
-						transport.fail(io::ErrorKind::Other, "host storage completion panicked");
-					}
-					callback_response.complete(Err(io::Error::other("host storage completion panicked")));
-				}
-				Ok(())
-			},
-		);
+		self.admit(request_id, Some(request), response_budget, &response, deadline, class)?;
+		let handler = self
+			.handler
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.as_ref()
+			.cloned();
+		let status = handler.map_or(Status::Closing, |handler| {
+			handler.call(
+				HostDispatch {
+					transport_id: self.id,
+					request_id,
+				},
+				ThreadsafeFunctionCallMode::NonBlocking,
+			)
+		});
 		if status != Status::Ok {
 			if status == Status::Closing {
 				self.fail(io::ErrorKind::BrokenPipe, "host storage transport is closed");
@@ -171,20 +195,41 @@ impl HostTransport {
 		))
 	}
 
-	fn close(&self) {
+	pub(crate) fn close(&self) {
+		unregister_transport(self.id);
 		self.fail(io::ErrorKind::BrokenPipe, "host storage transport is closed");
+		if let Some(handler) = self
+			.handler
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			let _ = handler.abort();
+		}
+	}
+
+	pub(crate) fn wait_idle(&self) {
+		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		while state.operations != 0 {
+			state = self
+				.capacity
+				.wait(state)
+				.unwrap_or_else(|poisoned| poisoned.into_inner());
+		}
 	}
 
 	fn admit(
 		&self,
 		request_id: u64,
-		request_bytes: usize,
+		request: Option<Vec<u8>>,
 		response_bytes: usize,
 		response: &Arc<ResponseSlot>,
 		deadline: Option<Instant>,
 		class: AdmissionClass,
 	) -> io::Result<()> {
-		let retained_bytes = request_bytes
+		let retained_bytes = request
+			.as_ref()
+			.map_or(0, Vec::len)
 			.checked_add(response_bytes)
 			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host storage byte reservation overflow"))?;
 		if response_bytes == 0 || retained_bytes > self.max_bytes {
@@ -244,11 +289,28 @@ impl HostTransport {
 			request_id,
 			PendingRequest {
 				retained_bytes,
+				response_budget: response_bytes,
 				class,
+				entered: false,
+				request,
 				response: Arc::downgrade(response),
 			},
 		);
 		Ok(())
+	}
+
+	fn begin(&self, request_id: u64) -> Option<Vec<u8>> {
+		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		if state.closed.is_some() {
+			return None;
+		}
+		let pending = state.pending.get_mut(&request_id)?;
+		if pending.entered {
+			return None;
+		}
+		let request = pending.request.take()?;
+		pending.entered = true;
+		Some(request)
 	}
 
 	fn has_capacity(&self, state: &TransportState, retained_bytes: usize, class: AdmissionClass) -> io::Result<bool> {
@@ -284,6 +346,7 @@ impl HostTransport {
 				<= self.max_bytes)
 	}
 
+	#[cfg(feature = "test-panic")]
 	fn configure_cleanup(&self, foreground_reserved_bytes: usize, max_cleanup_bytes: usize) -> io::Result<()> {
 		if self.max_operations < 2 || foreground_reserved_bytes == 0 || max_cleanup_bytes == 0 {
 			return Err(io::Error::new(
@@ -318,11 +381,11 @@ impl HostTransport {
 		}
 	}
 
-	fn complete(&self, request_id: u64, result: io::Result<Vec<u8>>) {
+	fn complete(&self, request_id: u64, result: io::Result<Vec<u8>>) -> bool {
 		let response = {
 			let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 			let Some(pending) = state.pending.remove(&request_id) else {
-				return;
+				return false;
 			};
 			let cleanup_underflow = pending.class == AdmissionClass::Cleanup
 				&& (state.cleanup_operations == 0 || state.cleanup_bytes < pending.retained_bytes);
@@ -344,7 +407,7 @@ impl HostTransport {
 						response.complete(Err(error()));
 					}
 				}
-				return;
+				return true;
 			}
 			let response = pending.response.upgrade();
 			state.operations -= 1;
@@ -359,6 +422,17 @@ impl HostTransport {
 		if let Some(response) = response {
 			response.complete(result);
 		}
+		true
+	}
+
+	fn response_budget(&self, request_id: u64) -> Option<usize> {
+		self.state
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.pending
+			.get(&request_id)
+			.filter(|request| request.entered)
+			.map(|request| request.response_budget)
 	}
 
 	fn fail(&self, kind: io::ErrorKind, message: &str) {
@@ -379,6 +453,12 @@ impl HostTransport {
 				response.complete(Err(io::Error::new(kind, message.to_owned())));
 			}
 		}
+	}
+}
+
+impl Drop for HostTransport {
+	fn drop(&mut self) {
+		unregister_transport(self.id);
 	}
 }
 
@@ -447,6 +527,65 @@ fn response_bytes(value: JsUnknown, max_bytes: usize) -> io::Result<Vec<u8>> {
 	Ok(buffer.as_ref().to_vec())
 }
 
+// These internal exports fence lifecycle but do not authenticate callers; the package trusts process-local JavaScript.
+#[napi(catch_unwind, skip_typescript, js_name = "__hostStorageComplete")]
+pub fn host_storage_complete(dispatch_id: Buffer, response: JsUnknown) -> boundary::Result<bool> {
+	boundary::run_stateless(|| {
+		let (transport_id, request_id) = parse_dispatch_id(&dispatch_id)?;
+		let Some(transport) = registered_transport(transport_id) else {
+			return Ok(false);
+		};
+		let Some(response_budget) = transport.response_budget(request_id) else {
+			return Ok(false);
+		};
+		Ok(transport.complete(request_id, response_bytes(response, response_budget)))
+	})?
+}
+
+#[napi(catch_unwind, skip_typescript, js_name = "__hostStorageFail")]
+pub fn host_storage_fail(dispatch_id: Buffer, message: String) -> boundary::Result<bool> {
+	boundary::run_stateless(|| {
+		let (transport_id, request_id) = parse_dispatch_id(&dispatch_id)?;
+		let Some(transport) = registered_transport(transport_id) else {
+			return Ok(false);
+		};
+		let mut end = message.len().min(4_096);
+		while !message.is_char_boundary(end) {
+			end -= 1;
+		}
+		let message = &message[..end];
+		Ok(transport.complete(request_id, Err(io::Error::other(message.to_owned()))))
+	})?
+}
+
+fn parse_dispatch_id(id: &[u8]) -> boundary::Result<(u64, u64)> {
+	if id.len() != 16 {
+		return Err(napi::Error::new(
+			"E_INVALID_ARGUMENT",
+			"host storage dispatch id must contain sixteen bytes",
+		));
+	}
+	let transport_id = u64::from_le_bytes(id[..8].try_into().expect("dispatch id length checked"));
+	let request_id = u64::from_le_bytes(id[8..].try_into().expect("dispatch id length checked"));
+	Ok((transport_id, request_id))
+}
+
+fn next_id(counter: &AtomicU64, name: &str) -> io::Result<u64> {
+	loop {
+		let id = counter.load(Ordering::Relaxed);
+		if id == 0 {
+			return Err(io::Error::other(format!("{name} id space exhausted")));
+		}
+		let next = id.checked_add(1).unwrap_or(0);
+		if counter
+			.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
+			.is_ok()
+		{
+			return Ok(id);
+		}
+	}
+}
+
 const HOST_PROTOCOL_VERSION: u8 = 1;
 const OP_READ: u8 = 1;
 const OP_WRITE: u8 = 2;
@@ -457,16 +596,20 @@ const VALUE_MISSING: u8 = 0;
 const VALUE_PRESENT: u8 = 1;
 const MUTATION_PUT: u8 = 1;
 const MUTATION_DELETE: u8 = 2;
+#[cfg(any(test, feature = "test-panic"))]
 const HOST_PROTOCOL_HEADER_BYTES: usize = 2;
+#[cfg(any(test, feature = "test-panic"))]
 const HOST_LENGTH_PREFIX_BYTES: usize = 4;
 const READ_RESPONSE_OVERHEAD: usize = 7;
 
+#[cfg(any(test, feature = "test-panic"))]
 fn host_read_request_bytes(key_bytes: usize) -> io::Result<usize> {
 	key_bytes
 		.checked_add(HOST_PROTOCOL_HEADER_BYTES + HOST_LENGTH_PREFIX_BYTES)
 		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host read request size overflow"))
 }
 
+#[cfg(any(test, feature = "test-panic"))]
 fn minimum_cleanup_reservation(
 	max_read_response_bytes: usize,
 	max_control_response_bytes: usize,
@@ -493,7 +636,7 @@ fn validate_cleanup_request(request_bytes: usize, limit: Option<usize>, operatio
 }
 
 #[derive(Clone)]
-struct HostKvStore {
+pub(crate) struct HostKvStore {
 	transport: Arc<HostTransport>,
 	identity: KvStoreIdentity,
 	max_read_response_bytes: usize,
@@ -528,6 +671,7 @@ impl HostKvStore {
 		})
 	}
 
+	#[cfg(feature = "test-panic")]
 	fn minimum_cleanup_bytes(&self, namespace: &[u8], budget: ReclaimBudget) -> io::Result<usize> {
 		minimum_cleanup_reservation(
 			self.max_read_response_bytes,
@@ -537,6 +681,7 @@ impl HostKvStore {
 		)
 	}
 
+	#[cfg(feature = "test-panic")]
 	fn cleanup_directory(
 		&self,
 		namespace: &[u8],
@@ -619,6 +764,34 @@ impl HostKvStore {
 			)),
 		}
 	}
+}
+
+pub(crate) fn open_directory(
+	env: &Env,
+	handler: JsFunction,
+	config: &HostOpenConfig,
+) -> boundary::Result<(KvDirectory<HostKvStore>, Arc<HostTransport>)> {
+	let transport = Arc::new(HostTransport::new(
+		env,
+		handler,
+		config.max_operations,
+		config.max_transport_bytes,
+		config.read_timeout,
+	)?);
+	let identity = KvStoreIdentity(
+		config.store_identity.0,
+		config.store_identity.1,
+		config.store_identity.2,
+	);
+	let store = HostKvStore::new(
+		transport.clone(),
+		identity,
+		config.max_read_response_bytes,
+		config.max_control_response_bytes,
+	)
+	.map_err(|error| napi::Error::new("E_INVALID_ARGUMENT", error.to_string()))?;
+	register_transport(&transport);
+	Ok((KvDirectory::with_namespace(store, &config.namespace), transport))
 }
 
 impl KvStore for HostKvStore {
@@ -789,6 +962,7 @@ impl ResponseDecoder {
 	}
 }
 
+#[cfg(feature = "test-panic")]
 fn registry() -> std::sync::MutexGuard<'static, HashMap<u32, Arc<HostTransport>>> {
 	HOST_TRANSPORTS
 		.get_or_init(Default::default)
@@ -796,6 +970,37 @@ fn registry() -> std::sync::MutexGuard<'static, HashMap<u32, Arc<HostTransport>>
 		.unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn transport_shard(transport_id: u64) -> &'static Mutex<HashMap<u64, Weak<HostTransport>>> {
+	&TRANSPORTS.get_or_init(|| std::array::from_fn(|_| Mutex::new(HashMap::new())))
+		[transport_id as usize % TRANSPORT_SHARDS]
+}
+
+fn register_transport(transport: &Arc<HostTransport>) {
+	transport_shard(transport.id)
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.insert(transport.id, Arc::downgrade(transport));
+}
+
+fn registered_transport(transport_id: u64) -> Option<Arc<HostTransport>> {
+	let mut shard = transport_shard(transport_id)
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner());
+	let transport = shard.get(&transport_id).and_then(Weak::upgrade);
+	if transport.is_none() {
+		shard.remove(&transport_id);
+	}
+	transport
+}
+
+fn unregister_transport(transport_id: u64) {
+	transport_shard(transport_id)
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.remove(&transport_id);
+}
+
+#[cfg(feature = "test-panic")]
 fn completion(callback: JsFunction) -> boundary::Result<CompletionCallback> {
 	callback
 		.create_threadsafe_function::<Vec<u8>, Buffer, _, ErrorStrategy::Fatal>(
@@ -805,6 +1010,7 @@ fn completion(callback: JsFunction) -> boundary::Result<CompletionCallback> {
 		.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))
 }
 
+#[cfg(feature = "test-panic")]
 fn test_result(result: io::Result<Vec<u8>>) -> Vec<u8> {
 	match result {
 		Ok(bytes) => {
@@ -823,6 +1029,7 @@ fn test_result(result: io::Result<Vec<u8>>) -> Vec<u8> {
 	}
 }
 
+#[cfg(feature = "test-panic")]
 fn test_thread_result(operation: impl FnOnce() -> io::Result<Vec<u8>>) -> Vec<u8> {
 	match catch_unwind(AssertUnwindSafe(operation)) {
 		Ok(result) => test_result(result),
@@ -830,6 +1037,7 @@ fn test_thread_result(operation: impl FnOnce() -> io::Result<Vec<u8>>) -> Vec<u8
 	}
 }
 
+#[cfg(feature = "test-panic")]
 struct CleanupTransport {
 	handle: u32,
 	transport: Weak<HostTransport>,
@@ -859,6 +1067,7 @@ pub fn test_open_host_transport(
 			max_bytes as usize,
 			Duration::from_millis(read_timeout_ms as u64),
 		)?);
+		register_transport(&transport);
 		registry().insert(handle, transport.clone());
 		if let Err(error) = env.add_async_cleanup_hook(
 			CleanupTransport {
@@ -968,18 +1177,13 @@ pub fn test_hold_host_transport_capacity(
 			.get(&handle)
 			.cloned()
 			.ok_or_else(|| napi::Error::new("E_CLOSED", "unknown or closed host storage transport"))?;
-		let request_id = transport.next_request_id.fetch_add(1, Ordering::Relaxed);
-		if request_id == 0 {
-			return Err(napi::Error::new(
-				"E_NATIVE_FAILURE",
-				"host storage request id space exhausted",
-			));
-		}
+		let request_id = next_id(&transport.next_request_id, "host storage request")
+			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
 		let response = Arc::new(ResponseSlot::new());
 		transport
 			.admit(
 				request_id,
-				request_bytes as usize,
+				Some(vec![0; request_bytes as usize]),
 				response_bytes as usize,
 				&response,
 				Some(Instant::now()),

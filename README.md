@@ -1,10 +1,11 @@
 # @harperfast/fulltext
 
-Native Tantivy full-text indexing for Node.js, with a native filesystem backend and a planned
-caller-owned rocksdb-js backend for Harper.
+Native Tantivy full-text indexing for Node.js, with a standalone filesystem backend and an
+experimental Harper-owned storage integration.
 
 This repository is under active development. The native entry point provides a standalone Tantivy
-index backed by `MmapDirectory`. Harper releases will use only the planned RocksDB entry point.
+index backed by `MmapDirectory`. Harper releases will use only the Harper integration backed by
+Harper's existing RocksDB lifecycle; they will not use Tantivy's filesystem storage.
 
 ## Requirements
 
@@ -67,15 +68,30 @@ handle's searches.
 
 ## Storage boundaries
 
-The package is designed around two explicit entry points:
+The package has two explicit entry points:
 
 - `@harperfast/fulltext/native` uses Tantivy's native directory implementation and has no
   rocksdb-js dependency.
-- `@harperfast/fulltext/rocks` will use a caller-owned rocksdb-js database through a versioned
-  native capability lease. It is not exported until that contract is implemented and tested.
+- `@harperfast/fulltext/harper` is an experimental integration surface that stores Tantivy objects
+  through a synchronous Harper-owned key-value view. It exists to prove and measure the real
+  derived-index path before Harper enables a customer-facing feature.
 
 There is no generic storage selector and no fallback between backends. Harper will consume only the
-Rocks entry point. The fulltext addon will not link its own copy of RocksDB.
+Harper entry point. The fulltext addon does not link RocksDB or depend on rocksdb-js; Harper owns the
+database, durability, and store lifecycle.
+
+The Harper opener requires a process-lifetime store identity, persistent generation, byte namespace,
+bounded transport limits, and a `HostStorage` implementation. `publish(payload)` commits the index
+and opaque payload into one Tantivy `meta.json` generation, then reloads the local reader before it
+resolves. Harper uses that payload for its derived-index cursor. `committedPayload` exposes the
+payload recovered at open or the newest successful publish. If a publish poisons the generation,
+its durable outcome can be ambiguous, so the getter throws until the index is reopened. Host storage
+methods are strictly synchronous; `write` and `sync` must return `undefined`, and Promise-returning
+implementations are rejected rather than acknowledged.
+
+The current Harper path is owner-worker-only. It does not yet provide non-owner read handles,
+cross-worker refresh, generation retirement, or scheduled physical reclamation. Those lifecycle
+pieces and representative performance results are required before release enablement.
 
 ## Development
 

@@ -20,7 +20,7 @@ test('loads the artifact for the executing platform', async () => {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
 		nativeAbiVersion: 1,
-		storageBackends: ['native'],
+		storageBackends: ['native', 'harper'],
 	});
 	assert.strictEqual(cargoPackageVersion, packageManifest.version);
 	assert.match(platformTriple(), /^(darwin|linux|win32)-(arm64|x64)(-(gnu|musl|msvc))?$/);

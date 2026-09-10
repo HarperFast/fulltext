@@ -15,7 +15,7 @@ pub mod rocks_lease;
 #[cfg(feature = "node-api")]
 mod boundary;
 
-#[cfg(feature = "test-panic")]
+#[cfg(feature = "host-storage")]
 pub mod host_storage;
 
 #[cfg(feature = "node-api")]
@@ -49,11 +49,15 @@ pub struct RuntimeInfo {
 #[cfg(feature = "node-api")]
 #[napi(catch_unwind, js_name = "runtimeInfo")]
 pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
+	#[cfg(feature = "host-storage")]
+	let storage_backends = vec!["native".to_owned(), "harper".to_owned()];
+	#[cfg(not(feature = "host-storage"))]
+	let storage_backends = vec!["native".to_owned()];
 	boundary::run_stateless(|| RuntimeInfo {
 		package_version: env!("CARGO_PKG_VERSION").to_owned(),
 		tantivy_version: TANTIVY_VERSION.to_owned(),
 		native_abi_version: NATIVE_ABI_VERSION,
-		storage_backends: vec!["native".to_owned()],
+		storage_backends,
 	})
 }
 

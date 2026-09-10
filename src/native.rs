@@ -12,12 +12,17 @@ use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, JsFunction};
 use napi_derive::napi;
+use tantivy::directory::Directory;
 use tantivy::directory::MmapDirectory;
 use tantivy::IndexReader;
 
 use crate::boundary;
 use crate::engine::{Engine, SearchResult, TotalRelation, Writer};
 use crate::error::{FulltextError, Result};
+#[cfg(feature = "host-storage")]
+use crate::host_storage::HostTransport;
+#[cfg(feature = "host-storage")]
+use crate::protocol::decode_host_open;
 use crate::protocol::{
 	decode_batch, decode_open, decode_search, validate_batch_header, validate_search_header, EngineConfig,
 };
@@ -34,7 +39,7 @@ static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 #[derive(Default)]
 struct Registry {
 	handles: HashMap<u32, Arc<Runtime>>,
-	paths: HashMap<PathIdentity, u32>,
+	identities: HashMap<RuntimeIdentity, u32>,
 	opening: HashSet<u32>,
 	cancelled: HashSet<u32>,
 	environments: HashMap<usize, Weak<EnvironmentState>>,
@@ -48,9 +53,19 @@ enum PathIdentity {
 	Path(PathBuf),
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum RuntimeIdentity {
+	Native(PathIdentity),
+	#[cfg(feature = "host-storage")]
+	Host {
+		store: (u64, u64, u64),
+		namespace: Vec<u8>,
+	},
+}
+
 struct Runtime {
 	handle: u32,
-	path_identity: PathIdentity,
+	identity: RuntimeIdentity,
 	config: EngineConfig,
 	engine: Arc<Engine>,
 	reader: Arc<IndexReader>,
@@ -66,6 +81,18 @@ struct Runtime {
 	search_execution_nanoseconds: AtomicU64,
 	search_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 	closed: Arc<CompletionSignal>,
+	#[cfg(feature = "host-storage")]
+	host_transport: Option<Arc<HostTransport>>,
+}
+
+struct RuntimeParts {
+	identity: RuntimeIdentity,
+	config: EngineConfig,
+	engine: Engine,
+	writer: Writer,
+	reader: IndexReader,
+	#[cfg(feature = "host-storage")]
+	host_transport: Option<Arc<HostTransport>>,
 }
 
 struct CompletionSignal {
@@ -75,7 +102,13 @@ struct CompletionSignal {
 
 struct EnvironmentState {
 	alive: Arc<AtomicBool>,
-	handles: Mutex<HashMap<u32, Arc<CompletionSignal>>>,
+	handles: Mutex<HashMap<u32, TrackedHandle>>,
+}
+
+struct TrackedHandle {
+	opening_done: Arc<CompletionSignal>,
+	#[cfg(feature = "host-storage")]
+	host_transport: Option<Arc<HostTransport>>,
 }
 
 struct QueueState<T> {
@@ -113,9 +146,13 @@ struct WriterCommand {
 
 enum WriterOperation {
 	Apply(Vec<u8>),
-	Commit,
+	Commit(Option<String>),
+	#[cfg(feature = "host-storage")]
+	Publish(String),
 	Reload,
-	Close { rollback: bool },
+	Close {
+		rollback: bool,
+	},
 }
 
 enum WriterOutcome {
@@ -154,6 +191,42 @@ pub fn native_open(env: Env, packed_config: Buffer, callback: JsFunction) -> bou
 	})?
 }
 
+#[cfg(feature = "host-storage")]
+#[napi(catch_unwind, skip_typescript, js_name = "__harperOpen")]
+pub fn harper_open(env: Env, packed_config: Buffer, handler: JsFunction, callback: JsFunction) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		let config = decode_host_open(&packed_config).map_err(fulltext_napi_error)?;
+		let environment = environment_state(&env)?;
+		let opening_done = Arc::new(CompletionSignal::new());
+		let completion = completion(callback, environment.alive.clone())?;
+		let handle = next_handle().map_err(fulltext_napi_error)?;
+		let (directory, transport) = crate::host_storage::open_directory(&env, handler, &config)?;
+		registry().opening.insert(handle);
+		environment.track_host(handle, opening_done.clone(), transport.clone());
+		let thread_opening_done = opening_done.clone();
+		let thread_environment = environment.clone();
+		if let Err(error) = thread::Builder::new()
+			.name(format!("fulltext-harper-open-{handle}"))
+			.spawn(move || {
+				open_host_on_thread(
+					handle,
+					config,
+					directory,
+					transport,
+					completion,
+					thread_opening_done,
+					thread_environment,
+				)
+			}) {
+			registry().opening.remove(&handle);
+			environment.release(handle);
+			opening_done.signal();
+			return Err(napi_error("E_NATIVE_FAILURE", error));
+		}
+		Ok(())
+	})?
+}
+
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeApply")]
 pub fn native_apply(handle: u32, packed_batch: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
@@ -182,10 +255,33 @@ pub fn native_commit(handle: u32, callback: JsFunction) -> boundary::Result<()> 
 		let completion = completion(callback, runtime.environment.alive.clone())?;
 		runtime.enqueue_writer(
 			WriterCommand {
-				operation: WriterOperation::Commit,
+				operation: WriterOperation::Commit(None),
 				completion,
 			},
 			0,
+		)
+	})?
+}
+
+#[cfg(feature = "host-storage")]
+#[napi(catch_unwind, skip_typescript, js_name = "__harperPublish")]
+pub fn harper_publish(handle: u32, payload: String, callback: JsFunction) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		if payload.len() > crate::engine::MAX_COMMIT_PAYLOAD_BYTES {
+			return Err(fulltext_napi_error(FulltextError::invalid(format!(
+				"commit payload exceeds {} UTF-8 bytes",
+				crate::engine::MAX_COMMIT_PAYLOAD_BYTES
+			))));
+		}
+		let runtime = runtime(handle)?;
+		let completion = completion(callback, runtime.environment.alive.clone())?;
+		let bytes = payload.len();
+		runtime.enqueue_writer(
+			WriterCommand {
+				operation: WriterOperation::Publish(payload),
+				completion,
+			},
+			bytes,
 		)
 	})?
 }
@@ -284,30 +380,22 @@ pub fn native_status(handle: u32) -> boundary::Result<Buffer> {
 }
 
 impl Runtime {
-	fn start(
-		handle: u32,
-		path_identity: PathIdentity,
-		config: EngineConfig,
-		engine: Engine,
-		writer: Writer,
-		reader: IndexReader,
-		environment: Arc<EnvironmentState>,
-	) -> Result<Arc<Self>> {
-		let search_thread_count = config.limits.search_threads;
+	fn start(handle: u32, environment: Arc<EnvironmentState>, parts: RuntimeParts) -> Result<Arc<Self>> {
+		let search_thread_count = parts.config.limits.search_threads;
 		let writer_queue = Arc::new(BoundedQueue::new(
-			config.limits.max_queued_commands,
-			config.limits.max_queued_bytes,
+			parts.config.limits.max_queued_commands,
+			parts.config.limits.max_queued_bytes,
 		));
 		let search_queue = Arc::new(BoundedQueue::new(
-			config.limits.max_queued_commands,
-			config.limits.max_queued_bytes,
+			parts.config.limits.max_queued_commands,
+			parts.config.limits.max_queued_bytes,
 		));
 		let runtime = Arc::new(Self {
 			handle,
-			path_identity,
-			config,
-			engine: Arc::new(engine),
-			reader: Arc::new(reader),
+			identity: parts.identity,
+			config: parts.config,
+			engine: Arc::new(parts.engine),
+			reader: Arc::new(parts.reader),
 			writer_queue,
 			search_queue,
 			state: AtomicU8::new(STATE_OPEN),
@@ -320,11 +408,13 @@ impl Runtime {
 			search_execution_nanoseconds: AtomicU64::new(0),
 			search_threads: Mutex::new(Vec::with_capacity(search_thread_count)),
 			closed: Arc::new(CompletionSignal::new()),
+			#[cfg(feature = "host-storage")]
+			host_transport: parts.host_transport,
 		});
 		let writer_runtime = runtime.clone();
 		thread::Builder::new()
 			.name(format!("fulltext-writer-{handle}"))
-			.spawn(move || writer_loop(writer_runtime, writer))
+			.spawn(move || writer_loop(writer_runtime, parts.writer))
 			.map_err(FulltextError::native)?;
 		for worker in 0..search_thread_count {
 			let search_runtime = runtime.clone();
@@ -385,8 +475,16 @@ impl Runtime {
 
 	fn poison(&self, error: FulltextError) {
 		self.state.store(STATE_POISONED, Ordering::Release);
+		let mut close = None;
 		for command in self.writer_queue.drain() {
-			command.value.fail(error.clone());
+			if matches!(&command.value.operation, WriterOperation::Close { .. }) && close.is_none() {
+				close = Some(command.value);
+			} else {
+				command.value.fail(error.clone());
+			}
+		}
+		if let Some(close) = close {
+			let _ = self.writer_queue.push_force(close.force_rollback(), 0);
 		}
 		for command in self.search_queue.close() {
 			command.value.completion.failure(error.clone());
@@ -588,6 +686,12 @@ impl WriterCommand {
 	fn fail(self, error: FulltextError) {
 		self.completion.failure(error);
 	}
+
+	fn force_rollback(mut self) -> Self {
+		debug_assert!(matches!(self.operation, WriterOperation::Close { .. }));
+		self.operation = WriterOperation::Close { rollback: true };
+		self
+	}
 }
 
 fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
@@ -617,7 +721,29 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 					Err(error) => WriterOutcome::Continue(Err(error)),
 				}
 			}
-			WriterOperation::Commit => match active_writer_mut(&mut writer).and_then(Writer::commit) {
+			WriterOperation::Commit(payload) => {
+				match active_writer_mut(&mut writer).and_then(|writer| writer.commit_with_payload(payload.as_deref())) {
+					Ok(opstamp) => {
+						runtime.uncommitted_mutations.store(0, Ordering::Release);
+						runtime.commit_opstamp.store(opstamp, Ordering::Release);
+						WriterOutcome::Continue(Ok(u64_body(opstamp)))
+					}
+					Err(error) => WriterOutcome::Poison(
+						Err(error),
+						FulltextError::new(
+							"E_POISONED",
+							"a prior commit failed and the index generation is terminal",
+						),
+					),
+				}
+			}
+			#[cfg(feature = "host-storage")]
+			WriterOperation::Publish(payload) => match active_writer_mut(&mut writer)
+				.and_then(|writer| writer.commit_with_payload(Some(&payload)))
+				.and_then(|opstamp| {
+					runtime.reader.reload().map_err(FulltextError::native)?;
+					Ok(opstamp)
+				}) {
 				Ok(opstamp) => {
 					runtime.uncommitted_mutations.store(0, Ordering::Release);
 					runtime.commit_opstamp.store(opstamp, Ordering::Release);
@@ -627,7 +753,7 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 					Err(error),
 					FulltextError::new(
 						"E_POISONED",
-						"a prior commit failed and the index generation is terminal",
+						"a publish failed after writer state changed and the index generation is terminal",
 					),
 				),
 			},
@@ -659,9 +785,14 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 					for join in std::mem::take(&mut *lock(&runtime.search_threads)) {
 						let _ = join.join();
 					}
+					#[cfg(feature = "host-storage")]
+					if let Some(transport) = &runtime.host_transport {
+						transport.wait_idle();
+						transport.close();
+					}
 					runtime.writer_queue.close();
 					runtime.state.store(STATE_CLOSED, Ordering::Release);
-					release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
+					release_runtime(runtime.handle, &runtime.identity, &runtime.environment);
 					runtime.signal_closed();
 					WriterOutcome::Stop(close_result.map(|()| Vec::new()))
 				}
@@ -684,14 +815,22 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 				completion.failure(FulltextError::new("E_NATIVE_PANIC", "native writer actor panicked"));
 				runtime.poison(FulltextError::new("E_NATIVE_PANIC", "native writer actor panicked"));
 				runtime.writer_queue.close();
-				release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
+				#[cfg(feature = "host-storage")]
+				if let Some(transport) = &runtime.host_transport {
+					transport.close();
+				}
+				release_runtime(runtime.handle, &runtime.identity, &runtime.environment);
 				runtime.signal_closed();
 				return;
 			}
 		}
 	}
 	runtime.state.store(STATE_CLOSED, Ordering::Release);
-	release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
+	#[cfg(feature = "host-storage")]
+	if let Some(transport) = &runtime.host_transport {
+		transport.close();
+	}
+	release_runtime(runtime.handle, &runtime.identity, &runtime.environment);
 	runtime.signal_closed();
 }
 
@@ -764,9 +903,68 @@ fn open_on_thread(
 }
 
 fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>) -> Result<()> {
-	let config = decode_open(&bytes)?;
-	let canonical = create_and_canonicalize(Path::new(&config.path))?;
-	let path_identity = path_identity(&canonical)?;
+	let open = decode_open(&bytes)?;
+	let canonical = create_and_canonicalize(Path::new(&open.path))?;
+	let identity = RuntimeIdentity::Native(path_identity(&canonical)?);
+	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
+	open_runtime_with_directory(
+		handle,
+		identity,
+		open.engine,
+		directory,
+		environment,
+		#[cfg(feature = "host-storage")]
+		None,
+	)
+	.map(|_| ())
+}
+
+#[cfg(feature = "host-storage")]
+fn open_host_on_thread(
+	handle: u32,
+	open: crate::protocol::HostOpenConfig,
+	directory: crate::phase0::KvDirectory<crate::host_storage::HostKvStore>,
+	transport: Arc<HostTransport>,
+	completion: Completion,
+	opening_done: Arc<CompletionSignal>,
+	environment: Arc<EnvironmentState>,
+) {
+	let identity = RuntimeIdentity::Host {
+		store: open.store_identity,
+		namespace: open.namespace.clone(),
+	};
+	let result = catch_unwind(AssertUnwindSafe(|| {
+		open_runtime_with_directory(
+			handle,
+			identity,
+			open.engine,
+			directory,
+			environment.clone(),
+			Some(transport.clone()),
+		)
+	}));
+	let opened = matches!(result, Ok(Ok(_)));
+	match result {
+		Ok(Ok(payload)) => completion.success(host_open_body(handle, payload.as_deref())),
+		Ok(Err(error)) => completion.failure(error),
+		Err(_) => completion.failure(FulltextError::new("E_NATIVE_PANIC", "Harper index open panicked")),
+	}
+	registry().opening.remove(&handle);
+	if !opened {
+		transport.close();
+		environment.release(handle);
+	}
+	opening_done.signal();
+}
+
+fn open_runtime_with_directory<D: Directory + Clone>(
+	handle: u32,
+	identity: RuntimeIdentity,
+	config: EngineConfig,
+	directory: D,
+	environment: Arc<EnvironmentState>,
+	#[cfg(feature = "host-storage")] host_transport: Option<Arc<HostTransport>>,
+) -> Result<Option<String>> {
 	{
 		let mut registry = registry();
 		if registry.cancelled.remove(&handle) || !environment.alive.load(Ordering::Acquire) {
@@ -776,27 +974,31 @@ fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>)
 				"Node environment closed during index open",
 			));
 		}
-		if registry.paths.contains_key(&path_identity) {
+		if registry.identities.contains_key(&identity) {
 			return Err(FulltextError::new(
 				"E_DUPLICATE_OPEN",
 				"the physical index is already open",
 			));
 		}
-		registry.paths.insert(path_identity.clone(), handle);
+		registry.identities.insert(identity.clone(), handle);
 	}
 	let result = (|| {
-		let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
 		let engine = Engine::open(directory, &config)?;
+		let committed_payload = engine.committed_payload()?;
 		let writer = engine.writer(&config)?;
 		let reader = engine.reader()?;
 		let runtime = Runtime::start(
 			handle,
-			path_identity.clone(),
-			config,
-			engine,
-			writer,
-			reader,
 			environment.clone(),
+			RuntimeParts {
+				identity: identity.clone(),
+				config,
+				engine,
+				writer,
+				reader,
+				#[cfg(feature = "host-storage")]
+				host_transport,
+			},
 		)?;
 		let mut registry = registry();
 		if registry.cancelled.remove(&handle) || !environment.alive.load(Ordering::Acquire) {
@@ -810,10 +1012,10 @@ fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>)
 		}
 		registry.handles.insert(handle, runtime);
 		registry.opening.remove(&handle);
-		Ok(())
+		Ok(committed_payload)
 	})();
 	if result.is_err() {
-		release_runtime(handle, &path_identity, &environment);
+		release_runtime(handle, &identity, &environment);
 	}
 	result
 }
@@ -895,11 +1097,17 @@ fn environment_state(env: &Env) -> boundary::Result<Arc<EnvironmentState>> {
 fn finish_environment_cleanup(data: EnvironmentHookData) {
 	data.environment.alive.store(false, Ordering::Release);
 	let tracked = data.environment.take_handles();
+	#[cfg(feature = "host-storage")]
+	for handle in tracked.values() {
+		if let Some(transport) = &handle.host_transport {
+			transport.close();
+		}
+	}
 	let waits = tracked
 		.into_iter()
-		.map(|(handle, opening_done)| match cleanup_handle(handle) {
+		.map(|(handle, tracked)| match cleanup_handle(handle) {
 			Some(runtime) => CleanupWait::Runtime(runtime),
-			None => CleanupWait::Opening(opening_done),
+			None => CleanupWait::Opening(tracked.opening_done),
 		})
 		.collect::<Vec<_>>();
 	let remove_environment = registry()
@@ -922,14 +1130,32 @@ fn finish_environment_cleanup(data: EnvironmentHookData) {
 
 impl EnvironmentState {
 	fn track(&self, handle: u32, opening_done: Arc<CompletionSignal>) {
-		lock(&self.handles).insert(handle, opening_done);
+		lock(&self.handles).insert(
+			handle,
+			TrackedHandle {
+				opening_done,
+				#[cfg(feature = "host-storage")]
+				host_transport: None,
+			},
+		);
+	}
+
+	#[cfg(feature = "host-storage")]
+	fn track_host(&self, handle: u32, opening_done: Arc<CompletionSignal>, host_transport: Arc<HostTransport>) {
+		lock(&self.handles).insert(
+			handle,
+			TrackedHandle {
+				opening_done,
+				host_transport: Some(host_transport),
+			},
+		);
 	}
 
 	fn release(&self, handle: u32) {
 		lock(&self.handles).remove(&handle);
 	}
 
-	fn take_handles(&self) -> HashMap<u32, Arc<CompletionSignal>> {
+	fn take_handles(&self) -> HashMap<u32, TrackedHandle> {
 		mem::take(&mut *lock(&self.handles))
 	}
 }
@@ -943,11 +1169,11 @@ impl CleanupWait {
 	}
 }
 
-fn release_runtime(handle: u32, identity: &PathIdentity, environment: &EnvironmentState) {
+fn release_runtime(handle: u32, identity: &RuntimeIdentity, environment: &EnvironmentState) {
 	let mut registry = registry();
 	registry.handles.remove(&handle);
-	if registry.paths.get(identity) == Some(&handle) {
-		registry.paths.remove(identity);
+	if registry.identities.get(identity) == Some(&handle) {
+		registry.identities.remove(identity);
 	}
 	drop(registry);
 	environment.release(handle);
@@ -1006,6 +1232,16 @@ fn error_envelope(error: FulltextError) -> Vec<u8> {
 
 fn u32_body(value: u32) -> Vec<u8> {
 	value.to_le_bytes().to_vec()
+}
+
+#[cfg(feature = "host-storage")]
+fn host_open_body(handle: u32, payload: Option<&str>) -> Vec<u8> {
+	let mut bytes = u32_body(handle);
+	bytes.push(u8::from(payload.is_some()));
+	if let Some(payload) = payload {
+		push_string(&mut bytes, payload);
+	}
+	bytes
 }
 
 fn u64_body(value: u64) -> Vec<u8> {

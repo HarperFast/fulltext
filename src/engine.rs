@@ -17,6 +17,7 @@ const ID_FIELD_NAME: &str = "__fulltext_id";
 const IDENTITY_PATH: &str = ".harper-fulltext-identity";
 const META_PATH: &str = "meta.json";
 const ANALYZER_NAME: &str = "english@1";
+pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct Engine {
@@ -139,6 +140,10 @@ impl Engine {
 			.reload_policy(ReloadPolicy::Manual)
 			.try_into()
 			.map_err(index_error)
+	}
+
+	pub fn committed_payload(&self) -> Result<Option<String>> {
+		Ok(self.index.load_metas().map_err(index_error)?.payload)
 	}
 
 	pub fn search(&self, searcher: &Searcher, request: &SearchRequest) -> Result<SearchResult> {
@@ -326,7 +331,20 @@ impl Writer {
 	}
 
 	pub fn commit(&mut self) -> Result<u64> {
-		self.inner.commit().map_err(index_error)
+		self.commit_with_payload(None)
+	}
+
+	pub fn commit_with_payload(&mut self, payload: Option<&str>) -> Result<u64> {
+		if payload.is_some_and(|payload| payload.len() > MAX_COMMIT_PAYLOAD_BYTES) {
+			return Err(FulltextError::invalid(format!(
+				"commit payload exceeds {MAX_COMMIT_PAYLOAD_BYTES} UTF-8 bytes"
+			)));
+		}
+		let mut commit = self.inner.prepare_commit().map_err(index_error)?;
+		if let Some(payload) = payload {
+			commit.set_payload(payload);
+		}
+		commit.commit().map_err(index_error)
 	}
 
 	pub fn rollback(&mut self) -> Result<u64> {
@@ -429,7 +447,6 @@ mod tests {
 
 	fn config() -> EngineConfig {
 		EngineConfig {
-			path: "unused".to_owned(),
 			index_id: "products".to_owned(),
 			generation: "one".to_owned(),
 			fields: vec![
@@ -548,6 +565,37 @@ mod tests {
 			reopened.search(&reopened_reader.searcher(), &request).unwrap().hits[0].id,
 			"one"
 		);
+	}
+
+	#[test]
+	fn commit_payload_survives_merge_and_reopen() {
+		let directory = RamDirectory::create();
+		let config = config();
+		let engine = Engine::open(directory.clone(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		writer.apply(batch()).unwrap();
+		writer.commit_with_payload(Some("cursor-v1:42")).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "three".to_owned(),
+					fields: vec![("title".to_owned(), vec!["Hiking Boots".to_owned()])],
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit_with_payload(Some("cursor-v1:43")).unwrap();
+		let segments = engine.index.searchable_segment_ids().unwrap();
+		assert_eq!(segments.len(), 2);
+		writer.inner.merge(&segments).wait().unwrap();
+		assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("cursor-v1:43"));
+		writer.close().unwrap();
+
+		let reopened = Engine::open(directory, &config).unwrap();
+		assert_eq!(reopened.committed_payload().unwrap().as_deref(), Some("cursor-v1:43"));
 	}
 
 	#[test]
