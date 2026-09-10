@@ -49,7 +49,7 @@ pub struct ReclaimBudget {
 impl Default for ReclaimBudget {
 	fn default() -> Self {
 		Self {
-			max_point_reads: 128,
+			max_point_reads: RECLAIM_SHARD_COUNT * 2 + 4,
 			max_mutations: RECLAIM_MAX_BATCH_MUTATIONS,
 			max_request_bytes: RECLAIM_MAX_BATCH_REQUEST_BYTES,
 			max_elapsed: Duration::from_millis(10),
@@ -143,6 +143,8 @@ struct State {
 	pending_wal: Vec<Vec<(Vec<u8>, VersionedValue)>>,
 	fail_next_write: bool,
 	fail_after_next_write: bool,
+	fail_read_after_next_write: bool,
+	fail_next_read: bool,
 	fail_next_flush: bool,
 }
 
@@ -199,6 +201,7 @@ impl FaultingKv {
 			return Err(io::Error::other("injected write failure"));
 		}
 		let fail_after_write = std::mem::take(&mut state.fail_after_next_write);
+		let fail_read_after_write = std::mem::take(&mut state.fail_read_after_next_write);
 		let mut wal_batch = Vec::with_capacity(mutations.len());
 		for mutation in mutations {
 			state.next_sequence += 1;
@@ -222,6 +225,9 @@ impl FaultingKv {
 					apply_if_newer(&mut state.durable, key, entry);
 				}
 			}
+		}
+		if fail_read_after_write {
+			state.fail_next_read = true;
 		}
 		if fail_after_write {
 			Err(io::Error::other("injected post-commit write failure"))
@@ -258,6 +264,8 @@ impl FaultingKv {
 				pending_wal: Vec::new(),
 				fail_next_write: false,
 				fail_after_next_write: false,
+				fail_read_after_next_write: false,
+				fail_next_read: false,
 				fail_next_flush: false,
 			})),
 		}
@@ -271,6 +279,12 @@ impl FaultingKv {
 		self.state.lock().unwrap().fail_after_next_write = true;
 	}
 
+	pub fn fail_after_next_write_and_next_read(&self) {
+		let mut state = self.state.lock().unwrap();
+		state.fail_after_next_write = true;
+		state.fail_read_after_next_write = true;
+	}
+
 	pub fn fail_next_flush(&self) {
 		self.state.lock().unwrap().fail_next_flush = true;
 	}
@@ -282,7 +296,15 @@ impl KvStore for FaultingKv {
 	}
 
 	fn read(&self, key: &[u8]) -> io::Result<Option<OwnedBytes>> {
-		Ok(self.get(key).map(OwnedBytes::new))
+		let mut state = self.state.lock().unwrap();
+		if std::mem::take(&mut state.fail_next_read) {
+			return Err(io::Error::other("injected read failure"));
+		}
+		Ok(state
+			.visible
+			.get(key)
+			.and_then(|entry| entry.value.clone())
+			.map(OwnedBytes::new))
 	}
 
 	fn write(&self, mutations: &[Mutation], policy: WritePolicy) -> io::Result<()> {
@@ -463,16 +485,19 @@ impl ReclaimAdmission {
 	}
 
 	fn batch_fits(&self, mutations: usize, request_bytes: usize) -> bool {
-		!self.elapsed()
-			&& mutations <= RECLAIM_MAX_BATCH_MUTATIONS
+		mutations <= RECLAIM_MAX_BATCH_MUTATIONS
 			&& request_bytes <= RECLAIM_MAX_BATCH_REQUEST_BYTES
-			&& self.outcome.mutations.saturating_add(mutations) <= self.budget.max_mutations
+			&& self.admission_fits(mutations, request_bytes)
+	}
+
+	fn admission_fits(&self, mutations: usize, request_bytes: usize) -> bool {
+		self.outcome.mutations.saturating_add(mutations) <= self.budget.max_mutations
 			&& self.outcome.request_bytes.saturating_add(request_bytes) <= self.budget.max_request_bytes
 	}
 
 	fn write<S: KvStore>(&mut self, store: &S, mutations: &[Mutation]) -> io::Result<Budgeted<()>> {
 		let request_bytes = mutation_batch_request_bytes(mutations)?;
-		if !self.batch_fits(mutations.len(), request_bytes) {
+		if self.elapsed() || !self.batch_fits(mutations.len(), request_bytes) {
 			self.outcome.budget_exhausted = true;
 			return Ok(Budgeted::Exhausted);
 		}
@@ -911,8 +936,14 @@ impl<S: KvStore> KvDirectory<S> {
 
 	fn record_reclaim_tail(&self, shard: u8, tail: u64) {
 		let hint = &self.state.reclaim_hints[usize::from(shard)];
-		hint.tail.store(tail, Ordering::Release);
+		hint.tail.fetch_max(tail, Ordering::AcqRel);
 		hint.tail_known.store(true, Ordering::Release);
+	}
+
+	fn invalidate_reclaim_tail(&self, shard: u8) {
+		self.state.reclaim_hints[usize::from(shard)]
+			.tail_known
+			.store(false, Ordering::Release);
 	}
 
 	pub fn reclaim(&self, budget: ReclaimBudget) -> io::Result<ReclaimOutcome> {
@@ -920,6 +951,10 @@ impl<S: KvStore> KvDirectory<S> {
 		let mut admission = ReclaimAdmission::new(budget);
 		if matches!(self.ensure_reclaim_format(&mut admission)?, Budgeted::Exhausted) {
 			admission.outcome.has_more = true;
+			admission.outcome.no_progress = true;
+			return Ok(admission.outcome);
+		}
+		if self.format.state.load(Ordering::Acquire) == FORMAT_ABSENT {
 			admission.outcome.no_progress = true;
 			return Ok(admission.outcome);
 		}
@@ -1027,7 +1062,7 @@ impl<S: KvStore> KvDirectory<S> {
 		}
 		let depth = tail - head;
 		let mut examined = 0_u64;
-		while examined < depth && !admission.outcome.budget_exhausted {
+		while sequence < tail && examined < depth && !admission.outcome.budget_exhausted {
 			let entry_key = reclaim_entry_key(&self.namespace, shard, sequence);
 			let entry_bytes = match admission.read(&self.store, &entry_key)? {
 				Budgeted::Performed(entry) => entry,
@@ -1087,11 +1122,12 @@ impl<S: KvStore> KvDirectory<S> {
 				Budgeted::Exhausted => break,
 			};
 			match self.reclaim_entry(shard, sequence, head, &entry, progress, admission)? {
-				Budgeted::Performed(completed) => {
-					if completed && sequence == head {
+				Budgeted::Performed(true) => {
+					if sequence == head {
 						head += 1;
 					}
 				}
+				Budgeted::Performed(false) => continue,
 				Budgeted::Exhausted => break,
 			}
 			sequence += 1;
@@ -1184,7 +1220,13 @@ impl<S: KvStore> KvDirectory<S> {
 			return Ok(Budgeted::Exhausted);
 		}
 
-		let mut mutations = Vec::new();
+		let capacity = RECLAIM_MAX_BATCH_MUTATIONS.min(
+			admission
+				.budget
+				.max_mutations
+				.saturating_sub(admission.outcome.mutations),
+		);
+		let mut mutations = Vec::with_capacity(capacity);
 		let mut payload_bytes = 0_usize;
 		let mut progress_changed = false;
 		while progress.next_chunk < entry.full_chunks {
@@ -1301,7 +1343,9 @@ impl<S: KvStore> KvDirectory<S> {
 		if admission.batch_fits(mutation_count, request_bytes) {
 			Ok(true)
 		} else {
-			admission.outcome.budget_exhausted = true;
+			if !admission.admission_fits(mutation_count, request_bytes) {
+				admission.outcome.budget_exhausted = true;
+			}
 			Ok(false)
 		}
 	}
@@ -1582,7 +1626,10 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 					}
 					Err(delete_io_error(path, error))
 				}
-				Ok(Some(_)) | Err(_) => Err(delete_io_error(path, error)),
+				Ok(Some(_)) | Err(_) => {
+					self.invalidate_reclaim_tail(shard);
+					Err(delete_io_error(path, error))
+				}
 			},
 		}
 	}
@@ -2085,6 +2132,7 @@ const RECLAIM_ENTRY_FORMAT_VERSION: u8 = 2;
 const RECLAIM_PROGRESS_FORMAT_VERSION: u8 = 1;
 const RECLAIM_ENTRY_WHOLE_OBJECT: u8 = 1;
 const RECLAIM_SHARD_COUNT: usize = 64;
+const _: () = assert!(RECLAIM_SHARD_COUNT <= u64::BITS as usize);
 const RECLAIM_MAX_BATCH_MUTATIONS: usize = 512;
 const RECLAIM_MAX_BATCH_REQUEST_BYTES: usize = 64 * 1024;
 const READER_REGISTRATION_SHARD_COUNT: usize = 256;
@@ -3253,6 +3301,30 @@ mod tests {
 	}
 
 	#[test]
+	fn ambiguous_delete_invalidates_the_cached_reclaim_tail() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		directory.atomic_write(Path::new("marker"), b"ready").unwrap();
+		assert!(!directory.reclaim(generous_reclaim_budget()).unwrap().has_more);
+		let path = Path::new("segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(b"contents").unwrap();
+		writer.terminate().unwrap();
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+
+		store.fail_after_next_write_and_next_read();
+		assert!(directory.delete(path).is_err());
+		let outcome = directory.reclaim(generous_reclaim_budget()).unwrap();
+
+		assert_eq!(outcome.entries_reclaimed, 1);
+		assert!(!outcome.has_more);
+		assert_eq!(
+			store.get(&tail_key(b"phase0", binding.object_id, binding.tail_revision)),
+			None
+		);
+	}
+
+	#[test]
 	fn failed_delete_reactivates_its_writer() {
 		let store = FaultingKv::default();
 		let directory = FaultingDirectory::new(store.clone());
@@ -4323,56 +4395,55 @@ mod tests {
 		let store = FaultingKv::default();
 		let directory = FaultingDirectory::new(store.clone());
 		directory.atomic_write(Path::new("marker"), b"ready").unwrap();
-		let first = ReclaimEntry {
-			object_id: 1,
-			full_chunks: 0,
-			chunk_high_water: 0,
-			tail_high_water: 1,
-		};
+		let path = Path::new("pinned-segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(b"first").unwrap();
+		writer.terminate().unwrap();
+		let first_binding = decode_binding(&store.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+		let first_handle = directory.open_read(path).unwrap();
+		directory.delete(path).unwrap();
+		let first = ReclaimEntry::from_binding(&first_binding);
 		let second = ReclaimEntry {
-			object_id: 65,
+			object_id: first.object_id + RECLAIM_SHARD_COUNT as u64,
 			full_chunks: 0,
 			chunk_high_water: 0,
 			tail_high_water: 1,
 		};
-		install_reclaim_entries(&store, b"phase0", &[first.clone(), second.clone()]);
+		let shard = reclaim_shard(first.object_id);
 		store
 			.write(
 				&[
-					Mutation::Put(tail_key(b"phase0", first.object_id, 1), vec![1]),
+					Mutation::Put(
+						reclaim_entry_key(b"phase0", shard, 1),
+						encode_reclaim_entry(&second).unwrap(),
+					),
+					Mutation::Put(reclaim_tail_key(b"phase0", shard), 2_u64.to_be_bytes().to_vec()),
 					Mutation::Put(tail_key(b"phase0", second.object_id, 1), vec![2]),
 				],
 				WritePolicy::WAL_SYNC,
 			)
 			.unwrap();
-		let pin = directory
-			.state
-			.reader_pins
-			.register(&Binding {
-				object_id: first.object_id,
-				full_chunks: 0,
-				tail_revision: 1,
-				tail_length: 1,
-				visible_length: 1,
-				chunk_high_water: 0,
-				tail_high_water: 1,
-			})
-			.unwrap();
+		directory.record_reclaim_tail(shard, 2);
 
 		let first_pass = directory.reclaim(generous_reclaim_budget()).unwrap();
 		assert_eq!(first_pass.entries_reclaimed, 1);
 		assert_eq!(first_pass.pinned_skips, 1);
 		assert!(first_pass.has_more);
-		assert!(store.get(&tail_key(b"phase0", first.object_id, 1)).is_some());
+		assert!(store
+			.get(&tail_key(b"phase0", first.object_id, first_binding.tail_revision))
+			.is_some());
 		assert_eq!(store.get(&tail_key(b"phase0", second.object_id, 1)), None);
-		assert!(store.get(&reclaim_entry_key(b"phase0", 1, 0)).is_some());
-		assert_eq!(store.get(&reclaim_entry_key(b"phase0", 1, 1)), None);
+		assert!(store.get(&reclaim_entry_key(b"phase0", shard, 0)).is_some());
+		assert_eq!(store.get(&reclaim_entry_key(b"phase0", shard, 1)), None);
 
-		drop(pin);
+		drop(first_handle);
 		drain_reclamation(&directory);
-		assert_eq!(store.get(&tail_key(b"phase0", first.object_id, 1)), None);
 		assert_eq!(
-			decode_u64(&store.get(&reclaim_head_key(b"phase0", 1)).unwrap()).unwrap(),
+			store.get(&tail_key(b"phase0", first.object_id, first_binding.tail_revision)),
+			None
+		);
+		assert_eq!(
+			decode_u64(&store.get(&reclaim_head_key(b"phase0", shard)).unwrap()).unwrap(),
 			2
 		);
 	}
@@ -4419,6 +4490,92 @@ mod tests {
 			assert_eq!(recovered.get(&chunk_key(b"phase0", entry.object_id, chunk)), None);
 		}
 		assert_eq!(recovered.get(&reclaim_progress_key(b"phase0", 1, 0)), None);
+	}
+
+	#[test]
+	fn reclaim_finishes_multiple_batches_before_moving_its_cursor() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		directory.atomic_write(Path::new("marker"), b"ready").unwrap();
+		let entry = ReclaimEntry {
+			object_id: 1,
+			full_chunks: 600,
+			chunk_high_water: 600,
+			tail_high_water: 0,
+		};
+		install_reclaim_entries(&store, b"phase0", std::slice::from_ref(&entry));
+		store
+			.write(
+				&(0..entry.full_chunks)
+					.map(|chunk| Mutation::Put(chunk_key(b"phase0", entry.object_id, chunk), vec![chunk as u8]))
+					.collect::<Vec<_>>(),
+				WritePolicy::WAL_SYNC,
+			)
+			.unwrap();
+
+		let outcome = directory.reclaim(generous_reclaim_budget()).unwrap();
+
+		assert_eq!(outcome.entries_reclaimed, 1);
+		assert_eq!(outcome.write_batches, 2);
+		assert_eq!(outcome.payload_delete_mutations, entry.full_chunks as usize);
+		assert!(!outcome.has_more);
+	}
+
+	#[test]
+	fn resumed_cursor_stops_at_the_snapshotted_tail() {
+		let store = CountingKv::new();
+		let directory = KvDirectory::new(store.clone());
+		directory.atomic_write(Path::new("marker"), b"ready").unwrap();
+		let entry = ReclaimEntry {
+			object_id: 1,
+			full_chunks: 0,
+			chunk_high_water: 0,
+			tail_high_water: 0,
+		};
+		install_reclaim_entries(&store.inner, b"phase0", std::slice::from_ref(&entry));
+		store
+			.inner
+			.write(
+				&[
+					Mutation::Put(reclaim_tail_key(b"phase0", 1), 3_u64.to_be_bytes().to_vec()),
+					Mutation::Put(reclaim_head_key(b"phase0", 1), 0_u64.to_be_bytes().to_vec()),
+				],
+				WritePolicy::WAL_SYNC,
+			)
+			.unwrap();
+		let pin = directory
+			.state
+			.reader_pins
+			.register(&Binding {
+				object_id: entry.object_id,
+				full_chunks: 0,
+				tail_revision: 0,
+				tail_length: 0,
+				visible_length: 0,
+				chunk_high_water: 0,
+				tail_high_water: 0,
+			})
+			.unwrap();
+		let hint = &directory.state.reclaim_hints[1];
+		for empty in &directory.state.reclaim_hints {
+			empty.head.store(0, Ordering::Release);
+			empty.head_known.store(true, Ordering::Release);
+			empty.tail.store(0, Ordering::Release);
+			empty.tail_known.store(true, Ordering::Release);
+		}
+		hint.head.store(0, Ordering::Release);
+		hint.head_known.store(true, Ordering::Release);
+		hint.tail.store(3, Ordering::Release);
+		hint.tail_known.store(true, Ordering::Release);
+		hint.next_sequence.store(2, Ordering::Release);
+		store.take_io_counts();
+
+		let outcome = directory.reclaim(generous_reclaim_budget()).unwrap();
+
+		assert_eq!(outcome.point_reads, 2);
+		assert_eq!(store.take_reads(), 2);
+		assert_eq!(hint.next_sequence.load(Ordering::Acquire), 0);
+		drop(pin);
 	}
 
 	#[test]
@@ -4500,8 +4657,9 @@ mod tests {
 
 		assert_eq!(outcome.point_reads, 4);
 		assert_eq!(store.take_reads(), 4);
-		assert!(outcome.budget_exhausted);
+		assert!(!outcome.budget_exhausted);
 		assert!(outcome.no_progress);
+		assert!(!outcome.has_more);
 	}
 
 	#[test]

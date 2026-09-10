@@ -240,14 +240,16 @@ progress key kinds, this unit advances the directory key-format marker to v3. A 
 with the former v2 prototype is rejected and rebuilt; the implementation does not strand v2 keys
 under a parallel prefix or attempt a migration for data that has never shipped.
 
-The consumer snapshots each visited shard's tail and examines each starting sequence at most once
-per admission. A pinned entry remains durable while a process-local cursor moves to the next
-sequence. An unpinned later entry may complete out of order, leaving a missing slot. When the oldest
+The consumer snapshots each visited shard's tail and never scans beyond that bound during an
+admission. A pinned entry remains durable while a process-local cursor moves to the next sequence.
+An unpinned later entry may complete out of order, leaving a missing slot. When the oldest
 entry completes, bounded point reads advance the durable head across consecutive holes. This
 prevents one retained handle from blocking later garbage without adding another durable queue,
-copying entries, or sharing foreground tail state. The result reports pinned skips and whether the
-remaining queue made no deletion progress; the later background-task unit owns retry timing and
-health thresholds.
+copying entries, or sharing foreground tail state. The cursor never advances beyond the tail
+snapshot and remains on an unpinned entry until all of that entry's bounded batches complete. It is
+process-local; after restart all pins are gone and scanning safely resumes at the durable head. The
+result reports pinned skips and whether the remaining queue made no deletion progress; the later
+background-task unit owns retry timing and health thresholds.
 
 Reclaim entries add the published full-chunk count alongside the existing high-waters. Published
 chunks are a known contiguous prefix and are deleted directly. Any staged chunks between the
@@ -260,8 +262,8 @@ can make their physical presence sparse.
 One process-local consumer mutex, round-robin shard cursor, and lazy per-shard head/tail hints live
 in `DirectoryState`. They serialize cleanup for one storage identity and namespace without coordinating different indexes,
 prevent a small budget from always starting at shard zero, and make repeated empty admissions avoid
-host reads after a shard has been observed empty. Enqueue invalidates or advances the corresponding
-hint after its definitive result. The call accepts hard limits for
+host reads after a shard has been observed empty. Enqueue advances the corresponding tail hint after
+a definitive commit and invalidates it after an unknown result. The call accepts hard limits for
 point reads, batch mutations, encoded mutation bytes, and elapsed work. It starts an operation only
 when that operation fits the remaining count and byte limits, and checks elapsed time between host
 operations. A synchronous operation already admitted to the host remains uncancellable and may
@@ -272,6 +274,12 @@ blocked work.
 This unit does not create a thread, reserve host-transport capacity,
 accept an owner lease, expose Node.js API, or enable Harper cleanup; those lifecycle and admission
 rules remain the next unit.
+
+An enqueue with an unknown commit result invalidates the cached shard tail before returning the
+error. The next admission rereads durable state, so an applied batch cannot be stranded behind a
+stale empty hint. A namespace proven absent after bounded format validation returns immediately;
+the default read budget covers format validation plus one cold 64-shard sweep for a present
+namespace.
 
 Cleanup runs on a dedicated native task, not the JavaScript service thread or writer actor. Host
 callbacks still execute on JavaScript, so cleanup has a low-priority admission class that cannot
@@ -286,6 +294,11 @@ configured maximum total extent before allocating or scheduling work. An undecod
 guessed from point misses: this is a derived index, so the generation is marked corrupt and rebuilt
 from Harper source data. A caught cleanup panic enters the same terminal health state. Neither case
 silently retries forever or advances past unknown data.
+
+A progress record without its sequence-matched entry is terminal corruption, not disposable
+garbage. The entry is the only durable copy of the retired object id and physical extent; removing
+the progress record would allow unknown payload to leak permanently. Harper rebuilds that derived
+generation from source data instead of masking the broken atomicity invariant.
 
 ## Alternatives
 
@@ -365,10 +378,11 @@ distinct-file concurrency. Distinct-file cases run at one, two, four, and eight 
 cases start at two threads.
 
 Slice 5 tests durable per-sequence progress, crash/reopen resumption, out-of-order completion behind
-a pinned head, later head compaction across holes, applied-but-reported-failed final batches,
-terminal corruption latching, concurrent admission, staged-prefix probing, and exact read and
-mutation budgets. Format validation is charged to the same point-read and elapsed-work budget as
-queue processing. A real Tantivy merge and garbage-collection cycle is reopened after the queue
+a real retained handle, later head compaction across holes, multi-batch entry completion,
+tail-bounded cursor resumption, applied-but-reported-failed final batches, ambiguous enqueue-result
+recovery, terminal corruption latching, concurrent admission, staged-prefix probing, and exact read
+and mutation budgets. Format validation is charged to the same point-read and elapsed-work budget
+as queue processing. A real Tantivy merge and garbage-collection cycle is reopened after the queue
 drains to prove that physical cleanup preserves the index. The release benchmark times reclamation
 of deleted 4 KiB directory objects with creation and logical deletion outside the measured region.
 
