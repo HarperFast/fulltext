@@ -1235,7 +1235,7 @@ impl<S: KvStore> KvDirectory<S> {
 			return Ok(Budgeted::Exhausted);
 		}
 
-		let remaining_chunks = u64::from(entry.chunk_high_water - progress.next_chunk);
+		let remaining_chunks = u64::from(entry.chunk_high_water.saturating_sub(progress.next_chunk));
 		let remaining_tails = entry
 			.tail_high_water
 			.saturating_add(1)
