@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import test from 'node:test';
+import { Worker } from 'node:worker_threads';
 
 import { createHostStorageHandler } from '../dist/host-storage.js';
 import { loadAddon } from '../dist/load-addon.js';
@@ -92,7 +93,7 @@ test('a host request can wait for a definitive result without a deadline', async
 	assert.deepStrictEqual(await roundTrip(handle, Buffer.from('slow'), 128, false), Buffer.from('slow'));
 });
 
-test('a read timeout fences only that request', async (context) => {
+test('a timed-out callback stays charged until its response completes', async (context) => {
 	let calls = 0;
 	const handle = addon.__testOpenHostTransport(
 		(request) => {
@@ -105,8 +106,77 @@ test('a read timeout fences only that request', async (context) => {
 	);
 	context.after(() => addon.__testCloseHostTransport(handle));
 
-	await assert.rejects(roundTrip(handle, Buffer.from('slow')), /timed out/);
+	const first = roundTrip(handle, Buffer.from('slow'));
+	const second = roundTrip(handle, Buffer.from('blocked'));
+	const results = await Promise.allSettled([first, second]);
+	assert.deepStrictEqual(
+		results.map((result) => result.status),
+		['rejected', 'rejected'],
+	);
+	assert.deepStrictEqual(results.map((result) => result.reason.message).sort(), [
+		'host storage admission timed out',
+		'host storage response timed out',
+	]);
+	assert.deepStrictEqual(addon.__testHostTransportStats(handle), ['0', '0', '0', '0', '1']);
 	assert.deepStrictEqual(await roundTrip(handle, Buffer.from('recovered')), Buffer.from('recovered'));
+});
+
+test('cleanup uses one operation while preserving foreground admission', (context) => {
+	const handle = addon.__testOpenHostTransport((request) => request, 2, 1_024, 1_000);
+	context.after(() => addon.__testCloseHostTransport(handle));
+	addon.__testConfigureHostTransportCleanup(handle, 256, 512);
+
+	const cleanup = addon.__testHoldHostTransportCapacity(handle, 8, 128, true);
+	assert.throws(
+		() => addon.__testHoldHostTransportCapacity(handle, 8, 128, true),
+		/low-priority.*capacity is unavailable/,
+	);
+	const foreground = addon.__testHoldHostTransportCapacity(handle, 10, 128, false);
+	assert.deepStrictEqual(addon.__testHostTransportStats(handle), ['2', '274', '1', '136', '0']);
+	assert.strictEqual(addon.__testReleaseHostTransportCapacity(handle, cleanup), true);
+	assert.strictEqual(addon.__testReleaseHostTransportCapacity(handle, foreground), true);
+});
+
+test('cleanup preserves foreground byte headroom and rejects impossible reservations', (context) => {
+	const handle = addon.__testOpenHostTransport((request) => request, 3, 300, 1_000);
+	context.after(() => addon.__testCloseHostTransport(handle));
+	addon.__testConfigureHostTransportCleanup(handle, 128, 172);
+
+	const foreground = addon.__testHoldHostTransportCapacity(handle, 20, 80, false);
+	assert.throws(() => addon.__testHoldHostTransportCapacity(handle, 20, 80, true), /capacity is unavailable/);
+	assert.strictEqual(addon.__testReleaseHostTransportCapacity(handle, foreground), true);
+	assert.throws(
+		() => addon.__testHoldHostTransportCapacity(handle, 45, 128, true),
+		/reservation exceeds its byte limit/,
+	);
+});
+
+test('cleanup configuration is opt-in and must leave foreground capacity', async (context) => {
+	const handle = addon.__testOpenHostTransport((request) => request, 1, 128, 1_000);
+	context.after(() => addon.__testCloseHostTransport(handle));
+
+	assert.throws(() => addon.__testHoldHostTransportCapacity(handle, 7, 16, true), /is not configured/);
+	assert.throws(() => addon.__testConfigureHostTransportCleanup(handle, 64, 64), /requires two operation slots/);
+});
+
+test('cleanup configuration is idempotent but cannot change for a live transport', (context) => {
+	const handle = addon.__testOpenHostTransport((request) => request, 2, 1_024, 1_000);
+	context.after(() => addon.__testCloseHostTransport(handle));
+
+	addon.__testConfigureHostTransportCleanup(handle, 256, 512);
+	addon.__testConfigureHostTransportCleanup(handle, 256, 512);
+	assert.throws(() => addon.__testConfigureHostTransportCleanup(handle, 128, 512), /already configured differently/);
+});
+
+test('worker teardown closes a transport with charged foreground and cleanup capacity', async () => {
+	const worker = new Worker(new URL('./fixtures/host-storage-transport-worker.mjs', import.meta.url));
+	const { handle, stats } = await new Promise((resolve, reject) => {
+		worker.once('error', reject);
+		worker.once('message', resolve);
+	});
+	assert.deepStrictEqual(stats, ['2', '274', '1', '136', '0']);
+	await worker.terminate();
+	assert.throws(() => addon.__testHostTransportStats(handle), /unknown or closed/);
 });
 
 test('invalid callback responses fail the request without terminating the process', async (context) => {
@@ -160,6 +230,43 @@ test('KvDirectory and Tantivy operate through the host storage transport', async
 	assert.ok(!requests.includes('write:wal-sync'), 'the host is not asked for an unsupported per-write sync primitive');
 	assert.ok(requests.includes('sync'), 'metadata publication and directory sync use explicit durability barriers');
 	assert.ok(entries.size > 0, 'Tantivy state remains in host storage for reopen');
+});
+
+test('reclamation shares reader pins across foreground and cleanup storage views', async (context) => {
+	const entries = new Map();
+	let payloadDeletes = 0;
+	const handler = createHostStorageHandler(
+		{
+			read(key) {
+				return entries.get(key.toString('hex'));
+			},
+			write(mutations) {
+				for (const mutation of mutations) {
+					const key = mutation.key.toString('hex');
+					if (mutation.type === 'put') entries.set(key, Buffer.from(mutation.value));
+					else {
+						entries.delete(key);
+						payloadDeletes++;
+					}
+				}
+			},
+			sync() {},
+		},
+		{
+			maxMutations: 1_024,
+			maxReadResponseBytes: readResponseBytes,
+			maxControlResponseBytes: controlResponseBytes,
+			maxErrorBytes: controlResponseBytes,
+		},
+	);
+	const handle = addon.__testOpenHostTransport(handler, 32, 40 * 1024 * 1024, 5_000);
+	context.after(() => addon.__testCloseHostTransport(handle));
+
+	const result = (await reclaimOnHostTransport(handle)).toString().split(',').map(Number);
+	assert.strictEqual(result[0], 2);
+	assert.ok(result[1] > 0, 'the cleanup view observed the foreground reader pin');
+	assert.ok(result[2] > 0, 'the cleanup view deleted retired payload keys');
+	assert.ok(payloadDeletes >= result[2]);
 });
 
 test('host directory rejects a read budget that cannot carry one full chunk', async (context) => {
@@ -281,9 +388,9 @@ test('host storage handler preserves no-WAL policy and rejects malformed frames'
 	assert.match(decodeHandlerError(handler(Buffer.from([1, 1, 4, 0, 0]))), /truncated/);
 });
 
-function roundTrip(handle, request, responseBudget = 128, useTimeout = true) {
+function roundTrip(handle, request, responseBudget = 128, useTimeout = true, lowPriority = false) {
 	return new Promise((resolve, reject) => {
-		addon.__testHostRoundTrip(handle, request, responseBudget, useTimeout, (encoded) => {
+		addon.__testHostRoundTrip(handle, request, responseBudget, useTimeout, lowPriority, (encoded) => {
 			if (encoded[0] === 0) {
 				resolve(encoded.subarray(1));
 			} else {
@@ -298,6 +405,18 @@ function verifyTantivy(handle, maxReadResponseBytes = readResponseBytes) {
 		addon.__testVerifyTantivyOnHostTransport(handle, maxReadResponseBytes, controlResponseBytes, (encoded) => {
 			if (encoded[0] === 0) {
 				resolve();
+			} else {
+				reject(new Error(encoded.subarray(1).toString()));
+			}
+		});
+	});
+}
+
+function reclaimOnHostTransport(handle) {
+	return new Promise((resolve, reject) => {
+		addon.__testReclaimOnHostTransport(handle, readResponseBytes, controlResponseBytes, (encoded) => {
+			if (encoded[0] === 0) {
+				resolve(encoded.subarray(1));
 			} else {
 				reject(new Error(encoded.subarray(1).toString()));
 			}
