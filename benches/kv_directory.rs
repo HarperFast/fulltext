@@ -201,9 +201,9 @@ where
 }
 
 fn writer_case(call_bytes: usize) -> impl FnMut(usize) -> io::Result<Sample> {
-	let directory = FaultingDirectory::new(FaultingKv::default());
 	let payload = vec![7u8; call_bytes];
 	move |sample| {
+		let directory = FaultingDirectory::new(FaultingKv::default());
 		let path = format!("writer-{call_bytes}-{sample}");
 		let mut writer = open_writer(&directory, Path::new(&path))?;
 		let operations = WRITE_BYTES_PER_SAMPLE / call_bytes;
@@ -213,7 +213,7 @@ fn writer_case(call_bytes: usize) -> impl FnMut(usize) -> io::Result<Sample> {
 		}
 		let elapsed_nanoseconds = started.elapsed().as_nanos();
 		black_box(&mut writer);
-		drop(writer);
+		writer.terminate()?;
 		Ok(Sample {
 			elapsed_nanoseconds,
 			operations: operations as u64,
@@ -239,9 +239,9 @@ fn empty_flush_case() -> io::Result<impl FnMut(usize) -> io::Result<Sample>> {
 }
 
 fn dirty_flush_case() -> impl FnMut(usize) -> io::Result<Sample> {
-	let directory = FaultingDirectory::new(FaultingKv::default());
 	let payload = vec![11u8; 4 * 1024];
 	move |sample| {
+		let directory = FaultingDirectory::new(FaultingKv::default());
 		let path = format!("dirty-flush-{sample}");
 		let mut writer = open_writer(&directory, Path::new(&path))?;
 		writer.write_all(&payload)?;
@@ -256,9 +256,9 @@ fn dirty_flush_case() -> impl FnMut(usize) -> io::Result<Sample> {
 }
 
 fn chunk_case() -> impl FnMut(usize) -> io::Result<Sample> {
-	let directory = FaultingDirectory::new(FaultingKv::default());
 	let payload = vec![13u8; CHUNK_BYTES];
 	move |sample| {
+		let directory = FaultingDirectory::new(FaultingKv::default());
 		let path = format!("chunk-{sample}");
 		let mut writer = open_writer(&directory, Path::new(&path))?;
 		let started = Instant::now();
@@ -273,9 +273,9 @@ fn chunk_case() -> impl FnMut(usize) -> io::Result<Sample> {
 }
 
 fn delete_case(active_writer: bool) -> impl FnMut(usize) -> io::Result<Sample> {
-	let directory = FaultingDirectory::new(FaultingKv::default());
 	let payload = vec![17u8; 4 * 1024];
 	move |sample| {
+		let directory = FaultingDirectory::new(FaultingKv::default());
 		let path = format!("delete-{active_writer}-{sample}");
 		let path = Path::new(&path);
 		let mut writer = open_writer(&directory, path)?;
@@ -303,32 +303,40 @@ fn concurrent_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Resu
 	let files_per_thread = if smoke { 1 } else { CONCURRENT_FILES_PER_THREAD };
 	move |sample| {
 		let directory = FaultingDirectory::new(FaultingKv::default());
-		let barrier = Arc::new(Barrier::new(threads + 1));
+		let start_barrier = Arc::new(Barrier::new(threads + 1));
+		let finish_barrier = Arc::new(Barrier::new(threads + 1));
 		let elapsed_nanoseconds = std::thread::scope(|scope| -> io::Result<u128> {
 			let mut handles = Vec::with_capacity(threads);
 			for thread in 0..threads {
 				let directory = directory.clone();
-				let barrier = barrier.clone();
+				let start_barrier = start_barrier.clone();
+				let finish_barrier = finish_barrier.clone();
 				handles.push(scope.spawn(move || -> io::Result<()> {
 					let payload = vec![19u8; WRITE_BYTES_PER_SAMPLE];
-					barrier.wait();
-					for file in 0..files_per_thread {
-						let path = format!("concurrent-{sample}-{thread}-{file}");
-						let mut writer = open_writer(&directory, Path::new(&path))?;
-						writer.write_all(&payload)?;
-						writer.terminate()?;
-					}
-					Ok(())
+					start_barrier.wait();
+					let result = (|| {
+						for file in 0..files_per_thread {
+							let path = format!("concurrent-{sample}-{thread}-{file}");
+							let mut writer = open_writer(&directory, Path::new(&path))?;
+							writer.write_all(&payload)?;
+							writer.terminate()?;
+						}
+						Ok(())
+					})();
+					finish_barrier.wait();
+					result
 				}));
 			}
 			let started = Instant::now();
-			barrier.wait();
+			start_barrier.wait();
+			finish_barrier.wait();
+			let elapsed_nanoseconds = started.elapsed().as_nanos();
 			for handle in handles {
 				handle
 					.join()
 					.map_err(|_| io::Error::other("benchmark worker panicked"))??;
 			}
-			Ok(started.elapsed().as_nanos())
+			Ok(elapsed_nanoseconds)
 		})?;
 		let operations = threads * files_per_thread;
 		Ok(Sample {
