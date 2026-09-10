@@ -296,8 +296,8 @@ byte ceiling left after its configured foreground reserve. The owner derives tha
 fixed chunk size, bounded directory-key encoding, configured read/control response limits, and the
 index's worker limits. Cleanup admission is enabled only when the low-priority view is requested, at
 which point validation rejects a transport that cannot hold its foreground reserve, the configured
-cleanup mutation cap, and the store's read/control response reservations; small transports used
-without cleanup retain their current behavior.
+bounded read and mutation request sizes, and the store's read/control response reservations; small
+transports used without cleanup retain their current behavior.
 
 A statically valid cleanup request that does not fit current occupancy returns `WouldBlock` without
 joining the condition-variable wait queue. Permanent configuration and request-size failures are

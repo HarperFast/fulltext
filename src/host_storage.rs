@@ -457,20 +457,19 @@ const VALUE_MISSING: u8 = 0;
 const VALUE_PRESENT: u8 = 1;
 const MUTATION_PUT: u8 = 1;
 const MUTATION_DELETE: u8 = 2;
-const HOST_PROTOCOL_HEADER_BYTES: usize = 2;
-const HOST_LENGTH_PREFIX_BYTES: usize = 4;
 const READ_RESPONSE_OVERHEAD: usize = 7;
 
 fn minimum_cleanup_reservation(
 	max_read_response_bytes: usize,
 	max_control_response_bytes: usize,
-	max_cleanup_request_bytes: usize,
+	max_read_request_bytes: usize,
+	max_mutation_request_bytes: usize,
 ) -> io::Result<usize> {
 	let read = max_read_response_bytes
-		.checked_add(HOST_PROTOCOL_HEADER_BYTES + HOST_LENGTH_PREFIX_BYTES)
+		.checked_add(max_read_request_bytes)
 		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cleanup read reservation overflow"))?;
 	let write = max_control_response_bytes
-		.checked_add(max_cleanup_request_bytes.min(RECLAIM_MAX_BATCH_REQUEST_BYTES))
+		.checked_add(max_mutation_request_bytes.min(RECLAIM_MAX_BATCH_REQUEST_BYTES))
 		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cleanup write reservation overflow"))?;
 	Ok(read.max(write))
 }
@@ -511,12 +510,14 @@ impl HostKvStore {
 		&self,
 		foreground_reserved_bytes: usize,
 		max_cleanup_bytes: usize,
-		max_cleanup_request_bytes: usize,
+		max_read_request_bytes: usize,
+		max_mutation_request_bytes: usize,
 	) -> io::Result<Self> {
 		let minimum_reservation = minimum_cleanup_reservation(
 			self.max_read_response_bytes,
 			self.max_control_response_bytes,
-			max_cleanup_request_bytes,
+			max_read_request_bytes,
+			max_mutation_request_bytes,
 		)?;
 		if max_cleanup_bytes < minimum_reservation {
 			return Err(io::Error::new(
@@ -1061,8 +1062,13 @@ pub fn test_reclaim_on_host_transport(
 						max_request_bytes: 1024 * 1024,
 						max_elapsed: Duration::from_secs(5),
 					};
-					let cleanup_store =
-						store.cleanup_view(foreground_reserved_bytes, max_cleanup_bytes, budget.max_request_bytes)?;
+					let max_read_request_bytes = max_control_response_bytes as usize;
+					let cleanup_store = store.cleanup_view(
+						foreground_reserved_bytes,
+						max_cleanup_bytes,
+						max_read_request_bytes,
+						budget.max_request_bytes,
+					)?;
 					if cleanup_store.identity() != store.identity() {
 						return Err(io::Error::other("cleanup storage view changed the directory identity"));
 					}
@@ -1152,9 +1158,9 @@ mod tests {
 
 	#[test]
 	fn cleanup_reservation_covers_reads_and_bounded_writes() {
-		assert_eq!(minimum_cleanup_reservation(100, 10, 20).unwrap(), 106);
-		assert_eq!(minimum_cleanup_reservation(10, 100, 20).unwrap(), 120);
-		assert!(minimum_cleanup_reservation(usize::MAX, 10, 20).is_err());
-		assert!(minimum_cleanup_reservation(10, usize::MAX, 20).is_err());
+		assert_eq!(minimum_cleanup_reservation(100, 10, 6, 20).unwrap(), 106);
+		assert_eq!(minimum_cleanup_reservation(10, 100, 6, 20).unwrap(), 120);
+		assert!(minimum_cleanup_reservation(usize::MAX, 10, 6, 20).is_err());
+		assert!(minimum_cleanup_reservation(10, usize::MAX, 6, 20).is_err());
 	}
 }
