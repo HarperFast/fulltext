@@ -64,6 +64,7 @@ pub struct ReclaimOutcome {
 	pub has_more: bool,
 	pub no_progress: bool,
 	pub terminal_shard_mask: u64,
+	pub terminal_error: Option<String>,
 	pub point_reads: usize,
 	pub write_batches: usize,
 	pub mutations: usize,
@@ -362,6 +363,7 @@ struct ReclaimHint {
 	head_known: AtomicBool,
 	tail: AtomicU64,
 	tail_known: AtomicBool,
+	tail_invalidations: AtomicU64,
 	next_sequence: AtomicU64,
 }
 
@@ -941,9 +943,9 @@ impl<S: KvStore> KvDirectory<S> {
 	}
 
 	fn invalidate_reclaim_tail(&self, shard: u8) {
-		self.state.reclaim_hints[usize::from(shard)]
-			.tail_known
-			.store(false, Ordering::Release);
+		let hint = &self.state.reclaim_hints[usize::from(shard)];
+		hint.tail_invalidations.fetch_add(1, Ordering::AcqRel);
+		hint.tail_known.store(false, Ordering::Release);
 	}
 
 	pub fn reclaim(&self, budget: ReclaimBudget) -> io::Result<ReclaimOutcome> {
@@ -977,15 +979,24 @@ impl<S: KvStore> KvDirectory<S> {
 			if self.state.reclaim_terminal_shard_mask.load(Ordering::Acquire) & (1_u64 << shard) != 0 {
 				continue;
 			}
-			self.reclaim_shard(shard as u8, &mut admission)?;
+			if let Err(error) = self.reclaim_shard(shard as u8, &mut admission) {
+				let terminal = self.state.reclaim_terminal_shard_mask.load(Ordering::Acquire);
+				if terminal & (1_u64 << shard) == 0 {
+					return Err(error);
+				}
+				admission
+					.outcome
+					.terminal_error
+					.get_or_insert_with(|| error.to_string());
+			}
 		}
 		admission.outcome.terminal_shard_mask = self.state.reclaim_terminal_shard_mask.load(Ordering::Acquire);
-		admission.outcome.has_more = admission.outcome.terminal_shard_mask != 0
-			|| self.state.reclaim_hints.iter().any(|hint| {
-				!hint.head_known.load(Ordering::Acquire)
+		admission.outcome.has_more = self.state.reclaim_hints.iter().enumerate().any(|(shard, hint)| {
+			admission.outcome.terminal_shard_mask & (1_u64 << shard) == 0
+				&& (!hint.head_known.load(Ordering::Acquire)
 					|| !hint.tail_known.load(Ordering::Acquire)
-					|| hint.head.load(Ordering::Acquire) < hint.tail.load(Ordering::Acquire)
-			});
+					|| hint.head.load(Ordering::Acquire) < hint.tail.load(Ordering::Acquire))
+		});
 		admission.outcome.no_progress = admission.outcome.mutations == 0;
 		Ok(admission.outcome)
 	}
@@ -1166,6 +1177,7 @@ impl<S: KvStore> KvDirectory<S> {
 		let tail = if hint.tail_known.load(Ordering::Acquire) {
 			hint.tail.load(Ordering::Acquire)
 		} else {
+			let invalidations = hint.tail_invalidations.load(Ordering::Acquire);
 			let key = reclaim_tail_key(&self.namespace, shard);
 			let value = match admission.read(&self.store, &key)? {
 				Budgeted::Performed(value) => value,
@@ -1176,9 +1188,12 @@ impl<S: KvStore> KvDirectory<S> {
 				.transpose()
 				.map_err(|error| self.terminal_reclaim_error(shard, error))?
 				.unwrap_or(0);
-			hint.tail.store(tail, Ordering::Release);
+			hint.tail.fetch_max(tail, Ordering::AcqRel);
 			hint.tail_known.store(true, Ordering::Release);
-			tail
+			if hint.tail_invalidations.load(Ordering::Acquire) != invalidations {
+				hint.tail_known.store(false, Ordering::Release);
+			}
+			hint.tail.load(Ordering::Acquire)
 		};
 		if head > tail {
 			return Err(self.terminal_reclaim_error(
@@ -1220,12 +1235,20 @@ impl<S: KvStore> KvDirectory<S> {
 			return Ok(Budgeted::Exhausted);
 		}
 
-		let capacity = RECLAIM_MAX_BATCH_MUTATIONS.min(
-			admission
-				.budget
-				.max_mutations
-				.saturating_sub(admission.outcome.mutations),
-		);
+		let remaining_chunks = u64::from(entry.chunk_high_water - progress.next_chunk);
+		let remaining_tails = entry
+			.tail_high_water
+			.saturating_add(1)
+			.saturating_sub(progress.next_tail);
+		let remaining_work = usize::try_from(remaining_chunks.saturating_add(remaining_tails)).unwrap_or(usize::MAX);
+		let capacity = RECLAIM_MAX_BATCH_MUTATIONS
+			.min(
+				admission
+					.budget
+					.max_mutations
+					.saturating_sub(admission.outcome.mutations),
+			)
+			.min(remaining_work.saturating_add(reserved_mutations));
 		let mut mutations = Vec::with_capacity(capacity);
 		let mut payload_bytes = 0_usize;
 		let mut progress_changed = false;
@@ -2514,7 +2537,8 @@ mod tests {
 	#[derive(Clone)]
 	struct BlockingKv {
 		inner: FaultingKv,
-		block: Arc<(Mutex<BlockState>, Condvar)>,
+		write_block: Arc<(Mutex<BlockState>, Condvar)>,
+		read_block: Arc<(Mutex<BlockState>, Condvar)>,
 	}
 
 	#[derive(Default)]
@@ -2590,12 +2614,13 @@ mod tests {
 		fn new() -> Self {
 			Self {
 				inner: FaultingKv::default(),
-				block: Arc::new((Mutex::new(BlockState::default()), Condvar::new())),
+				write_block: Arc::new((Mutex::new(BlockState::default()), Condvar::new())),
+				read_block: Arc::new((Mutex::new(BlockState::default()), Condvar::new())),
 			}
 		}
 
 		fn arm_next_write(&self) {
-			let (state, _) = &*self.block;
+			let (state, _) = &*self.write_block;
 			let mut state = state.lock().unwrap();
 			state.armed = true;
 			state.entered = false;
@@ -2603,7 +2628,23 @@ mod tests {
 		}
 
 		fn wait_until_blocked(&self) -> bool {
-			let (state, changed) = &*self.block;
+			Self::wait_until(&self.write_block)
+		}
+
+		fn arm_next_read(&self) {
+			let (state, _) = &*self.read_block;
+			let mut state = state.lock().unwrap();
+			state.armed = true;
+			state.entered = false;
+			state.released = false;
+		}
+
+		fn wait_until_read_blocked(&self) -> bool {
+			Self::wait_until(&self.read_block)
+		}
+
+		fn wait_until(block: &Arc<(Mutex<BlockState>, Condvar)>) -> bool {
+			let (state, changed) = &**block;
 			let deadline = Instant::now() + Duration::from_secs(5);
 			let mut state = state.lock().unwrap();
 			while !state.entered {
@@ -2625,7 +2666,15 @@ mod tests {
 		}
 
 		fn release_write(&self) {
-			let (state, changed) = &*self.block;
+			Self::release(&self.write_block);
+		}
+
+		fn release_read(&self) {
+			Self::release(&self.read_block);
+		}
+
+		fn release(block: &Arc<(Mutex<BlockState>, Condvar)>) {
+			let (state, changed) = &**block;
 			let mut state = state.lock().unwrap();
 			state.released = true;
 			changed.notify_all();
@@ -2638,11 +2687,22 @@ mod tests {
 		}
 
 		fn read(&self, key: &[u8]) -> io::Result<Option<OwnedBytes>> {
-			KvStore::read(&self.inner, key)
+			let value = KvStore::read(&self.inner, key)?;
+			let (state, changed) = &*self.read_block;
+			let mut state = state.lock().unwrap();
+			if state.armed {
+				state.armed = false;
+				state.entered = true;
+				changed.notify_all();
+				while !state.released {
+					state = changed.wait(state).unwrap();
+				}
+			}
+			Ok(value)
 		}
 
 		fn write(&self, mutations: &[Mutation], policy: WritePolicy) -> io::Result<()> {
-			let (state, changed) = &*self.block;
+			let (state, changed) = &*self.write_block;
 			let mut state = state.lock().unwrap();
 			if state.armed {
 				state.armed = false;
@@ -3320,6 +3380,45 @@ mod tests {
 		assert!(!outcome.has_more);
 		assert_eq!(
 			store.get(&tail_key(b"phase0", binding.object_id, binding.tail_revision)),
+			None
+		);
+	}
+
+	#[test]
+	fn cold_tail_read_cannot_overwrite_a_concurrent_enqueue() {
+		let store = BlockingKv::new();
+		let directory = KvDirectory::new(store.clone());
+		directory.atomic_write(Path::new("marker"), b"ready").unwrap();
+		let path = Path::new("segment");
+		let mut writer = directory.open_write(path).unwrap();
+		writer.write_all(b"contents").unwrap();
+		writer.terminate().unwrap();
+		let binding = decode_binding(&store.inner.get(&binding_key(b"phase0", path)).unwrap()).unwrap();
+		let shard = usize::from(reclaim_shard(binding.object_id));
+		for hint in &directory.state.reclaim_hints {
+			hint.head.store(0, Ordering::Release);
+			hint.head_known.store(true, Ordering::Release);
+			hint.tail.store(0, Ordering::Release);
+			hint.tail_known.store(true, Ordering::Release);
+		}
+		directory.state.reclaim_hints[shard]
+			.tail_known
+			.store(false, Ordering::Release);
+		store.arm_next_read();
+		let reclaiming = directory.clone();
+		let thread = std::thread::spawn(move || reclaiming.reclaim(generous_reclaim_budget()));
+		assert!(store.wait_until_read_blocked());
+
+		directory.delete(path).unwrap();
+		store.release_read();
+		let outcome = thread.join().unwrap().unwrap();
+
+		assert_eq!(outcome.entries_reclaimed, 1);
+		assert!(!outcome.has_more);
+		assert_eq!(
+			store
+				.inner
+				.get(&tail_key(b"phase0", binding.object_id, binding.tail_revision)),
 			None
 		);
 	}
@@ -4432,6 +4531,7 @@ mod tests {
 		assert!(store
 			.get(&tail_key(b"phase0", first.object_id, first_binding.tail_revision))
 			.is_some());
+		assert_eq!(first_handle.read_bytes().unwrap().as_slice(), b"first");
 		assert_eq!(store.get(&tail_key(b"phase0", second.object_id, 1)), None);
 		assert!(store.get(&reclaim_entry_key(b"phase0", shard, 0)).is_some());
 		assert_eq!(store.get(&reclaim_entry_key(b"phase0", shard, 1)), None);
@@ -4670,6 +4770,17 @@ mod tests {
 		store
 			.write(
 				&[
+					Mutation::Put(reclaim_tail_key(b"phase0", 0), 1_u64.to_be_bytes().to_vec()),
+					Mutation::Put(
+						reclaim_entry_key(b"phase0", 0, 0),
+						encode_reclaim_entry(&ReclaimEntry {
+							object_id: 64,
+							full_chunks: 0,
+							chunk_high_water: 0,
+							tail_high_water: 0,
+						})
+						.unwrap(),
+					),
 					Mutation::Put(reclaim_tail_key(b"phase0", 1), 1_u64.to_be_bytes().to_vec()),
 					Mutation::Put(
 						reclaim_progress_key(b"phase0", 1, 0),
@@ -4680,11 +4791,14 @@ mod tests {
 			)
 			.unwrap();
 
-		let error = directory.reclaim(generous_reclaim_budget()).unwrap_err();
-		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-		assert!(error.to_string().contains("shard 1"));
+		let first = directory.reclaim(generous_reclaim_budget()).unwrap();
+		assert_eq!(first.entries_reclaimed, 1);
+		assert_eq!(first.terminal_shard_mask, 1_u64 << 1);
+		assert!(first.terminal_error.unwrap().contains("shard 1"));
+		assert!(!first.has_more);
 		let next = directory.reclaim(generous_reclaim_budget()).unwrap();
 		assert_eq!(next.terminal_shard_mask, 1_u64 << 1);
+		assert!(!next.has_more);
 	}
 
 	#[test]

@@ -268,9 +268,9 @@ point reads, batch mutations, encoded mutation bytes, and elapsed work. It start
 when that operation fits the remaining count and byte limits, and checks elapsed time between host
 operations. A synchronous operation already admitted to the host remains uncancellable and may
 finish after the elapsed target. Limits that cannot admit the smallest legal cleanup step are
-rejected rather than reported as no progress. Invalid persisted queue data returns `InvalidData`
-and latches the affected bit in the terminal-shard mask so a caller cannot hot-loop it as ordinary
-blocked work.
+rejected rather than reported as no progress. Invalid persisted queue data latches the affected bit
+and first error text in the outcome while the admission finishes healthy shards. Terminal shards
+are excluded from `has_more`, so callers do not hot-loop work that requires a generation rebuild.
 This unit does not create a thread, reserve host-transport capacity,
 accept an owner lease, expose Node.js API, or enable Harper cleanup; those lifecycle and admission
 rules remain the next unit.
@@ -380,11 +380,12 @@ cases start at two threads.
 Slice 5 tests durable per-sequence progress, crash/reopen resumption, out-of-order completion behind
 a real retained handle, later head compaction across holes, multi-batch entry completion,
 tail-bounded cursor resumption, applied-but-reported-failed final batches, ambiguous enqueue-result
-recovery, terminal corruption latching, concurrent admission, staged-prefix probing, and exact read
-and mutation budgets. Format validation is charged to the same point-read and elapsed-work budget
-as queue processing. A real Tantivy merge and garbage-collection cycle is reopened after the queue
-drains to prove that physical cleanup preserves the index. The release benchmark times reclamation
-of deleted 4 KiB directory objects with creation and logical deletion outside the measured region.
+recovery, a cold-tail-read race with concurrent enqueue, terminal corruption latching without losing
+healthy-shard accounting, concurrent admission, staged-prefix probing, and exact read and mutation
+budgets. Format validation is charged to the same point-read and elapsed-work budget as queue
+processing. A real Tantivy merge and garbage-collection cycle is reopened after the queue drains to
+prove that physical cleanup preserves the index. The release benchmark times reclamation of deleted
+4 KiB directory objects with creation and logical deletion outside the measured region.
 
 The dependency-free `kv_directory` release benchmark compares adjacent merged slices through
 Tantivy's public directory interfaces. It reports per-sample-mean p50/p95/p99 and aggregate
