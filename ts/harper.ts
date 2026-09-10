@@ -78,6 +78,8 @@ export class HarperFullTextIndex {
 	readonly #index: NativeFullTextIndex;
 	readonly #storageGate: StorageGate;
 	#committedPayload?: string;
+	#nextPublishSequence = 0n;
+	#publishedSequence = 0n;
 
 	constructor(handle: number, committedPayload: string | undefined, storageGate: StorageGate) {
 		this.#handle = handle;
@@ -99,10 +101,14 @@ export class HarperFullTextIndex {
 		if (Buffer.byteLength(payload) > maxCommitPayloadBytes) {
 			throw new FulltextError('E_INVALID_ARGUMENT', `commit payload exceeds ${maxCommitPayloadBytes} UTF-8 bytes`);
 		}
+		const sequence = ++this.#nextPublishSequence;
 		const cursor = await invoke((callback) => loadAddon().__harperPublish(this.#handle, payload, callback));
 		const opstamp = cursor.u64();
 		cursor.finish();
-		this.#committedPayload = payload;
+		if (sequence > this.#publishedSequence) {
+			this.#publishedSequence = sequence;
+			this.#committedPayload = payload;
+		}
 		return opstamp;
 	}
 

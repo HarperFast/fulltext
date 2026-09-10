@@ -17,7 +17,7 @@ export type HostStorageMutation = { type: 'put'; key: Buffer; value: Buffer } | 
 
 export interface HostStorage {
 	read(key: Buffer): Buffer | undefined;
-	/** Apply all mutations or none, satisfy the policy, and return undefined synchronously. */
+	/** Apply all mutations or none, satisfy the policy, return undefined synchronously, and throw only if none applied. */
 	write(mutations: Array<HostStorageMutation>, policy: HostWritePolicy): undefined;
 	/** Make prior writes durable and return undefined synchronously. */
 	sync(): undefined;

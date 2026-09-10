@@ -110,6 +110,19 @@ test('rejects duplicate owner-writer opens for one process identity and namespac
 	await first.close();
 });
 
+test('keeps the newest payload when publishes are issued concurrently', async () => {
+	const host = createStorage();
+	const config = options(host.storage);
+	let index = await openHarperFullTextIndex(config);
+	await Promise.all([index.publish('cursor-v1:1'), index.publish('cursor-v1:2')]);
+	assert.strictEqual(index.committedPayload, 'cursor-v1:2');
+	await index.close();
+
+	index = await openHarperFullTextIndex(config);
+	assert.strictEqual(index.committedPayload, 'cursor-v1:2');
+	await index.close();
+});
+
 test('rejects an oversized cursor without changing or poisoning the generation', async () => {
 	const host = createStorage();
 	const index = await openHarperFullTextIndex(options(host.storage));
@@ -136,7 +149,7 @@ test('rejects a promise returned by a nominally synchronous storage method witho
 });
 
 for (const stage of ['open', 'read', 'apply', 'publish']) {
-	test(`worker termination safely drains a hosted runtime during ${stage}`, async () => {
+	test(`worker termination safely drains a hosted runtime during ${stage}`, { timeout: 20_000 }, async () => {
 		const control = new SharedArrayBuffer(4);
 		const worker = new Worker(new URL('./fixtures/harper-worker-child.mjs', import.meta.url), {
 			workerData: { stage, control },

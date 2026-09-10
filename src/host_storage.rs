@@ -25,7 +25,7 @@ use tantivy::directory::{Directory, TerminatingWrite};
 use crate::boundary;
 #[cfg(feature = "test-panic")]
 use crate::phase0::ReclaimBudget;
-#[cfg(any(test, feature = "test-panic"))]
+#[cfg(any(feature = "test-panic", all(test, feature = "host-storage")))]
 use crate::phase0::{reclaim_read_key_bytes, RECLAIM_MAX_BATCH_REQUEST_BYTES};
 use crate::phase0::{KvDirectory, KvStore, KvStoreIdentity, Mutation, WritePolicy, CHUNK_SIZE};
 use crate::protocol::HostOpenConfig;
@@ -44,9 +44,9 @@ type TransportShards = [Mutex<TransportRegistry>; TRANSPORT_SHARDS];
 static TRANSPORTS: OnceLock<TransportShards> = OnceLock::new();
 
 struct HostDispatch {
+	// napi 2.16 can abandon queued TSFN data during environment teardown, so keep this payload fixed-size.
 	transport_id: u64,
 	request_id: u64,
-	request: Vec<u8>,
 }
 
 type HostCallback = ThreadsafeFunction<HostDispatch, ErrorStrategy::Fatal>;
@@ -79,6 +79,7 @@ struct PendingRequest {
 	response_budget: usize,
 	class: AdmissionClass,
 	entered: bool,
+	request: Option<Vec<u8>>,
 	response: Weak<ResponseSlot>,
 }
 
@@ -118,10 +119,13 @@ impl HostTransport {
 			.create_threadsafe_function::<HostDispatch, Buffer, _, ErrorStrategy::Fatal>(
 				max_operations,
 				|context: ThreadSafeCallContext<HostDispatch>| {
+					let request = registered_transport(context.value.transport_id)
+						.and_then(|transport| transport.take_request(context.value.request_id))
+						.unwrap_or_default();
 					Ok(vec![
 						Buffer::from(context.value.transport_id.to_le_bytes().to_vec()),
 						Buffer::from(context.value.request_id.to_le_bytes().to_vec()),
-						Buffer::from(context.value.request),
+						Buffer::from(request),
 					])
 				},
 			)
@@ -153,7 +157,7 @@ impl HostTransport {
 	) -> io::Result<Vec<u8>> {
 		let request_id = next_id(&self.next_request_id, "host storage request")?;
 		let response = Arc::new(ResponseSlot::new());
-		self.admit(request_id, request.len(), response_budget, &response, deadline, class)?;
+		self.admit(request_id, Some(request), response_budget, &response, deadline, class)?;
 		let handler = self
 			.handler
 			.lock()
@@ -165,7 +169,6 @@ impl HostTransport {
 				HostDispatch {
 					transport_id: self.id,
 					request_id,
-					request,
 				},
 				ThreadsafeFunctionCallMode::NonBlocking,
 			)
@@ -217,13 +220,15 @@ impl HostTransport {
 	fn admit(
 		&self,
 		request_id: u64,
-		request_bytes: usize,
+		request: Option<Vec<u8>>,
 		response_bytes: usize,
 		response: &Arc<ResponseSlot>,
 		deadline: Option<Instant>,
 		class: AdmissionClass,
 	) -> io::Result<()> {
-		let retained_bytes = request_bytes
+		let retained_bytes = request
+			.as_ref()
+			.map_or(0, Vec::len)
 			.checked_add(response_bytes)
 			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host storage byte reservation overflow"))?;
 		if response_bytes == 0 || retained_bytes > self.max_bytes {
@@ -286,10 +291,20 @@ impl HostTransport {
 				response_budget: response_bytes,
 				class,
 				entered: false,
+				request,
 				response: Arc::downgrade(response),
 			},
 		);
 		Ok(())
+	}
+
+	fn take_request(&self, request_id: u64) -> Option<Vec<u8>> {
+		self.state
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.pending
+			.get_mut(&request_id)
+			.and_then(|pending| pending.request.take())
 	}
 
 	fn begin(&self, request_id: u64) -> bool {
@@ -1186,7 +1201,7 @@ pub fn test_hold_host_transport_capacity(
 		transport
 			.admit(
 				request_id,
-				request_bytes as usize,
+				Some(vec![0; request_bytes as usize]),
 				response_bytes as usize,
 				&response,
 				Some(Instant::now()),

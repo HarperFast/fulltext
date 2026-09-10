@@ -14,8 +14,10 @@ function maybeBlock(operation) {
 		parentPort.postMessage('blocked');
 	}
 	blocked = false;
-	Atomics.wait(wait, 0, 0);
-	if (Atomics.load(wait, 0) === 1) throw new Error('host generation was revoked');
+	if (Atomics.wait(wait, 0, 0, 15_000) !== 'ok') {
+		throw new Error('blocked host storage test exceeded its failure bound');
+	}
+	throw new Error('host generation was revoked');
 }
 
 const storage = {
@@ -90,6 +92,12 @@ try {
 			config.limits.maxBatchBytes,
 		);
 		const applying = index.apply(batch);
+		while (index.status().writerQueuedCommands !== 0n) {
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		if (index.status().uncommittedMutations !== 0n) {
+			throw new Error('apply completed before the worker termination checkpoint');
+		}
 		parentPort.postMessage('blocked');
 		await applying;
 	} else {
