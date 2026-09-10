@@ -115,12 +115,13 @@ gate is held by chunk staging or publication across a host round trip.
 
 Pins are indexed by object id, not logical path, so delete/recreate cannot hide handles to the prior
 object. Each object has counted pins by tail revision. A handle owns one pin and retains the shared
-directory and path state; dropping it decrements the revision and object counts, and dropping the
-last pin removes the object's weak registry entry. Registry shards use the same object-id partition
-as reclamation, so unrelated objects do not share one pin mutex. This bounds retained control state
-by live handles during repeated object, revision, and open/drop churn. Writer state is likewise
-retained through failed and unterminated writes. Gates recover poisoned state rather than panicking
-the writer actor. Pins land in the first slice 4 unit before the FIFO consumer. A handle reads its
+directory state; dropping it decrements the revision and object counts, and dropping the last pin
+removes the object's weak registry entry. Registry shards use the same object-id partition as
+reclamation, while revision counts use a per-object mutex and keep the common single-revision case
+inline. This bounds retained control state by live handles during repeated object, revision, and
+open/drop churn. Writer state is likewise retained through failed and unterminated writes. Gates
+recover poisoned state rather than panicking the writer actor. Pins land in the first slice 4 unit
+before the FIFO consumer. A handle reads its
 binding and registers the pin under the shared side of a fixed hash-sharded registration fence.
 Deletion takes the exclusive side of the same shard only for its final binding-removal batch, so
 concurrent opens remain parallel except for hash collisions and writer retirement does not block
@@ -135,7 +136,10 @@ single atomic host write. Ending either side earlier reopens the registration ra
 can therefore delay an unrelated open whose path collides in the same one of 256 shards. Replacing
 this bounded collision risk requires a quiescence or epoch protocol that prevents cleanup until all
 readers that started before publication have either registered or exited; it is not a safe lock
-substitution.
+substitution. Conversely, a stalled colliding reader can hold deletion behind its binding read;
+because deletion already owns that path's lifecycle gate, this can also delay an `open_write()` for
+the path being deleted. The host transport's definitive-completion contract bounds this only when
+the host operation completes or the transport closes.
 
 Cleanup never holds a path gate or pin-registry lock across storage I/O. A retired object cannot
 gain a new pin because its binding is gone. Before tail-only reclamation is enabled, publication of
@@ -297,13 +301,20 @@ real Tantivy merge and garbage-collection cycles and after crash/reopen. `Faulti
 recovery at atomic batch boundaries; the Harper integration separately proves that one host write
 request commits as one RocksDB batch.
 
+Slice 4 tests object and exact-revision pin counts, delete/recreate identity, the binding-read and
+pin-registration race, shared state across independently constructed directories, handle-owned
+state lifetime, one storage read per open, bounded open/drop churn, and reader independence from
+writer retirement. The release benchmark adds retained and churned opens plus shared- and
+distinct-file concurrency at one, two, four, and eight threads.
+
 The dependency-free `kv_directory` release benchmark compares adjacent merged slices through
 Tantivy's public directory interfaces. It reports per-sample-mean p50/p95/p99 and aggregate
 throughput for caller write sizes, empty and dirty flushes, chunk publication, deletion with closed
-and active writers, retained and churned read-handle opens, and distinct-file read-open and write
-concurrency. The empty-flush case isolates the per-call retirement-fence cost; the buffered cases
-show how Tantivy's writer amortizes it in practice. Retained handles measure registration growth,
-while churned handles exercise drop-time pin removal. Results are versioned JSON labeled by
+and active writers, retained and churned read-handle opens, shared- and distinct-file read-open
+concurrency, and distinct-file write concurrency. The empty-flush case isolates the per-call
+retirement-fence cost; the buffered cases show how Tantivy's writer amortizes it in practice.
+Retained handles measure registration growth, churned handles exercise drop-time pin removal, and
+shared-file concurrency exercises per-object pin accounting. Results are versioned JSON labeled by
 revision. Shared CI runs a correctness smoke with no timing threshold; performance decisions use
 alternating runs on one fixed host. The deterministic Phase 0 store removes RocksDB and Node
 transport variance but serializes access, so its concurrency results detect directory-coordination

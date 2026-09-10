@@ -320,7 +320,15 @@ struct ObjectReaderPins {
 #[derive(Default)]
 struct ObjectReaderPinState {
 	total: usize,
-	revisions: HashMap<u64, usize>,
+	revisions: ReaderRevisions,
+}
+
+#[derive(Default)]
+enum ReaderRevisions {
+	#[default]
+	None,
+	One(u64, usize),
+	Many(HashMap<u64, usize>),
 }
 
 struct ReaderPin {
@@ -465,15 +473,8 @@ impl ReaderPinRegistry {
 			.total
 			.checked_add(1)
 			.ok_or_else(|| io::Error::other("reader pin count exhausted"))?;
-		let revision = state
-			.revisions
-			.get(&binding.tail_revision)
-			.copied()
-			.unwrap_or(0)
-			.checked_add(1)
-			.ok_or_else(|| io::Error::other("reader revision pin count exhausted"))?;
+		state.revisions.increment(binding.tail_revision)?;
 		state.total = total;
-		state.revisions.insert(binding.tail_revision, revision);
 		drop(state);
 		Ok(ReaderPin {
 			object,
@@ -492,9 +493,82 @@ impl ReaderPinRegistry {
 		};
 		drop(objects);
 		let state = object.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-		tail_revision.map_or(state.total != 0, |revision| {
-			state.revisions.get(&revision).is_some_and(|count| *count != 0)
-		})
+		tail_revision.map_or(state.total != 0, |revision| state.revisions.contains(revision))
+	}
+}
+
+impl ReaderRevisions {
+	fn increment(&mut self, tail_revision: u64) -> io::Result<()> {
+		match self {
+			Self::None => *self = Self::One(tail_revision, 1),
+			Self::One(revision, count) if *revision == tail_revision => {
+				*count = count
+					.checked_add(1)
+					.ok_or_else(|| io::Error::other("reader revision pin count exhausted"))?;
+			}
+			Self::One(revision, count) => {
+				let mut revisions = HashMap::with_capacity(2);
+				revisions.insert(*revision, *count);
+				revisions.insert(tail_revision, 1);
+				*self = Self::Many(revisions);
+			}
+			Self::Many(revisions) => {
+				let count = revisions.get(&tail_revision).copied().unwrap_or(0);
+				revisions.insert(
+					tail_revision,
+					count
+						.checked_add(1)
+						.ok_or_else(|| io::Error::other("reader revision pin count exhausted"))?,
+				);
+			}
+		}
+		Ok(())
+	}
+
+	#[cfg(test)]
+	fn contains(&self, tail_revision: u64) -> bool {
+		match self {
+			Self::None => false,
+			Self::One(revision, count) => *revision == tail_revision && *count != 0,
+			Self::Many(revisions) => revisions.get(&tail_revision).is_some_and(|count| *count != 0),
+		}
+	}
+
+	fn decrement(&mut self, tail_revision: u64) -> bool {
+		match self {
+			Self::None => false,
+			Self::One(revision, count) if *revision == tail_revision && *count > 1 => {
+				*count -= 1;
+				true
+			}
+			Self::One(revision, count) if *revision == tail_revision && *count == 1 => {
+				*self = Self::None;
+				true
+			}
+			Self::One(_, _) => false,
+			Self::Many(revisions) => {
+				let remove = match revisions.get_mut(&tail_revision) {
+					Some(count) if *count > 1 => {
+						*count -= 1;
+						false
+					}
+					Some(count) if *count == 1 => true,
+					_ => return false,
+				};
+				if remove {
+					revisions.remove(&tail_revision);
+				}
+				let remaining = if revisions.len() == 1 {
+					revisions.iter().next().map(|(revision, count)| (*revision, *count))
+				} else {
+					None
+				};
+				if let Some((revision, count)) = remaining {
+					*self = Self::One(revision, count);
+				}
+				true
+			}
+		}
 	}
 }
 
@@ -505,22 +579,20 @@ impl Drop for ReaderPin {
 			.state
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		debug_assert!(
+			state.total != 0 || std::thread::panicking(),
+			"reader object pin count is missing"
+		);
 		if state.total == 0 {
 			return;
 		}
-		let remove_revision = match state.revisions.get_mut(&self.tail_revision) {
-			Some(revision) if *revision != 0 => {
-				*revision -= 1;
-				*revision == 0
-			}
-			_ => false,
-		};
-		state.total -= 1;
-		if remove_revision {
-			state.revisions.remove(&self.tail_revision);
-		}
-		if state.total == 0 {
-			state.revisions.clear();
+		let revision_found = state.revisions.decrement(self.tail_revision);
+		debug_assert!(
+			revision_found || std::thread::panicking(),
+			"reader revision pin count is missing"
+		);
+		if revision_found {
+			state.total -= 1;
 		}
 	}
 }
@@ -2841,6 +2913,10 @@ mod tests {
 		assert_ne!(
 			reclaim_shard(first_binding.object_id),
 			reclaim_shard(second_binding.object_id)
+		);
+		assert_ne!(
+			reader_registration_shard(Path::new("first")),
+			reader_registration_shard(Path::new("second"))
 		);
 		store.arm_next_write();
 

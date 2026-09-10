@@ -207,7 +207,14 @@ fn main() -> io::Result<()> {
 			"open-read",
 			threads,
 			&arguments,
-			concurrent_open_read_case(threads, arguments.smoke),
+			concurrent_open_read_case(threads, arguments.smoke, false),
+		)?);
+		results.push(measure_case(
+			format!("concurrent-shared-open-read-{threads}t"),
+			"open-read",
+			threads,
+			&arguments,
+			concurrent_open_read_case(threads, arguments.smoke, true),
 		)?);
 	}
 
@@ -523,21 +530,30 @@ fn open_read_case(retain_handles: bool, smoke: bool) -> impl FnMut(usize) -> io:
 	}
 }
 
-fn concurrent_open_read_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
+fn concurrent_open_read_case(
+	threads: usize,
+	smoke: bool,
+	shared_paths: bool,
+) -> impl FnMut(usize) -> io::Result<Sample> {
 	let files_per_thread = if smoke { 2 } else { CONCURRENT_FILES_PER_THREAD };
 	move |sample| {
 		let directory = FaultingDirectory::new(FaultingKv::default());
 		let mut paths = Vec::with_capacity(threads);
-		for thread in 0..threads {
+		let path_groups = if shared_paths { 1 } else { threads };
+		for thread in 0..path_groups {
 			let mut thread_paths = Vec::with_capacity(files_per_thread);
 			for file in 0..files_per_thread {
-				let path = format!("concurrent-open-read-{sample}-{thread}-{file}");
+				let path = format!("concurrent-open-read-{shared_paths}-{sample}-{thread}-{file}");
 				let mut writer = open_writer(&directory, Path::new(&path))?;
 				writer.write_all(b"contents")?;
 				writer.terminate()?;
 				thread_paths.push(path);
 			}
 			paths.push(thread_paths);
+		}
+		if shared_paths {
+			let shared = paths[0].clone();
+			paths.resize_with(threads, || shared.clone());
 		}
 		let start_gate = Arc::new(StartGate::new());
 		let remaining = Arc::new(AtomicUsize::new(threads));
