@@ -15,7 +15,8 @@ use tantivy::directory::{Directory, TerminatingWrite, WritePtr};
 const WRITE_BYTES_PER_SAMPLE: usize = 128 * 1024;
 const CHUNK_BYTES: usize = 256 * 1024;
 const EMPTY_FLUSHES_PER_SAMPLE: usize = 10_000;
-const CONCURRENT_FILES_PER_THREAD: usize = 4;
+const CONCURRENT_BYTES_PER_FILE: usize = 4 * 1024;
+const CONCURRENT_FILES_PER_THREAD: usize = 64;
 
 struct Arguments {
 	samples: usize,
@@ -312,9 +313,9 @@ fn concurrent_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Resu
 				let start_barrier = start_barrier.clone();
 				let finish_barrier = finish_barrier.clone();
 				handles.push(scope.spawn(move || -> io::Result<()> {
-					let payload = vec![19u8; WRITE_BYTES_PER_SAMPLE];
+					let payload = [19u8; CONCURRENT_BYTES_PER_FILE];
 					start_barrier.wait();
-					let result = (|| {
+					let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
 						for file in 0..files_per_thread {
 							let path = format!("concurrent-{sample}-{thread}-{file}");
 							let mut writer = open_writer(&directory, Path::new(&path))?;
@@ -322,7 +323,8 @@ fn concurrent_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Resu
 							writer.terminate()?;
 						}
 						Ok(())
-					})();
+					}))
+					.unwrap_or_else(|_| Err(io::Error::other("benchmark worker panicked")));
 					finish_barrier.wait();
 					result
 				}));
@@ -342,7 +344,7 @@ fn concurrent_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Resu
 		Ok(Sample {
 			elapsed_nanoseconds,
 			operations: operations as u64,
-			bytes: (operations * WRITE_BYTES_PER_SAMPLE) as u64,
+			bytes: (operations * CONCURRENT_BYTES_PER_FILE) as u64,
 		})
 	}
 }
