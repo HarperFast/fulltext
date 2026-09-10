@@ -15,7 +15,10 @@ use napi_derive::napi;
 use tantivy::directory::{Directory, OwnedBytes, TerminatingWrite};
 
 use crate::boundary;
-use crate::phase0::{KvDirectory, KvStore, KvStoreIdentity, Mutation, ReclaimBudget, WritePolicy, CHUNK_SIZE};
+use crate::phase0::{
+	KvDirectory, KvStore, KvStoreIdentity, Mutation, ReclaimBudget, WritePolicy, CHUNK_SIZE,
+	RECLAIM_MAX_BATCH_REQUEST_BYTES,
+};
 
 type HostCallback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
 type CompletionCallback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
@@ -148,10 +151,14 @@ impl HostTransport {
 			},
 		);
 		if status != Status::Ok {
-			self.fail(
-				io::ErrorKind::Other,
-				&format!("host storage callback rejected an admitted request: {status:?}"),
-			);
+			if status == Status::Closing {
+				self.fail(io::ErrorKind::BrokenPipe, "host storage transport is closed");
+			} else {
+				self.fail(
+					io::ErrorKind::Other,
+					&format!("host storage callback rejected an admitted request: {status:?}"),
+				);
+			}
 		}
 
 		if let Some(result) = response.wait(deadline) {
@@ -245,24 +252,29 @@ impl HostTransport {
 	}
 
 	fn has_capacity(&self, state: &TransportState, retained_bytes: usize, class: AdmissionClass) -> io::Result<bool> {
+		let cleanup_capacity = if class == AdmissionClass::Cleanup {
+			let capacity = state.cleanup_capacity.ok_or_else(|| {
+				io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"low-priority host storage admission is not configured",
+				)
+			})?;
+			if retained_bytes > capacity.max_bytes {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"low-priority host storage reservation exceeds its byte limit",
+				));
+			}
+			Some(capacity)
+		} else {
+			None
+		};
 		if state.operations >= self.max_operations || state.bytes.saturating_add(retained_bytes) > self.max_bytes {
 			return Ok(false);
 		}
-		if class == AdmissionClass::Foreground {
+		let Some(capacity) = cleanup_capacity else {
 			return Ok(true);
-		}
-		let capacity = state.cleanup_capacity.ok_or_else(|| {
-			io::Error::new(
-				io::ErrorKind::InvalidInput,
-				"low-priority host storage admission is not configured",
-			)
-		})?;
-		if retained_bytes > capacity.max_bytes {
-			return Err(io::Error::new(
-				io::ErrorKind::InvalidInput,
-				"low-priority host storage reservation exceeds its byte limit",
-			));
-		}
+		};
 		Ok(state.cleanup_operations == 0
 			&& state.cleanup_bytes.saturating_add(retained_bytes) <= capacity.max_bytes
 			&& state
@@ -445,7 +457,23 @@ const VALUE_MISSING: u8 = 0;
 const VALUE_PRESENT: u8 = 1;
 const MUTATION_PUT: u8 = 1;
 const MUTATION_DELETE: u8 = 2;
+const HOST_PROTOCOL_HEADER_BYTES: usize = 2;
+const HOST_LENGTH_PREFIX_BYTES: usize = 4;
 const READ_RESPONSE_OVERHEAD: usize = 7;
+
+fn minimum_cleanup_reservation(
+	max_read_response_bytes: usize,
+	max_control_response_bytes: usize,
+	max_cleanup_request_bytes: usize,
+) -> io::Result<usize> {
+	let read = max_read_response_bytes
+		.checked_add(HOST_PROTOCOL_HEADER_BYTES + HOST_LENGTH_PREFIX_BYTES)
+		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cleanup read reservation overflow"))?;
+	let write = max_control_response_bytes
+		.checked_add(max_cleanup_request_bytes.min(RECLAIM_MAX_BATCH_REQUEST_BYTES))
+		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cleanup write reservation overflow"))?;
+	Ok(read.max(write))
+}
 
 #[derive(Clone)]
 struct HostKvStore {
@@ -479,7 +507,23 @@ impl HostKvStore {
 		})
 	}
 
-	fn cleanup_view(&self, foreground_reserved_bytes: usize, max_cleanup_bytes: usize) -> io::Result<Self> {
+	fn cleanup_view(
+		&self,
+		foreground_reserved_bytes: usize,
+		max_cleanup_bytes: usize,
+		max_cleanup_request_bytes: usize,
+	) -> io::Result<Self> {
+		let minimum_reservation = minimum_cleanup_reservation(
+			self.max_read_response_bytes,
+			self.max_control_response_bytes,
+			max_cleanup_request_bytes,
+		)?;
+		if max_cleanup_bytes < minimum_reservation {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("low-priority host storage byte limit must be at least {minimum_reservation} bytes"),
+			));
+		}
 		self.transport
 			.configure_cleanup(foreground_reserved_bytes, max_cleanup_bytes)?;
 		Ok(Self {
@@ -1011,7 +1055,14 @@ pub fn test_reclaim_on_host_transport(
 						.checked_add(max_control_response_bytes as usize)
 						.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "foreground reserve overflow"))?;
 					let max_cleanup_bytes = foreground_reserved_bytes;
-					let cleanup_store = store.cleanup_view(foreground_reserved_bytes, max_cleanup_bytes)?;
+					let budget = ReclaimBudget {
+						max_point_reads: 1_024,
+						max_mutations: 4_096,
+						max_request_bytes: 1024 * 1024,
+						max_elapsed: Duration::from_secs(5),
+					};
+					let cleanup_store =
+						store.cleanup_view(foreground_reserved_bytes, max_cleanup_bytes, budget.max_request_bytes)?;
 					if cleanup_store.identity() != store.identity() {
 						return Err(io::Error::other("cleanup storage view changed the directory identity"));
 					}
@@ -1036,12 +1087,6 @@ pub fn test_reclaim_on_host_transport(
 							.delete(Path::new(path))
 							.map_err(|error| io::Error::other(error.to_string()))?;
 					}
-					let budget = ReclaimBudget {
-						max_point_reads: 1_024,
-						max_mutations: 4_096,
-						max_request_bytes: 1024 * 1024,
-						max_elapsed: Duration::from_secs(5),
-					};
 					let first = cleanup.reclaim(budget)?;
 					if first.entries_reclaimed == 0 || first.pinned_skips == 0 {
 						return Err(io::Error::other(
@@ -1056,10 +1101,11 @@ pub fn test_reclaim_on_host_transport(
 						));
 					}
 					Ok(format!(
-						"{},{},{}",
+						"{},{},{},{}",
 						first.entries_reclaimed + second.entries_reclaimed,
 						first.pinned_skips,
-						first.payload_delete_mutations + second.payload_delete_mutations
+						first.payload_delete_mutations + second.payload_delete_mutations,
+						payload.len() * 2
 					)
 					.into_bytes())
 				});
@@ -1087,7 +1133,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn closing_wakes_every_pending_request() {
+	fn response_slot_returns_a_close_error() {
 		let response = Arc::new(ResponseSlot::new());
 		response.complete(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
 		assert_eq!(
@@ -1102,5 +1148,13 @@ mod tests {
 		response.complete(Ok(vec![1]));
 		response.complete(Ok(vec![2]));
 		assert_eq!(response.wait(Some(Instant::now())).unwrap().unwrap(), vec![1]);
+	}
+
+	#[test]
+	fn cleanup_reservation_covers_reads_and_bounded_writes() {
+		assert_eq!(minimum_cleanup_reservation(100, 10, 20).unwrap(), 106);
+		assert_eq!(minimum_cleanup_reservation(10, 100, 20).unwrap(), 120);
+		assert!(minimum_cleanup_reservation(usize::MAX, 10, 20).is_err());
+		assert!(minimum_cleanup_reservation(10, usize::MAX, 20).is_err());
 	}
 }

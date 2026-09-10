@@ -144,11 +144,11 @@ test('cleanup preserves foreground byte headroom and rejects impossible reservat
 
 	const foreground = addon.__testHoldHostTransportCapacity(handle, 20, 80, false);
 	assert.throws(() => addon.__testHoldHostTransportCapacity(handle, 20, 80, true), /capacity is unavailable/);
-	assert.strictEqual(addon.__testReleaseHostTransportCapacity(handle, foreground), true);
 	assert.throws(
 		() => addon.__testHoldHostTransportCapacity(handle, 45, 128, true),
 		/reservation exceeds its byte limit/,
 	);
+	assert.strictEqual(addon.__testReleaseHostTransportCapacity(handle, foreground), true);
 });
 
 test('cleanup configuration is opt-in and must leave foreground capacity', async (context) => {
@@ -177,6 +177,15 @@ test('worker teardown closes a transport with charged foreground and cleanup cap
 	assert.deepStrictEqual(stats, ['2', '274', '1', '136', '0']);
 	await worker.terminate();
 	assert.throws(() => addon.__testHostTransportStats(handle), /unknown or closed/);
+});
+
+test('close wakes a request waiting indefinitely for foreground admission', async () => {
+	const handle = addon.__testOpenHostTransport((request) => request, 1, 1_024, 1_000);
+	addon.__testHoldHostTransportCapacity(handle, 8, 128, false);
+	const waiting = roundTrip(handle, Buffer.from('waiting'), 128, false);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.strictEqual(addon.__testCloseHostTransport(handle), true);
+	await assert.rejects(waiting, /host storage transport is closed/);
 });
 
 test('invalid callback responses fail the request without terminating the process', async (context) => {
@@ -235,6 +244,7 @@ test('KvDirectory and Tantivy operate through the host storage transport', async
 test('reclamation shares reader pins across foreground and cleanup storage views', async (context) => {
 	const entries = new Map();
 	let payloadDeletes = 0;
+	let physicallyDeletedBytes = 0;
 	const handler = createHostStorageHandler(
 		{
 			read(key) {
@@ -245,8 +255,12 @@ test('reclamation shares reader pins across foreground and cleanup storage views
 					const key = mutation.key.toString('hex');
 					if (mutation.type === 'put') entries.set(key, Buffer.from(mutation.value));
 					else {
+						const value = entries.get(key);
+						if (value) {
+							physicallyDeletedBytes += value.length;
+							payloadDeletes++;
+						}
 						entries.delete(key);
-						payloadDeletes++;
 					}
 				}
 			},
@@ -267,6 +281,7 @@ test('reclamation shares reader pins across foreground and cleanup storage views
 	assert.ok(result[1] > 0, 'the cleanup view observed the foreground reader pin');
 	assert.ok(result[2] > 0, 'the cleanup view deleted retired payload keys');
 	assert.ok(payloadDeletes >= result[2]);
+	assert.ok(physicallyDeletedBytes >= result[3], 'both retired file payloads were physically removed');
 });
 
 test('host directory rejects a read budget that cannot carry one full chunk', async (context) => {

@@ -295,11 +295,14 @@ for low-priority work. Cleanup may have exactly one operation in flight, leaving
 byte ceiling left after its configured foreground reserve. The owner derives that reserve from the
 fixed chunk size, bounded directory-key encoding, configured read/control response limits, and the
 index's worker limits. Cleanup admission is enabled only when the low-priority view is requested, at
-which point validation rejects a transport that cannot hold its foreground reserve and the smallest
-cleanup request together; small transports used without cleanup retain their current behavior.
+which point validation rejects a transport that cannot hold its foreground reserve, the configured
+cleanup mutation cap, and the store's read/control response reservations; small transports used
+without cleanup retain their current behavior.
 
-A cleanup request that does not fit returns `WouldBlock` without joining the condition-variable wait
-queue. Once dispatched, a mutation still waits for a definitive host result because canceling an
+A statically valid cleanup request that does not fit current occupancy returns `WouldBlock` without
+joining the condition-variable wait queue. Permanent configuration and request-size failures are
+classified before occupancy so they cannot masquerade as healthy deferral. Once dispatched, a
+mutation still waits for a definitive host result because canceling an
 unknown write outcome would violate queue progress atomicity. `WouldBlock` from this explicit
 admission path is reported as deferred work; a threadsafe-function queue-full result is an accounting
 failure and closes the transport rather than masquerading as deferral. `BrokenPipe` after close is
@@ -468,12 +471,14 @@ ids ever allocated, plus request-byte and time-admission bounds. Measure real Ta
 per file before retaining the tail-only path. The transport suite fills cleanup-eligible operation
 slots and bytes independently and proves that one maximum foreground reservation still admits. It
 also proves that an unsatisfiable cleanup reservation fails immediately, a timed-out foreground
-callback remains charged until completion, and close releases both an admission waiter and a
-dispatched low-priority operation without leaking a native task.
+callback remains charged until completion, close wakes an admission waiter, and worker teardown
+removes a transport while foreground and cleanup reservations are charged. Teardown of a dispatched
+low-priority callback moves with the dedicated cleanup task that creates that callback.
 
 The same reclamation harness runs through foreground and low-priority views of one host transport.
-It verifies identical `KvStoreIdentity`, retained-reader protection across those views, at least one
-physically reclaimed object, and durable resume after interruption. A latency benchmark measures
+It verifies identical `KvStoreIdentity`, retained-reader protection across those views, and physical
+removal of both pinned-then-released and immediately reclaimable object payloads. Durable resume
+after interruption is added with the dedicated cleanup task. A latency benchmark measures
 foreground reads while cleanup issues one host operation at each candidate mutation/request cap;
 capacity-only assertions do not qualify the shared callback queue. Open/drop churn separately keeps
 weak-pin memory bounded. Harper verifies owner loss with a second worker, close drain, cleanup health
@@ -482,8 +487,8 @@ reporting, backup/restore, and derived-index replay coordination.
 Priority-selection hooks remain test-only and absent from the packed release artifact. The existing
 single-slot timeout test is rewritten for conservative accounting: a second request cannot reuse the
 timed-out request's charge until the callback finishes, and admission versus response timeout text is
-asserted separately. Environment teardown proves the async cleanup hook closes the transport and
-releases every charged request even when a queued callback never runs.
+asserted separately. Environment teardown proves the async cleanup hook closes and removes a
+transport while both admission classes are charged.
 
 The FIFO tests include parallel enqueue on different shards, sequence/batch failure, pinned-entry
 skip cost, out-of-order completion and bounded head compaction, corrupt binding and entry handling,
