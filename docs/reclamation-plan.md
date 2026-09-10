@@ -121,11 +121,12 @@ as reclamation, so unrelated objects do not share one pin mutex. This bounds ret
 by live handles during repeated object, revision, and open/drop churn. Writer state is likewise
 retained through failed and unterminated writes. Gates recover poisoned state rather than panicking
 the writer actor. Pins land in the first slice 4 unit before the FIFO consumer. A handle reads its
-binding and registers the pin under a shared per-path registration fence. Deletion takes the
-exclusive side only for its final queue and binding transition, so concurrent opens remain parallel
-and writer retirement does not block them. This preserves one storage read per handle open and adds
-no cross-path coordination. The consumer follows only after these lifetime rules are independently
-covered. Harper may enable cleanup only after a two-worker test proves that every local search
+binding and registers the pin under the shared side of a fixed hash-sharded registration fence.
+Deletion takes the exclusive side of the same shard only for its final binding-removal batch, so
+concurrent opens remain parallel except for hash collisions and writer retirement does not block
+them. This preserves one storage read per handle open and adds no directory-wide coordination. The
+consumer follows only after these lifetime rules are independently covered. Harper may enable
+cleanup only after a two-worker test proves that every local search
 handle for one RocksDB-backed generation reaches the same native `DirectoryState`. A process that
 cannot establish that invariant cannot obtain the cleanup owner lease.
 
@@ -255,7 +256,7 @@ Then deliver reclamation in reviewable slices:
    enqueue at object deletion; key writer retirement by object id so path reuse cannot retire the
    replacement writer;
 4. add object-id/revision reader pins and coordinate registration with deletion through the
-   per-path registration fence;
+   hash-sharded registration fence;
 5. measure and, if justified, add tail-supersession entries; then add bounded FIFO draining and
    deferred queues, low-priority admission, failure observability, close fencing, crash recovery, and
    Harper's exclusive-owner integration.
@@ -290,10 +291,11 @@ request commits as one RocksDB batch.
 The dependency-free `kv_directory` release benchmark compares adjacent merged slices through
 Tantivy's public directory interfaces. It reports per-sample-mean p50/p95/p99 and aggregate
 throughput for caller write sizes, empty and dirty flushes, chunk publication, deletion with closed
-and active writers, retained and churned read-handle opens, and distinct-file concurrency. The
+and active writers, retained and churned read-handle opens, and distinct-file read-open and write
+concurrency. The
 empty-flush case isolates the per-call retirement-fence cost; the buffered cases show how Tantivy's
 writer amortizes it in practice. Retained handles measure registration growth, while churned handles
-exercise weak-pin pruning. Results are versioned JSON labeled by revision. Shared CI runs a
+exercise drop-time pin removal. Results are versioned JSON labeled by revision. Shared CI runs a
 correctness smoke with no timing threshold; performance decisions use alternating runs on one fixed
 host. The deterministic Phase 0 store removes RocksDB and Node transport variance but serializes
 access, so its concurrency results detect directory-coordination regressions rather than predicting

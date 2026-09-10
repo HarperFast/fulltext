@@ -99,7 +99,8 @@ require controlled hardware.
 
 The `kv-directory` benchmark measures the caller-visible buffered write path, empty and dirty
 flushes, 256 KiB chunk publication, closed- and active-writer deletion, retained and churned read
-handle opens, and distinct-file concurrency at one, two, four, and eight threads. It reports
+handle opens, and distinct-file read-open and write concurrency at one, two, four, and eight
+threads. It reports
 percentiles across per-sample mean latencies and uses the deterministic in-memory Phase 0 store to
 isolate directory coordination from RocksDB and Node transport costs. That store serializes access,
 so the concurrency cases detect coordination regressions but do not predict RocksDB scaling.

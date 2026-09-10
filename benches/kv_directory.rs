@@ -201,6 +201,15 @@ fn main() -> io::Result<()> {
 		&arguments,
 		open_read_case(false, arguments.smoke),
 	)?);
+	for threads in [1, 2, 4, 8] {
+		results.push(measure_case(
+			format!("concurrent-open-read-{threads}t"),
+			"open-read",
+			threads,
+			&arguments,
+			concurrent_open_read_case(threads, arguments.smoke),
+		)?);
+	}
 
 	for threads in [1, 2, 4, 8] {
 		results.push(measure_case(
@@ -506,6 +515,90 @@ fn open_read_case(retain_handles: bool, smoke: bool) -> impl FnMut(usize) -> io:
 		}
 		let elapsed_nanoseconds = started.elapsed().as_nanos();
 		black_box(handles);
+		Ok(Sample {
+			elapsed_nanoseconds,
+			operations: operations as u64,
+			bytes: 0,
+		})
+	}
+}
+
+fn concurrent_open_read_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
+	let files_per_thread = if smoke { 2 } else { CONCURRENT_FILES_PER_THREAD };
+	move |sample| {
+		let directory = FaultingDirectory::new(FaultingKv::default());
+		let mut paths = Vec::with_capacity(threads);
+		for thread in 0..threads {
+			let mut thread_paths = Vec::with_capacity(files_per_thread);
+			for file in 0..files_per_thread {
+				let path = format!("concurrent-open-read-{sample}-{thread}-{file}");
+				let mut writer = open_writer(&directory, Path::new(&path))?;
+				writer.write_all(b"contents")?;
+				writer.terminate()?;
+				thread_paths.push(path);
+			}
+			paths.push(thread_paths);
+		}
+		let start_gate = Arc::new(StartGate::new());
+		let remaining = Arc::new(AtomicUsize::new(threads));
+		let (completion, completed) = mpsc::sync_channel(1);
+		let elapsed_nanoseconds = std::thread::scope(|scope| -> io::Result<u128> {
+			let mut handles = Vec::with_capacity(threads);
+			for thread_paths in paths {
+				let directory = directory.clone();
+				let worker_start_gate = start_gate.clone();
+				let remaining = remaining.clone();
+				let completion = completion.clone();
+				let handle = std::thread::Builder::new()
+					.name("kv-directory-open-read-benchmark".to_owned())
+					.spawn_scoped(scope, move || -> io::Result<()> {
+						let Some(started) = worker_start_gate.wait() else {
+							return Ok(());
+						};
+						let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+							let mut opened = Vec::with_capacity(thread_paths.len());
+							for path in thread_paths {
+								opened.push(
+									directory
+										.open_read(Path::new(&path))
+										.map_err(|error| io::Error::other(error.to_string()))?,
+								);
+							}
+							black_box(opened);
+							Ok(())
+						}))
+						.unwrap_or_else(|_| Err(io::Error::other("benchmark worker panicked")));
+						if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+							let _ = completion.send(started.elapsed().as_nanos());
+						}
+						result
+					});
+				match handle {
+					Ok(handle) => handles.push(handle),
+					Err(error) => {
+						start_gate.cancel();
+						for handle in handles {
+							handle
+								.join()
+								.map_err(|_| io::Error::other("benchmark worker panicked"))??;
+						}
+						return Err(error);
+					}
+				}
+			}
+			start_gate.start(threads);
+			drop(completion);
+			let elapsed_nanoseconds = completed
+				.recv()
+				.map_err(|_| io::Error::other("benchmark workers did not report completion"))?;
+			for handle in handles {
+				handle
+					.join()
+					.map_err(|_| io::Error::other("benchmark worker panicked"))??;
+			}
+			Ok(elapsed_nanoseconds)
+		})?;
+		let operations = threads * files_per_thread;
 		Ok(Sample {
 			elapsed_nanoseconds,
 			operations: operations as u64,
