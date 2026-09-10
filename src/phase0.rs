@@ -505,22 +505,22 @@ impl Drop for ReaderPin {
 			.state
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner());
-		debug_assert_ne!(state.total, 0, "reader object pin count is missing");
 		if state.total == 0 {
 			return;
 		}
-		let revision_count = state.revisions.get(&self.tail_revision).copied().unwrap_or(0);
-		debug_assert_ne!(revision_count, 0, "reader revision pin count is missing");
 		let remove_revision = match state.revisions.get_mut(&self.tail_revision) {
 			Some(revision) if *revision != 0 => {
 				*revision -= 1;
 				*revision == 0
 			}
-			_ => return,
+			_ => false,
 		};
 		state.total -= 1;
 		if remove_revision {
 			state.revisions.remove(&self.tail_revision);
+		}
+		if state.total == 0 {
+			state.revisions.clear();
 		}
 	}
 }
@@ -949,10 +949,13 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 		};
 		mutations.push(Mutation::Delete(binding_key.clone()));
 		mutations.push(Mutation::Delete(atomic_key));
-		let _reader_registration = self.state.reader_registration_shards[reader_registration_shard(path)]
-			.write()
-			.unwrap_or_else(|poisoned| poisoned.into_inner());
-		match self.store.write(&mutations, WritePolicy::WAL) {
+		let write_result = {
+			let _reader_registration = self.state.reader_registration_shards[reader_registration_shard(path)]
+				.write()
+				.unwrap_or_else(|poisoned| poisoned.into_inner());
+			self.store.write(&mutations, WritePolicy::WAL)
+		};
+		match write_result {
 			Ok(()) => {
 				lifecycle.writer = None;
 				Ok(())

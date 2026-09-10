@@ -544,18 +544,18 @@ fn concurrent_open_read_case(threads: usize, smoke: bool) -> impl FnMut(usize) -
 		let (completion, completed) = mpsc::sync_channel(1);
 		let elapsed_nanoseconds = std::thread::scope(|scope| -> io::Result<u128> {
 			let mut handles = Vec::with_capacity(threads);
-			for thread_paths in paths {
+			for (thread, thread_paths) in paths.into_iter().enumerate() {
 				let directory = directory.clone();
 				let worker_start_gate = start_gate.clone();
 				let remaining = remaining.clone();
 				let completion = completion.clone();
 				let handle = std::thread::Builder::new()
-					.name("kv-directory-open-read-benchmark".to_owned())
-					.spawn_scoped(scope, move || -> io::Result<()> {
+					.name(format!("kv-directory-open-read-benchmark-{thread}"))
+					.spawn_scoped(scope, move || {
 						let Some(started) = worker_start_gate.wait() else {
-							return Ok(());
+							return Ok(Vec::new());
 						};
-						let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+						let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
 							let mut opened = Vec::with_capacity(thread_paths.len());
 							for path in thread_paths {
 								opened.push(
@@ -564,8 +564,8 @@ fn concurrent_open_read_case(threads: usize, smoke: bool) -> impl FnMut(usize) -
 										.map_err(|error| io::Error::other(error.to_string()))?,
 								);
 							}
-							black_box(opened);
-							Ok(())
+							black_box(&opened);
+							Ok::<_, io::Error>(opened)
 						}))
 						.unwrap_or_else(|_| Err(io::Error::other("benchmark worker panicked")));
 						if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -592,9 +592,10 @@ fn concurrent_open_read_case(threads: usize, smoke: bool) -> impl FnMut(usize) -
 				.recv()
 				.map_err(|_| io::Error::other("benchmark workers did not report completion"))?;
 			for handle in handles {
-				handle
+				let opened = handle
 					.join()
 					.map_err(|_| io::Error::other("benchmark worker panicked"))??;
+				black_box(opened);
 			}
 			Ok(elapsed_nanoseconds)
 		})?;

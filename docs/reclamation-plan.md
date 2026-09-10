@@ -130,14 +130,16 @@ cleanup only after a two-worker test proves that every local search
 handle for one RocksDB-backed generation reaches the same native `DirectoryState`. A process that
 cannot establish that invariant cannot obtain the cleanup owner lease.
 
-Cleanup never holds a path gate or pin-registry lock across storage I/O. A retired object cannot gain
-a new pin because its binding is gone; a tail-only entry can gain no new pin for its old revision
-after the newer binding is published. Whole-object entries match any pin for that object, while
-tail-only entries match only the exact object id and tail revision. If a matching pin remains,
-cleanup moves the entry to a cleanup-only deferred queue with bounded backoff rather than blocking
-later garbage. Foreground publishers only mutate the ingress tail; cleanup only mutates the ingress
-head and deferred queue. A low-priority cleanup host operation therefore never owns the mutex or
-counter needed by a foreground enqueue.
+Cleanup never holds a path gate or pin-registry lock across storage I/O. A retired object cannot
+gain a new pin because its binding is gone. Before tail-only reclamation is enabled, publication of
+the newer binding and its superseded-tail entry must take the exclusive side of the same
+registration fence used by deletion. That prevents a reader from registering the old revision
+after publication. Whole-object entries match any pin for that object, while tail-only entries
+match only the exact object id and tail revision. If a matching pin remains, cleanup moves the entry
+to a cleanup-only deferred queue with bounded backoff rather than blocking later garbage.
+Foreground publishers only mutate the ingress tail; cleanup only mutates the ingress head and
+deferred queue. A low-priority cleanup host operation therefore never owns the mutex or counter
+needed by a foreground enqueue.
 
 This process-local pin model is valid only while Harper's derived-index lifecycle guarantees one
 active generation owner. Cleanup requires an explicit owner lease supplied by that lifecycle; the
@@ -292,14 +294,13 @@ The dependency-free `kv_directory` release benchmark compares adjacent merged sl
 Tantivy's public directory interfaces. It reports per-sample-mean p50/p95/p99 and aggregate
 throughput for caller write sizes, empty and dirty flushes, chunk publication, deletion with closed
 and active writers, retained and churned read-handle opens, and distinct-file read-open and write
-concurrency. The
-empty-flush case isolates the per-call retirement-fence cost; the buffered cases show how Tantivy's
-writer amortizes it in practice. Retained handles measure registration growth, while churned handles
-exercise drop-time pin removal. Results are versioned JSON labeled by revision. Shared CI runs a
-correctness smoke with no timing threshold; performance decisions use alternating runs on one fixed
-host. The deterministic Phase 0 store removes RocksDB and Node transport variance but serializes
-access, so its concurrency results detect directory-coordination regressions rather than predicting
-RocksDB scaling.
+concurrency. The empty-flush case isolates the per-call retirement-fence cost; the buffered cases
+show how Tantivy's writer amortizes it in practice. Retained handles measure registration growth,
+while churned handles exercise drop-time pin removal. Results are versioned JSON labeled by
+revision. Shared CI runs a correctness smoke with no timing threshold; performance decisions use
+alternating runs on one fixed host. The deterministic Phase 0 store removes RocksDB and Node
+transport variance but serializes access, so its concurrency results detect directory-coordination
+regressions rather than predicting RocksDB scaling.
 
 The completed mapping tests cover repeated flush, delete/recreate with a retained old reader,
 abandoned writers, partial object cleanup, restart during a range and between FIFO entries, namespace
