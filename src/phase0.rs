@@ -441,7 +441,7 @@ impl Drop for WriterClaim<'_> {
 }
 
 impl ReaderPinRegistry {
-	fn register(self: &Arc<Self>, binding: &Binding) -> io::Result<Arc<ReaderPin>> {
+	fn register(self: &Arc<Self>, binding: &Binding) -> io::Result<ReaderPin> {
 		let shard = usize::from(reclaim_shard(binding.object_id));
 		let object = {
 			let mut objects = self.shards[shard]
@@ -475,10 +475,10 @@ impl ReaderPinRegistry {
 		state.total = total;
 		state.revisions.insert(binding.tail_revision, revision);
 		drop(state);
-		Ok(Arc::new(ReaderPin {
+		Ok(ReaderPin {
 			object,
 			tail_revision: binding.tail_revision,
-		}))
+		})
 	}
 
 	#[cfg(test)]
@@ -711,7 +711,7 @@ impl<S: KvStore> KvDirectory<S> {
 		&self,
 		path: &Path,
 		after_binding_read: impl FnOnce(),
-	) -> Result<(Binding, Arc<ReaderPin>), OpenReadError> {
+	) -> Result<(Binding, ReaderPin), OpenReadError> {
 		let registration = self.state.reader_registration_shards[reader_registration_shard(path)]
 			.read()
 			.unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -733,7 +733,7 @@ struct KvFileHandle<S> {
 	path: PathBuf,
 	binding: Binding,
 	_state: Arc<DirectoryState>,
-	_pin: Arc<ReaderPin>,
+	_pin: ReaderPin,
 }
 
 impl<S> fmt::Debug for KvFileHandle<S> {

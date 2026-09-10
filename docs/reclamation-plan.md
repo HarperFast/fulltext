@@ -126,9 +126,16 @@ Deletion takes the exclusive side of the same shard only for its final binding-r
 concurrent opens remain parallel except for hash collisions and writer retirement does not block
 them. This preserves one storage read per handle open and adds no directory-wide coordination. The
 consumer follows only after these lifetime rules are independently covered. Harper may enable
-cleanup only after a two-worker test proves that every local search
-handle for one RocksDB-backed generation reaches the same native `DirectoryState`. A process that
-cannot establish that invariant cannot obtain the cleanup owner lease.
+cleanup only after a two-worker test proves that every local search handle for one RocksDB-backed
+generation reaches the same native `DirectoryState`. A process that cannot establish that invariant
+cannot obtain the cleanup owner lease.
+
+The blocking fence deliberately spans a reader's binding read and pin registration and deletion's
+single atomic host write. Ending either side earlier reopens the registration race. A stalled delete
+can therefore delay an unrelated open whose path collides in the same one of 256 shards. Replacing
+this bounded collision risk requires a quiescence or epoch protocol that prevents cleanup until all
+readers that started before publication have either registered or exited; it is not a safe lock
+substitution.
 
 Cleanup never holds a path gate or pin-registry lock across storage I/O. A retired object cannot
 gain a new pin because its binding is gone. Before tail-only reclamation is enabled, publication of
