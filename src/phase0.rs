@@ -1675,20 +1675,26 @@ mod tests {
 			state.released = false;
 		}
 
-		fn wait_until_blocked(&self) {
+		fn wait_until_blocked(&self) -> bool {
 			let (state, changed) = &*self.block;
 			let deadline = Instant::now() + Duration::from_secs(5);
 			let mut state = state.lock().unwrap();
 			while !state.entered {
 				let remaining = deadline.saturating_duration_since(Instant::now());
-				assert!(!remaining.is_zero(), "write did not reach the test barrier");
+				if remaining.is_zero() {
+					state.released = true;
+					changed.notify_all();
+					return false;
+				}
 				let (next, timeout) = changed.wait_timeout(state, remaining).unwrap();
 				state = next;
-				assert!(
-					!timeout.timed_out() || state.entered,
-					"write did not reach the test barrier"
-				);
+				if timeout.timed_out() && !state.entered {
+					state.released = true;
+					changed.notify_all();
+					return false;
+				}
 			}
+			true
 		}
 
 		fn release_write(&self) {
@@ -1846,6 +1852,19 @@ mod tests {
 				apply_if_newer(&mut recovered, key.clone(), entry.clone());
 			}
 			assert_object_keys_within_high_water(&recovered, namespace, path, 1);
+		}
+	}
+
+	fn wait_for_retirement(fence: &WriterFence) -> bool {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			if fence.retired.load(Ordering::SeqCst) {
+				return true;
+			}
+			if Instant::now() >= deadline {
+				return false;
+			}
+			std::thread::sleep(Duration::from_millis(1));
 		}
 	}
 
@@ -2339,15 +2358,16 @@ mod tests {
 			let deleting_directory = directory.clone();
 			let deleting_path = path.clone();
 			let helper = std::thread::spawn(move || {
-				helper_store.wait_until_blocked();
+				assert!(
+					helper_store.wait_until_blocked(),
+					"write did not reach the test barrier"
+				);
 				let deletion = std::thread::spawn(move || deleting_directory.delete(&deleting_path));
-				let deadline = Instant::now() + Duration::from_secs(5);
-				while !fence.retired.load(Ordering::SeqCst) {
-					assert!(Instant::now() < deadline, "delete did not retire the writer");
-					std::thread::yield_now();
-				}
+				let retired = wait_for_retirement(&fence);
 				helper_store.release_write();
-				deletion.join().unwrap()
+				let deletion = deletion.join().unwrap();
+				assert!(retired, "delete did not retire the writer");
+				deletion
 			});
 			writer.flush().unwrap();
 			helper.join().unwrap().unwrap();
@@ -2379,15 +2399,16 @@ mod tests {
 		let helper_store = store.clone();
 		let deleting_directory = directory.clone();
 		let helper = std::thread::spawn(move || {
-			helper_store.wait_until_blocked();
+			assert!(
+				helper_store.wait_until_blocked(),
+				"write did not reach the test barrier"
+			);
 			let deletion = std::thread::spawn(move || deleting_directory.delete(Path::new("segment")));
-			let deadline = Instant::now() + Duration::from_secs(5);
-			while !fence.retired.load(Ordering::SeqCst) {
-				assert!(Instant::now() < deadline, "delete did not retire the writer");
-				std::thread::yield_now();
-			}
+			let retired = wait_for_retirement(&fence);
 			helper_store.release_write();
-			deletion.join().unwrap()
+			let deletion = deletion.join().unwrap();
+			assert!(retired, "delete did not retire the writer");
+			deletion
 		});
 
 		writer.flush().unwrap();
@@ -2418,7 +2439,7 @@ mod tests {
 
 		let first_directory = directory.clone();
 		let first_delete = std::thread::spawn(move || first_directory.delete(Path::new("first")));
-		store.wait_until_blocked();
+		assert!(store.wait_until_blocked(), "write did not reach the test barrier");
 		let second_directory = directory.clone();
 		let (sent, received) = std::sync::mpsc::channel();
 		let second_delete = std::thread::spawn(move || {
