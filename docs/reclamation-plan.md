@@ -114,17 +114,20 @@ an unrelated timeout. Closing the host wakes pending operations and releases the
 gate is held by chunk staging or publication across a host round trip.
 
 Pins are indexed by object id, not logical path, so delete/recreate cannot hide handles to the prior
-object. A handle owns an `Arc` pin, and drop only decrements the `Arc`. Pin insertion prunes dead weak
-entries above a small fixed threshold, and FIFO visits prune them again. This bounds control-block
-retention during repeated open/drop churn. Writer state is likewise retained through failed and
-unterminated writes. Gates recover poisoned state rather than panicking the writer actor. Pins land
-in the first slice 4 unit before the FIFO consumer. A handle reads its binding and registers the pin
-under the existing per-path lifecycle gate. Deletion uses the same gate, so it either observes a
-registered pin or removes the binding before a later open can read it. This preserves one storage
-read per handle open and adds no cross-path coordination. The consumer follows only after these
-lifetime rules are independently covered. Harper may enable cleanup only after a two-worker test proves that every local search handle for one
-RocksDB-backed generation reaches the same native `DirectoryState`. A process that cannot establish
-that invariant cannot obtain the cleanup owner lease.
+object. Each object has counted pins by tail revision. A handle owns one pin and retains the shared
+directory and path state; dropping it decrements the revision and object counts, and dropping the
+last pin removes the object's weak registry entry. Registry shards use the same object-id partition
+as reclamation, so unrelated objects do not share one pin mutex. This bounds retained control state
+by live handles during repeated object, revision, and open/drop churn. Writer state is likewise
+retained through failed and unterminated writes. Gates recover poisoned state rather than panicking
+the writer actor. Pins land in the first slice 4 unit before the FIFO consumer. A handle reads its
+binding and registers the pin under a shared per-path registration fence. Deletion takes the
+exclusive side only for its final queue and binding transition, so concurrent opens remain parallel
+and writer retirement does not block them. This preserves one storage read per handle open and adds
+no cross-path coordination. The consumer follows only after these lifetime rules are independently
+covered. Harper may enable cleanup only after a two-worker test proves that every local search
+handle for one RocksDB-backed generation reaches the same native `DirectoryState`. A process that
+cannot establish that invariant cannot obtain the cleanup owner lease.
 
 Cleanup never holds a path gate or pin-registry lock across storage I/O. A retired object cannot gain
 a new pin because its binding is gone; a tail-only entry can gain no new pin for its old revision
@@ -252,7 +255,7 @@ Then deliver reclamation in reviewable slices:
    enqueue at object deletion; key writer retirement by object id so path reuse cannot retire the
    replacement writer;
 4. add object-id/revision reader pins and coordinate registration with deletion through the
-   per-path lifecycle gate;
+   per-path registration fence;
 5. measure and, if justified, add tail-supersession entries; then add bounded FIFO draining and
    deferred queues, low-priority admission, failure observability, close fencing, crash recovery, and
    Harper's exclusive-owner integration.

@@ -19,6 +19,7 @@ const MIN_WRITE_OPERATIONS_PER_SAMPLE: usize = 256;
 const CHUNK_BYTES: usize = 256 * 1024;
 const STORAGE_OPERATIONS_PER_SAMPLE: usize = 64;
 const EMPTY_FLUSHES_PER_SAMPLE: usize = 10_000;
+const RETAINED_OPEN_READS_PER_SAMPLE: usize = 1_024;
 const OPEN_READS_PER_SAMPLE: usize = 10_000;
 const CONCURRENT_BYTES_PER_FILE: usize = 4 * 1024;
 const CONCURRENT_FILES_PER_THREAD: usize = 64;
@@ -477,7 +478,7 @@ fn open_read_case(retain_handles: bool, smoke: bool) -> impl FnMut(usize) -> io:
 		let operations = if smoke {
 			4
 		} else if retain_handles {
-			STORAGE_OPERATIONS_PER_SAMPLE
+			RETAINED_OPEN_READS_PER_SAMPLE
 		} else {
 			OPEN_READS_PER_SAMPLE
 		};
