@@ -17,10 +17,10 @@ export type HostStorageMutation = { type: 'put'; key: Buffer; value: Buffer } | 
 
 export interface HostStorage {
 	read(key: Buffer): Buffer | undefined;
-	/** Apply all mutations or none, satisfy the policy before returning, and throw only when none were applied. */
-	write(mutations: Array<HostStorageMutation>, policy: HostWritePolicy): void;
-	/** Make prior writes durable before returning. */
-	sync(): void;
+	/** Apply all mutations or none, satisfy the policy, and return undefined synchronously. */
+	write(mutations: Array<HostStorageMutation>, policy: HostWritePolicy): undefined;
+	/** Make prior writes durable and return undefined synchronously. */
+	sync(): undefined;
 }
 
 export interface HostStorageHandlerOptions {
@@ -86,12 +86,16 @@ export function createHostStorageHandler(
 					}
 				}
 				decoder.finish();
-				storage.write(mutations, policy);
+				if (storage.write(mutations, policy) !== undefined) {
+					throw new Error('host storage write must return undefined synchronously');
+				}
 				return Buffer.from([protocolVersion, responseOk]);
 			}
 			if (operation === operationSync) {
 				decoder.finish();
-				storage.sync();
+				if (storage.sync() !== undefined) {
+					throw new Error('host storage sync must return undefined synchronously');
+				}
 				return Buffer.from([protocolVersion, responseOk]);
 			}
 			throw new Error(`unknown host storage operation ${operation}`);

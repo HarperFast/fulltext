@@ -14,7 +14,7 @@ function maybeBlock(operation) {
 		parentPort.postMessage('blocked');
 	}
 	blocked = false;
-	Atomics.wait(wait, 0, 0, 250);
+	Atomics.wait(wait, 0, 0);
 	if (Atomics.load(wait, 0) === 1) throw new Error('host generation was revoked');
 }
 

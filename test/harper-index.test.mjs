@@ -118,6 +118,23 @@ test('rejects an oversized cursor without changing or poisoning the generation',
 	await index.close();
 });
 
+test('rejects asynchronous host storage before opening a runtime', async () => {
+	const host = createStorage();
+	host.storage.sync = async () => {};
+	await assert.rejects(openHarperFullTextIndex(options(host.storage)), (error) => error.code === 'E_INVALID_ARGUMENT');
+	assert.deepStrictEqual(host.calls, []);
+});
+
+test('rejects a promise returned by a nominally synchronous storage method without wedging reopen', async () => {
+	const host = createStorage();
+	const synchronousSync = host.storage.sync;
+	host.storage.sync = () => Promise.resolve();
+	await assert.rejects(openHarperFullTextIndex(options(host.storage)), /must return undefined synchronously/);
+	host.storage.sync = synchronousSync;
+	const index = await openHarperFullTextIndex(options(host.storage));
+	await index.close({ mode: 'rollback' });
+});
+
 for (const stage of ['open', 'read', 'apply', 'publish']) {
 	test(`worker termination safely drains a hosted runtime during ${stage}`, async () => {
 		const control = new SharedArrayBuffer(4);
@@ -138,8 +155,8 @@ for (const stage of ['open', 'read', 'apply', 'publish']) {
 			});
 		});
 		const started = performance.now();
-		Atomics.store(new Int32Array(control), 0, 1);
-		await worker.terminate();
+		const exitCode = await worker.terminate();
+		assert(Number.isInteger(exitCode));
 		assert(performance.now() - started < 5_000, `${stage} teardown did not drain bounded storage work promptly`);
 	});
 }

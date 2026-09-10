@@ -473,13 +473,12 @@ function decodeHandlerError(response) {
 }
 
 function dispatchHostStorage(handler) {
-	return (dispatch) => {
-		const requestId = dispatch.readBigUInt64LE().toString();
-		if (!addon.__hostStorageBegin(requestId)) return;
+	return (transportId, requestId, request) => {
 		try {
-			addon.__hostStorageComplete(requestId, handler(dispatch.subarray(8)));
+			if (!addon.__hostStorageBegin(transportId, requestId)) return;
+			addon.__hostStorageComplete(transportId, requestId, handler(request));
 		} catch (error) {
-			addon.__hostStorageFail(requestId, error instanceof Error ? error.message : String(error));
+			addon.__hostStorageFail(transportId, requestId, error instanceof Error ? error.message : String(error));
 		}
 	};
 }

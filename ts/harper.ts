@@ -54,14 +54,14 @@ class StorageGate implements HostStorage {
 		return this.#storage.read(key);
 	}
 
-	write(mutations: Parameters<HostStorage['write']>[0], policy: Parameters<HostStorage['write']>[1]): void {
+	write(mutations: Parameters<HostStorage['write']>[0], policy: Parameters<HostStorage['write']>[1]): undefined {
 		this.#requireActive();
-		this.#storage.write(mutations, policy);
+		return this.#storage.write(mutations, policy);
 	}
 
-	sync(): void {
+	sync(): undefined {
 		this.#requireActive();
-		this.#storage.sync();
+		return this.#storage.sync();
 	}
 
 	revoke(): void {
@@ -121,6 +121,7 @@ export class HarperFullTextIndex {
 }
 
 export async function openHarperFullTextIndex(options: HarperFullTextIndexOptions): Promise<HarperFullTextIndex> {
+	validateSynchronousStorage(options.storage);
 	const gate = new StorageGate(options.storage);
 	const handler = createHostStorageHandler(gate, {
 		maxMutations: options.transport.maxMutations,
@@ -129,6 +130,7 @@ export async function openHarperFullTextIndex(options: HarperFullTextIndexOption
 		maxErrorBytes: options.transport.maxErrorBytes,
 	});
 	const dispatch = createStorageDispatcher(handler);
+	let openedHandle: number | undefined;
 	try {
 		const cursor = await invoke((callback) =>
 			loadAddon().__harperOpen(
@@ -150,6 +152,7 @@ export async function openHarperFullTextIndex(options: HarperFullTextIndexOption
 			),
 		);
 		const handle = cursor.u32();
+		openedHandle = handle;
 		const hasPayload = cursor.u8();
 		if (hasPayload !== 0 && hasPayload !== 1) {
 			throw new FulltextError('E_NATIVE_FAILURE', `Unknown committed payload status ${hasPayload}`);
@@ -158,20 +161,36 @@ export async function openHarperFullTextIndex(options: HarperFullTextIndexOption
 		cursor.finish();
 		return new HarperFullTextIndex(handle, committedPayload, gate);
 	} catch (error) {
+		const handle = openedHandle;
+		if (handle !== undefined) {
+			await invoke((callback) => loadAddon().__nativeClose(handle, true, callback)).catch(() => undefined);
+		}
 		gate.revoke();
 		throw error;
 	}
 }
 
-function createStorageDispatcher(handler: (request: Buffer) => Buffer): (dispatch: Buffer) => void {
-	return (dispatch) => {
-		if (dispatch.length < 8) return;
-		const requestId = dispatch.readBigUInt64LE().toString();
-		if (!loadAddon().__hostStorageBegin(requestId)) return;
+function validateSynchronousStorage(storage: HostStorage): void {
+	for (const name of ['read', 'write', 'sync'] as const) {
+		const method = storage?.[name];
+		if (typeof method !== 'function') {
+			throw new FulltextError('E_INVALID_ARGUMENT', `host storage ${name} must be a function`);
+		}
+		if (method.constructor?.name === 'AsyncFunction') {
+			throw new FulltextError('E_INVALID_ARGUMENT', `host storage ${name} must be synchronous`);
+		}
+	}
+}
+
+function createStorageDispatcher(
+	handler: (request: Buffer) => Buffer,
+): (transportId: Buffer, requestId: Buffer, request: Buffer) => void {
+	return (transportId, requestId, request) => {
 		try {
-			loadAddon().__hostStorageComplete(requestId, handler(dispatch.subarray(8)));
+			if (!loadAddon().__hostStorageBegin(transportId, requestId)) return;
+			loadAddon().__hostStorageComplete(transportId, requestId, handler(request));
 		} catch (error) {
-			loadAddon().__hostStorageFail(requestId, error instanceof Error ? error.message : String(error));
+			loadAddon().__hostStorageFail(transportId, requestId, error instanceof Error ? error.message : String(error));
 		}
 	};
 }

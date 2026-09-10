@@ -20,17 +20,21 @@ interface NativeAddonApi {
 	__nativeSearch(handle: number, request: Buffer, callback: NativeCallback): void;
 	__nativeClose(handle: number, rollback: boolean, callback: NativeCallback): void;
 	__nativeStatus(handle: number): Buffer;
-	__harperOpen(config: Buffer, handler: (dispatch: Buffer) => void, callback: NativeCallback): void;
+	__harperOpen(
+		config: Buffer,
+		handler: (transportId: Buffer, requestId: Buffer, request: Buffer) => void,
+		callback: NativeCallback,
+	): void;
 	__harperPublish(handle: number, payload: string, callback: NativeCallback): void;
-	__hostStorageBegin(requestId: string): boolean;
-	__hostStorageComplete(requestId: string, response: unknown): boolean;
-	__hostStorageFail(requestId: string, message: string): boolean;
+	__hostStorageBegin(transportId: Buffer, requestId: Buffer): boolean;
+	__hostStorageComplete(transportId: Buffer, requestId: Buffer, response: unknown): boolean;
+	__hostStorageFail(transportId: Buffer, requestId: Buffer, message: string): boolean;
 	__testCreateHandle?(): number;
 	__testPanic?(id: number): void;
 	__testCheck?(id: number): boolean;
 	__testPoisonNativeHandle?(handle: number): void;
 	__testOpenHostTransport?(
-		handler: (dispatch: Buffer) => void,
+		handler: (transportId: Buffer, requestId: Buffer, request: Buffer) => void,
 		maxOperations: number,
 		maxBytes: number,
 		readTimeoutMs: number,

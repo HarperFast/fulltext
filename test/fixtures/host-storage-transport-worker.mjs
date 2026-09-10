@@ -4,10 +4,9 @@ import { loadAddon } from '../../dist/load-addon.js';
 
 const addon = loadAddon();
 const handle = addon.__testOpenHostTransport(
-	(dispatch) => {
-		const requestId = dispatch.readBigUInt64LE().toString();
-		if (!addon.__hostStorageBegin(requestId)) return;
-		addon.__hostStorageComplete(requestId, dispatch.subarray(8));
+	(transportId, requestId, request) => {
+		if (!addon.__hostStorageBegin(transportId, requestId)) return;
+		addon.__hostStorageComplete(transportId, requestId, request);
 	},
 	2,
 	1_024,

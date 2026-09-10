@@ -84,7 +84,8 @@ The Harper opener requires a process-lifetime store identity, persistent generat
 bounded transport limits, and a `HostStorage` implementation. `publish(payload)` commits the index
 and opaque payload into one Tantivy `meta.json` generation, then reloads the local reader before it
 resolves. Harper uses that payload for its derived-index cursor. `committedPayload` exposes the
-payload recovered at open.
+payload recovered at open. Host storage methods are strictly synchronous; `write` and `sync` must
+return `undefined`, and Promise-returning implementations are rejected rather than acknowledged.
 
 The current Harper path is owner-worker-only. It does not yet provide non-owner read handles,
 cross-worker refresh, generation retirement, or scheduled physical reclamation. Those lifecycle
