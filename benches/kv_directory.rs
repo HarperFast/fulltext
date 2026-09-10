@@ -9,10 +9,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harper_fulltext::phase0::{
-	FaultingDirectory, FaultingKv, KvDirectory, KvStore, KvStoreIdentity, Mutation, WritePolicy,
+	FaultingDirectory, FaultingKv, KvDirectory, KvStore, KvStoreIdentity, Mutation, ReclaimBudget, WritePolicy,
 };
 use harper_fulltext::TANTIVY_VERSION;
 use tantivy::directory::{Directory, OwnedBytes, TerminatingWrite, WritePtr};
@@ -240,6 +240,13 @@ fn main() -> io::Result<()> {
 		1,
 		&arguments,
 		delete_case(true, arguments.smoke),
+	)?);
+	results.push(measure_case(
+		"reclaim-retired-4k".to_owned(),
+		"retired-object",
+		1,
+		&arguments,
+		reclaim_case(arguments.smoke),
 	)?);
 	results.push(measure_case(
 		"open-read-retained".to_owned(),
@@ -540,6 +547,41 @@ fn delete_case(active_writer: bool, smoke: bool) -> impl FnMut(usize) -> io::Res
 			elapsed_nanoseconds,
 			operations: operations as u64,
 			bytes: 0,
+		})
+	}
+}
+
+fn reclaim_case(smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
+	let payload = vec![19u8; 4 * 1024];
+	move |sample| {
+		let directory = FaultingDirectory::new(FaultingKv::default());
+		let operations = if smoke { 4 } else { STORAGE_OPERATIONS_PER_SAMPLE };
+		for operation in 0..operations {
+			let path = format!("reclaim-{sample}-{operation}");
+			let mut writer = open_writer(&directory, Path::new(&path))?;
+			writer.write_all(&payload)?;
+			writer.terminate()?;
+			delete_path(&directory, Path::new(&path))?;
+		}
+		let budget = ReclaimBudget {
+			max_point_reads: operations * 8 + 128,
+			max_mutations: operations * 8 + 512,
+			max_request_bytes: 1024 * 1024,
+			max_elapsed: Duration::from_secs(1),
+		};
+		let started = Instant::now();
+		let outcome = directory.reclaim(budget)?;
+		let elapsed_nanoseconds = started.elapsed().as_nanos();
+		if outcome.entries_reclaimed != operations {
+			return Err(io::Error::other(format!(
+				"reclamation completed {} of {operations} retired objects",
+				outcome.entries_reclaimed
+			)));
+		}
+		Ok(Sample {
+			elapsed_nanoseconds,
+			operations: operations as u64,
+			bytes: (operations * payload.len()) as u64,
 		})
 	}
 }

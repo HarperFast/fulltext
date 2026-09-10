@@ -9,13 +9,14 @@ readiness wait for a complete sweep.
 
 ## Grounding
 
-This plan is written against fulltext main at `36d96e3`, the rebase-merged result of
-[Enqueue deleted directory objects for reclamation #26](https://github.com/HarperFast/fulltext/pull/26).
+This plan is written against fulltext main at `15045c9`, the squash-merged result of
+[Protect Harper-backed Tantivy readers during reclamation #27](https://github.com/HarperFast/fulltext/pull/27).
 `KvDirectory` stores immutable 256 KiB chunks and revisioned tails. `delete()` atomically removes a
-logical binding and enqueues the object's derivable physical extent, but no consumer deletes those
-payloads yet. Each successful `flush()` can leave the previous tail revision unreachable. `KvStore`
-supplies point read, atomic batch write, and sync, but no key enumeration. Harper PR #2535 supplies
-the same narrow storage shape from Harper-owned RocksDB.
+logical binding and enqueues the object's derivable physical extent, and open handles retain
+process-local object/revision pins, but no consumer deletes those payloads yet. Each successful
+`flush()` can leave the previous tail revision unreachable. `KvStore` supplies point read, atomic
+batch write, and sync, but no key enumeration. Harper PR #2535 supplies the same narrow storage shape
+from Harper-owned RocksDB.
 
 Tantivy's `ManagedDirectory` decides when a logical file name is retired. `KvDirectory` owns the
 physical object behind that name and the lifetime of opened handles. Harper's derived-index runtime
@@ -79,7 +80,7 @@ underlying `delete()` before removing that path from `.managed.json`. A crash-ab
 therefore remains named by its binding and managed path until it is placed on the reclaim FIFO.
 
 Whole-object deletion already covers every tail revision through `tail_high_water`. Tail-only
-enqueue is deferred to slice 4 and retained only if measurement shows that repeated non-empty tail
+enqueue is deferred to slice 6 and retained only if measurement shows that repeated non-empty tail
 publication materially increases live-index storage before final file deletion. If retained, the
 publication batch appends the exact old revision so bytes cannot be deleted while an earlier handle
 still references them. Queue entries are the durable consequence of the transition that made bytes
@@ -206,7 +207,7 @@ A definitively failed delete rereads the binding while it still owns the path li
 same binding remains, the writer fence is reopened and the error is returned; if the binding is gone,
 the atomic enqueue also committed and delete succeeds. An unreadable or unexpected binding keeps the
 writer retired and fails closed. Invalid persisted directory or queue data is a
-generation-corruption signal; slice 4 must surface that terminal health state to Harper before
+generation-corruption signal; slice 6 must surface that terminal health state to Harper before
 production is enabled rather than relying on Tantivy's repeated GC attempt.
 
 Queue writers for one namespace must share one `DirectoryState`. This follows the existing
@@ -234,6 +235,11 @@ its progress and advances the head when it completes the current head. A crash c
 deletes, which are idempotent, but cannot recover a cursor beyond bytes that may still exist or
 apply one entry's cursor to another entry.
 
+Because the unreleased reclaim entry gains the published chunk count and the consumer adds head and
+progress key kinds, this unit advances the directory key-format marker to v3. A namespace marked
+with the former v2 prototype is rejected and rebuilt; the implementation does not strand v2 keys
+under a parallel prefix or attempt a migration for data that has never shipped.
+
 The consumer snapshots each visited shard's tail and examines each starting sequence at most once
 per admission. A pinned entry remains durable while a process-local cursor moves to the next
 sequence. An unpinned later entry may complete out of order, leaving a missing slot. When the oldest
@@ -260,8 +266,9 @@ point reads, batch mutations, encoded mutation bytes, and elapsed work. It start
 when that operation fits the remaining count and byte limits, and checks elapsed time between host
 operations. A synchronous operation already admitted to the host remains uncancellable and may
 finish after the elapsed target. Limits that cannot admit the smallest legal cleanup step are
-rejected rather than reported as no progress. Invalid persisted queue data returns a distinct
-terminal result for the affected shard so a caller cannot hot-loop it as ordinary blocked work.
+rejected rather than reported as no progress. Invalid persisted queue data returns `InvalidData`
+and latches the affected bit in the terminal-shard mask so a caller cannot hot-loop it as ordinary
+blocked work.
 This unit does not create a thread, reserve host-transport capacity,
 accept an owner lease, expose Node.js API, or enable Harper cleanup; those lifecycle and admission
 rules remain the next unit.
@@ -282,24 +289,24 @@ silently retries forever or advances past unknown data.
 
 ## Alternatives
 
-| Axis                     | Candidate and disposition                                                                                                                                                                                                                                                                                                               |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Different layer          | RocksDB compaction and Harper log retention cannot see Tantivy handles. `ManagedDirectory` owns logical retirement, while `KvDirectory` owns physical retirement.                                                                                                                                                                       |
+| Axis                     | Candidate and disposition                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Different layer          | RocksDB compaction and Harper log retention cannot see Tantivy handles. `ManagedDirectory` owns logical retirement, while `KvDirectory` owns physical retirement.                                                                                                                                                                                                                                                                              |
 | Discovery                | Payload-prefix enumeration or a dense object-id sweep. The Directory's frozen `KvStore` and host transport expose no enumeration primitive. `RocksLease::scan_page` sits outside that contract and returns values, so using it for 256 KiB payload discovery would transfer the object being reclaimed and would not support the standalone host transport. Either scan would also do work proportional to stored history rather than garbage. |
-| Managed paths            | Treat Tantivy's `.managed.json` as the discovery source. It names logical paths, not object ids, chunk ordinals, or tail revisions, so delete/recreate cannot recover the retired object's extent.                                                                                                                                      |
-| Bound placement          | Update the binding with every payload, reserve bounded strides in the binding, or add a separate per-object extent key. Strided binding reservation is chosen: it keeps deletion capture atomic in slice 3 without per-chunk host reads.                                                                                                |
-| Different timing         | Delete up to a fixed number of chunks synchronously in `delete()` and enqueue only the remainder. This may help small objects, but it lengthens Tantivy metadata GC and is deferred until measurement shows a net win.                                                                                                                  |
-| Lower-layer range delete | Add a range-tombstone primitive. This expands the frozen Harper storage surface and makes foreground reads pay tombstone checks until compaction in a shared column family, so it is rejected for the first release.                                                                                                                    |
-| Deeper cause             | Record existence in the batch that creates each key and enqueue retirement in the batch that makes it unreachable. This is the chosen foundation.                                                                                                                                                                                       |
-| Do less                  | Slice 3 enqueues only whole-object deletion. It leaves superseded tails within the object's high-water until final deletion; tail-only enqueue moves to slice 4 and ships only if measured tail accumulation justifies publication-path cost.                                                                                           |
-| Higher-layer rotation    | Rebuild into a fresh Harper generation and drop the old column family. This remains the corruption-recovery path, but routine reclamation would require replaying hundreds of millions of records and would move cleanup outside the standalone library.                                                                                |
-| Reader lifetime          | Process-wide object/revision `Arc` pins are chosen because they exactly model Tantivy handle lifetime without a read-time storage call. A Harper two-worker shared-state test is an enablement gate. A searcher epoch would require a new cross-layer reader API, and a wall-clock grace cannot prove that a reader released the bytes. |
-| Enqueue naming           | An object-id-addressed record requires scanning every allocated id because `KvStore` has no enumeration. Rewriting a tombstone binding under the logical path loses the old object on path reuse. A persisted sharded sequence FIFO is chosen because its point-read cost is proportional to garbage transitions.                       |
-| Writer fence             | Holding a path lock across each chunk write would add lock convoying around an uncancellable host round trip. A per-writer atomic retired/in-flight fence is chosen: delete closes admission and waits before its final binding read, while chunk staging adds no mutex or allocation.                                                  |
-| Object-id allocation     | Updating the counter with every binding creation serializes file creation across a host round trip. The allocator reserves fixed durable strides, reducing that shared operation to one per stride; unused ids after failure or restart are harmless.                                                                                   |
-| Queue-tail reads         | Cache the next sequence and reread only after errors, or point-read it before every enqueue. The durable point read is chosen because slice 3 enqueues only file deletion rather than indexed documents, removes cache recovery state, and is measured explicitly.                                                                      |
-| Cleanup priority         | Cleanup leaves pinned entries durable and skips them with a process-local sequence cursor. Later entries may complete out of order, while the durable head advances only across observed holes. This lets the consumer advance without a second persistent queue or holding a foreground enqueue mutex or counter across low-priority host I/O. |
-| Chosen                   | Binding high-waters plus one transition-fed durable FIFO per shard, sequence-keyed progress, object-id pins, and bounded low-priority draining.                                                                                                                                                                                          |
+| Managed paths            | Treat Tantivy's `.managed.json` as the discovery source. It names logical paths, not object ids, chunk ordinals, or tail revisions, so delete/recreate cannot recover the retired object's extent.                                                                                                                                                                                                                                             |
+| Bound placement          | Update the binding with every payload, reserve bounded strides in the binding, or add a separate per-object extent key. Strided binding reservation is chosen: it keeps deletion capture atomic in slice 3 without per-chunk host reads.                                                                                                                                                                                                       |
+| Different timing         | Delete up to a fixed number of chunks synchronously in `delete()` and enqueue only the remainder. This may help small objects, but it lengthens Tantivy metadata GC and is deferred until measurement shows a net win.                                                                                                                                                                                                                         |
+| Lower-layer range delete | Add a range-tombstone primitive. This expands the frozen Harper storage surface and makes foreground reads pay tombstone checks until compaction in a shared column family, so it is rejected for the first release.                                                                                                                                                                                                                           |
+| Deeper cause             | Record existence in the batch that creates each key and enqueue retirement in the batch that makes it unreachable. This is the chosen foundation.                                                                                                                                                                                                                                                                                              |
+| Do less                  | Slice 3 enqueues only whole-object deletion. It leaves superseded tails within the object's high-water until final deletion; tail-only enqueue moves to slice 6 and ships only if measured tail accumulation justifies publication-path cost.                                                                                                                                                                                                  |
+| Higher-layer rotation    | Rebuild into a fresh Harper generation and drop the old column family. This remains the corruption-recovery path, but routine reclamation would require replaying hundreds of millions of records and would move cleanup outside the standalone library.                                                                                                                                                                                       |
+| Reader lifetime          | Process-wide object/revision `Arc` pins are chosen because they exactly model Tantivy handle lifetime without a read-time storage call. A Harper two-worker shared-state test is an enablement gate. A searcher epoch would require a new cross-layer reader API, and a wall-clock grace cannot prove that a reader released the bytes.                                                                                                        |
+| Enqueue naming           | An object-id-addressed record requires scanning every allocated id because `KvStore` has no enumeration. Rewriting a tombstone binding under the logical path loses the old object on path reuse. A persisted sharded sequence FIFO is chosen because its point-read cost is proportional to garbage transitions.                                                                                                                              |
+| Writer fence             | Holding a path lock across each chunk write would add lock convoying around an uncancellable host round trip. A per-writer atomic retired/in-flight fence is chosen: delete closes admission and waits before its final binding read, while chunk staging adds no mutex or allocation.                                                                                                                                                         |
+| Object-id allocation     | Updating the counter with every binding creation serializes file creation across a host round trip. The allocator reserves fixed durable strides, reducing that shared operation to one per stride; unused ids after failure or restart are harmless.                                                                                                                                                                                          |
+| Queue-tail reads         | Cache the next sequence and reread only after errors, or point-read it before every enqueue. The durable point read is chosen because slice 3 enqueues only file deletion rather than indexed documents, removes cache recovery state, and is measured explicitly.                                                                                                                                                                             |
+| Cleanup priority         | Cleanup leaves pinned entries durable and skips them with a process-local sequence cursor. Later entries may complete out of order, while the durable head advances only across observed holes. This lets the consumer advance without a second persistent queue or holding a foreground enqueue mutex or counter across low-priority host I/O.                                                                                                |
+| Chosen                   | Binding high-waters plus one transition-fed durable FIFO per shard, sequence-keyed progress, object-id pins, and bounded low-priority draining.                                                                                                                                                                                                                                                                                                |
 
 ## Persistence format and delivery sequence
 
@@ -318,9 +325,10 @@ Then deliver reclamation in reviewable slices:
    replacement writer;
 4. add object-id/revision reader pins and coordinate registration with deletion through the
    hash-sharded registration fence;
-5. measure and, if justified, add tail-supersession entries; then add bounded sparse FIFO draining,
-   low-priority admission, failure observability, close fencing, crash recovery, and
-   Harper's exclusive-owner integration.
+5. add bounded sparse FIFO draining and its synchronous admission API;
+6. add low-priority scheduling, failure observability, close fencing, crash recovery, and Harper's
+   exclusive-owner integration. Measure tail accumulation and add tail-supersession entries only if
+   that data justifies publication-path cost.
 
 The production Harper package remains disabled until the cleanup lifecycle fence and Harper host-
 storage integration both pass. No native RocksDB storage provider is added to the public library.
@@ -356,10 +364,18 @@ writer retirement. The release benchmark adds retained and churned opens plus sh
 distinct-file concurrency. Distinct-file cases run at one, two, four, and eight threads; shared-file
 cases start at two threads.
 
+Slice 5 tests durable per-sequence progress, crash/reopen resumption, out-of-order completion behind
+a pinned head, later head compaction across holes, applied-but-reported-failed final batches,
+terminal corruption latching, concurrent admission, staged-prefix probing, and exact read and
+mutation budgets. Format validation is charged to the same point-read and elapsed-work budget as
+queue processing. A real Tantivy merge and garbage-collection cycle is reopened after the queue
+drains to prove that physical cleanup preserves the index. The release benchmark times reclamation
+of deleted 4 KiB directory objects with creation and logical deletion outside the measured region.
+
 The dependency-free `kv_directory` release benchmark compares adjacent merged slices through
 Tantivy's public directory interfaces. It reports per-sample-mean p50/p95/p99 and aggregate
 throughput for caller write sizes, empty and dirty flushes, chunk publication, deletion with closed
-and active writers, retained and churned read-handle opens, shared- and distinct-file read-open
+and active writers, physical reclamation, retained and churned read-handle opens, shared- and distinct-file read-open
 concurrency, and distinct-file write concurrency. The empty-flush case isolates the per-call
 retirement-fence cost; the buffered cases show how Tantivy's writer amortizes it in practice.
 Retained handles measure registration growth, churned handles exercise drop-time pin removal, and
