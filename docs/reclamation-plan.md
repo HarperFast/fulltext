@@ -220,6 +220,35 @@ deletes one derived key. A pinned entry rotates behind other work; repeated rota
 and surface a blocked-reclamation health state rather than consuming the JavaScript service thread.
 Cleanup cost is proportional to garbage queued, never to object ids or records ever created.
 
+The first consumer-core unit remains synchronous and available only through the experimental Rust
+`phase0` surface. It adds an ingress head and one progress record per shard. Progress contains the
+next chunk ordinal and next tail revision for the current head entry. Every payload-deletion batch
+also persists the resulting progress; the batch that removes the final payload keys deletes the
+entry and advances the head instead. A crash can therefore repeat deletes, which are idempotent, but
+cannot recover a cursor beyond bytes that may still exist. The cursor is independent of the queue
+entry so the immutable entry remains identical when it moves between queues.
+
+Each shard also receives a cleanup-only deferred FIFO with its own head, tail, entries, and progress.
+When an ingress head is pinned, one atomic batch appends that immutable entry to the deferred tail,
+advances the deferred tail, removes the ingress entry, and advances the ingress head. Foreground
+enqueue never reads or mutates deferred state. Deferred processing snapshots its starting depth and
+examines each of those entries at most once per admission. An unpinned entry is reclaimed normally;
+a pinned entry moves to the deferred tail only when another entry follows it. A sole pinned entry is
+left in place. This prevents one retained handle from blocking later garbage without letting one
+admission cycle the same pinned entry indefinitely. The result reports pinned rotations and whether
+the remaining queue made no deletion progress; the later background-task unit owns retry timing and
+health thresholds.
+
+One process-local consumer mutex and round-robin shard cursor live in `DirectoryState`. They
+serialize cleanup for one storage identity and namespace without coordinating different indexes,
+and prevent a small budget from always starting at shard zero. The call accepts hard limits for
+point reads, batch mutations, encoded mutation bytes, and elapsed work. It starts an operation only
+when that operation fits the remaining count and byte limits, and checks elapsed time between host
+operations. A synchronous operation already admitted to the host remains uncancellable and may
+finish after the elapsed target. This unit does not create a thread, reserve host-transport capacity,
+accept an owner lease, expose Node.js API, or enable Harper cleanup; those lifecycle and admission
+rules remain the next unit.
+
 Cleanup runs on a dedicated native task, not the JavaScript service thread or writer actor. Host
 callbacks still execute on JavaScript, so cleanup has a low-priority admission class that cannot
 take the last foreground transport slot. Each admission bounds point reads, delete mutations,
