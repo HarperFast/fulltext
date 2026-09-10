@@ -106,15 +106,15 @@ export class HarperFullTextIndex {
 			throw new FulltextError('E_INVALID_ARGUMENT', `commit payload exceeds ${maxCommitPayloadBytes} UTF-8 bytes`);
 		}
 		const sequence = ++this.#nextPublishSequence;
-		let cursor;
+		let opstamp: bigint;
 		try {
-			cursor = await invoke((callback) => loadAddon().__harperPublish(this.#handle, payload, callback));
+			const cursor = await invoke((callback) => loadAddon().__harperPublish(this.#handle, payload, callback));
+			opstamp = cursor.u64();
+			cursor.finish();
 		} catch (error) {
 			if (sequence > this.#uncertainPublishSequence) this.#uncertainPublishSequence = sequence;
 			throw error;
 		}
-		const opstamp = cursor.u64();
-		cursor.finish();
 		if (sequence > this.#publishedSequence) {
 			this.#publishedSequence = sequence;
 			this.#committedPayload = payload;
