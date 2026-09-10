@@ -93,12 +93,9 @@ pub trait KvStore: Clone + Send + Sync + 'static {
 
 pub(crate) const CHUNK_SIZE: usize = 256 * 1024;
 
-pub(crate) fn reclaim_read_request_bytes(namespace: &[u8]) -> io::Result<usize> {
+pub(crate) fn reclaim_read_key_bytes(namespace: &[u8]) -> usize {
 	// Tail objects have the longest key read by reclamation.
-	tail_key(namespace, u64::MAX, u64::MAX)
-		.len()
-		.checked_add(6)
-		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "reclaim read request size overflow"))
+	tail_key(namespace, u64::MAX, u64::MAX).len()
 }
 
 impl Mutation {

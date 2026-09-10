@@ -299,9 +299,10 @@ which point validation rejects a transport that cannot hold its foreground reser
 bounded read and mutation request sizes, and the store's read/control response reservations; small
 transports used without cleanup retain their current behavior.
 
-The owner derives the read-request bound from the directory namespace and format key high-water.
-The low-priority store view retains both request bounds and rejects an encoded cleanup request that
-exceeds either one before transport admission; these are enforced limits rather than sizing hints.
+Cleanup-directory construction derives the read-request bound from its namespace and the format key
+high-water, so a store view cannot be paired with a different namespace after sizing. The
+low-priority store retains both request bounds and rejects an encoded cleanup request that exceeds
+either one before transport admission; these are enforced limits rather than sizing hints.
 
 A statically valid cleanup request that does not fit current occupancy returns `WouldBlock` without
 joining the condition-variable wait queue. Permanent configuration and request-size failures are

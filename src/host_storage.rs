@@ -16,8 +16,8 @@ use tantivy::directory::{Directory, OwnedBytes, TerminatingWrite};
 
 use crate::boundary;
 use crate::phase0::{
-	reclaim_read_request_bytes, KvDirectory, KvStore, KvStoreIdentity, Mutation, ReclaimBudget, WritePolicy,
-	CHUNK_SIZE, RECLAIM_MAX_BATCH_REQUEST_BYTES,
+	reclaim_read_key_bytes, KvDirectory, KvStore, KvStoreIdentity, Mutation, ReclaimBudget, WritePolicy, CHUNK_SIZE,
+	RECLAIM_MAX_BATCH_REQUEST_BYTES,
 };
 
 type HostCallback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
@@ -457,7 +457,15 @@ const VALUE_MISSING: u8 = 0;
 const VALUE_PRESENT: u8 = 1;
 const MUTATION_PUT: u8 = 1;
 const MUTATION_DELETE: u8 = 2;
+const HOST_PROTOCOL_HEADER_BYTES: usize = 2;
+const HOST_LENGTH_PREFIX_BYTES: usize = 4;
 const READ_RESPONSE_OVERHEAD: usize = 7;
+
+fn host_read_request_bytes(key_bytes: usize) -> io::Result<usize> {
+	key_bytes
+		.checked_add(HOST_PROTOCOL_HEADER_BYTES + HOST_LENGTH_PREFIX_BYTES)
+		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host read request size overflow"))
+}
 
 fn minimum_cleanup_reservation(
 	max_read_response_bytes: usize,
@@ -472,6 +480,16 @@ fn minimum_cleanup_reservation(
 		.checked_add(max_mutation_request_bytes.min(RECLAIM_MAX_BATCH_REQUEST_BYTES))
 		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cleanup write reservation overflow"))?;
 	Ok(read.max(write))
+}
+
+fn validate_cleanup_request(request_bytes: usize, limit: Option<usize>, operation: &str) -> io::Result<()> {
+	if limit.is_some_and(|limit| request_bytes > limit) {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			format!("low-priority host storage {operation} request exceeds its byte limit"),
+		));
+	}
+	Ok(())
 }
 
 #[derive(Clone)]
@@ -510,13 +528,24 @@ impl HostKvStore {
 		})
 	}
 
-	fn cleanup_view(
+	fn minimum_cleanup_bytes(&self, namespace: &[u8], budget: ReclaimBudget) -> io::Result<usize> {
+		minimum_cleanup_reservation(
+			self.max_read_response_bytes,
+			self.max_control_response_bytes,
+			host_read_request_bytes(reclaim_read_key_bytes(namespace))?,
+			budget.max_request_bytes,
+		)
+	}
+
+	fn cleanup_directory(
 		&self,
+		namespace: &[u8],
 		foreground_reserved_bytes: usize,
 		max_cleanup_bytes: usize,
-		max_read_request_bytes: usize,
-		max_mutation_request_bytes: usize,
-	) -> io::Result<Self> {
+		budget: ReclaimBudget,
+	) -> io::Result<KvDirectory<Self>> {
+		let max_read_request_bytes = host_read_request_bytes(reclaim_read_key_bytes(namespace))?;
+		let max_mutation_request_bytes = budget.max_request_bytes.min(RECLAIM_MAX_BATCH_REQUEST_BYTES);
 		if max_read_request_bytes == 0 || max_mutation_request_bytes == 0 {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,
@@ -537,16 +566,17 @@ impl HostKvStore {
 		}
 		self.transport
 			.configure_cleanup(foreground_reserved_bytes, max_cleanup_bytes)?;
-		Ok(Self {
+		let store = Self {
 			class: AdmissionClass::Cleanup,
 			max_cleanup_read_request_bytes: Some(max_read_request_bytes),
-			max_cleanup_mutation_request_bytes: Some(max_mutation_request_bytes.min(RECLAIM_MAX_BATCH_REQUEST_BYTES)),
+			max_cleanup_mutation_request_bytes: Some(max_mutation_request_bytes),
 			..self.clone()
-		})
+		};
+		Ok(KvDirectory::with_namespace(store, namespace))
 	}
 
 	fn request(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
-		self.validate_cleanup_request(request.len(), self.max_cleanup_read_request_bytes, "read")?;
+		validate_cleanup_request(request.len(), self.max_cleanup_read_request_bytes, "read")?;
 		// Read deadlines cover admission and host execution; a timed-out read has no storage side effect.
 		let deadline = Instant::now()
 			.checked_add(self.transport.read_timeout)
@@ -555,19 +585,9 @@ impl HostKvStore {
 	}
 
 	fn request_mutation(&self, request: Vec<u8>, response_budget: usize) -> io::Result<ResponseDecoder> {
-		self.validate_cleanup_request(request.len(), self.max_cleanup_mutation_request_bytes, "mutation")?;
+		validate_cleanup_request(request.len(), self.max_cleanup_mutation_request_bytes, "mutation")?;
 		// A dispatched JavaScript mutation cannot be canceled, so wait for its definitive result.
 		self.request_with_deadline(request, response_budget, None)
-	}
-
-	fn validate_cleanup_request(&self, request_bytes: usize, limit: Option<usize>, operation: &str) -> io::Result<()> {
-		if limit.is_some_and(|limit| request_bytes > limit) {
-			return Err(io::Error::new(
-				io::ErrorKind::InvalidInput,
-				format!("low-priority host storage {operation} request exceeds its byte limit"),
-			));
-		}
-		Ok(())
 	}
 
 	fn request_with_deadline(
@@ -1087,35 +1107,25 @@ pub fn test_reclaim_on_host_transport(
 					};
 					let run = NEXT_TRANSPORT_HANDLE.fetch_add(1, Ordering::Relaxed);
 					let namespace = format!("host-reclaim/{run}");
-					let max_read_request_bytes = reclaim_read_request_bytes(namespace.as_bytes())?;
-					let max_cleanup_bytes = minimum_cleanup_reservation(
-						max_read_response_bytes as usize,
-						max_control_response_bytes as usize,
-						max_read_request_bytes,
-						budget.max_request_bytes,
-					)?;
+					let max_cleanup_bytes = store.minimum_cleanup_bytes(namespace.as_bytes(), budget)?;
 					if store
-						.cleanup_view(
+						.cleanup_directory(
+							namespace.as_bytes(),
 							foreground_reserved_bytes,
 							max_cleanup_bytes - 1,
-							max_read_request_bytes,
-							budget.max_request_bytes,
+							budget,
 						)
 						.is_ok()
 					{
 						return Err(io::Error::other("undersized cleanup storage view was accepted"));
 					}
-					let cleanup_store = store.cleanup_view(
+					let cleanup = store.cleanup_directory(
+						namespace.as_bytes(),
 						foreground_reserved_bytes,
 						max_cleanup_bytes,
-						max_read_request_bytes,
-						budget.max_request_bytes,
+						budget,
 					)?;
-					if cleanup_store.identity() != store.identity() {
-						return Err(io::Error::other("cleanup storage view changed the directory identity"));
-					}
 					let foreground = KvDirectory::with_namespace(store, namespace.as_bytes());
-					let cleanup = KvDirectory::with_namespace(cleanup_store, namespace.as_bytes());
 					let payload = vec![7_u8; CHUNK_SIZE + 17];
 					for path in ["pinned", "unpinned"] {
 						let path = Path::new(path);
@@ -1204,9 +1214,18 @@ mod tests {
 			minimum_cleanup_reservation(10, 100, 6, usize::MAX).unwrap(),
 			100 + RECLAIM_MAX_BATCH_REQUEST_BYTES
 		);
-		assert_eq!(reclaim_read_request_bytes(b"").unwrap(), 36);
-		assert_eq!(reclaim_read_request_bytes(b"index").unwrap(), 41);
+		assert_eq!(reclaim_read_key_bytes(b""), 30);
+		assert_eq!(reclaim_read_key_bytes(b"index"), 35);
+		assert_eq!(host_read_request_bytes(reclaim_read_key_bytes(b"")).unwrap(), 36);
+		assert_eq!(host_read_request_bytes(reclaim_read_key_bytes(b"index")).unwrap(), 41);
 		assert!(minimum_cleanup_reservation(usize::MAX, 10, 6, 20).is_err());
 		assert!(minimum_cleanup_reservation(10, usize::MAX, 6, 20).is_err());
+	}
+
+	#[test]
+	fn cleanup_request_limits_are_enforced() {
+		assert!(validate_cleanup_request(6, Some(6), "read").is_ok());
+		assert!(validate_cleanup_request(7, Some(6), "read").is_err());
+		assert!(validate_cleanup_request(usize::MAX, None, "read").is_ok());
 	}
 }
