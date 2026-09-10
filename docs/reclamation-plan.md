@@ -316,9 +316,10 @@ retirement-fence cost; the buffered cases show how Tantivy's writer amortizes it
 Retained handles measure registration growth, churned handles exercise drop-time pin removal, and
 shared-file concurrency exercises per-object pin accounting. Results are versioned JSON labeled by
 revision. Shared CI runs a correctness smoke with no timing threshold; performance decisions use
-alternating runs on one fixed host. The deterministic Phase 0 store removes RocksDB and Node
-transport variance but serializes access, so its concurrency results detect directory-coordination
-regressions rather than predicting RocksDB scaling.
+alternating runs on one fixed host. The deterministic benchmark store removes RocksDB and Node
+transport variance, permits concurrent point reads, and serializes writes. Read-open concurrency
+therefore isolates registration contention, while write concurrency detects directory-coordination
+regressions; neither predicts RocksDB scaling.
 
 The completed mapping tests cover repeated flush, delete/recreate with a retained old reader,
 abandoned writers, partial object cleanup, restart during a range and between FIFO entries, namespace

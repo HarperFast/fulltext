@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::hint::black_box;
@@ -5,14 +6,16 @@ use std::io;
 use std::io::Write as IoWrite;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use harper_fulltext::phase0::{FaultingDirectory, FaultingKv};
+use harper_fulltext::phase0::{
+	FaultingDirectory, FaultingKv, KvDirectory, KvStore, KvStoreIdentity, Mutation, WritePolicy,
+};
 use harper_fulltext::TANTIVY_VERSION;
-use tantivy::directory::{Directory, TerminatingWrite, WritePtr};
+use tantivy::directory::{Directory, OwnedBytes, TerminatingWrite, WritePtr};
 
 const WRITE_BYTES_PER_SAMPLE: usize = 128 * 1024;
 const MIN_WRITE_OPERATIONS_PER_SAMPLE: usize = 256;
@@ -23,6 +26,57 @@ const RETAINED_OPEN_READS_PER_SAMPLE: usize = 1_024;
 const OPEN_READS_PER_SAMPLE: usize = 10_000;
 const CONCURRENT_BYTES_PER_FILE: usize = 4 * 1024;
 const CONCURRENT_FILES_PER_THREAD: usize = 64;
+
+static NEXT_BENCHMARK_KV_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct BenchmarkKv {
+	identity: u64,
+	values: Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>,
+}
+
+type BenchmarkDirectory = KvDirectory<BenchmarkKv>;
+
+impl Default for BenchmarkKv {
+	fn default() -> Self {
+		let identity = NEXT_BENCHMARK_KV_IDENTITY.fetch_add(1, Ordering::Relaxed);
+		assert_ne!(identity, 0, "benchmark store identity space exhausted");
+		Self {
+			identity,
+			values: Arc::new(RwLock::new(BTreeMap::new())),
+		}
+	}
+}
+
+impl KvStore for BenchmarkKv {
+	fn identity(&self) -> KvStoreIdentity {
+		KvStoreIdentity(0, self.identity, 0)
+	}
+
+	fn read(&self, key: &[u8]) -> io::Result<Option<OwnedBytes>> {
+		let values = self.values.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+		Ok(values.get(key).cloned().map(OwnedBytes::new))
+	}
+
+	fn write(&self, mutations: &[Mutation], _policy: WritePolicy) -> io::Result<()> {
+		let mut values = self.values.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+		for mutation in mutations {
+			match mutation {
+				Mutation::Put(key, value) => {
+					values.insert(key.clone(), value.clone());
+				}
+				Mutation::Delete(key) => {
+					values.remove(key);
+				}
+			}
+		}
+		Ok(())
+	}
+
+	fn sync(&self) -> io::Result<()> {
+		Ok(())
+	}
+}
 
 struct Arguments {
 	samples: usize,
@@ -537,7 +591,7 @@ fn concurrent_open_read_case(
 ) -> impl FnMut(usize) -> io::Result<Sample> {
 	let files_per_thread = if smoke { 2 } else { CONCURRENT_FILES_PER_THREAD };
 	move |sample| {
-		let directory = FaultingDirectory::new(FaultingKv::default());
+		let directory = BenchmarkDirectory::new(BenchmarkKv::default());
 		let mut paths = Vec::with_capacity(threads);
 		let path_groups = if shared_paths { 1 } else { threads };
 		for thread in 0..path_groups {
@@ -696,7 +750,7 @@ fn concurrent_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Resu
 	}
 }
 
-fn open_writer(directory: &FaultingDirectory, path: &Path) -> io::Result<WritePtr> {
+fn open_writer(directory: &impl Directory, path: &Path) -> io::Result<WritePtr> {
 	directory
 		.open_write(path)
 		.map_err(|error| io::Error::other(error.to_string()))
