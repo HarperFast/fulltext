@@ -7,8 +7,7 @@ export interface PackedFieldConfig {
 	weight: number;
 }
 
-export interface PackedOpenConfig {
-	path: string;
+export interface PackedEngineConfig {
 	indexId: string;
 	generation: string;
 	fields: PackedFieldConfig[];
@@ -23,6 +22,22 @@ export interface PackedOpenConfig {
 		maxQueuedCommands: number;
 		maxQueuedBytes: number;
 		maxBatchBytes: number;
+	};
+}
+
+export interface PackedOpenConfig extends PackedEngineConfig {
+	path: string;
+}
+
+export interface PackedHostOpenConfig extends PackedEngineConfig {
+	storeIdentity: readonly [bigint, bigint, bigint];
+	namespace: Uint8Array;
+	transport: {
+		maxOperations: number;
+		maxBytes: number;
+		readTimeoutMs: number;
+		maxReadResponseBytes: number;
+		maxControlResponseBytes: number;
 	};
 }
 
@@ -44,6 +59,25 @@ export function encodeOpen(config: PackedOpenConfig): Buffer {
 	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER);
 	writer.header('FTOP');
 	writer.string(config.path);
+	encodeEngine(writer, config);
+	return writer.finish();
+}
+
+export function encodeHostOpen(config: PackedHostOpenConfig): Buffer {
+	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER);
+	writer.header('FTHO');
+	for (const identity of config.storeIdentity) writer.u64BigInt(identity, 'storeIdentity');
+	writer.byteString(config.namespace);
+	writer.u32(config.transport.maxOperations, 'transport.maxOperations');
+	writer.u64(config.transport.maxBytes, 'transport.maxBytes');
+	writer.u64(config.transport.readTimeoutMs, 'transport.readTimeoutMs');
+	writer.u64(config.transport.maxReadResponseBytes, 'transport.maxReadResponseBytes');
+	writer.u64(config.transport.maxControlResponseBytes, 'transport.maxControlResponseBytes');
+	encodeEngine(writer, config);
+	return writer.finish();
+}
+
+function encodeEngine(writer: ByteWriter, config: PackedEngineConfig): void {
 	writer.string(config.indexId);
 	writer.string(config.generation);
 	writer.string(config.analyzer);
@@ -61,7 +95,6 @@ export function encodeOpen(config: PackedOpenConfig): Buffer {
 	writer.u32(config.limits.maxQueuedCommands, 'limits.maxQueuedCommands');
 	writer.u64(config.limits.maxQueuedBytes, 'limits.maxQueuedBytes');
 	writer.u64(config.limits.maxBatchBytes, 'limits.maxBatchBytes');
-	return writer.finish();
 }
 
 export function encodeBatch(batch: PackedMutationBatch, maxBytes: number): Buffer {
@@ -226,6 +259,15 @@ class ByteWriter {
 		this.bytes(buffer);
 	}
 
+	u64BigInt(value: bigint, name: string): void {
+		if (typeof value !== 'bigint' || value < 0n || value > 0xffff_ffff_ffff_ffffn) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `${name} is outside its packed integer range`);
+		}
+		const buffer = Buffer.allocUnsafe(8);
+		buffer.writeBigUInt64LE(value);
+		this.bytes(buffer);
+	}
+
 	f32(value: number, name: string): void {
 		if (!Number.isFinite(value) || value <= 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', `${name} must be finite and greater than zero`);
@@ -241,6 +283,15 @@ class ByteWriter {
 		}
 		const bytes = Buffer.from(value, 'utf8');
 		this.u32(bytes.length, 'string byte length');
+		this.bytes(bytes);
+	}
+
+	byteString(value: Uint8Array): void {
+		if (!(value instanceof Uint8Array)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'packed byte string values must be Uint8Array instances');
+		}
+		const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+		this.u32(bytes.length, 'byte string length');
 		this.bytes(bytes);
 	}
 

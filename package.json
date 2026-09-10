@@ -7,6 +7,10 @@
 		"./native": {
 			"types": "./dist/native.d.ts",
 			"import": "./dist/native.js"
+		},
+		"./harper": {
+			"types": "./dist/harper.d.ts",
+			"import": "./dist/harper.js"
 		}
 	},
 	"files": [
@@ -29,8 +33,8 @@
 	},
 	"scripts": {
 		"build": "npm run build:typescript && npm run build:native",
-		"build:debug": "npm run build:typescript && napi build --platform --js false --dts ts/addon.d.ts --features node-api",
-		"build:native": "napi build --platform --js false --dts ts/addon.d.ts --release --features node-api",
+		"build:debug": "npm run build:typescript && napi build --platform --js false --dts ts/addon.d.ts --features host-storage",
+		"build:native": "napi build --platform --js false --dts ts/addon.d.ts --release --features host-storage",
 		"build:test-native": "napi build --platform --js false --dts ts/addon.d.ts --features test-panic",
 		"build:typescript": "tsc -p tsconfig.json",
 		"benchmark:native": "npm run build && node benchmarks/native.mjs",

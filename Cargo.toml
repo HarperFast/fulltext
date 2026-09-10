@@ -19,7 +19,8 @@ required-features = ["phase0"]
 default = []
 node-api = ["dep:napi", "dep:napi-derive"]
 phase0 = ["dep:async-trait", "dep:stable_deref_trait"]
-test-panic = ["node-api", "phase0"]
+host-storage = ["node-api", "phase0"]
+test-panic = ["host-storage"]
 
 [dependencies]
 async-trait = { version = "=0.1.92", optional = true }

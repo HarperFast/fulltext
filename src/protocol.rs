@@ -22,7 +22,6 @@ pub struct Limits {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineConfig {
-	pub path: String,
 	pub index_id: String,
 	pub generation: String,
 	pub fields: Vec<FieldConfig>,
@@ -31,6 +30,24 @@ pub struct EngineConfig {
 	pub positions: bool,
 	pub surface_terms: bool,
 	pub limits: Limits,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeOpenConfig {
+	pub path: String,
+	pub engine: EngineConfig,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostOpenConfig {
+	pub engine: EngineConfig,
+	pub store_identity: (u64, u64, u64),
+	pub namespace: Vec<u8>,
+	pub max_operations: usize,
+	pub max_transport_bytes: usize,
+	pub read_timeout: std::time::Duration,
+	pub max_read_response_bytes: usize,
+	pub max_control_response_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,9 +78,57 @@ pub struct SearchRequest {
 	pub exact_total: bool,
 }
 
-pub fn decode_open(bytes: &[u8]) -> Result<EngineConfig> {
+pub fn decode_open(bytes: &[u8]) -> Result<NativeOpenConfig> {
 	let mut cursor = Cursor::new(bytes, *b"FTOP")?;
 	let path = cursor.string()?;
+	let engine = decode_engine_config(&mut cursor)?;
+	cursor.finish()?;
+	if path.is_empty() {
+		return Err(FulltextError::invalid("path must not be empty"));
+	}
+	Ok(NativeOpenConfig { path, engine })
+}
+
+pub fn decode_host_open(bytes: &[u8]) -> Result<HostOpenConfig> {
+	let mut cursor = Cursor::new(bytes, *b"FTHO")?;
+	let store_identity = (cursor.u64()?, cursor.u64()?, cursor.u64()?);
+	if store_identity == (0, 0, 0) {
+		return Err(FulltextError::invalid("store identity must not be all zero"));
+	}
+	let namespace = cursor.bytes()?.to_vec();
+	if namespace.is_empty() {
+		return Err(FulltextError::invalid("namespace must not be empty"));
+	}
+	let max_operations = cursor.u32()? as usize;
+	let max_transport_bytes = cursor.u64_usize()?;
+	let read_timeout_ms = cursor.u64()?;
+	let max_read_response_bytes = cursor.u64_usize()?;
+	let max_control_response_bytes = cursor.u64_usize()?;
+	let engine = decode_engine_config(&mut cursor)?;
+	cursor.finish()?;
+	if max_operations == 0
+		|| max_transport_bytes == 0
+		|| read_timeout_ms == 0
+		|| max_read_response_bytes == 0
+		|| max_control_response_bytes == 0
+	{
+		return Err(FulltextError::invalid(
+			"host transport limits must be greater than zero",
+		));
+	}
+	Ok(HostOpenConfig {
+		engine,
+		store_identity,
+		namespace,
+		max_operations,
+		max_transport_bytes,
+		read_timeout: std::time::Duration::from_millis(read_timeout_ms),
+		max_read_response_bytes,
+		max_control_response_bytes,
+	})
+}
+
+fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
 	let index_id = cursor.string()?;
 	let generation = cursor.string()?;
 	let analyzer = cursor.string()?;
@@ -93,9 +158,7 @@ pub fn decode_open(bytes: &[u8]) -> Result<EngineConfig> {
 		max_queued_bytes: cursor.u64_usize()?,
 		max_batch_bytes: cursor.u64_usize()?,
 	};
-	cursor.finish()?;
 	validate_config(EngineConfig {
-		path,
 		index_id,
 		generation,
 		fields,
@@ -215,10 +278,8 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 }
 
 fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
-	if config.path.is_empty() || config.index_id.is_empty() || config.generation.is_empty() {
-		return Err(FulltextError::invalid(
-			"path, indexId, and generation must not be empty",
-		));
+	if config.index_id.is_empty() || config.generation.is_empty() {
+		return Err(FulltextError::invalid("indexId and generation must not be empty"));
 	}
 	if config.index_id.len() > 4_096 || config.generation.len() > 4_096 {
 		return Err(FulltextError::invalid(
@@ -315,11 +376,23 @@ impl<'a> Cursor<'a> {
 	}
 
 	fn u64_usize(&mut self) -> Result<usize> {
-		let bytes = self.take(8)?;
-		let value = u64::from_le_bytes([
-			bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-		]);
+		let value = self.u64()?;
 		usize::try_from(value).map_err(|_| FulltextError::invalid("numeric limit exceeds usize"))
+	}
+
+	fn u64(&mut self) -> Result<u64> {
+		let bytes = self.take(8)?;
+		Ok(u64::from_le_bytes([
+			bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+		]))
+	}
+
+	fn bytes(&mut self) -> Result<&'a [u8]> {
+		let length = self.u32()? as usize;
+		if length > MAX_STRING_BYTES {
+			return Err(FulltextError::invalid("packed byte string exceeds 1 MiB"));
+		}
+		self.take(length)
 	}
 
 	fn f32(&mut self) -> Result<f32> {
@@ -328,11 +401,7 @@ impl<'a> Cursor<'a> {
 	}
 
 	fn string(&mut self) -> Result<String> {
-		let length = self.u32()? as usize;
-		if length > MAX_STRING_BYTES {
-			return Err(FulltextError::invalid("packed string exceeds 1 MiB"));
-		}
-		let bytes = self.take(length)?;
+		let bytes = self.bytes()?;
 		String::from_utf8(bytes.to_vec()).map_err(|_| FulltextError::invalid("packed string is not valid UTF-8"))
 	}
 

@@ -1,5 +1,6 @@
 import { FulltextError, normalizeNativeError } from './errors.js';
-import { Cursor, decodeResponse, encodeBatch, encodeOpen, encodeSearch } from './codec.js';
+import { decodeResponse, encodeBatch, encodeOpen, encodeSearch } from './codec.js';
+import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
 
 export { FulltextError } from './errors.js';
@@ -9,7 +10,7 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	storageBackends: ReadonlyArray<'native'>;
+	storageBackends: ReadonlyArray<'native' | 'harper'>;
 }
 
 export interface NativeFullTextIndexOptions {
@@ -217,27 +218,11 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			storageBackends: ['native'],
+			storageBackends: ['native', 'harper'],
 		};
 	} catch (error) {
 		throw normalizeNativeError(error);
 	}
-}
-
-function invoke(start: (callback: (response: Buffer) => void) => void): Promise<Cursor> {
-	return new Promise((resolve, reject) => {
-		try {
-			start((response) => {
-				try {
-					resolve(decodeResponse(response));
-				} catch (error) {
-					reject(normalizeNativeError(error));
-				}
-			});
-		} catch (error) {
-			reject(normalizeNativeError(error));
-		}
-	});
 }
 
 function asBuffer(value: Uint8Array): Buffer {

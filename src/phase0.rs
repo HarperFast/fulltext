@@ -93,6 +93,7 @@ pub trait KvStore: Clone + Send + Sync + 'static {
 
 pub(crate) const CHUNK_SIZE: usize = 256 * 1024;
 
+#[cfg(any(test, feature = "test-panic"))]
 pub(crate) fn reclaim_read_key_bytes(namespace: &[u8]) -> usize {
 	// Tail objects have the longest key read by reclamation.
 	tail_key(namespace, u64::MAX, u64::MAX).len()

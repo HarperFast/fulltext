@@ -6,6 +6,8 @@ import { createHostStorageHandler } from '../dist/host-storage.js';
 import { loadAddon } from '../dist/load-addon.js';
 
 const addon = loadAddon();
+const openHostTransport = addon.__testOpenHostTransport.bind(addon);
+addon.__testOpenHostTransport = (handler, ...limits) => openHostTransport(dispatchHostStorage(handler), ...limits);
 const readResponseBytes = 1024 * 1024;
 const controlResponseBytes = 64 * 1024;
 
@@ -186,6 +188,30 @@ test('close wakes a request waiting indefinitely for foreground admission', asyn
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.strictEqual(addon.__testCloseHostTransport(handle), true);
 	await assert.rejects(waiting, /host storage transport is closed/);
+});
+
+test('close fences a host callback already queued for JavaScript', async () => {
+	let calls = 0;
+	const handle = addon.__testOpenHostTransport(
+		(request) => {
+			calls++;
+			return request;
+		},
+		1,
+		1_024,
+		1_000,
+	);
+	const pending = roundTrip(handle, Buffer.from('queued'), 128, false);
+	const pause = new Int32Array(new SharedArrayBuffer(4));
+	const deadline = performance.now() + 1_000;
+	while (addon.__testHostTransportStats(handle)[0] !== '1') {
+		if (performance.now() >= deadline) throw new Error('request was not admitted');
+		Atomics.wait(pause, 0, 0, 1);
+	}
+	assert.strictEqual(addon.__testCloseHostTransport(handle), true);
+	await assert.rejects(pending, /host storage transport is closed/);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.strictEqual(calls, 0);
 });
 
 test('invalid callback responses fail the request without terminating the process', async (context) => {
@@ -444,4 +470,16 @@ function decodeHandlerError(response) {
 	assert.strictEqual(response[1], 1);
 	const length = response.readUInt32LE(2);
 	return response.subarray(6, 6 + length).toString();
+}
+
+function dispatchHostStorage(handler) {
+	return (dispatch) => {
+		const requestId = dispatch.readBigUInt64LE().toString();
+		if (!addon.__hostStorageBegin(requestId)) return;
+		try {
+			addon.__hostStorageComplete(requestId, handler(dispatch.subarray(8)));
+		} catch (error) {
+			addon.__hostStorageFail(requestId, error instanceof Error ? error.message : String(error));
+		}
+	};
 }
