@@ -4,7 +4,7 @@ use std::io;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -262,10 +262,46 @@ pub struct KvDirectory<S> {
 pub type FaultingDirectory = KvDirectory<FaultingKv>;
 
 struct DirectoryState {
-	mutation: Mutex<()>,
+	allocator: Mutex<ObjectIdAllocator>,
+	paths: Arc<PathRegistry>,
+	reclaim_shards: [Mutex<()>; RECLAIM_SHARD_COUNT],
 	locks: Mutex<DirectoryLocks>,
 	locks_changed: Condvar,
 	watches: WatchCallbackList,
+}
+
+#[derive(Default)]
+struct ObjectIdAllocator {
+	next: u64,
+	remaining: u64,
+}
+
+#[derive(Default)]
+struct PathRegistry {
+	states: Mutex<HashMap<PathBuf, Weak<PathState>>>,
+}
+
+struct PathState {
+	path: PathBuf,
+	registry: Weak<PathRegistry>,
+	lifecycle: Mutex<PathLifecycle>,
+}
+
+#[derive(Default)]
+struct PathLifecycle {
+	writer: Option<Weak<WriterFence>>,
+}
+
+struct WriterFence {
+	object_id: u64,
+	retired: AtomicBool,
+	in_flight: AtomicUsize,
+	waiting: Mutex<()>,
+	idle: Condvar,
+}
+
+struct WriterClaim<'a> {
+	fence: &'a WriterFence,
 }
 
 #[derive(Default)]
@@ -282,6 +318,106 @@ struct DirectoryIdentity {
 }
 
 static DIRECTORY_STATES: OnceLock<Mutex<HashMap<DirectoryIdentity, Weak<DirectoryState>>>> = OnceLock::new();
+
+impl PathRegistry {
+	fn state(self: &Arc<Self>, path: &Path) -> Arc<PathState> {
+		let mut states = self.states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		if let Some(state) = states.get(path).and_then(Weak::upgrade) {
+			return state;
+		}
+		let state = Arc::new(PathState {
+			path: path.to_path_buf(),
+			registry: Arc::downgrade(self),
+			lifecycle: Mutex::new(PathLifecycle::default()),
+		});
+		states.insert(path.to_path_buf(), Arc::downgrade(&state));
+		state
+	}
+}
+
+impl Drop for PathState {
+	fn drop(&mut self) {
+		let Some(registry) = self.registry.upgrade() else {
+			return;
+		};
+		let mut states = registry.states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		if states
+			.get(&self.path)
+			.is_some_and(|state| std::ptr::eq(state.as_ptr(), self))
+		{
+			states.remove(&self.path);
+		}
+	}
+}
+
+impl WriterFence {
+	fn new(object_id: u64) -> Self {
+		Self {
+			object_id,
+			retired: AtomicBool::new(false),
+			in_flight: AtomicUsize::new(0),
+			waiting: Mutex::new(()),
+			idle: Condvar::new(),
+		}
+	}
+
+	fn claim(&self) -> io::Result<WriterClaim<'_>> {
+		self.claim_after_first_check(|| {})
+	}
+
+	fn claim_after_first_check(&self, after_first_check: impl FnOnce()) -> io::Result<WriterClaim<'_>> {
+		if self.retired.load(Ordering::SeqCst) {
+			return Err(writer_retired_error());
+		}
+		after_first_check();
+		let previous = self.in_flight.fetch_add(1, Ordering::SeqCst);
+		if previous == usize::MAX {
+			self.in_flight.fetch_sub(1, Ordering::SeqCst);
+			return Err(io::Error::other("writer in-flight count exhausted"));
+		}
+		if self.retired.load(Ordering::SeqCst) {
+			self.release();
+			return Err(writer_retired_error());
+		}
+		Ok(WriterClaim { fence: self })
+	}
+
+	fn retire_and_wait(&self) {
+		self.retired.store(true, Ordering::SeqCst);
+		let mut waiting = self.waiting.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		while self.in_flight.load(Ordering::SeqCst) != 0 {
+			waiting = self.idle.wait(waiting).unwrap_or_else(|poisoned| poisoned.into_inner());
+		}
+	}
+
+	fn reactivate(&self) {
+		self.retired.store(false, Ordering::SeqCst);
+	}
+
+	fn release(&self) {
+		if self.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 && self.retired.load(Ordering::SeqCst) {
+			let _waiting = self.waiting.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+			self.idle.notify_all();
+		}
+	}
+}
+
+impl Drop for WriterClaim<'_> {
+	fn drop(&mut self) {
+		self.fence.release();
+	}
+}
+
+fn writer_retired_error() -> io::Error {
+	io::Error::new(io::ErrorKind::NotFound, "file was deleted while its writer was open")
+}
+
+fn delete_io_error(path: &Path, error: io::Error) -> DeleteError {
+	DeleteError::IoError {
+		io_error: Arc::new(error),
+		filepath: path.to_path_buf(),
+	}
+}
 
 struct FormatValidation {
 	state: AtomicU8,
@@ -324,7 +460,9 @@ impl<S: KvStore> KvDirectory<S> {
 		states.retain(|_, state| state.strong_count() != 0);
 		let state = states.get(&identity).and_then(Weak::upgrade).unwrap_or_else(|| {
 			let state = Arc::new(DirectoryState {
-				mutation: Mutex::new(()),
+				allocator: Mutex::new(ObjectIdAllocator::default()),
+				paths: Arc::new(PathRegistry::default()),
+				reclaim_shards: std::array::from_fn(|_| Mutex::new(())),
 				locks: Mutex::new(DirectoryLocks::default()),
 				locks_changed: Condvar::new(),
 				watches: WatchCallbackList::default(),
@@ -368,6 +506,68 @@ impl<S: KvStore> KvDirectory<S> {
 			.map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))?
 			.ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_path_buf()))?;
 		decode_binding(&bytes).map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))
+	}
+
+	fn allocate_object_id(&self) -> io::Result<u64> {
+		let mut allocator = self
+			.state
+			.allocator
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		if allocator.remaining != 0 {
+			let object_id = allocator.next;
+			allocator.next = allocator.next.wrapping_add(1);
+			allocator.remaining -= 1;
+			return Ok(object_id);
+		}
+		let previous = self
+			.store
+			.read(&counter_key(&self.namespace))?
+			.map(|bytes| decode_u64(&bytes))
+			.transpose()?
+			.unwrap_or(0);
+		let available = u64::MAX - previous;
+		if available == 0 {
+			return Err(io::Error::other("object id exhausted"));
+		}
+		let reserved = available.min(OBJECT_ID_RESERVATION_STRIDE);
+		let object_id = previous + 1;
+		let reserved_through = previous + reserved;
+		self.store.write(
+			&[Mutation::Put(
+				counter_key(&self.namespace),
+				reserved_through.to_be_bytes().to_vec(),
+			)],
+			WritePolicy::WAL,
+		)?;
+		allocator.next = object_id.wrapping_add(1);
+		allocator.remaining = reserved - 1;
+		Ok(object_id)
+	}
+
+	fn reclaim_enqueue_mutations(&self, binding: &Binding) -> io::Result<Vec<Mutation>> {
+		let shard = reclaim_shard(binding.object_id);
+		let tail_key = reclaim_tail_key(&self.namespace, shard);
+		let sequence = self
+			.store
+			.read(&tail_key)?
+			.map(|bytes| decode_u64(&bytes))
+			.transpose()?
+			.unwrap_or(0);
+		let entry_key = reclaim_entry_key(&self.namespace, shard, sequence);
+		if self.store.read(&entry_key)?.is_some() {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"reclaim queue tail references an occupied entry",
+			));
+		}
+		let next = sequence
+			.checked_add(1)
+			.ok_or_else(|| io::Error::other("reclaim queue sequence exhausted"))?;
+		Ok(vec![
+			Mutation::Put(entry_key, encode_reclaim_entry(&ReclaimEntry::from_binding(binding))?),
+			Mutation::Put(tail_key, next.to_be_bytes().to_vec()),
+		])
 	}
 }
 
@@ -512,42 +712,101 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 	}
 
 	fn delete(&self, path: &Path) -> Result<(), DeleteError> {
-		self.ensure_format(false).map_err(|error| DeleteError::IoError {
-			io_error: Arc::new(error),
-			filepath: path.to_path_buf(),
-		})?;
-		let _mutation = self
-			.state
-			.mutation
+		self.ensure_format(false)
+			.map_err(|error| delete_io_error(path, error))?;
+		let path_state = self.state.paths.state(path);
+		let mut lifecycle = path_state
+			.lifecycle
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner());
-		let binding = binding_key(&self.namespace, path);
-		let atomic = atomic_key(&self.namespace, path);
-		if self
+		let binding_key = binding_key(&self.namespace, path);
+		let atomic_key = atomic_key(&self.namespace, path);
+		let initial_binding = self
 			.store
-			.read(&binding)
-			.map_err(|error| DeleteError::IoError {
-				io_error: Arc::new(error),
-				filepath: path.to_path_buf(),
-			})?
-			.is_none()
-			&& self
-				.store
-				.read(&atomic)
-				.map_err(|error| DeleteError::IoError {
-					io_error: Arc::new(error),
-					filepath: path.to_path_buf(),
-				})?
-				.is_none()
-		{
+			.read(&binding_key)
+			.map_err(|error| delete_io_error(path, error))?;
+		let atomic = self
+			.store
+			.read(&atomic_key)
+			.map_err(|error| delete_io_error(path, error))?;
+		if initial_binding.is_none() && atomic.is_none() {
 			return Err(DeleteError::FileDoesNotExist(path.to_path_buf()));
 		}
-		self.store
-			.write(&[Mutation::Delete(binding), Mutation::Delete(atomic)], WritePolicy::WAL)
-			.map_err(|error| DeleteError::IoError {
-				io_error: Arc::new(error),
-				filepath: path.to_path_buf(),
-			})
+		let Some(initial_binding) = initial_binding else {
+			return self
+				.store
+				.write(&[Mutation::Delete(atomic_key)], WritePolicy::WAL)
+				.map_err(|error| delete_io_error(path, error));
+		};
+		let initial = decode_binding(&initial_binding).map_err(|error| delete_io_error(path, error))?;
+		let fence = lifecycle
+			.writer
+			.as_ref()
+			.and_then(Weak::upgrade)
+			.filter(|fence| fence.object_id == initial.object_id);
+		if let Some(fence) = &fence {
+			fence.retire_and_wait();
+		}
+		let final_bytes = if fence.is_none() {
+			initial_binding
+		} else {
+			match self.store.read(&binding_key) {
+				Ok(Some(binding)) => binding,
+				Ok(None) => {
+					return Err(delete_io_error(
+						path,
+						io::Error::other("file binding disappeared during deletion"),
+					));
+				}
+				Err(error) => {
+					if let Some(fence) = &fence {
+						fence.reactivate();
+					}
+					return Err(delete_io_error(path, error));
+				}
+			}
+		};
+		let final_binding = decode_binding(&final_bytes).map_err(|error| delete_io_error(path, error))?;
+		if final_binding.object_id != initial.object_id {
+			return Err(delete_io_error(
+				path,
+				io::Error::new(io::ErrorKind::InvalidData, "file binding changed during deletion"),
+			));
+		}
+		let shard = reclaim_shard(final_binding.object_id);
+		let _queue = self.state.reclaim_shards[usize::from(shard)]
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let mut mutations = match self.reclaim_enqueue_mutations(&final_binding) {
+			Ok(mutations) => mutations,
+			Err(error) => {
+				if let Some(fence) = &fence {
+					fence.reactivate();
+				}
+				return Err(delete_io_error(path, error));
+			}
+		};
+		mutations.push(Mutation::Delete(binding_key.clone()));
+		mutations.push(Mutation::Delete(atomic_key));
+		match self.store.write(&mutations, WritePolicy::WAL) {
+			Ok(()) => {
+				lifecycle.writer = None;
+				Ok(())
+			}
+			Err(error) => match self.store.read(&binding_key) {
+				Ok(None) => {
+					lifecycle.writer = None;
+					Ok(())
+				}
+				Ok(Some(current)) if current.as_slice() == final_bytes.as_slice() => {
+					if let Some(fence) = &fence {
+						fence.reactivate();
+					}
+					Err(delete_io_error(path, error))
+				}
+				Ok(Some(_)) | Err(_) => Err(delete_io_error(path, error)),
+			},
+		}
 	}
 
 	fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
@@ -566,9 +825,9 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 	}
 
 	fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-		let _mutation = self
-			.state
-			.mutation
+		let path_state = self.state.paths.state(path);
+		let mut lifecycle = path_state
+			.lifecycle
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		self.ensure_format(true)
@@ -587,17 +846,9 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 		{
 			return Err(OpenWriteError::FileAlreadyExists(path.to_path_buf()));
 		}
-		let counter = self
-			.store
-			.read(&counter_key(&self.namespace))
-			.map_err(|error| OpenWriteError::wrap_io_error(error, path.to_path_buf()))?
-			.map(|bytes| decode_u64(&bytes))
-			.transpose()
-			.map_err(|error| OpenWriteError::wrap_io_error(error, path.to_path_buf()))?
-			.unwrap_or(0);
-		let object_id = counter.checked_add(1).ok_or_else(|| {
-			OpenWriteError::wrap_io_error(io::Error::other("object id exhausted"), path.to_path_buf())
-		})?;
+		let object_id = self
+			.allocate_object_id()
+			.map_err(|error| OpenWriteError::wrap_io_error(error, path.to_path_buf()))?;
 		let binding = Binding {
 			object_id,
 			full_chunks: 0,
@@ -608,17 +859,16 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 			tail_high_water: 0,
 		};
 		self.store
-			.write(
-				&[
-					Mutation::Put(counter_key(&self.namespace), object_id.to_be_bytes().to_vec()),
-					Mutation::Put(key, encode_binding(&binding)),
-				],
-				WritePolicy::WAL,
-			)
+			.write(&[Mutation::Put(key, encode_binding(&binding))], WritePolicy::WAL)
 			.map_err(|error| OpenWriteError::wrap_io_error(error, path.to_path_buf()))?;
+		let fence = Arc::new(WriterFence::new(object_id));
+		lifecycle.writer = Some(Arc::downgrade(&fence));
+		drop(lifecycle);
 		Ok(std::io::BufWriter::new(Box::new(KvWriter {
 			store: self.store.clone(),
-			state: self.state.clone(),
+			_state: self.state.clone(),
+			_path_state: path_state,
+			fence,
 			namespace: self.namespace.clone(),
 			path: path.to_path_buf(),
 			binding,
@@ -641,9 +891,9 @@ impl<S: KvStore> Directory for KvDirectory<S> {
 
 	fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
 		{
-			let _mutation = self
-				.state
-				.mutation
+			let path_state = self.state.paths.state(path);
+			let _lifecycle = path_state
+				.lifecycle
 				.lock()
 				.unwrap_or_else(|poisoned| poisoned.into_inner());
 			self.ensure_format(true)?;
@@ -757,7 +1007,9 @@ fn remove_waiter(locks: &mut DirectoryLocks, path: &Path, ticket: u64) {
 
 struct KvWriter<S> {
 	store: S,
-	state: Arc<DirectoryState>,
+	_state: Arc<DirectoryState>,
+	_path_state: Arc<PathState>,
+	fence: Arc<WriterFence>,
 	namespace: Arc<[u8]>,
 	path: PathBuf,
 	binding: Binding,
@@ -772,6 +1024,8 @@ impl<S: KvStore> Write for KvWriter<S> {
 		if bytes.is_empty() {
 			return Ok(0);
 		}
+		let fence = self.fence.clone();
+		let _claim = fence.claim()?;
 		self.reconcile_pending_publication()?;
 		self.stage_full_tail()?;
 		let accepted = bytes.len().min(CHUNK_SIZE - self.tail.len());
@@ -784,13 +1038,13 @@ impl<S: KvStore> Write for KvWriter<S> {
 	}
 
 	fn flush(&mut self) -> io::Result<()> {
+		let fence = self.fence.clone();
+		let _claim = fence.claim()?;
 		self.reconcile_pending_publication()?;
 		if !self.dirty {
 			return Ok(());
 		}
 		self.stage_full_tail()?;
-		let state = self.state.clone();
-		let _mutation = state.mutation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		let current = self.current_binding()?;
 		let expected = self.next_binding()?;
 		if current == expected {
@@ -826,8 +1080,6 @@ impl<S: KvStore> KvWriter<S> {
 		let Some(pending) = self.pending_publication.clone() else {
 			return Ok(());
 		};
-		let state = self.state.clone();
-		let _mutation = state.mutation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		let current = self.current_binding()?;
 		if current == pending {
 			self.finish_flush(pending);
@@ -935,8 +1187,6 @@ impl<S: KvStore> KvWriter<S> {
 		if chunk < self.binding.chunk_high_water {
 			return Ok(());
 		}
-		let state = self.state.clone();
-		let _mutation = state.mutation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		let current = self.current_binding()?;
 		self.adopt_high_waters(&current)?;
 		if chunk < self.binding.chunk_high_water {
@@ -1002,6 +1252,23 @@ impl Binding {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReclaimEntry {
+	object_id: u64,
+	chunk_high_water: u32,
+	tail_high_water: u64,
+}
+
+impl ReclaimEntry {
+	fn from_binding(binding: &Binding) -> Self {
+		Self {
+			object_id: binding.object_id,
+			chunk_high_water: binding.chunk_high_water,
+			tail_high_water: binding.tail_high_water,
+		}
+	}
+}
+
 fn counter_key(namespace: &[u8]) -> Vec<u8> {
 	namespaced_prefix(namespace, KEY_KIND_COUNTER)
 }
@@ -1017,12 +1284,18 @@ fn atomic_key(namespace: &[u8], path: &Path) -> Vec<u8> {
 const KEY_FORMAT_VERSION: u8 = 2;
 const BINDING_FORMAT_VERSION: u8 = 3;
 const CHUNK_RESERVATION_STRIDE: u32 = 64;
+const OBJECT_ID_RESERVATION_STRIDE: u64 = 1_024;
 const MAX_OBJECT_EXTENT_BYTES: u128 = 1 << 40;
+const RECLAIM_ENTRY_FORMAT_VERSION: u8 = 1;
+const RECLAIM_ENTRY_WHOLE_OBJECT: u8 = 1;
+const RECLAIM_SHARD_COUNT: usize = 64;
 const KEY_KIND_COUNTER: u8 = 1;
 const KEY_KIND_BINDING: u8 = 2;
 const KEY_KIND_ATOMIC: u8 = 3;
 const KEY_KIND_CHUNK: u8 = 4;
 const KEY_KIND_TAIL: u8 = 5;
+const KEY_KIND_RECLAIM_TAIL: u8 = 7;
+const KEY_KIND_RECLAIM_ENTRY: u8 = 8;
 const KEY_PREFIX: &[u8; 4] = b"HFTK";
 const FORMAT_MARKER_PREFIX: &[u8; 4] = b"HFTM";
 const FORMAT_UNKNOWN: u8 = 0;
@@ -1128,6 +1401,23 @@ fn tail_key(namespace: &[u8], object_id: u64, revision: u64) -> Vec<u8> {
 	key
 }
 
+fn reclaim_tail_key(namespace: &[u8], shard: u8) -> Vec<u8> {
+	let mut key = namespaced_prefix_with_capacity(namespace, KEY_KIND_RECLAIM_TAIL, 1);
+	key.push(shard);
+	key
+}
+
+fn reclaim_entry_key(namespace: &[u8], shard: u8, sequence: u64) -> Vec<u8> {
+	let mut key = namespaced_prefix_with_capacity(namespace, KEY_KIND_RECLAIM_ENTRY, 9);
+	key.push(shard);
+	key.extend_from_slice(&sequence.to_be_bytes());
+	key
+}
+
+fn reclaim_shard(object_id: u64) -> u8 {
+	(object_id % RECLAIM_SHARD_COUNT as u64) as u8
+}
+
 fn encode_binding(binding: &Binding) -> Vec<u8> {
 	let mut bytes = Vec::with_capacity(45);
 	bytes.push(BINDING_FORMAT_VERSION);
@@ -1139,6 +1429,63 @@ fn encode_binding(binding: &Binding) -> Vec<u8> {
 	bytes.extend_from_slice(&binding.chunk_high_water.to_be_bytes());
 	bytes.extend_from_slice(&binding.tail_high_water.to_be_bytes());
 	bytes
+}
+
+fn encode_reclaim_entry(entry: &ReclaimEntry) -> io::Result<Vec<u8>> {
+	validate_physical_extent(entry.chunk_high_water, entry.tail_high_water, "reclaim entry")?;
+	if entry.object_id == 0 {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			"reclaim entry has an invalid object id",
+		));
+	}
+	let mut bytes = Vec::with_capacity(22);
+	bytes.push(RECLAIM_ENTRY_FORMAT_VERSION);
+	bytes.push(RECLAIM_ENTRY_WHOLE_OBJECT);
+	bytes.extend_from_slice(&entry.object_id.to_be_bytes());
+	bytes.extend_from_slice(&entry.chunk_high_water.to_be_bytes());
+	bytes.extend_from_slice(&entry.tail_high_water.to_be_bytes());
+	Ok(bytes)
+}
+
+#[cfg(test)]
+fn decode_reclaim_entry(bytes: &[u8]) -> io::Result<ReclaimEntry> {
+	if bytes.first().copied() != Some(RECLAIM_ENTRY_FORMAT_VERSION) {
+		let version = bytes.first().copied().unwrap_or(0);
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("unsupported reclaim entry format version {version}"),
+		));
+	}
+	if bytes.len() < 2 {
+		return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed reclaim entry"));
+	}
+	if bytes[1] != RECLAIM_ENTRY_WHOLE_OBJECT {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("unsupported reclaim entry kind {}", bytes[1]),
+		));
+	}
+	if bytes.len() != 22 {
+		return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed reclaim entry"));
+	}
+	let entry = ReclaimEntry {
+		object_id: decode_u64(&bytes[2..10])?,
+		chunk_high_water: u32::from_be_bytes(
+			bytes[10..14]
+				.try_into()
+				.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid reclaim chunk high-water"))?,
+		),
+		tail_high_water: decode_u64(&bytes[14..22])?,
+	};
+	validate_physical_extent(entry.chunk_high_water, entry.tail_high_water, "reclaim entry")?;
+	if entry.object_id == 0 {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			"reclaim entry has an invalid object id",
+		));
+	}
+	Ok(entry)
 }
 
 fn decode_binding(bytes: &[u8]) -> io::Result<Binding> {
@@ -1196,12 +1543,16 @@ fn validate_binding(binding: &Binding) -> io::Result<()> {
 			"binding high-water is below published state",
 		));
 	}
-	let possible_extent = binding.chunk_high_water as u128 * CHUNK_SIZE as u128
-		+ binding.tail_high_water as u128 * (CHUNK_SIZE - 1) as u128;
+	validate_physical_extent(binding.chunk_high_water, binding.tail_high_water, "binding")
+}
+
+fn validate_physical_extent(chunk_high_water: u32, tail_high_water: u64, subject: &str) -> io::Result<()> {
+	let possible_extent =
+		chunk_high_water as u128 * CHUNK_SIZE as u128 + tail_high_water as u128 * (CHUNK_SIZE - 1) as u128;
 	if possible_extent > MAX_OBJECT_EXTENT_BYTES {
 		return Err(io::Error::new(
 			io::ErrorKind::InvalidData,
-			"binding physical extent exceeds the format limit",
+			format!("{subject} physical extent exceeds the format limit"),
 		));
 	}
 	Ok(())
@@ -1231,6 +1582,19 @@ mod tests {
 	struct FixedIdentityKv {
 		inner: FaultingKv,
 		identity: KvStoreIdentity,
+	}
+
+	#[derive(Clone)]
+	struct BlockingKv {
+		inner: FaultingKv,
+		block: Arc<(Mutex<BlockState>, Condvar)>,
+	}
+
+	#[derive(Default)]
+	struct BlockState {
+		armed: bool,
+		entered: bool,
+		released: bool,
 	}
 
 	impl CountingKv {
@@ -1295,6 +1659,81 @@ mod tests {
 		}
 	}
 
+	impl BlockingKv {
+		fn new() -> Self {
+			Self {
+				inner: FaultingKv::default(),
+				block: Arc::new((Mutex::new(BlockState::default()), Condvar::new())),
+			}
+		}
+
+		fn arm_next_write(&self) {
+			let (state, _) = &*self.block;
+			let mut state = state.lock().unwrap();
+			state.armed = true;
+			state.entered = false;
+			state.released = false;
+		}
+
+		fn wait_until_blocked(&self) -> bool {
+			let (state, changed) = &*self.block;
+			let deadline = Instant::now() + Duration::from_secs(5);
+			let mut state = state.lock().unwrap();
+			while !state.entered {
+				let remaining = deadline.saturating_duration_since(Instant::now());
+				if remaining.is_zero() {
+					state.released = true;
+					changed.notify_all();
+					return false;
+				}
+				let (next, timeout) = changed.wait_timeout(state, remaining).unwrap();
+				state = next;
+				if timeout.timed_out() && !state.entered {
+					state.released = true;
+					changed.notify_all();
+					return false;
+				}
+			}
+			true
+		}
+
+		fn release_write(&self) {
+			let (state, changed) = &*self.block;
+			let mut state = state.lock().unwrap();
+			state.released = true;
+			changed.notify_all();
+		}
+	}
+
+	impl KvStore for BlockingKv {
+		fn identity(&self) -> KvStoreIdentity {
+			self.inner.identity()
+		}
+
+		fn read(&self, key: &[u8]) -> io::Result<Option<OwnedBytes>> {
+			KvStore::read(&self.inner, key)
+		}
+
+		fn write(&self, mutations: &[Mutation], policy: WritePolicy) -> io::Result<()> {
+			let (state, changed) = &*self.block;
+			let mut state = state.lock().unwrap();
+			if state.armed {
+				state.armed = false;
+				state.entered = true;
+				changed.notify_all();
+				while !state.released {
+					state = changed.wait(state).unwrap();
+				}
+			}
+			drop(state);
+			KvStore::write(&self.inner, mutations, policy)
+		}
+
+		fn sync(&self) -> io::Result<()> {
+			KvStore::sync(&self.inner)
+		}
+	}
+
 	fn put(key: &[u8], value: &[u8]) -> Mutation {
 		Mutation::Put(key.to_vec(), value.to_vec())
 	}
@@ -1333,6 +1772,30 @@ mod tests {
 			visible_length: 0,
 			chunk_high_water: 0,
 			tail_high_water: 0,
+		}
+	}
+
+	fn test_writer<S: KvStore>(directory: &KvDirectory<S>, binding: Binding) -> KvWriter<S> {
+		let path = PathBuf::from("segment");
+		let path_state = directory.state.paths.state(&path);
+		let fence = Arc::new(WriterFence::new(binding.object_id));
+		path_state
+			.lifecycle
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.writer = Some(Arc::downgrade(&fence));
+		KvWriter {
+			store: directory.store.clone(),
+			_state: directory.state.clone(),
+			_path_state: path_state,
+			fence,
+			namespace: directory.namespace.clone(),
+			path,
+			binding,
+			tail: Vec::new(),
+			staged_full_chunks: 0,
+			dirty: false,
+			pending_publication: None,
 		}
 	}
 
@@ -1390,6 +1853,93 @@ mod tests {
 			}
 			assert_object_keys_within_high_water(&recovered, namespace, path, 1);
 		}
+	}
+
+	fn wait_for_retirement(fence: &WriterFence) -> bool {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			if fence.retired.load(Ordering::SeqCst) {
+				return true;
+			}
+			if Instant::now() >= deadline {
+				return false;
+			}
+			std::thread::sleep(Duration::from_millis(1));
+		}
+	}
+
+	fn assert_reclamation_inventory(store: &FaultingKv, namespace: &[u8]) {
+		let state = store.state.lock().unwrap();
+		let binding_prefix = namespaced_prefix(namespace, KEY_KIND_BINDING);
+		let entry_prefix = namespaced_prefix(namespace, KEY_KIND_RECLAIM_ENTRY);
+		let chunk_prefix = namespaced_prefix(namespace, KEY_KIND_CHUNK);
+		let tail_prefix = namespaced_prefix(namespace, KEY_KIND_TAIL);
+		let mut live = HashMap::new();
+		let mut retired = HashMap::new();
+		for (key, value) in &state.visible {
+			let Some(value) = &value.value else {
+				continue;
+			};
+			if key.starts_with(&binding_prefix) {
+				let binding = decode_binding(value).unwrap();
+				assert!(live.insert(binding.object_id, binding).is_none());
+			} else if key.starts_with(&entry_prefix) {
+				let entry = decode_reclaim_entry(value).unwrap();
+				assert!(retired.insert(entry.object_id, entry).is_none());
+			}
+		}
+		for object_id in live.keys() {
+			assert!(
+				!retired.contains_key(object_id),
+				"live object was queued for reclamation"
+			);
+		}
+		for (key, value) in &state.visible {
+			if value.value.is_none() {
+				continue;
+			}
+			if let Some(suffix) = key.strip_prefix(chunk_prefix.as_slice()) {
+				let object_id = decode_u64(&suffix[..8]).unwrap();
+				let chunk = u32::from_be_bytes(suffix[8..].try_into().unwrap());
+				if let Some(binding) = live.get(&object_id) {
+					assert!(chunk < binding.chunk_high_water);
+				} else {
+					assert!(
+						chunk
+							< retired
+								.get(&object_id)
+								.expect("unreachable chunk was not queued")
+								.chunk_high_water
+					);
+				}
+			} else if let Some(suffix) = key.strip_prefix(tail_prefix.as_slice()) {
+				let object_id = decode_u64(&suffix[..8]).unwrap();
+				let revision = decode_u64(&suffix[8..]).unwrap();
+				if let Some(binding) = live.get(&object_id) {
+					assert!(revision <= binding.tail_high_water);
+				} else {
+					assert!(
+						revision
+							<= retired
+								.get(&object_id)
+								.expect("unreachable tail was not queued")
+								.tail_high_water
+					);
+				}
+			}
+		}
+	}
+
+	fn reclaim_entry_count(store: &FaultingKv, namespace: &[u8]) -> usize {
+		let prefix = namespaced_prefix(namespace, KEY_KIND_RECLAIM_ENTRY);
+		store
+			.state
+			.lock()
+			.unwrap()
+			.visible
+			.iter()
+			.filter(|(key, value)| key.starts_with(&prefix) && value.value.is_some())
+			.count()
 	}
 
 	#[test]
@@ -1540,6 +2090,394 @@ mod tests {
 	}
 
 	#[test]
+	fn deletion_enqueues_the_whole_object_extent() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(&vec![7; CHUNK_SIZE * 2 + 17]).unwrap();
+		writer.write_all(b" second").unwrap();
+		writer.flush().unwrap();
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", Path::new("segment"))).unwrap()).unwrap();
+
+		directory.delete(Path::new("segment")).unwrap();
+
+		let shard = reclaim_shard(binding.object_id);
+		assert_eq!(
+			decode_u64(&store.get(&reclaim_tail_key(b"phase0", shard)).unwrap()).unwrap(),
+			1
+		);
+		assert_eq!(
+			decode_reclaim_entry(&store.get(&reclaim_entry_key(b"phase0", shard, 0)).unwrap()).unwrap(),
+			ReclaimEntry::from_binding(&binding)
+		);
+		assert_eq!(binding.chunk_high_water, CHUNK_RESERVATION_STRIDE);
+		assert_eq!(store.get(&binding_key(b"phase0", Path::new("segment"))), None);
+		assert!(store.get(&chunk_key(b"phase0", binding.object_id, 0)).is_some());
+		assert!(store.get(&chunk_key(b"phase0", binding.object_id, 1)).is_some());
+		assert!(store
+			.get(&tail_key(b"phase0", binding.object_id, binding.tail_revision))
+			.is_some());
+		assert_reclamation_inventory(&store, b"phase0");
+	}
+
+	#[test]
+	fn applied_but_reported_failed_delete_is_not_enqueued_twice() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(b"contents").unwrap();
+		writer.flush().unwrap();
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", Path::new("segment"))).unwrap()).unwrap();
+		let shard = reclaim_shard(binding.object_id);
+
+		store.fail_after_next_write();
+		directory.delete(Path::new("segment")).unwrap();
+		assert!(matches!(
+			directory.delete(Path::new("segment")),
+			Err(DeleteError::FileDoesNotExist(_))
+		));
+		assert_eq!(
+			decode_u64(&store.get(&reclaim_tail_key(b"phase0", shard)).unwrap()).unwrap(),
+			1
+		);
+		assert!(store.get(&reclaim_entry_key(b"phase0", shard, 0)).is_some());
+		assert!(store.get(&reclaim_entry_key(b"phase0", shard, 1)).is_none());
+	}
+
+	#[test]
+	fn failed_delete_reactivates_its_writer() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(b"first").unwrap();
+		writer.flush().unwrap();
+
+		store.fail_next_write();
+		assert!(directory.delete(Path::new("segment")).is_err());
+		writer.write_all(b" second").unwrap();
+		writer.flush().unwrap();
+		assert_eq!(
+			directory
+				.open_read(Path::new("segment"))
+				.unwrap()
+				.read_bytes()
+				.unwrap()
+				.as_slice(),
+			b"first second"
+		);
+	}
+
+	#[test]
+	fn atomic_only_deletion_does_not_enqueue_reclamation() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		directory.atomic_write(Path::new("meta.json"), b"metadata").unwrap();
+
+		directory.delete(Path::new("meta.json")).unwrap();
+
+		let state = store.state.lock().unwrap();
+		assert!(!state.visible.iter().any(|(key, value)| {
+			value.value.is_some()
+				&& (key.starts_with(&namespaced_prefix(b"phase0", KEY_KIND_RECLAIM_TAIL))
+					|| key.starts_with(&namespaced_prefix(b"phase0", KEY_KIND_RECLAIM_ENTRY)))
+		}));
+	}
+
+	#[test]
+	fn occupied_reclaim_slot_fails_without_retiring_the_writer() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(b"first").unwrap();
+		writer.flush().unwrap();
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", Path::new("segment"))).unwrap()).unwrap();
+		let shard = reclaim_shard(binding.object_id);
+		store
+			.write(
+				&[Mutation::Put(
+					reclaim_entry_key(b"phase0", shard, 0),
+					encode_reclaim_entry(&ReclaimEntry::from_binding(&binding)).unwrap(),
+				)],
+				WritePolicy::WAL,
+			)
+			.unwrap();
+
+		assert!(directory.delete(Path::new("segment")).is_err());
+		writer.write_all(b" second").unwrap();
+		writer.flush().unwrap();
+	}
+
+	#[test]
+	fn malformed_reclaim_tail_fails_without_retiring_the_writer() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(b"first").unwrap();
+		writer.flush().unwrap();
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", Path::new("segment"))).unwrap()).unwrap();
+		store
+			.write(
+				&[Mutation::Put(
+					reclaim_tail_key(b"phase0", reclaim_shard(binding.object_id)),
+					vec![1],
+				)],
+				WritePolicy::WAL,
+			)
+			.unwrap();
+
+		let error = directory.delete(Path::new("segment")).unwrap_err();
+		assert!(error.to_string().contains("invalid u64"));
+		writer.write_all(b" second").unwrap();
+		writer.flush().unwrap();
+	}
+
+	#[test]
+	fn delete_uses_bounded_point_io() {
+		let store = CountingKv::new();
+		let directory = KvDirectory::new(store.clone());
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(b"contents").unwrap();
+		writer.flush().unwrap();
+		store.take_io_counts();
+
+		directory.delete(Path::new("segment")).unwrap();
+
+		assert_eq!(store.take_io_counts(), (5, 1, 4));
+	}
+
+	#[test]
+	fn closed_writer_delete_skips_the_fence_reread() {
+		let store = CountingKv::new();
+		let directory = KvDirectory::new(store.clone());
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(b"contents").unwrap();
+		writer.flush().unwrap();
+		drop(writer);
+		store.take_io_counts();
+
+		directory.delete(Path::new("segment")).unwrap();
+
+		assert_eq!(store.take_io_counts(), (4, 1, 4));
+	}
+
+	#[test]
+	fn object_ids_are_reserved_in_strides() {
+		let store = CountingKv::new();
+		let directory = KvDirectory::new(store.clone());
+		let first = directory.open_write(Path::new("first")).unwrap();
+		assert_eq!(
+			decode_u64(&store.inner.get(&counter_key(b"phase0")).unwrap()).unwrap(),
+			OBJECT_ID_RESERVATION_STRIDE
+		);
+		store.take_io_counts();
+		let second = directory.open_write(Path::new("second")).unwrap();
+		assert_eq!(store.take_io_counts(), (2, 1, 1));
+		assert_eq!(
+			decode_binding(&store.inner.get(&binding_key(b"phase0", Path::new("second"))).unwrap())
+				.unwrap()
+				.object_id,
+			2
+		);
+		drop((first, second));
+	}
+
+	#[test]
+	fn live_writer_keeps_shared_directory_state_discoverable() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let state = Arc::downgrade(&directory.state);
+		let mut writer = directory.open_write(Path::new("segment")).unwrap();
+		writer.write_all(b"pending").unwrap();
+		drop(directory);
+
+		let reopened = FaultingDirectory::new(store);
+		assert!(Arc::ptr_eq(&state.upgrade().unwrap(), &reopened.state));
+		reopened.delete(Path::new("segment")).unwrap();
+		assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::NotFound);
+	}
+
+	#[test]
+	fn writer_claim_rechecks_retirement_after_registering_in_flight() {
+		let fence = Arc::new(WriterFence::new(1));
+		let (checked, reached_check) = std::sync::mpsc::channel();
+		let (resume, may_resume) = std::sync::mpsc::channel();
+		let claiming_fence = fence.clone();
+		let claiming = std::thread::spawn(move || {
+			claiming_fence
+				.claim_after_first_check(|| {
+					checked.send(()).unwrap();
+					may_resume.recv().unwrap();
+				})
+				.map(drop)
+		});
+		reached_check.recv().unwrap();
+		fence.retire_and_wait();
+		resume.send(()).unwrap();
+
+		assert_eq!(claiming.join().unwrap().unwrap_err().kind(), io::ErrorKind::NotFound);
+		assert_eq!(fence.in_flight.load(Ordering::SeqCst), 0);
+	}
+
+	#[test]
+	fn active_writer_release_does_not_take_the_retirement_mutex() {
+		let fence = Arc::new(WriterFence::new(1));
+		let waiting = fence.waiting.lock().unwrap();
+		let releasing_fence = fence.clone();
+		let (completed, completion) = std::sync::mpsc::channel();
+		let releasing = std::thread::spawn(move || {
+			drop(releasing_fence.claim().unwrap());
+			completed.send(()).unwrap();
+		});
+
+		completion
+			.recv_timeout(Duration::from_secs(5))
+			.expect("active writer release took the retirement mutex");
+		drop(waiting);
+		releasing.join().unwrap();
+	}
+
+	#[test]
+	fn delete_waits_for_in_flight_writer_storage() {
+		for iteration in 0..32 {
+			let store = BlockingKv::new();
+			let directory = KvDirectory::new(store.clone());
+			let path = PathBuf::from(format!("segment-{iteration}"));
+			let mut writer = directory.open_write(&path).unwrap();
+			let path_state = directory.state.paths.state(&path);
+			let fence = path_state
+				.lifecycle
+				.lock()
+				.unwrap_or_else(|poisoned| poisoned.into_inner())
+				.writer
+				.as_ref()
+				.and_then(Weak::upgrade)
+				.unwrap();
+			writer.write_all(b"contents").unwrap();
+			store.arm_next_write();
+			let helper_store = store.clone();
+			let deleting_directory = directory.clone();
+			let deleting_path = path.clone();
+			let helper = std::thread::spawn(move || {
+				assert!(
+					helper_store.wait_until_blocked(),
+					"write did not reach the test barrier"
+				);
+				let deletion = std::thread::spawn(move || deleting_directory.delete(&deleting_path));
+				let retired = wait_for_retirement(&fence);
+				helper_store.release_write();
+				let deletion = deletion.join().unwrap();
+				assert!(retired, "delete did not retire the writer");
+				deletion
+			});
+			writer.flush().unwrap();
+			helper.join().unwrap().unwrap();
+			assert_reclamation_inventory(&store.inner, b"phase0");
+			assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::NotFound);
+		}
+	}
+
+	#[test]
+	fn delete_waits_for_in_flight_chunk_storage() {
+		let store = BlockingKv::new();
+		let directory = KvDirectory::new(store.clone());
+		directory.ensure_format(true).unwrap();
+		let binding = empty_binding();
+		store
+			.write(
+				&[Mutation::Put(
+					binding_key(b"phase0", Path::new("segment")),
+					encode_binding(&binding),
+				)],
+				WritePolicy::WAL,
+			)
+			.unwrap();
+		let mut writer = test_writer(&directory, binding);
+		writer.tail = vec![7; CHUNK_SIZE];
+		writer.dirty = true;
+		let fence = writer.fence.clone();
+		store.arm_next_write();
+		let helper_store = store.clone();
+		let deleting_directory = directory.clone();
+		let helper = std::thread::spawn(move || {
+			assert!(
+				helper_store.wait_until_blocked(),
+				"write did not reach the test barrier"
+			);
+			let deletion = std::thread::spawn(move || deleting_directory.delete(Path::new("segment")));
+			let retired = wait_for_retirement(&fence);
+			helper_store.release_write();
+			let deletion = deletion.join().unwrap();
+			assert!(retired, "delete did not retire the writer");
+			deletion
+		});
+
+		writer.flush().unwrap();
+		helper.join().unwrap().unwrap();
+		assert!(store.inner.get(&chunk_key(b"phase0", 1, 0)).is_some());
+		assert_reclamation_inventory(&store.inner, b"phase0");
+	}
+
+	#[test]
+	fn different_reclaim_shards_enqueue_concurrently() {
+		let store = BlockingKv::new();
+		let directory = KvDirectory::new(store.clone());
+		let mut first = directory.open_write(Path::new("first")).unwrap();
+		let mut second = directory.open_write(Path::new("second")).unwrap();
+		first.write_all(b"first").unwrap();
+		first.flush().unwrap();
+		second.write_all(b"second").unwrap();
+		second.flush().unwrap();
+		let first_binding =
+			decode_binding(&store.inner.get(&binding_key(b"phase0", Path::new("first"))).unwrap()).unwrap();
+		let second_binding =
+			decode_binding(&store.inner.get(&binding_key(b"phase0", Path::new("second"))).unwrap()).unwrap();
+		assert_ne!(
+			reclaim_shard(first_binding.object_id),
+			reclaim_shard(second_binding.object_id)
+		);
+		store.arm_next_write();
+
+		let first_directory = directory.clone();
+		let first_delete = std::thread::spawn(move || first_directory.delete(Path::new("first")));
+		assert!(store.wait_until_blocked(), "write did not reach the test barrier");
+		let second_directory = directory.clone();
+		let (sent, received) = std::sync::mpsc::channel();
+		let second_delete = std::thread::spawn(move || {
+			sent.send(second_directory.delete(Path::new("second"))).unwrap();
+		});
+		let second_result = received.recv_timeout(Duration::from_secs(5));
+		store.release_write();
+		first_delete.join().unwrap().unwrap();
+		second_delete.join().unwrap();
+		second_result.expect("different reclaim shard was serialized").unwrap();
+	}
+
+	#[test]
+	fn persisted_reclaim_tail_is_read_after_directory_reopen() {
+		let store = FaultingKv::default();
+		let first_directory = FaultingDirectory::new(store.clone());
+		let first = first_directory.open_write(Path::new("first")).unwrap();
+		let first_binding = decode_binding(&store.get(&binding_key(b"phase0", Path::new("first"))).unwrap()).unwrap();
+		first_directory.delete(Path::new("first")).unwrap();
+		drop((first, first_directory));
+
+		let second_directory = FaultingDirectory::new(store.clone());
+		let second = second_directory.open_write(Path::new("second")).unwrap();
+		let binding = decode_binding(&store.get(&binding_key(b"phase0", Path::new("second"))).unwrap()).unwrap();
+		let shard = reclaim_shard(binding.object_id);
+		assert_eq!(reclaim_shard(first_binding.object_id), shard);
+		second_directory.delete(Path::new("second")).unwrap();
+		drop(second);
+
+		assert_eq!(
+			decode_u64(&store.get(&reclaim_tail_key(b"phase0", shard)).unwrap()).unwrap(),
+			2
+		);
+		assert!(store.get(&reclaim_entry_key(b"phase0", shard, 0)).is_some());
+		assert!(store.get(&reclaim_entry_key(b"phase0", shard, 1)).is_some());
+	}
+
+	#[test]
 	fn failed_writer_flush_can_be_retried_without_losing_bytes() {
 		let store = FaultingKv::default();
 		let directory = FaultingDirectory::new(store.clone());
@@ -1585,6 +2523,8 @@ mod tests {
 		let second = binding_key(b"a/binding/b", Path::new("x"));
 		assert_ne!(first, second);
 		assert_ne!(binding_key(b"a", Path::new("x")), atomic_key(b"a", Path::new("x")));
+		assert_ne!(reclaim_tail_key(b"a", 1), reclaim_entry_key(b"a", 1, 0));
+		assert_ne!(reclaim_tail_key(b"a", 1), reclaim_tail_key(b"a\0", 1));
 	}
 
 	#[test]
@@ -1980,17 +2920,9 @@ mod tests {
 				WritePolicy::WAL,
 			)
 			.unwrap();
-		let mut writer = KvWriter {
-			store: store.clone(),
-			state: directory.state.clone(),
-			namespace: directory.namespace.clone(),
-			path: PathBuf::from("segment"),
-			binding,
-			tail: vec![7; CHUNK_SIZE],
-			staged_full_chunks: 0,
-			dirty: true,
-			pending_publication: None,
-		};
+		let mut writer = test_writer(&directory, binding);
+		writer.tail = vec![7; CHUNK_SIZE];
+		writer.dirty = true;
 
 		store.fail_after_next_write();
 		assert!(writer.flush().is_err());
@@ -2019,17 +2951,7 @@ mod tests {
 				WritePolicy::WAL,
 			)
 			.unwrap();
-		let mut writer = KvWriter {
-			store,
-			state: directory.state.clone(),
-			namespace: directory.namespace.clone(),
-			path: PathBuf::from("segment"),
-			binding,
-			tail: Vec::new(),
-			staged_full_chunks: 0,
-			dirty: false,
-			pending_publication: None,
-		};
+		let mut writer = test_writer(&directory, binding);
 		let prefix = vec![1; CHUNK_SIZE - 4_096];
 		let suffix = vec![2; 8_192];
 		assert_eq!(writer.write(&prefix).unwrap(), prefix.len());
@@ -2055,6 +2977,45 @@ mod tests {
 		let error = decode_binding(&[BINDING_FORMAT_VERSION; 20]).unwrap_err();
 		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 		assert_eq!(error.to_string(), "malformed binding");
+	}
+
+	#[test]
+	fn reclaim_entries_round_trip_and_enforce_the_extent_limit() {
+		let entry = ReclaimEntry {
+			object_id: 17,
+			chunk_high_water: 7,
+			tail_high_water: 11,
+		};
+		assert_eq!(
+			decode_reclaim_entry(&encode_reclaim_entry(&entry).unwrap()).unwrap(),
+			entry
+		);
+		let error = encode_reclaim_entry(&ReclaimEntry {
+			object_id: 17,
+			chunk_high_water: u32::MAX,
+			tail_high_water: u64::MAX,
+		})
+		.unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert!(error.to_string().contains("extent"));
+		assert_eq!(
+			decode_reclaim_entry(&[RECLAIM_ENTRY_FORMAT_VERSION, RECLAIM_ENTRY_WHOLE_OBJECT])
+				.unwrap_err()
+				.kind(),
+			io::ErrorKind::InvalidData
+		);
+		let mut zero_id = encode_reclaim_entry(&entry).unwrap();
+		zero_id[2..10].fill(0);
+		assert!(decode_reclaim_entry(&zero_id)
+			.unwrap_err()
+			.to_string()
+			.contains("object id"));
+		let mut unknown_kind = encode_reclaim_entry(&entry).unwrap();
+		unknown_kind[1] = RECLAIM_ENTRY_WHOLE_OBJECT + 1;
+		assert!(decode_reclaim_entry(&unknown_kind)
+			.unwrap_err()
+			.to_string()
+			.contains("unsupported reclaim entry kind"));
 	}
 
 	#[test]
@@ -2086,13 +3047,46 @@ mod tests {
 	fn directory_supports_a_real_tantivy_lifecycle_and_crash_reopen() {
 		let store = FaultingKv::default();
 		verify_tantivy_lifecycle(FaultingDirectory::new(store.clone())).unwrap();
-		let reopened = tantivy::Index::open(FaultingDirectory::new(store.crash())).unwrap();
+		assert_reclamation_inventory(&store, b"phase0");
+		let recovered = store.crash();
+		assert_reclamation_inventory(&recovered, b"phase0");
+		let reopened = tantivy::Index::open(FaultingDirectory::new(recovered)).unwrap();
 		assert_eq!(reopened.searchable_segment_ids().unwrap().len(), 1);
 		reopened
 			.writer::<tantivy::TantivyDocument>(15_000_000)
 			.unwrap()
 			.wait_merging_threads()
 			.unwrap();
+	}
+
+	#[test]
+	fn tantivy_merge_enqueues_garbage_collection_and_recovers_it_atomically() {
+		let store = FaultingKv::default();
+		let directory = FaultingDirectory::new(store.clone());
+		let mut schema = tantivy::schema::Schema::builder();
+		let body = schema.add_text_field("body", tantivy::schema::TEXT);
+		let index =
+			tantivy::Index::create(directory.clone(), schema.build(), tantivy::IndexSettings::default()).unwrap();
+		let mut writer = index.writer(15_000_000).unwrap();
+		writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		writer.add_document(tantivy::doc!(body => "first segment")).unwrap();
+		writer.commit().unwrap();
+		writer.add_document(tantivy::doc!(body => "second segment")).unwrap();
+		writer.commit().unwrap();
+		let segments = index.searchable_segment_ids().unwrap();
+		assert_eq!(segments.len(), 2);
+
+		writer.merge(&segments).wait().unwrap();
+		writer.garbage_collect_files().wait().unwrap();
+
+		assert!(reclaim_entry_count(&store, b"phase0") > 0);
+		assert_reclamation_inventory(&store, b"phase0");
+		directory
+			.atomic_write(Path::new("test-durability-barrier"), b"complete")
+			.unwrap();
+		let recovered = store.crash();
+		assert!(reclaim_entry_count(&recovered, b"phase0") > 0);
+		assert_reclamation_inventory(&recovered, b"phase0");
 	}
 
 	#[test]

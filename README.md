@@ -86,6 +86,7 @@ npm test
 npm run lint
 npm run format:check
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000
+npm run benchmark:kv-directory -- --revision candidate
 ```
 
 The benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
@@ -95,6 +96,16 @@ index bytes, and periodically sampled process RSS. `--commit-every` sets the tar
 durability points; it materially affects throughput and peak memory because replacement-safe
 upserts include delete terms. CI runs only the correctness smoke profile; timing comparisons
 require controlled hardware.
+
+The `kv-directory` benchmark measures the caller-visible buffered write path, empty and dirty
+flushes, 256 KiB chunk publication, closed- and active-writer deletion, and distinct-file
+concurrency at one, two, four, and eight threads. It reports percentiles across per-sample mean
+latencies and uses the deterministic in-memory Phase 0 store to isolate directory coordination from
+RocksDB and Node transport costs. That store serializes access, so the concurrency cases detect
+coordination regressions but do not predict RocksDB scaling. Compare two optimized builds on the
+same quiet host; records include the Git revision and dirty state, while `--revision` can add a run
+label and `--samples` and `--warmup` control the run. CI executes only `--smoke`, whose timings are
+not comparable to a full run, and applies no timing threshold.
 
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.

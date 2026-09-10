@@ -10,6 +10,11 @@ repository = "https://github.com/HarperFast/fulltext"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bench]]
+name = "kv_directory"
+harness = false
+required-features = ["phase0"]
+
 [features]
 default = []
 node-api = ["dep:napi", "dep:napi-derive"]
