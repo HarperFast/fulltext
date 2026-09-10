@@ -120,13 +120,12 @@ impl HostTransport {
 				max_operations,
 				|context: ThreadSafeCallContext<HostDispatch>| {
 					let request = registered_transport(context.value.transport_id)
-						.and_then(|transport| transport.take_request(context.value.request_id))
+						.and_then(|transport| transport.begin(context.value.request_id))
 						.unwrap_or_default();
-					Ok(vec![
-						Buffer::from(context.value.transport_id.to_le_bytes().to_vec()),
-						Buffer::from(context.value.request_id.to_le_bytes().to_vec()),
-						Buffer::from(request),
-					])
+					let mut dispatch_id = Vec::with_capacity(16);
+					dispatch_id.extend_from_slice(&context.value.transport_id.to_le_bytes());
+					dispatch_id.extend_from_slice(&context.value.request_id.to_le_bytes());
+					Ok(vec![Buffer::from(dispatch_id), Buffer::from(request)])
 				},
 			)
 			.map_err(|error| napi::Error::new("E_NATIVE_FAILURE", error.to_string()))?;
@@ -298,28 +297,18 @@ impl HostTransport {
 		Ok(())
 	}
 
-	fn take_request(&self, request_id: u64) -> Option<Vec<u8>> {
-		self.state
-			.lock()
-			.unwrap_or_else(|poisoned| poisoned.into_inner())
-			.pending
-			.get_mut(&request_id)
-			.and_then(|pending| pending.request.take())
-	}
-
-	fn begin(&self, request_id: u64) -> bool {
+	fn begin(&self, request_id: u64) -> Option<Vec<u8>> {
 		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		if state.closed.is_some() {
-			return false;
+			return None;
 		}
-		let Some(pending) = state.pending.get_mut(&request_id) else {
-			return false;
-		};
+		let pending = state.pending.get_mut(&request_id)?;
 		if pending.entered {
-			return false;
+			return None;
 		}
+		let request = pending.request.take()?;
 		pending.entered = true;
-		true
+		Some(request)
 	}
 
 	fn has_capacity(&self, state: &TransportState, retained_bytes: usize, class: AdmissionClass) -> io::Result<bool> {
@@ -390,11 +379,11 @@ impl HostTransport {
 		}
 	}
 
-	fn complete(&self, request_id: u64, result: io::Result<Vec<u8>>) {
+	fn complete(&self, request_id: u64, result: io::Result<Vec<u8>>) -> bool {
 		let response = {
 			let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 			let Some(pending) = state.pending.remove(&request_id) else {
-				return;
+				return false;
 			};
 			let cleanup_underflow = pending.class == AdmissionClass::Cleanup
 				&& (state.cleanup_operations == 0 || state.cleanup_bytes < pending.retained_bytes);
@@ -416,7 +405,7 @@ impl HostTransport {
 						response.complete(Err(error()));
 					}
 				}
-				return;
+				return true;
 			}
 			let response = pending.response.upgrade();
 			state.operations -= 1;
@@ -431,6 +420,7 @@ impl HostTransport {
 		if let Some(response) = response {
 			response.complete(result);
 		}
+		true
 	}
 
 	fn response_budget(&self, request_id: u64) -> Option<usize> {
@@ -535,57 +525,47 @@ fn response_bytes(value: JsUnknown, max_bytes: usize) -> io::Result<Vec<u8>> {
 	Ok(buffer.as_ref().to_vec())
 }
 
+// These internal exports fence lifecycle but do not authenticate callers; the package trusts process-local JavaScript.
 #[napi(catch_unwind, skip_typescript, js_name = "__hostStorageComplete")]
-pub fn host_storage_complete(transport_id: Buffer, request_id: Buffer, response: JsUnknown) -> boundary::Result<bool> {
+pub fn host_storage_complete(dispatch_id: Buffer, response: JsUnknown) -> boundary::Result<bool> {
 	boundary::run_stateless(|| {
-		let transport_id = parse_id(&transport_id)?;
-		let request_id = parse_id(&request_id)?;
+		let (transport_id, request_id) = parse_dispatch_id(&dispatch_id)?;
 		let Some(transport) = registered_transport(transport_id) else {
 			return Ok(false);
 		};
 		let Some(response_budget) = transport.response_budget(request_id) else {
 			return Ok(false);
 		};
-		transport.complete(request_id, response_bytes(response, response_budget));
-		Ok(true)
-	})?
-}
-
-#[napi(catch_unwind, skip_typescript, js_name = "__hostStorageBegin")]
-pub fn host_storage_begin(transport_id: Buffer, request_id: Buffer) -> boundary::Result<bool> {
-	boundary::run_stateless(|| {
-		let transport_id = parse_id(&transport_id)?;
-		let request_id = parse_id(&request_id)?;
-		Ok(registered_transport(transport_id).is_some_and(|transport| transport.begin(request_id)))
+		Ok(transport.complete(request_id, response_bytes(response, response_budget)))
 	})?
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__hostStorageFail")]
-pub fn host_storage_fail(transport_id: Buffer, request_id: Buffer, message: String) -> boundary::Result<bool> {
+pub fn host_storage_fail(dispatch_id: Buffer, message: String) -> boundary::Result<bool> {
 	boundary::run_stateless(|| {
-		let transport_id = parse_id(&transport_id)?;
-		let request_id = parse_id(&request_id)?;
+		let (transport_id, request_id) = parse_dispatch_id(&dispatch_id)?;
 		let Some(transport) = registered_transport(transport_id) else {
 			return Ok(false);
 		};
-		if transport.response_budget(request_id).is_none() {
-			return Ok(false);
-		}
 		let mut end = message.len().min(4_096);
 		while !message.is_char_boundary(end) {
 			end -= 1;
 		}
 		let message = &message[..end];
-		transport.complete(request_id, Err(io::Error::other(message.to_owned())));
-		Ok(true)
+		Ok(transport.complete(request_id, Err(io::Error::other(message.to_owned()))))
 	})?
 }
 
-fn parse_id(id: &[u8]) -> boundary::Result<u64> {
-	let bytes: [u8; 8] = id
-		.try_into()
-		.map_err(|_| napi::Error::new("E_INVALID_ARGUMENT", "host storage id must contain eight bytes"))?;
-	Ok(u64::from_le_bytes(bytes))
+fn parse_dispatch_id(id: &[u8]) -> boundary::Result<(u64, u64)> {
+	if id.len() != 16 {
+		return Err(napi::Error::new(
+			"E_INVALID_ARGUMENT",
+			"host storage dispatch id must contain sixteen bytes",
+		));
+	}
+	let transport_id = u64::from_le_bytes(id[..8].try_into().expect("dispatch id length checked"));
+	let request_id = u64::from_le_bytes(id[8..].try_into().expect("dispatch id length checked"));
+	Ok((transport_id, request_id))
 }
 
 fn next_id(counter: &AtomicU64, name: &str) -> io::Result<u64> {

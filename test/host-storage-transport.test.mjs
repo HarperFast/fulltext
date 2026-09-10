@@ -473,12 +473,15 @@ function decodeHandlerError(response) {
 }
 
 function dispatchHostStorage(handler) {
-	return (transportId, requestId, request) => {
+	return (dispatchId, request) => {
 		try {
-			if (!addon.__hostStorageBegin(transportId, requestId)) return;
-			addon.__hostStorageComplete(transportId, requestId, handler(request));
+			addon.__hostStorageComplete(dispatchId, handler(request));
 		} catch (error) {
-			addon.__hostStorageFail(transportId, requestId, error instanceof Error ? error.message : String(error));
+			try {
+				addon.__hostStorageFail(dispatchId, error instanceof Error ? error.message : String(error));
+			} catch {
+				// Transport teardown resolves any request that cannot be failed here.
+			}
 		}
 	};
 }

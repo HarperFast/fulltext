@@ -78,6 +78,7 @@ export class HarperFullTextIndex {
 	readonly #index: NativeFullTextIndex;
 	readonly #storageGate: StorageGate;
 	#committedPayload?: string;
+	#payloadKnown = true;
 	#nextPublishSequence = 0n;
 	#publishedSequence = 0n;
 
@@ -89,6 +90,9 @@ export class HarperFullTextIndex {
 	}
 
 	get committedPayload(): string | undefined {
+		if (!this.#payloadKnown) {
+			throw new FulltextError('E_POISONED', 'committed payload is unknown until the index is reopened');
+		}
 		return this.#committedPayload;
 	}
 
@@ -102,7 +106,17 @@ export class HarperFullTextIndex {
 			throw new FulltextError('E_INVALID_ARGUMENT', `commit payload exceeds ${maxCommitPayloadBytes} UTF-8 bytes`);
 		}
 		const sequence = ++this.#nextPublishSequence;
-		const cursor = await invoke((callback) => loadAddon().__harperPublish(this.#handle, payload, callback));
+		let cursor;
+		try {
+			cursor = await invoke((callback) => loadAddon().__harperPublish(this.#handle, payload, callback));
+		} catch (error) {
+			try {
+				this.#payloadKnown = this.#index.status().state !== 'poisoned';
+			} catch {
+				this.#payloadKnown = false;
+			}
+			throw error;
+		}
 		const opstamp = cursor.u64();
 		cursor.finish();
 		if (sequence > this.#publishedSequence) {
@@ -188,15 +202,17 @@ function validateSynchronousStorage(storage: HostStorage): void {
 	}
 }
 
-function createStorageDispatcher(
-	handler: (request: Buffer) => Buffer,
-): (transportId: Buffer, requestId: Buffer, request: Buffer) => void {
-	return (transportId, requestId, request) => {
+function createStorageDispatcher(handler: (request: Buffer) => Buffer): (dispatchId: Buffer, request: Buffer) => void {
+	const addon = loadAddon();
+	return (dispatchId, request) => {
 		try {
-			if (!loadAddon().__hostStorageBegin(transportId, requestId)) return;
-			loadAddon().__hostStorageComplete(transportId, requestId, handler(request));
+			addon.__hostStorageComplete(dispatchId, handler(request));
 		} catch (error) {
-			loadAddon().__hostStorageFail(transportId, requestId, error instanceof Error ? error.message : String(error));
+			try {
+				addon.__hostStorageFail(dispatchId, error instanceof Error ? error.message : String(error));
+			} catch {
+				// Transport teardown resolves any request that cannot be failed here.
+			}
 		}
 	};
 }

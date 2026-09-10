@@ -275,12 +275,13 @@ pub fn harper_publish(handle: u32, payload: String, callback: JsFunction) -> bou
 		}
 		let runtime = runtime(handle)?;
 		let completion = completion(callback, runtime.environment.alive.clone())?;
+		let bytes = payload.len();
 		runtime.enqueue_writer(
 			WriterCommand {
 				operation: WriterOperation::Publish(payload),
 				completion,
 			},
-			0,
+			bytes,
 		)
 	})?
 }
@@ -483,7 +484,7 @@ impl Runtime {
 			}
 		}
 		if let Some(close) = close {
-			let _ = self.writer_queue.push_force(close, 0);
+			let _ = self.writer_queue.push_force(close.force_rollback(), 0);
 		}
 		for command in self.search_queue.close() {
 			command.value.completion.failure(error.clone());
@@ -684,6 +685,12 @@ impl Drop for Completion {
 impl WriterCommand {
 	fn fail(self, error: FulltextError) {
 		self.completion.failure(error);
+	}
+
+	fn force_rollback(mut self) -> Self {
+		debug_assert!(matches!(self.operation, WriterOperation::Close { .. }));
+		self.operation = WriterOperation::Close { rollback: true };
+		self
 	}
 }
 

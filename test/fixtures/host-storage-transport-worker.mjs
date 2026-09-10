@@ -4,9 +4,8 @@ import { loadAddon } from '../../dist/load-addon.js';
 
 const addon = loadAddon();
 const handle = addon.__testOpenHostTransport(
-	(transportId, requestId, request) => {
-		if (!addon.__hostStorageBegin(transportId, requestId)) return;
-		addon.__hostStorageComplete(transportId, requestId, request);
+	(dispatchId, request) => {
+		addon.__hostStorageComplete(dispatchId, request);
 	},
 	2,
 	1_024,

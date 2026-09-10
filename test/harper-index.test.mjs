@@ -6,40 +6,44 @@ import { encodeMutationBatch, openHarperFullTextIndex } from '@harperfast/fullte
 
 const readResponseBytes = 1024 * 1024;
 const controlResponseBytes = 1024 * 1024;
+const storeIdentities = new WeakMap();
+let nextStoreIdentity = 0n;
 
 function createStorage() {
 	const entries = new Map();
 	const calls = [];
+	const storage = {
+		read(key) {
+			calls.push('read');
+			const value = entries.get(key.toString('hex'));
+			return value && Buffer.from(value);
+		},
+		write(mutations, policy) {
+			calls.push(`write:${policy}`);
+			const next = new Map(entries);
+			for (const mutation of mutations) {
+				const key = mutation.key.toString('hex');
+				if (mutation.type === 'put') next.set(key, Buffer.from(mutation.value));
+				else next.delete(key);
+			}
+			entries.clear();
+			for (const [key, value] of next) entries.set(key, value);
+		},
+		sync() {
+			calls.push('sync');
+		},
+	};
+	storeIdentities.set(storage, [11n, 22n, ++nextStoreIdentity]);
 	return {
 		calls,
-		storage: {
-			read(key) {
-				calls.push('read');
-				const value = entries.get(key.toString('hex'));
-				return value && Buffer.from(value);
-			},
-			write(mutations, policy) {
-				calls.push(`write:${policy}`);
-				const next = new Map(entries);
-				for (const mutation of mutations) {
-					const key = mutation.key.toString('hex');
-					if (mutation.type === 'put') next.set(key, Buffer.from(mutation.value));
-					else next.delete(key);
-				}
-				entries.clear();
-				for (const [key, value] of next) entries.set(key, value);
-			},
-			sync() {
-				calls.push('sync');
-			},
-		},
+		storage,
 	};
 }
 
 function options(storage, overrides = {}) {
 	return {
 		storage,
-		storeIdentity: [11n, 22n, 33n],
+		storeIdentity: storeIdentities.get(storage),
 		namespace: Buffer.from('products-title'),
 		indexId: 'products-title',
 		generation: 'generation-1',
@@ -121,6 +125,23 @@ test('keeps the newest payload when publishes are issued concurrently', async ()
 	index = await openHarperFullTextIndex(config);
 	assert.strictEqual(index.committedPayload, 'cursor-v1:2');
 	await index.close();
+});
+
+test('marks the committed payload unknown when a publish poisons the generation', async () => {
+	const host = createStorage();
+	const index = await openHarperFullTextIndex(options(host.storage));
+	await index.apply(encodeMutationBatch({ upserts: [{ id: 'shoe-1', fields: { title: 'running shoe' } }] }));
+	const sync = host.storage.sync;
+	host.storage.sync = () => {
+		throw new Error('injected durability failure');
+	};
+	await assert.rejects(index.publish('cursor-v1:1'), /injected durability failure/);
+	assert.throws(
+		() => index.committedPayload,
+		(error) => error.code === 'E_POISONED',
+	);
+	host.storage.sync = sync;
+	await index.close({ mode: 'rollback' });
 });
 
 test('rejects an oversized cursor without changing or poisoning the generation', async () => {
