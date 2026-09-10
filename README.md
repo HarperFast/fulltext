@@ -99,10 +99,13 @@ require controlled hardware.
 
 The `kv-directory` benchmark measures the caller-visible buffered write path, empty and dirty
 flushes, 256 KiB chunk publication, closed- and active-writer deletion, and distinct-file
-concurrency at one, two, four, and eight threads. It uses the deterministic in-memory Phase 0 store
-to isolate directory coordination from RocksDB and Node transport costs. Compare two optimized
-builds on the same quiet host; use `--revision` to label each JSON record and `--samples` and
-`--warmup` to control the run. CI executes only `--smoke` and applies no timing threshold.
+concurrency at one, two, four, and eight threads. It reports percentiles across per-sample mean
+latencies and uses the deterministic in-memory Phase 0 store to isolate directory coordination from
+RocksDB and Node transport costs. That store serializes access, so the concurrency cases detect
+coordination regressions but do not predict RocksDB scaling. Compare two optimized builds on the
+same quiet host; records include the Git revision and dirty state, while `--revision` can add a run
+label and `--samples` and `--warmup` control the run. CI executes only `--smoke`, whose timings are
+not comparable to a full run, and applies no timing threshold.
 
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.

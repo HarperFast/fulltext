@@ -5,17 +5,19 @@ use std::io;
 use std::io::Write as IoWrite;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use harper_fulltext::phase0::{FaultingDirectory, FaultingKv};
 use harper_fulltext::TANTIVY_VERSION;
 use tantivy::directory::{Directory, TerminatingWrite, WritePtr};
 
 const WRITE_BYTES_PER_SAMPLE: usize = 128 * 1024;
+const MIN_WRITE_OPERATIONS_PER_SAMPLE: usize = 256;
 const CHUNK_BYTES: usize = 256 * 1024;
+const STORAGE_OPERATIONS_PER_SAMPLE: usize = 64;
 const EMPTY_FLUSHES_PER_SAMPLE: usize = 10_000;
 const CONCURRENT_BYTES_PER_FILE: usize = 4 * 1024;
 const CONCURRENT_FILES_PER_THREAD: usize = 64;
@@ -25,6 +27,9 @@ struct Arguments {
 	warmup_samples: usize,
 	smoke: bool,
 	revision: String,
+	git_revision: String,
+	worktree_dirty: Option<bool>,
+	captured_at_unix_milliseconds: u128,
 }
 
 struct Sample {
@@ -46,57 +51,88 @@ struct CaseResult {
 #[derive(Clone, Copy)]
 enum StartCommand {
 	Waiting,
-	Run(Instant),
+	Prepare,
 	Cancel,
 }
 
+struct StartState {
+	registered: usize,
+	ready: usize,
+	command: StartCommand,
+}
+
 struct StartGate {
-	state: Mutex<(usize, StartCommand)>,
+	state: Mutex<StartState>,
 	changed: Condvar,
+	started: OnceLock<Instant>,
+	go: AtomicBool,
 }
 
 impl StartGate {
 	fn new() -> Self {
 		Self {
-			state: Mutex::new((0, StartCommand::Waiting)),
+			state: Mutex::new(StartState {
+				registered: 0,
+				ready: 0,
+				command: StartCommand::Waiting,
+			}),
 			changed: Condvar::new(),
+			started: OnceLock::new(),
+			go: AtomicBool::new(false),
 		}
 	}
 
 	fn wait(&self) -> Option<Instant> {
 		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-		state.0 += 1;
+		state.registered += 1;
 		self.changed.notify_all();
 		loop {
-			match state.1 {
+			match state.command {
 				StartCommand::Waiting => {
 					state = self
 						.changed
 						.wait(state)
 						.unwrap_or_else(|poisoned| poisoned.into_inner());
 				}
-				StartCommand::Run(started) => return Some(started),
+				StartCommand::Prepare => break,
 				StartCommand::Cancel => return None,
 			}
 		}
+		state.ready += 1;
+		self.changed.notify_all();
+		drop(state);
+		while !self.go.load(Ordering::Acquire) {
+			std::hint::spin_loop();
+		}
+		self.started.get().copied()
 	}
 
 	fn start(&self, workers: usize) {
 		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-		while state.0 != workers {
+		while state.registered != workers {
 			state = self
 				.changed
 				.wait(state)
 				.unwrap_or_else(|poisoned| poisoned.into_inner());
 		}
-		let started = Instant::now();
-		state.1 = StartCommand::Run(started);
+		state.command = StartCommand::Prepare;
 		self.changed.notify_all();
+		while state.ready != workers {
+			state = self
+				.changed
+				.wait(state)
+				.unwrap_or_else(|poisoned| poisoned.into_inner());
+		}
+		drop(state);
+		self.started
+			.set(Instant::now())
+			.expect("benchmark start time was already set");
+		self.go.store(true, Ordering::Release);
 	}
 
 	fn cancel(&self) {
 		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-		state.1 = StartCommand::Cancel;
+		state.command = StartCommand::Cancel;
 		self.changed.notify_all();
 	}
 }
@@ -111,7 +147,7 @@ fn main() -> io::Result<()> {
 			"caller-write",
 			1,
 			&arguments,
-			writer_case(call_bytes),
+			writer_case(call_bytes, arguments.smoke),
 		)?);
 	}
 	results.push(measure_case(
@@ -126,28 +162,28 @@ fn main() -> io::Result<()> {
 		"flush",
 		1,
 		&arguments,
-		dirty_flush_case(),
+		dirty_flush_case(arguments.smoke),
 	)?);
 	results.push(measure_case(
 		"chunk-publication-256k".to_owned(),
 		"file",
 		1,
 		&arguments,
-		chunk_case(),
+		chunk_case(arguments.smoke),
 	)?);
 	results.push(measure_case(
 		"delete-closed-writer".to_owned(),
 		"delete",
 		1,
 		&arguments,
-		delete_case(false),
+		delete_case(false, arguments.smoke),
 	)?);
 	results.push(measure_case(
 		"delete-active-writer".to_owned(),
 		"delete",
 		1,
 		&arguments,
-		delete_case(true),
+		delete_case(true, arguments.smoke),
 	)?);
 
 	for threads in [1, 2, 4, 8] {
@@ -160,7 +196,12 @@ fn main() -> io::Result<()> {
 		)?);
 	}
 
-	assert!(results.iter().all(|result| result.operations != 0));
+	if let Some(result) = results.iter().find(|result| result.operations == 0) {
+		return Err(io::Error::other(format!(
+			"benchmark case {} reported no operations",
+			result.name
+		)));
+	}
 	println!("{}", encode_results(&arguments, &results));
 	Ok(())
 }
@@ -169,7 +210,7 @@ fn parse_arguments() -> io::Result<Arguments> {
 	let mut smoke = false;
 	let mut samples = None;
 	let mut warmup_samples = None;
-	let mut revision = "unknown".to_owned();
+	let mut revision = None;
 	let mut arguments = env::args().skip(1);
 	while let Some(argument) = arguments.next() {
 		match argument.as_str() {
@@ -178,10 +219,12 @@ fn parse_arguments() -> io::Result<Arguments> {
 			"--samples" => samples = Some(positive_argument("--samples", arguments.next())?),
 			"--warmup" => warmup_samples = Some(nonnegative_argument("--warmup", arguments.next())?),
 			"--revision" => {
-				revision = arguments
-					.next()
-					.filter(|value| !value.is_empty())
-					.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--revision requires a value"))?;
+				revision = Some(
+					arguments
+						.next()
+						.filter(|value| !value.is_empty())
+						.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--revision requires a value"))?,
+				);
 			}
 			_ => {
 				return Err(io::Error::new(
@@ -191,11 +234,22 @@ fn parse_arguments() -> io::Result<Arguments> {
 			}
 		}
 	}
+	let git_revision = command_output("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
+	let revision = revision.unwrap_or_else(|| git_revision.clone());
+	let worktree_dirty =
+		command_output("git", &["status", "--porcelain", "--untracked-files=no"]).map(|status| !status.is_empty());
+	let captured_at_unix_milliseconds = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_err(|_| io::Error::other("system time is before the Unix epoch"))?
+		.as_millis();
 	Ok(Arguments {
 		samples: samples.unwrap_or(if smoke { 2 } else { 20 }),
 		warmup_samples: warmup_samples.unwrap_or(if smoke { 1 } else { 3 }),
 		smoke,
 		revision,
+		git_revision,
+		worktree_dirty,
+		captured_at_unix_milliseconds,
 	})
 }
 
@@ -261,24 +315,43 @@ where
 	})
 }
 
-fn writer_case(call_bytes: usize) -> impl FnMut(usize) -> io::Result<Sample> {
+fn writer_case(call_bytes: usize, smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
 	let payload = vec![7u8; call_bytes];
 	move |sample| {
 		let directory = FaultingDirectory::new(FaultingKv::default());
-		let path = format!("writer-{call_bytes}-{sample}");
-		let mut writer = open_writer(&directory, Path::new(&path))?;
-		let operations = WRITE_BYTES_PER_SAMPLE / call_bytes;
+		let minimum_operations = if smoke { 2 } else { MIN_WRITE_OPERATIONS_PER_SAMPLE };
+		let operations = (WRITE_BYTES_PER_SAMPLE / call_bytes).max(minimum_operations);
+		let bytes = operations
+			.checked_mul(call_bytes)
+			.ok_or_else(|| io::Error::other("benchmark byte count overflow"))?;
+		let operations_per_writer = CHUNK_BYTES / call_bytes;
+		if operations_per_writer == 0 {
+			return Err(io::Error::other("caller write exceeds the benchmark chunk size"));
+		}
+		let writer_count = operations.div_ceil(operations_per_writer);
+		let mut writers = Vec::with_capacity(writer_count);
+		for writer in 0..writer_count {
+			let path = format!("writer-{call_bytes}-{sample}-{writer}");
+			writers.push(open_writer(&directory, Path::new(&path))?);
+		}
+		let mut remaining = operations;
 		let started = Instant::now();
-		for _ in 0..operations {
-			writer.write_all(black_box(&payload))?;
+		for writer in &mut writers {
+			let writer_operations = remaining.min(operations_per_writer);
+			for _ in 0..writer_operations {
+				writer.write_all(black_box(&payload))?;
+			}
+			remaining -= writer_operations;
 		}
 		let elapsed_nanoseconds = started.elapsed().as_nanos();
-		black_box(&mut writer);
-		writer.terminate()?;
+		black_box(&mut writers);
+		for writer in writers {
+			writer.terminate()?;
+		}
 		Ok(Sample {
 			elapsed_nanoseconds,
 			operations: operations as u64,
-			bytes: WRITE_BYTES_PER_SAMPLE as u64,
+			bytes: bytes as u64,
 		})
 	}
 }
@@ -299,69 +372,92 @@ fn empty_flush_case() -> io::Result<impl FnMut(usize) -> io::Result<Sample>> {
 	})
 }
 
-fn dirty_flush_case() -> impl FnMut(usize) -> io::Result<Sample> {
+fn dirty_flush_case(smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
 	let payload = vec![11u8; 4 * 1024];
 	move |sample| {
 		let directory = FaultingDirectory::new(FaultingKv::default());
-		let path = format!("dirty-flush-{sample}");
-		let mut writer = open_writer(&directory, Path::new(&path))?;
-		writer.write_all(&payload)?;
+		let operations = if smoke { 4 } else { STORAGE_OPERATIONS_PER_SAMPLE };
+		let mut writers = Vec::with_capacity(operations);
+		for operation in 0..operations {
+			let path = format!("dirty-flush-{sample}-{operation}");
+			let mut writer = open_writer(&directory, Path::new(&path))?;
+			writer.write_all(&payload)?;
+			writers.push(writer);
+		}
 		let started = Instant::now();
-		writer.flush()?;
+		for writer in &mut writers {
+			writer.flush()?;
+		}
+		let elapsed_nanoseconds = started.elapsed().as_nanos();
+		for writer in writers {
+			writer.terminate()?;
+		}
 		Ok(Sample {
-			elapsed_nanoseconds: started.elapsed().as_nanos(),
-			operations: 1,
-			bytes: payload.len() as u64,
+			elapsed_nanoseconds,
+			operations: operations as u64,
+			bytes: (operations * payload.len()) as u64,
 		})
 	}
 }
 
-fn chunk_case() -> impl FnMut(usize) -> io::Result<Sample> {
+fn chunk_case(smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
 	let payload = vec![13u8; CHUNK_BYTES];
 	move |sample| {
 		let directory = FaultingDirectory::new(FaultingKv::default());
-		let path = format!("chunk-{sample}");
-		let mut writer = open_writer(&directory, Path::new(&path))?;
+		let operations = if smoke { 4 } else { STORAGE_OPERATIONS_PER_SAMPLE };
+		let mut writers = Vec::with_capacity(operations);
+		for operation in 0..operations {
+			let path = format!("chunk-{sample}-{operation}");
+			writers.push(open_writer(&directory, Path::new(&path))?);
+		}
 		let started = Instant::now();
-		writer.write_all(&payload)?;
-		writer.terminate()?;
+		for mut writer in writers {
+			writer.write_all(&payload)?;
+			writer.terminate()?;
+		}
 		Ok(Sample {
 			elapsed_nanoseconds: started.elapsed().as_nanos(),
-			operations: 1,
-			bytes: payload.len() as u64,
+			operations: operations as u64,
+			bytes: (operations * payload.len()) as u64,
 		})
 	}
 }
 
-fn delete_case(active_writer: bool) -> impl FnMut(usize) -> io::Result<Sample> {
+fn delete_case(active_writer: bool, smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
 	let payload = vec![17u8; 4 * 1024];
 	move |sample| {
 		let directory = FaultingDirectory::new(FaultingKv::default());
-		let path = format!("delete-{active_writer}-{sample}");
-		let path = Path::new(&path);
-		let mut writer = open_writer(&directory, path)?;
-		writer.write_all(&payload)?;
-		let writer = if active_writer {
-			writer.flush()?;
-			Some(writer)
-		} else {
-			writer.terminate()?;
-			None
-		};
+		let operations = if smoke { 4 } else { STORAGE_OPERATIONS_PER_SAMPLE };
+		let mut paths = Vec::with_capacity(operations);
+		let mut active_writers = Vec::with_capacity(if active_writer { operations } else { 0 });
+		for operation in 0..operations {
+			let path = format!("delete-{active_writer}-{sample}-{operation}");
+			let mut writer = open_writer(&directory, Path::new(&path))?;
+			writer.write_all(&payload)?;
+			if active_writer {
+				writer.flush()?;
+				active_writers.push(writer);
+			} else {
+				writer.terminate()?;
+			}
+			paths.push(path);
+		}
 		let started = Instant::now();
-		delete_path(&directory, path)?;
+		for path in &paths {
+			delete_path(&directory, Path::new(path))?;
+		}
 		let elapsed_nanoseconds = started.elapsed().as_nanos();
-		drop(writer);
+		drop(active_writers);
 		Ok(Sample {
 			elapsed_nanoseconds,
-			operations: 1,
+			operations: operations as u64,
 			bytes: 0,
 		})
 	}
 }
 
 fn concurrent_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Result<Sample> {
-	let files_per_thread = if smoke { 1 } else { CONCURRENT_FILES_PER_THREAD };
+	let files_per_thread = if smoke { 2 } else { CONCURRENT_FILES_PER_THREAD };
 	move |sample| {
 		let directory = FaultingDirectory::new(FaultingKv::default());
 		let start_gate = Arc::new(StartGate::new());
@@ -450,9 +546,31 @@ fn encode_results(arguments: &Arguments, results: &[CaseResult]) -> String {
 	writeln!(&mut output, "  \"formatVersion\": 1,").unwrap();
 	writeln!(&mut output, "  \"benchmark\": \"kv-directory\",").unwrap();
 	writeln!(&mut output, "  \"revision\": \"{}\",", escape_json(&arguments.revision)).unwrap();
+	writeln!(
+		&mut output,
+		"  \"gitRevision\": \"{}\",",
+		escape_json(&arguments.git_revision)
+	)
+	.unwrap();
+	writeln!(
+		&mut output,
+		"  \"worktreeDirty\": {},",
+		arguments
+			.worktree_dirty
+			.map_or_else(|| "null".to_owned(), |dirty| dirty.to_string())
+	)
+	.unwrap();
+	writeln!(
+		&mut output,
+		"  \"capturedAtUnixMilliseconds\": {},",
+		arguments.captured_at_unix_milliseconds
+	)
+	.unwrap();
 	writeln!(&mut output, "  \"runtime\": {{").unwrap();
 	writeln!(&mut output, "    \"rustc\": \"{}\",", escape_json(&rustc_version())).unwrap();
-	writeln!(&mut output, "    \"tantivy\": \"{}\"", escape_json(TANTIVY_VERSION)).unwrap();
+	writeln!(&mut output, "    \"tantivy\": \"{}\",", escape_json(TANTIVY_VERSION)).unwrap();
+	writeln!(&mut output, "    \"profile\": \"{}\",", env!("FULLTEXT_BUILD_PROFILE")).unwrap();
+	writeln!(&mut output, "    \"features\": {}", enabled_features_json()).unwrap();
 	writeln!(&mut output, "  }},").unwrap();
 	writeln!(&mut output, "  \"host\": {{").unwrap();
 	writeln!(&mut output, "    \"os\": \"{}\",", env::consts::OS).unwrap();
@@ -491,19 +609,19 @@ fn encode_results(arguments: &Arguments, results: &[CaseResult]) -> String {
 		writeln!(&mut output, "      \"bytesPerSecond\": {bytes_per_second:.3},").unwrap();
 		writeln!(
 			&mut output,
-			"      \"p50NanosecondsPerOperation\": {:.3},",
+			"      \"p50SampleMeanNanosecondsPerOperation\": {:.3},",
 			percentile(&samples, 0.50)
 		)
 		.unwrap();
 		writeln!(
 			&mut output,
-			"      \"p95NanosecondsPerOperation\": {:.3},",
+			"      \"p95SampleMeanNanosecondsPerOperation\": {:.3},",
 			percentile(&samples, 0.95)
 		)
 		.unwrap();
 		writeln!(
 			&mut output,
-			"      \"p99NanosecondsPerOperation\": {:.3}",
+			"      \"p99SampleMeanNanosecondsPerOperation\": {:.3}",
 			percentile(&samples, 0.99)
 		)
 		.unwrap();
@@ -524,13 +642,31 @@ fn percentile(sorted_values: &[f64], fraction: f64) -> f64 {
 }
 
 fn rustc_version() -> String {
-	Command::new("rustc")
-		.arg("--version")
+	command_output("rustc", &["--version"]).unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
+	Command::new(program)
+		.args(arguments)
 		.output()
 		.ok()
 		.filter(|output| output.status.success())
 		.and_then(|output| String::from_utf8(output.stdout).ok())
-		.map_or_else(|| "unknown".to_owned(), |version| version.trim().to_owned())
+		.map(|output| output.trim().to_owned())
+}
+
+fn enabled_features_json() -> String {
+	let mut features = Vec::new();
+	if cfg!(feature = "node-api") {
+		features.push("\"node-api\"");
+	}
+	if cfg!(feature = "phase0") {
+		features.push("\"phase0\"");
+	}
+	if cfg!(feature = "test-panic") {
+		features.push("\"test-panic\"");
+	}
+	format!("[{}]", features.join(", "))
 }
 
 fn escape_json(value: &str) -> String {
