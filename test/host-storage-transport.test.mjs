@@ -474,6 +474,7 @@ function decodeHandlerError(response) {
 
 function dispatchHostStorage(handler) {
 	return (dispatchId, request) => {
+		if (dispatchId.length === 0) return;
 		try {
 			addon.__hostStorageComplete(dispatchId, handler(request));
 		} catch (error) {

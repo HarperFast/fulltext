@@ -78,9 +78,9 @@ export class HarperFullTextIndex {
 	readonly #index: NativeFullTextIndex;
 	readonly #storageGate: StorageGate;
 	#committedPayload?: string;
-	#payloadKnown = true;
 	#nextPublishSequence = 0n;
 	#publishedSequence = 0n;
+	#uncertainPublishSequence = 0n;
 
 	constructor(handle: number, committedPayload: string | undefined, storageGate: StorageGate) {
 		this.#handle = handle;
@@ -90,7 +90,7 @@ export class HarperFullTextIndex {
 	}
 
 	get committedPayload(): string | undefined {
-		if (!this.#payloadKnown) {
+		if (this.#uncertainPublishSequence > this.#publishedSequence) {
 			throw new FulltextError('E_POISONED', 'committed payload is unknown until the index is reopened');
 		}
 		return this.#committedPayload;
@@ -110,11 +110,7 @@ export class HarperFullTextIndex {
 		try {
 			cursor = await invoke((callback) => loadAddon().__harperPublish(this.#handle, payload, callback));
 		} catch (error) {
-			try {
-				this.#payloadKnown = this.#index.status().state !== 'poisoned';
-			} catch {
-				this.#payloadKnown = false;
-			}
+			if (sequence > this.#uncertainPublishSequence) this.#uncertainPublishSequence = sequence;
 			throw error;
 		}
 		const opstamp = cursor.u64();
@@ -205,6 +201,7 @@ function validateSynchronousStorage(storage: HostStorage): void {
 function createStorageDispatcher(handler: (request: Buffer) => Buffer): (dispatchId: Buffer, request: Buffer) => void {
 	const addon = loadAddon();
 	return (dispatchId, request) => {
+		if (dispatchId.length === 0) return;
 		try {
 			addon.__hostStorageComplete(dispatchId, handler(request));
 		} catch (error) {

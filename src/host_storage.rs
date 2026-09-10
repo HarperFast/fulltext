@@ -119,9 +119,11 @@ impl HostTransport {
 			.create_threadsafe_function::<HostDispatch, Buffer, _, ErrorStrategy::Fatal>(
 				max_operations,
 				|context: ThreadSafeCallContext<HostDispatch>| {
-					let request = registered_transport(context.value.transport_id)
+					let Some(request) = registered_transport(context.value.transport_id)
 						.and_then(|transport| transport.begin(context.value.request_id))
-						.unwrap_or_default();
+					else {
+						return Ok(vec![Buffer::default(), Buffer::default()]);
+					};
 					let mut dispatch_id = Vec::with_capacity(16);
 					dispatch_id.extend_from_slice(&context.value.transport_id.to_le_bytes());
 					dispatch_id.extend_from_slice(&context.value.request_id.to_le_bytes());

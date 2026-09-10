@@ -5,6 +5,7 @@ import { loadAddon } from '../../dist/load-addon.js';
 const addon = loadAddon();
 const handle = addon.__testOpenHostTransport(
 	(dispatchId, request) => {
+		if (dispatchId.length === 0) return;
 		addon.__hostStorageComplete(dispatchId, request);
 	},
 	2,
