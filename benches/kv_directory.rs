@@ -5,7 +5,9 @@ use std::io;
 use std::io::Write as IoWrite;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use harper_fulltext::phase0::{FaultingDirectory, FaultingKv};
@@ -39,6 +41,64 @@ struct CaseResult {
 	bytes: u64,
 	total_nanoseconds: u128,
 	sample_nanoseconds_per_operation: Vec<f64>,
+}
+
+#[derive(Clone, Copy)]
+enum StartCommand {
+	Waiting,
+	Run(Instant),
+	Cancel,
+}
+
+struct StartGate {
+	state: Mutex<(usize, StartCommand)>,
+	changed: Condvar,
+}
+
+impl StartGate {
+	fn new() -> Self {
+		Self {
+			state: Mutex::new((0, StartCommand::Waiting)),
+			changed: Condvar::new(),
+		}
+	}
+
+	fn wait(&self) -> Option<Instant> {
+		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		state.0 += 1;
+		self.changed.notify_all();
+		loop {
+			match state.1 {
+				StartCommand::Waiting => {
+					state = self
+						.changed
+						.wait(state)
+						.unwrap_or_else(|poisoned| poisoned.into_inner());
+				}
+				StartCommand::Run(started) => return Some(started),
+				StartCommand::Cancel => return None,
+			}
+		}
+	}
+
+	fn start(&self, workers: usize) {
+		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		while state.0 != workers {
+			state = self
+				.changed
+				.wait(state)
+				.unwrap_or_else(|poisoned| poisoned.into_inner());
+		}
+		let started = Instant::now();
+		state.1 = StartCommand::Run(started);
+		self.changed.notify_all();
+	}
+
+	fn cancel(&self) {
+		let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		state.1 = StartCommand::Cancel;
+		self.changed.notify_all();
+	}
 }
 
 fn main() -> io::Result<()> {
@@ -304,35 +364,58 @@ fn concurrent_case(threads: usize, smoke: bool) -> impl FnMut(usize) -> io::Resu
 	let files_per_thread = if smoke { 1 } else { CONCURRENT_FILES_PER_THREAD };
 	move |sample| {
 		let directory = FaultingDirectory::new(FaultingKv::default());
-		let start_barrier = Arc::new(Barrier::new(threads + 1));
-		let finish_barrier = Arc::new(Barrier::new(threads + 1));
+		let start_gate = Arc::new(StartGate::new());
+		let remaining = Arc::new(AtomicUsize::new(threads));
+		let (completion, completed) = mpsc::sync_channel(1);
 		let elapsed_nanoseconds = std::thread::scope(|scope| -> io::Result<u128> {
 			let mut handles = Vec::with_capacity(threads);
 			for thread in 0..threads {
 				let directory = directory.clone();
-				let start_barrier = start_barrier.clone();
-				let finish_barrier = finish_barrier.clone();
-				handles.push(scope.spawn(move || -> io::Result<()> {
-					let payload = [19u8; CONCURRENT_BYTES_PER_FILE];
-					start_barrier.wait();
-					let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
-						for file in 0..files_per_thread {
-							let path = format!("concurrent-{sample}-{thread}-{file}");
-							let mut writer = open_writer(&directory, Path::new(&path))?;
-							writer.write_all(&payload)?;
-							writer.terminate()?;
+				let worker_start_gate = start_gate.clone();
+				let remaining = remaining.clone();
+				let completion = completion.clone();
+				let paths = (0..files_per_thread)
+					.map(|file| format!("concurrent-{sample}-{thread}-{file}"))
+					.collect::<Vec<_>>();
+				let handle = std::thread::Builder::new()
+					.name(format!("kv-directory-benchmark-{thread}"))
+					.spawn_scoped(scope, move || -> io::Result<()> {
+						let payload = [19u8; CONCURRENT_BYTES_PER_FILE];
+						let Some(started) = worker_start_gate.wait() else {
+							return Ok(());
+						};
+						let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+							for path in paths {
+								let mut writer = open_writer(&directory, Path::new(&path))?;
+								writer.write_all(&payload)?;
+								writer.terminate()?;
+							}
+							Ok(())
+						}))
+						.unwrap_or_else(|_| Err(io::Error::other("benchmark worker panicked")));
+						if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+							let _ = completion.send(started.elapsed().as_nanos());
 						}
-						Ok(())
-					}))
-					.unwrap_or_else(|_| Err(io::Error::other("benchmark worker panicked")));
-					finish_barrier.wait();
-					result
-				}));
+						result
+					});
+				match handle {
+					Ok(handle) => handles.push(handle),
+					Err(error) => {
+						start_gate.cancel();
+						for handle in handles {
+							handle
+								.join()
+								.map_err(|_| io::Error::other("benchmark worker panicked"))??;
+						}
+						return Err(error);
+					}
+				}
 			}
-			let started = Instant::now();
-			start_barrier.wait();
-			finish_barrier.wait();
-			let elapsed_nanoseconds = started.elapsed().as_nanos();
+			start_gate.start(threads);
+			drop(completion);
+			let elapsed_nanoseconds = completed
+				.recv()
+				.map_err(|_| io::Error::other("benchmark workers did not report completion"))?;
 			for handle in handles {
 				handle
 					.join()
