@@ -2,6 +2,9 @@ import { FulltextError, normalizeNativeError } from './errors.js';
 import { decodeResponse, encodeBatch, encodeOpen, encodeSearch } from './codec.js';
 import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
+import { PublicationState } from './publication.js';
+
+const maxCommitPayloadBytes = 64 * 1024;
 
 export { FulltextError } from './errors.js';
 export type { FulltextErrorCode } from './errors.js';
@@ -74,12 +77,21 @@ export interface CloseOptions {
 
 export class NativeFullTextIndex {
 	readonly #handle: number;
+	readonly #publication: PublicationState;
 	#closed = false;
 	#closedStatus?: FullTextStatus;
 	#closePromise?: Promise<void>;
 
-	constructor(handle: number) {
+	constructor(handle: number, committedPayload?: string) {
 		this.#handle = handle;
+		this.#publication = new PublicationState(committedPayload);
+	}
+
+	get committedPayload(): string | undefined {
+		if (this.status().state === 'poisoned') {
+			throw new FulltextError('E_POISONED', 'committed payload is unknown until the index is reopened');
+		}
+		return this.#publication.committedPayload;
 	}
 
 	async apply(packedBatch: Uint8Array): Promise<number> {
@@ -94,6 +106,33 @@ export class NativeFullTextIndex {
 		const opstamp = cursor.u64();
 		cursor.finish();
 		return opstamp;
+	}
+
+	async publish(payload: string): Promise<bigint> {
+		if (typeof payload !== 'string') {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'commit payload must be a string');
+		}
+		if (payload.length > maxCommitPayloadBytes || Buffer.byteLength(payload) > maxCommitPayloadBytes) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `commit payload exceeds ${maxCommitPayloadBytes} UTF-8 bytes`);
+		}
+		if (/[\uD800-\uDFFF]/u.test(payload)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'commit payload must be a well-formed Unicode string');
+		}
+		const sequence = this.#publication.begin();
+		let admitted = false;
+		try {
+			const cursor = await invoke((callback) => {
+				loadAddon().__nativePublish(this.#handle, payload, callback);
+				admitted = true;
+			});
+			const opstamp = cursor.u64();
+			cursor.finish();
+			this.#publication.succeed(sequence, payload);
+			return opstamp;
+		} catch (error) {
+			if (admitted) this.#publication.fail(sequence);
+			throw error;
+		}
 	}
 
 	async reload(): Promise<void> {
@@ -207,8 +246,18 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 		),
 	);
 	const handle = cursor.u32();
-	cursor.finish();
-	return new NativeFullTextIndex(handle);
+	try {
+		const hasPayload = cursor.u8();
+		if (hasPayload !== 0 && hasPayload !== 1) {
+			throw new FulltextError('E_NATIVE_FAILURE', `Unknown committed payload status ${hasPayload}`);
+		}
+		const payload = hasPayload === 1 ? cursor.string() : undefined;
+		cursor.finish();
+		return new NativeFullTextIndex(handle, payload);
+	} catch (error) {
+		await invoke((callback) => loadAddon().__nativeClose(handle, true, callback)).catch(() => undefined);
+		throw error;
+	}
 }
 
 export async function runtimeInfo(): Promise<RuntimeInfo> {

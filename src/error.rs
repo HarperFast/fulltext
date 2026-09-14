@@ -36,6 +36,7 @@ pub type Result<T> = std::result::Result<T, FulltextError>;
 pub const ERROR_CODES: &[&str] = &[
 	"E_CLOSED",
 	"E_DIRTY_CLOSE",
+	"E_CHECKPOINT_REQUIRED",
 	"E_DUPLICATE_OPEN",
 	"E_IDENTITY_MISMATCH",
 	"E_INCOMPLETE_CREATE",

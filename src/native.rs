@@ -81,6 +81,8 @@ struct Runtime {
 	search_execution_nanoseconds: AtomicU64,
 	search_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 	closed: Arc<CompletionSignal>,
+	#[cfg(feature = "test-panic")]
+	publish_fault: AtomicU8,
 	#[cfg(feature = "host-storage")]
 	host_transport: Option<Arc<HostTransport>>,
 }
@@ -146,13 +148,10 @@ struct WriterCommand {
 
 enum WriterOperation {
 	Apply(Vec<u8>),
-	Commit(Option<String>),
-	#[cfg(feature = "host-storage")]
+	Commit,
 	Publish(String),
 	Reload,
-	Close {
-		rollback: bool,
-	},
+	Close { rollback: bool },
 }
 
 enum WriterOutcome {
@@ -255,7 +254,7 @@ pub fn native_commit(handle: u32, callback: JsFunction) -> boundary::Result<()> 
 		let completion = completion(callback, runtime.environment.alive.clone())?;
 		runtime.enqueue_writer(
 			WriterCommand {
-				operation: WriterOperation::Commit(None),
+				operation: WriterOperation::Commit,
 				completion,
 			},
 			0,
@@ -266,6 +265,11 @@ pub fn native_commit(handle: u32, callback: JsFunction) -> boundary::Result<()> 
 #[cfg(feature = "host-storage")]
 #[napi(catch_unwind, skip_typescript, js_name = "__harperPublish")]
 pub fn harper_publish(handle: u32, payload: String, callback: JsFunction) -> boundary::Result<()> {
+	boundary::run_stateless(|| native_publish(handle, payload, callback))?
+}
+
+#[napi(catch_unwind, skip_typescript, js_name = "__nativePublish")]
+pub fn native_publish(handle: u32, payload: String, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		if payload.len() > crate::engine::MAX_COMMIT_PAYLOAD_BYTES {
 			return Err(fulltext_napi_error(FulltextError::invalid(format!(
@@ -371,6 +375,17 @@ pub fn test_poison_native_handle(handle: u32) -> boundary::Result<()> {
 	})?
 }
 
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailNextPublish")]
+pub fn test_fail_next_publish(handle: u32, after_commit: bool) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		runtime(handle)?
+			.publish_fault
+			.store(if after_commit { 2 } else { 1 }, Ordering::Release);
+		Ok(())
+	})?
+}
+
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeStatus")]
 pub fn native_status(handle: u32) -> boundary::Result<Buffer> {
 	boundary::run_stateless(|| {
@@ -408,6 +423,8 @@ impl Runtime {
 			search_execution_nanoseconds: AtomicU64::new(0),
 			search_threads: Mutex::new(Vec::with_capacity(search_thread_count)),
 			closed: Arc::new(CompletionSignal::new()),
+			#[cfg(feature = "test-panic")]
+			publish_fault: AtomicU8::new(0),
 			#[cfg(feature = "host-storage")]
 			host_transport: parts.host_transport,
 		});
@@ -721,26 +738,30 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 					Err(error) => WriterOutcome::Continue(Err(error)),
 				}
 			}
-			WriterOperation::Commit(payload) => {
-				match active_writer_mut(&mut writer).and_then(|writer| writer.commit_with_payload(payload.as_deref())) {
-					Ok(opstamp) => {
-						runtime.uncommitted_mutations.store(0, Ordering::Release);
-						runtime.commit_opstamp.store(opstamp, Ordering::Release);
-						WriterOutcome::Continue(Ok(u64_body(opstamp)))
-					}
-					Err(error) => WriterOutcome::Poison(
-						Err(error),
-						FulltextError::new(
-							"E_POISONED",
-							"a prior commit failed and the index generation is terminal",
-						),
-					),
+			WriterOperation::Commit => match active_writer_mut(&mut writer).and_then(|writer| writer.commit()) {
+				Ok(opstamp) => {
+					runtime.uncommitted_mutations.store(0, Ordering::Release);
+					runtime.commit_opstamp.store(opstamp, Ordering::Release);
+					WriterOutcome::Continue(Ok(u64_body(opstamp)))
 				}
-			}
-			#[cfg(feature = "host-storage")]
+				Err(error) if error.code == "E_CHECKPOINT_REQUIRED" => WriterOutcome::Continue(Err(error)),
+				Err(error) => WriterOutcome::Poison(
+					Err(error),
+					FulltextError::new(
+						"E_POISONED",
+						"a prior commit failed and the index generation is terminal",
+					),
+				),
+			},
 			WriterOperation::Publish(payload) => match active_writer_mut(&mut writer)
-				.and_then(|writer| writer.commit_with_payload(Some(&payload)))
+				.and_then(|writer| {
+					#[cfg(feature = "test-panic")]
+					fail_publish_at(&runtime, 1)?;
+					writer.commit_with_payload(Some(&payload))
+				})
 				.and_then(|opstamp| {
+					#[cfg(feature = "test-panic")]
+					fail_publish_at(&runtime, 2)?;
 					runtime.reader.reload().map_err(FulltextError::native)?;
 					Ok(opstamp)
 				}) {
@@ -769,7 +790,7 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 					runtime.state.store(STATE_OPEN, Ordering::Release);
 					WriterOutcome::Continue(Err(FulltextError::new(
 						"E_DIRTY_CLOSE",
-						"index has uncommitted mutations; commit or close with rollback",
+						"index has uncommitted mutations; publish (or commit if uncheckpointed), or close with rollback",
 					)))
 				} else {
 					let close_result = writer
@@ -841,6 +862,18 @@ fn settle(completion: Completion, result: Result<Vec<u8>>) {
 	}
 }
 
+#[cfg(feature = "test-panic")]
+fn fail_publish_at(runtime: &Runtime, stage: u8) -> Result<()> {
+	if runtime
+		.publish_fault
+		.compare_exchange(stage, 0, Ordering::AcqRel, Ordering::Acquire)
+		.is_ok()
+	{
+		return Err(FulltextError::new("E_STORAGE", "injected publication failure"));
+	}
+	Ok(())
+}
+
 fn active_writer(writer: &Option<Writer>) -> Result<&Writer> {
 	writer
 		.as_ref()
@@ -889,9 +922,9 @@ fn open_on_thread(
 	environment: Arc<EnvironmentState>,
 ) {
 	let result = catch_unwind(AssertUnwindSafe(|| open_runtime(handle, bytes, environment.clone())));
-	let opened = matches!(result, Ok(Ok(())));
+	let opened = matches!(result, Ok(Ok(_)));
 	match result {
-		Ok(Ok(())) => completion.success(u32_body(handle)),
+		Ok(Ok(payload)) => completion.success(open_body(handle, payload.as_deref())),
 		Ok(Err(error)) => completion.failure(error),
 		Err(_) => completion.failure(FulltextError::new("E_NATIVE_PANIC", "native index open panicked")),
 	}
@@ -902,7 +935,7 @@ fn open_on_thread(
 	opening_done.signal();
 }
 
-fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>) -> Result<()> {
+fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>) -> Result<Option<String>> {
 	let open = decode_open(&bytes)?;
 	let canonical = create_and_canonicalize(Path::new(&open.path))?;
 	let identity = RuntimeIdentity::Native(path_identity(&canonical)?);
@@ -916,7 +949,6 @@ fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>)
 		#[cfg(feature = "host-storage")]
 		None,
 	)
-	.map(|_| ())
 }
 
 #[cfg(feature = "host-storage")]
@@ -945,7 +977,7 @@ fn open_host_on_thread(
 	}));
 	let opened = matches!(result, Ok(Ok(_)));
 	match result {
-		Ok(Ok(payload)) => completion.success(host_open_body(handle, payload.as_deref())),
+		Ok(Ok(payload)) => completion.success(open_body(handle, payload.as_deref())),
 		Ok(Err(error)) => completion.failure(error),
 		Err(_) => completion.failure(FulltextError::new("E_NATIVE_PANIC", "Harper index open panicked")),
 	}
@@ -984,8 +1016,7 @@ fn open_runtime_with_directory<D: Directory + Clone>(
 	}
 	let result = (|| {
 		let engine = Engine::open(directory, &config)?;
-		let committed_payload = engine.committed_payload()?;
-		let writer = engine.writer(&config)?;
+		let (writer, committed_payload) = engine.writer_with_payload(&config)?;
 		let reader = engine.reader()?;
 		let runtime = Runtime::start(
 			handle,
@@ -1234,8 +1265,7 @@ fn u32_body(value: u32) -> Vec<u8> {
 	value.to_le_bytes().to_vec()
 }
 
-#[cfg(feature = "host-storage")]
-fn host_open_body(handle: u32, payload: Option<&str>) -> Vec<u8> {
+fn open_body(handle: u32, payload: Option<&str>) -> Vec<u8> {
 	let mut bytes = u32_body(handle);
 	bytes.push(u8::from(payload.is_some()));
 	if let Some(payload) = payload {

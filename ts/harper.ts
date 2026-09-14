@@ -24,8 +24,6 @@ export type {
 } from './native.js';
 export type { HostStorage, HostStorageMutation, HostWritePolicy } from './host-storage.js';
 
-const maxCommitPayloadBytes = 64 * 1024;
-
 export interface HarperFullTextIndexOptions extends Omit<NativeFullTextIndexOptions, 'path'> {
 	storage: HostStorage;
 	storeIdentity: readonly [bigint, bigint, bigint];
@@ -74,26 +72,16 @@ class StorageGate implements HostStorage {
 }
 
 export class HarperFullTextIndex {
-	readonly #handle: number;
 	readonly #index: NativeFullTextIndex;
 	readonly #storageGate: StorageGate;
-	#committedPayload?: string;
-	#nextPublishSequence = 0n;
-	#publishedSequence = 0n;
-	#uncertainPublishSequence = 0n;
 
 	constructor(handle: number, committedPayload: string | undefined, storageGate: StorageGate) {
-		this.#handle = handle;
-		this.#index = new NativeFullTextIndex(handle);
-		this.#committedPayload = committedPayload;
+		this.#index = new NativeFullTextIndex(handle, committedPayload);
 		this.#storageGate = storageGate;
 	}
 
 	get committedPayload(): string | undefined {
-		if (this.#uncertainPublishSequence > this.#publishedSequence) {
-			throw new FulltextError('E_POISONED', 'committed payload is unknown until the index is reopened');
-		}
-		return this.#committedPayload;
+		return this.#index.committedPayload;
 	}
 
 	apply(packedBatch: Uint8Array): Promise<number> {
@@ -101,25 +89,7 @@ export class HarperFullTextIndex {
 	}
 
 	async publish(payload: string): Promise<bigint> {
-		if (typeof payload !== 'string') throw new FulltextError('E_INVALID_ARGUMENT', 'commit payload must be a string');
-		if (Buffer.byteLength(payload) > maxCommitPayloadBytes) {
-			throw new FulltextError('E_INVALID_ARGUMENT', `commit payload exceeds ${maxCommitPayloadBytes} UTF-8 bytes`);
-		}
-		const sequence = ++this.#nextPublishSequence;
-		let opstamp: bigint;
-		try {
-			const cursor = await invoke((callback) => loadAddon().__harperPublish(this.#handle, payload, callback));
-			opstamp = cursor.u64();
-			cursor.finish();
-		} catch (error) {
-			if (sequence > this.#uncertainPublishSequence) this.#uncertainPublishSequence = sequence;
-			throw error;
-		}
-		if (sequence > this.#publishedSequence) {
-			this.#publishedSequence = sequence;
-			this.#committedPayload = payload;
-		}
-		return opstamp;
+		return this.#index.publish(payload);
 	}
 
 	search(request: SearchRequest): Promise<SearchResult> {

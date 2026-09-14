@@ -19,7 +19,7 @@ test('loads the artifact for the executing platform', async () => {
 	assert.deepStrictEqual(info, {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
-		nativeAbiVersion: 1,
+		nativeAbiVersion: 2,
 		storageBackends: ['native', 'harper'],
 	});
 	assert.strictEqual(cargoPackageVersion, packageManifest.version);
@@ -73,12 +73,14 @@ test('default close tears down a poisoned native handle', async (context) => {
 	};
 	const opened = await invoke((callback) => addon.__nativeOpen(encodeOpen(config), callback));
 	const handle = opened.u32();
+	assert.strictEqual(opened.u8(), 0);
 	opened.finish();
 	addon.__testPoisonNativeHandle(handle);
 	const closed = await invoke((callback) => addon.__nativeClose(handle, false, callback));
 	closed.finish();
 	const reopened = await invoke((callback) => addon.__nativeOpen(encodeOpen(config), callback));
 	const reopenedHandle = reopened.u32();
+	assert.strictEqual(reopened.u8(), 0);
 	reopened.finish();
 	const reclosed = await invoke((callback) => addon.__nativeClose(reopenedHandle, false, callback));
 	reclosed.finish();

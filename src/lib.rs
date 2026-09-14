@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "test-panic")]
 use napi::{bindgen_prelude::Buffer, Env, JsUnknown};
 
-pub const NATIVE_ABI_VERSION: u32 = 1;
+pub const NATIVE_ABI_VERSION: u32 = 2;
 pub const TANTIVY_VERSION: &str = "0.26.1";
 
 #[cfg(feature = "node-api")]
