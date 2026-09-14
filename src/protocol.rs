@@ -173,7 +173,7 @@ fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
 pub fn validate_batch_header(bytes: &[u8], max_batch_bytes: usize) -> Result<()> {
 	if bytes.len() > max_batch_bytes {
 		return Err(FulltextError::new(
-			"E_INVALID_ARGUMENT",
+			"E_BATCH_TOO_LARGE",
 			format!("mutation batch is {} bytes; maximum is {max_batch_bytes}", bytes.len()),
 		));
 	}
@@ -428,6 +428,20 @@ mod tests {
 		bytes.extend_from_slice(&u32::MAX.to_le_bytes());
 		bytes.extend_from_slice(&0u32.to_le_bytes());
 		assert_eq!(decode_batch(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+	}
+
+	#[test]
+	fn distinguishes_batch_size_from_invalid_encoding() {
+		let bytes = b"FTMB\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+		assert_eq!(
+			validate_batch_header(bytes, bytes.len() - 1).unwrap_err().code,
+			"E_BATCH_TOO_LARGE"
+		);
+		let malformed = b"NOPE\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+		assert_eq!(
+			validate_batch_header(malformed, malformed.len()).unwrap_err().code,
+			"E_INVALID_ARGUMENT"
+		);
 	}
 
 	#[test]

@@ -54,7 +54,12 @@ Mutation batches are versioned packed values, so indexing crosses Node-API once 
 than once per document. One dedicated actor owns Tantivy's single writer for each index. A bounded
 search pool shares immutable searchers and can execute reads while indexing or commit work is in
 progress. Queue limits reject overload with `E_QUEUE_FULL` rather than blocking the JavaScript
-thread.
+thread. `encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
+`E_BATCH_TOO_LARGE`; `maxBytes` defaults to 8 MiB and callers should normally pass the index's
+configured `maxBatchBytes`. `apply()` independently rejects a packed batch beyond the index's
+`maxBatchBytes` with the same code. Callers can split either rejection without treating the record
+contents as invalid. A successful `apply()` resolves to the number of accepted mutation commands,
+including deletes for IDs that are not currently indexed.
 
 Search uses BM25. `total` is a bounded result by default so Tantivy can retain block-max WAND
 pruning. Set `exactTotal: true` only when an exact match count is worth a second full-match
