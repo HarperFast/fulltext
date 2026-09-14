@@ -18,8 +18,18 @@ if (files.length === 0) {
 	throw new Error(`No ${phase} test files were discovered`);
 }
 
-const result = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit' });
-if (result.error) {
-	throw result.error;
+const isolatedFiles = files.filter((file) => path.basename(file) === 'native-worker.test.mjs');
+const concurrentFiles = files.filter((file) => !isolatedFiles.includes(file));
+for (const batch of [concurrentFiles, isolatedFiles]) {
+	if (batch.length === 0) {
+		continue;
+	}
+	const result = spawnSync(process.execPath, ['--test', ...batch], { stdio: 'inherit' });
+	if (result.error) {
+		throw result.error;
+	}
+	if (result.status !== 0) {
+		process.exitCode = result.status ?? 1;
+		break;
+	}
 }
-process.exitCode = result.status ?? 1;

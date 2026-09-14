@@ -29,6 +29,7 @@ interface NativeAddonApi {
 	__testPanic?(id: number): void;
 	__testCheck?(id: number): boolean;
 	__testPoisonNativeHandle?(handle: number): void;
+	__testPoisonBeforeNextAdmission?(handle: number): void;
 	__testFailNextPublish?(handle: number, afterCommit: boolean): void;
 	__testOpenHostTransport?(
 		handler: (dispatchId: Buffer, request: Buffer) => void,
