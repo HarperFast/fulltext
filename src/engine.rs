@@ -37,6 +37,7 @@ struct EngineField {
 
 pub struct Writer {
 	inner: IndexWriter,
+	checkpoint_required: bool,
 	id_field: Field,
 	fields: Vec<EngineField>,
 	field_lookup: HashMap<String, usize>,
@@ -122,16 +123,26 @@ impl Engine {
 	}
 
 	pub fn writer(&self, config: &EngineConfig) -> Result<Writer> {
+		self.writer_with_payload(config).map(|(writer, _)| writer)
+	}
+
+	pub(crate) fn writer_with_payload(&self, config: &EngineConfig) -> Result<(Writer, Option<String>)> {
 		let inner = self
 			.index
 			.writer_with_num_threads(config.limits.indexing_threads, config.limits.writer_memory_bytes)
 			.map_err(index_error)?;
-		Ok(Writer {
-			inner,
-			id_field: self.id_field,
-			fields: self.fields.clone(),
-			field_lookup: self.field_lookup.clone(),
-		})
+		// A competing process can publish until we acquire the writer lock.
+		let payload = self.committed_payload()?;
+		Ok((
+			Writer {
+				inner,
+				checkpoint_required: payload.is_some(),
+				id_field: self.id_field,
+				fields: self.fields.clone(),
+				field_lookup: self.field_lookup.clone(),
+			},
+			payload,
+		))
 	}
 
 	pub fn reader(&self) -> Result<IndexReader> {
@@ -335,6 +346,12 @@ impl Writer {
 	}
 
 	pub fn commit_with_payload(&mut self, payload: Option<&str>) -> Result<u64> {
+		if self.checkpoint_required && payload.is_none() {
+			return Err(FulltextError::new(
+				"E_CHECKPOINT_REQUIRED",
+				"index has a checkpoint; use publish with a payload",
+			));
+		}
 		if payload.is_some_and(|payload| payload.len() > MAX_COMMIT_PAYLOAD_BYTES) {
 			return Err(FulltextError::invalid(format!(
 				"commit payload exceeds {MAX_COMMIT_PAYLOAD_BYTES} UTF-8 bytes"
@@ -344,7 +361,9 @@ impl Writer {
 		if let Some(payload) = payload {
 			commit.set_payload(payload);
 		}
-		commit.commit().map_err(index_error)
+		self.checkpoint_required |= payload.is_some();
+		let opstamp = commit.commit().map_err(index_error)?;
+		Ok(opstamp)
 	}
 
 	pub fn rollback(&mut self) -> Result<u64> {
@@ -565,6 +584,65 @@ mod tests {
 			reopened.search(&reopened_reader.searcher(), &request).unwrap().hits[0].id,
 			"one"
 		);
+	}
+
+	#[test]
+	fn tantivy_plain_commit_erases_a_prior_payload_without_the_guard() {
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer.commit_with_payload(Some("checkpoint")).unwrap();
+		writer.inner.commit().unwrap();
+		assert_eq!(engine.committed_payload().unwrap(), None);
+	}
+
+	#[test]
+	fn checkpoint_guard_survives_reopen_and_rejected_commits_preserve_mutations() {
+		let directory = RamDirectory::create();
+		let config = config();
+		let engine = Engine::open(directory.clone(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer.commit_with_payload(Some("")).unwrap();
+		writer.apply(batch()).unwrap();
+		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
+		assert_eq!(engine.committed_payload().unwrap().as_deref(), Some(""));
+		writer.commit_with_payload(Some("next")).unwrap();
+		assert_eq!(engine.reader().unwrap().searcher().num_docs(), 2);
+		writer.close().unwrap();
+		let reopened = Engine::open(directory, &config).unwrap();
+		let (mut writer, payload) = reopened.writer_with_payload(&config).unwrap();
+		assert_eq!(payload.as_deref(), Some("next"));
+		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
+		writer.rollback().unwrap();
+		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
+	}
+
+	#[test]
+	fn writer_reads_checkpoint_after_another_owner_publishes() {
+		let directory = RamDirectory::create();
+		let config = config();
+		let old_view = Engine::open(directory.clone(), &config).unwrap();
+		assert_eq!(old_view.committed_payload().unwrap(), None);
+		let other = Engine::open(directory, &config).unwrap();
+		let mut owner = other.writer(&config).unwrap();
+		owner.commit_with_payload(Some("published-by-other-owner")).unwrap();
+		owner.close().unwrap();
+		let (mut writer, payload) = old_view.writer_with_payload(&config).unwrap();
+		assert_eq!(payload.as_deref(), Some("published-by-other-owner"));
+		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
+	}
+
+	#[test]
+	fn failed_checkpoint_commit_keeps_the_guard_conservative() {
+		let store = crate::phase0::FaultingKv::default();
+		let directory = crate::phase0::FaultingDirectory::new(store.clone());
+		let config = config();
+		let engine = Engine::open(directory, &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		store.fail_after_next_write();
+		assert!(writer.commit_with_payload(Some("uncertain")).is_err());
+		assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("uncertain"));
+		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
 	}
 
 	#[test]

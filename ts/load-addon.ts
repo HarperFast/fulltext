@@ -16,6 +16,7 @@ interface NativeAddonApi {
 	__nativeOpen(config: Buffer, callback: NativeCallback): void;
 	__nativeApply(handle: number, batch: Buffer, callback: NativeCallback): void;
 	__nativeCommit(handle: number, callback: NativeCallback): void;
+	__nativePublish(handle: number, payload: string, callback: NativeCallback): void;
 	__nativeReload(handle: number, callback: NativeCallback): void;
 	__nativeSearch(handle: number, request: Buffer, callback: NativeCallback): void;
 	__nativeClose(handle: number, rollback: boolean, callback: NativeCallback): void;
@@ -28,6 +29,7 @@ interface NativeAddonApi {
 	__testPanic?(id: number): void;
 	__testCheck?(id: number): boolean;
 	__testPoisonNativeHandle?(handle: number): void;
+	__testFailNextPublish?(handle: number, afterCommit: boolean): void;
 	__testOpenHostTransport?(
 		handler: (dispatchId: Buffer, request: Buffer) => void,
 		maxOperations: number,
@@ -69,7 +71,7 @@ interface NativeAddonApi {
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 1;
+const expectedNativeAbiVersion = 2;
 let loadedAddon: NativeAddonApi | undefined;
 
 export function loadAddon(): NativeAddonApi {

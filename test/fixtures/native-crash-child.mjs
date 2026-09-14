@@ -20,4 +20,12 @@ await index.apply(encodeMutationBatch({ upserts: [{ id: 'product-1', fields: { t
 if (mode === 'committed') {
 	await index.commit();
 }
+if (mode.startsWith('published')) {
+	await index.publish('checkpoint-1');
+	await index.apply(encodeMutationBatch({ upserts: [{ id: 'product-1', fields: { title: 'updated product' } }] }));
+	await index.publish('checkpoint-2');
+	if (mode === 'published-with-pending') {
+		await index.apply(encodeMutationBatch({ upserts: [{ id: 'pending', fields: { title: 'unpublished product' } }] }));
+	}
+}
 process.exit(17);

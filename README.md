@@ -3,9 +3,9 @@
 Native Tantivy full-text indexing for Node.js, with a standalone filesystem backend and an
 experimental Harper-owned storage integration.
 
-This repository is under active development. The native entry point provides a standalone Tantivy
-index backed by `MmapDirectory`. Harper releases will use only the Harper integration backed by
-Harper's existing RocksDB lifecycle; they will not use Tantivy's filesystem storage.
+This repository is under active development. The native entry point provides a Tantivy index
+backed by `MmapDirectory`, for standalone use and the planned Harper derived-index integration.
+Harper remains the source of truth; each node maintains its own rebuildable Tantivy files.
 
 ## Requirements
 
@@ -66,6 +66,36 @@ match when the index is reopened.
 explicitly. `commit()` publishes mutations, and `reload()` makes the latest commit visible to this
 handle's searches.
 
+### Checkpointed publication
+
+Use `publish(payload)` when a consumer needs to resume from a durable checkpoint:
+
+```js
+console.log(index.committedPayload); // undefined on a new index; recovered from files on reopen
+await index.apply(encodeMutationBatch({ upserts: [{ id: 'shoe-1', fields: { title: 'Trail shoes' } }] }));
+await index.publish('source-checkpoint-42');
+// Both the mutations and the checkpoint are committed; searches now see that commit.
+```
+
+The payload is an opaque, well-formed Unicode string, limited to 64 KiB in UTF-8. Fulltext does not
+interpret it or verify that it describes the mutations supplied by the caller. Empty strings are
+valid checkpoints; `undefined` means the index has never committed one. Publication uses the same
+bounded writer queue as mutations and returns a Tantivy opstamp, not an application cursor.
+
+Once a generation has a checkpoint, plain `commit()` rejects with `E_CHECKPOINT_REQUIRED`, including
+after reopen. Pending mutations remain available to a subsequent `publish()`, or can be discarded
+with rollback close. A publication without mutations can advance the checkpoint. Ordinary indexes
+that never publish retain the separate `commit()` and `reload()` API.
+
+An accepted publication that fails can have an ambiguous durable outcome: the commit may have
+succeeded before reader reload failed. The handle becomes terminal and `committedPayload` throws
+`E_POISONED`; close it, reopen the same files and identity, and recover the checkpoint from that new
+handle. Do not infer recovery progress from `status()` counters. Validation and queue admission
+failures do not themselves poison the handle or invalidate a known checkpoint.
+
+This API uses native ABI 2. The loader rejects older addon binaries; persisted index identity and
+Tantivy file formats are unchanged by the ABI update.
+
 ## Storage boundaries
 
 The package has two explicit entry points:
@@ -76,9 +106,12 @@ The package has two explicit entry points:
   through a synchronous Harper-owned key-value view. It exists to prove and measure the real
   derived-index path before Harper enables a customer-facing feature.
 
-There is no generic storage selector and no fallback between backends. Harper will consume only the
-Harper entry point. The fulltext addon does not link RocksDB or depend on rocksdb-js; Harper owns the
-database, durability, and store lifecycle.
+The hosted entry point remains temporarily for migration and regression coverage. It is not the
+planned Harper integration: Harper will use native Tantivy files as a locally rebuildable derived
+index, with authoritative records and replication owned by Harper. Native checkpoint publication
+is implemented here; wiring that lifecycle into Harper and removing the hosted backend are separate
+work. There is no automatic storage fallback. The fulltext addon does not link RocksDB or depend
+on rocksdb-js.
 
 The Harper opener requires a process-lifetime store identity, persistent generation, byte namespace,
 bounded transport limits, and a `HostStorage` implementation. `publish(payload)` commits the index

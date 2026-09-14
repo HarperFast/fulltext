@@ -11,6 +11,8 @@ import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
 for (const [mode, expected] of [
 	['committed', 1],
 	['uncommitted', 0],
+	['published', 1],
+	['published-with-pending', 1],
 ]) {
 	test(`reopens ${mode} state after abrupt process exit`, async (context) => {
 		const indexPath = mkdtempSync(path.join(tmpdir(), `harper-fulltext-${mode}-`));
@@ -37,6 +39,12 @@ for (const [mode, expected] of [
 			},
 		});
 		assert.strictEqual((await index.search({ text: 'durable product', exactTotal: true })).total, expected);
+		assert.strictEqual(index.committedPayload, mode.startsWith('published') ? 'checkpoint-2' : undefined);
+		if (mode.startsWith('published')) {
+			assert.strictEqual((await index.search({ text: 'updated', exactTotal: true })).total, 1);
+			assert.strictEqual((await index.search({ text: 'durable', exactTotal: true })).total, 0);
+			assert.strictEqual((await index.search({ text: 'unpublished', exactTotal: true })).total, 0);
+		}
 		await index.close();
 	});
 }
