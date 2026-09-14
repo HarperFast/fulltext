@@ -80,6 +80,31 @@ test('runs the public create, mutate, BM25 search, close, and reopen route', asy
 	await index.close();
 });
 
+test('reports accepted mutation count for absent deletes', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	assert.strictEqual(await index.apply(encodeMutationBatch({ deletes: ['not-indexed'] })), 1);
+	assert.strictEqual(index.status().uncommittedMutations, 1n);
+	await index.close({ mode: 'rollback' });
+});
+
+test('distinguishes oversized mutation batches from invalid input', async (context) => {
+	assert.throws(
+		() => encodeMutationBatch({ upserts: [{ id: 'large', fields: { title: 'x'.repeat(128) } }] }, 64),
+		(error) => error.code === 'E_BATCH_TOO_LARGE',
+	);
+
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 64 };
+	const index = await openNativeFullTextIndex(config);
+	const packed = encodeMutationBatch(
+		{ upserts: [{ id: 'large', fields: { title: 'x'.repeat(128) } }] },
+		config.limits.maxQueuedBytes,
+	);
+	await assert.rejects(index.apply(packed), (error) => error.code === 'E_BATCH_TOO_LARGE');
+	assert.strictEqual(index.status().uncommittedMutations, 0n);
+	await index.close();
+});
+
 test('preserves clean-close state after a rejected batch', async (context) => {
 	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
 	await assert.rejects(

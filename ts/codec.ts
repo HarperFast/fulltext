@@ -1,4 +1,4 @@
-import { FulltextError } from './errors.js';
+import { FulltextError, type FulltextErrorCode } from './errors.js';
 
 const protocolVersion = 1;
 
@@ -56,7 +56,7 @@ export interface PackedSearchRequest {
 }
 
 export function encodeOpen(config: PackedOpenConfig): Buffer {
-	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER);
+	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
 	writer.header('FTOP');
 	writer.string(config.path);
 	encodeEngine(writer, config);
@@ -64,7 +64,7 @@ export function encodeOpen(config: PackedOpenConfig): Buffer {
 }
 
 export function encodeHostOpen(config: PackedHostOpenConfig): Buffer {
-	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER);
+	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
 	writer.header('FTHO');
 	for (const identity of config.storeIdentity) writer.u64BigInt(identity, 'storeIdentity');
 	writer.byteString(config.namespace);
@@ -98,7 +98,7 @@ function encodeEngine(writer: ByteWriter, config: PackedEngineConfig): void {
 }
 
 export function encodeBatch(batch: PackedMutationBatch, maxBytes: number): Buffer {
-	const writer = new ByteWriter(maxBytes);
+	const writer = new ByteWriter(maxBytes, 'E_BATCH_TOO_LARGE');
 	writer.header('FTMB');
 	writer.u32(batch.upserts.length, 'upserts.length');
 	writer.u32(batch.deletes.length, 'deletes.length');
@@ -122,7 +122,7 @@ export function encodeBatch(batch: PackedMutationBatch, maxBytes: number): Buffe
 }
 
 export function encodeSearch(request: PackedSearchRequest): Buffer {
-	const writer = new ByteWriter(2 * 1024 * 1024);
+	const writer = new ByteWriter(2 * 1024 * 1024, 'E_INVALID_ARGUMENT');
 	writer.header('FTSQ');
 	writer.string(request.text);
 	writer.u8(request.operator === 'all' ? 1 : 0, 'operator');
@@ -220,13 +220,15 @@ export class Cursor {
 class ByteWriter {
 	readonly #chunks: Buffer[] = [];
 	readonly #maxBytes: number;
+	readonly #sizeErrorCode: FulltextErrorCode;
 	#length = 0;
 
-	constructor(maxBytes: number) {
+	constructor(maxBytes: number, sizeErrorCode: FulltextErrorCode) {
 		if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'maxBytes must be a positive safe integer');
 		}
 		this.#maxBytes = maxBytes;
+		this.#sizeErrorCode = sizeErrorCode;
 	}
 
 	header(magic: string): void {
@@ -317,7 +319,7 @@ class ByteWriter {
 	private bytes(value: Buffer): void {
 		const nextLength = this.#length + value.length;
 		if (!Number.isSafeInteger(nextLength) || nextLength > this.#maxBytes) {
-			throw new FulltextError('E_INVALID_ARGUMENT', `packed value exceeds ${this.#maxBytes} bytes`);
+			throw new FulltextError(this.#sizeErrorCode, `packed value exceeds ${this.#maxBytes} bytes`);
 		}
 		this.#length = nextLength;
 		this.#chunks.push(value);
