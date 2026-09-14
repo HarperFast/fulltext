@@ -9,7 +9,7 @@ import { encodeOpen } from '../dist/codec.js';
 import { invoke } from '../dist/invoke.js';
 import { loadAddon } from '../dist/load-addon.js';
 
-function config(context) {
+function config() {
 	const directory = mkdtempSync(path.join(tmpdir(), 'fulltext-publication-'));
 	return {
 		path: directory,
@@ -42,7 +42,7 @@ function cleanup(context, options, currentIndex) {
 }
 
 test('publishes visible mutations and opaque checkpoints, reopens, and replays by ID', async (context) => {
-	const options = config(context);
+	const options = config();
 	let index = await openNativeFullTextIndex(options);
 	cleanup(context, options, () => index);
 	assert.strictEqual(index.committedPayload, undefined);
@@ -73,7 +73,7 @@ test('publishes visible mutations and opaque checkpoints, reopens, and replays b
 });
 
 test('checks a queued commit after earlier publication and retains staged work on rejection', async (context) => {
-	const options = config(context);
+	const options = config();
 	let index = await openNativeFullTextIndex(options);
 	cleanup(context, options, () => index);
 	const published = index.publish('');
@@ -100,7 +100,7 @@ test('checks a queued commit after earlier publication and retains staged work o
 });
 
 test('preserves the latest checkpoint for overlapping and cursor-only publications', async (context) => {
-	const options = config(context);
+	const options = config();
 	let index = await openNativeFullTextIndex(options);
 	cleanup(context, options, () => index);
 	const stamps = await Promise.all([index.publish('one'), index.publish('two'), index.publish('three')]);
@@ -112,7 +112,7 @@ test('preserves the latest checkpoint for overlapping and cursor-only publicatio
 });
 
 test('validates Unicode and the UTF-8 byte limit without poisoning readback', async (context) => {
-	const options = config(context);
+	const options = config();
 	let index = await openNativeFullTextIndex(options);
 	cleanup(context, options, () => index);
 	const boundary = '🦀'.repeat(16 * 1024);
@@ -128,7 +128,7 @@ test('validates Unicode and the UTF-8 byte limit without poisoning readback', as
 });
 
 test('a synchronous queue rejection does not invalidate an earlier pending publication', async (context) => {
-	const options = config(context);
+	const options = config();
 	options.limits.maxQueuedBytes = options.limits.maxBatchBytes = 128;
 	const index = await openNativeFullTextIndex(options);
 	cleanup(context, options, () => index);
@@ -145,7 +145,7 @@ test('a synchronous queue rejection does not invalidate an earlier pending publi
 for (const afterCommit of [false, true]) {
 	for (const prior of [undefined, 'previous']) {
 		test(`recovers a ${afterCommit ? 'committed' : 'uncommitted'} failed publication after ${prior ?? 'no checkpoint'}`, async (context) => {
-			const options = config(context);
+			const options = config();
 			const addon = loadAddon();
 			const opened = await invoke((callback) => addon.__nativeOpen(encodeOpen(options), callback));
 			const handle = opened.u32();

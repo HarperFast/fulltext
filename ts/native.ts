@@ -88,9 +88,6 @@ export class NativeFullTextIndex {
 	}
 
 	get committedPayload(): string | undefined {
-		if (this.status().state === 'poisoned') {
-			throw new FulltextError('E_POISONED', 'committed payload is unknown until the index is reopened');
-		}
 		return this.#publication.committedPayload;
 	}
 

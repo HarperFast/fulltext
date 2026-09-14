@@ -361,8 +361,8 @@ impl Writer {
 		if let Some(payload) = payload {
 			commit.set_payload(payload);
 		}
-		let opstamp = commit.commit().map_err(index_error)?;
 		self.checkpoint_required |= payload.is_some();
+		let opstamp = commit.commit().map_err(index_error)?;
 		Ok(opstamp)
 	}
 
@@ -629,6 +629,19 @@ mod tests {
 		owner.close().unwrap();
 		let (mut writer, payload) = old_view.writer_with_payload(&config).unwrap();
 		assert_eq!(payload.as_deref(), Some("published-by-other-owner"));
+		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
+	}
+
+	#[test]
+	fn failed_checkpoint_commit_keeps_the_guard_conservative() {
+		let store = crate::phase0::FaultingKv::default();
+		let directory = crate::phase0::FaultingDirectory::new(store.clone());
+		let config = config();
+		let engine = Engine::open(directory, &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		store.fail_after_next_write();
+		assert!(writer.commit_with_payload(Some("uncertain")).is_err());
+		assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("uncertain"));
 		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
 	}
 

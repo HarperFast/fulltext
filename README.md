@@ -3,9 +3,9 @@
 Native Tantivy full-text indexing for Node.js, with a standalone filesystem backend and an
 experimental Harper-owned storage integration.
 
-This repository is under active development. The native entry point provides a standalone Tantivy
-index backed by `MmapDirectory`. Harper releases will use only the Harper integration backed by
-Harper's existing RocksDB lifecycle; they will not use Tantivy's filesystem storage.
+This repository is under active development. The native entry point provides a Tantivy index
+backed by `MmapDirectory`, for standalone use and the planned Harper derived-index integration.
+Harper remains the source of truth; each node maintains its own rebuildable Tantivy files.
 
 ## Requirements
 

@@ -34,11 +34,15 @@ Argument validation and queue admission failures do not change native state and 
 themselves make readback uncertain. Overlapping publications must not move the getter backward
 if JavaScript completions arrive out of order.
 
-The getter throws `E_POISONED` on uncertain publication or observed native poison. Reuse
+The getter throws `E_POISONED` on uncertain publication. Reuse
 monotonic local publication sequence numbers: calls synchronously enqueue in that order, while
 their callbacks may settle in another order. Track whether native admission succeeded so a
 definite queue rejection does not invalidate a known checkpoint. A native opstamp is not a
 Harper generation or cursor.
+
+Readback is local sequence state, not a synchronous native status call. Once payload-bearing
+commit execution begins, the writer keeps its checkpoint guard even if the commit reports an
+error: metadata may already have changed. Reopen determines whether anything persisted.
 
 ## Code boundaries
 
