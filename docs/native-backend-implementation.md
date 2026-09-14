@@ -1,15 +1,18 @@
 # Native Tantivy backend implementation
 
+The current architecture is [Native Tantivy storage and Harper derived indexes](native-storage-integration.md).
+This document records the original native implementation slice. Its source anchors and remaining
+work describe that slice, not current implementation status.
+
 ## Intent
 
 Implement `@harperfast/fulltext/native` as a usable standalone full-text index backed directly by
-Tantivy's `MmapDirectory`. This backend is the behavioral and performance reference for the future
-RocksDB-backed directory. Harper will never select it in a product release.
+Tantivy's `MmapDirectory`. This is now the only delivery target for both standalone use and Harper.
 
 This change covers the smallest end-to-end slice needed to measure real behavior: native index
 creation and reopen, batched document upsert/delete, explicit commit and reload, BM25 search,
 status, and deterministic close. Phrase, fuzzy, prefix, autocomplete,
-suggestions, highlighting, derived-index watermarks, and RocksDB storage remain separate work.
+suggestions, highlighting, and native derived-index checkpoint publication remain separate work.
 
 It deliberately implements narrow prerequisites from issues #14 and #17 without closing either
 issue. From #14 it uses one versioned packed mutation request, one packed search result, stable error

@@ -1,5 +1,9 @@
 # Fulltext package scaffold
 
+This records the initial scaffold. The current release architecture is
+[Native Tantivy storage and Harper derived indexes](native-storage-integration.md).
+Any hosted/RocksDB storage target below is historical; the delivered datasource is native only.
+
 - **Issue:** [HarperFast/fulltext#9](https://github.com/HarperFast/fulltext/issues/9)
 - **Status:** implementation plan
 - **Base:** `origin/main`

@@ -1,5 +1,12 @@
 # Phase 0: Tantivy Directory semantics and the rocksdb-js bridge
 
+> Storage architecture superseded September 14, 2026. The current design is
+> [Native Tantivy storage and Harper derived indexes](https://github.com/HarperFast/fulltext/blob/codex/native-storage-design/docs/native-storage-integration.md).
+> The wrapper and Harper now use native Tantivy files only, with local replay/rebuild on each node.
+> RocksDB Directory, host transport, and dual-backend release requirements below are historical,
+> not implementation requirements. Existing storage-independent schema, analysis, query, API safety,
+> and packaging decisions remain requirements unless explicitly superseded by the current design.
+
 - **Issue:** [HarperFast/fulltext#7](https://github.com/HarperFast/fulltext/issues/7)
 - **Related rocksdb-js issue:** [HarperFast/rocksdb-js#831](https://github.com/HarperFast/rocksdb-js/issues/831)
 - **Status:** Phase 0 implementation and qualification plan

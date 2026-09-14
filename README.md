@@ -1,11 +1,15 @@
 # @harperfast/fulltext
 
-Native Tantivy full-text indexing for Node.js, with a standalone filesystem backend and an
-experimental Harper-owned storage integration.
+Native Tantivy full-text indexing for Node.js using Tantivy's filesystem storage.
 
-This repository is under active development. The native entry point provides a standalone Tantivy
-index backed by `MmapDirectory`. Harper releases will use only the Harper integration backed by
-Harper's existing RocksDB lifecycle; they will not use Tantivy's filesystem storage.
+This repository is under active development. The native entry point provides a Tantivy index backed
+by `MmapDirectory`. Harper will use that same native storage, maintaining a local derived index on
+each node through its shared delivery/replay runtime. Local files are reused on restart; a missing
+or invalid index is rebuilt from authoritative Harper records.
+
+The [native storage integration design](docs/native-storage-integration.md) defines the current
+direction and remaining work. This documentation change does not yet remove the experimental hosted
+implementation or add native checkpoint publication.
 
 ## Requirements
 
@@ -68,30 +72,22 @@ handle's searches.
 
 ## Storage boundaries
 
-The package has two explicit entry points:
+The supported delivery target is `@harperfast/fulltext/native`, used by standalone applications and
+the planned Harper integration. It needs no rocksdb-js dependency or Harper storage provider.
 
-- `@harperfast/fulltext/native` uses Tantivy's native directory implementation and has no
-  rocksdb-js dependency.
-- `@harperfast/fulltext/harper` is an experimental integration surface that stores Tantivy objects
-  through a synchronous Harper-owned key-value view. It exists to prove and measure the real
-  derived-index path before Harper enables a customer-facing feature.
+The current source still contains the experimental `@harperfast/fulltext/harper` export and KV
+Directory. They are superseded and scheduled for removal before release; do not build a new
+integration against them. Historical storage experiments are not supported alternatives or fallbacks.
 
-There is no generic storage selector and no fallback between backends. Harper will consume only the
-Harper entry point. The fulltext addon does not link RocksDB or depend on rocksdb-js; Harper owns the
-database, durability, and store lifecycle.
+Harper owns source records, replication, checkpoint semantics, rebuilds, and local index lifecycle.
+Tantivy owns index files and their durability. Source database backups need not include index files;
+a restore rebuilds them locally before serving full-text queries. Index files contain sensitive
+derived text and require appropriate filesystem permissions and encryption at the volume level.
 
-The Harper opener requires a process-lifetime store identity, persistent generation, byte namespace,
-bounded transport limits, and a `HostStorage` implementation. `publish(payload)` commits the index
-and opaque payload into one Tantivy `meta.json` generation, then reloads the local reader before it
-resolves. Harper uses that payload for its derived-index cursor. `committedPayload` exposes the
-payload recovered at open or the newest successful publish. If a publish poisons the generation,
-its durable outcome can be ambiguous, so the getter throws until the index is reopened. Host storage
-methods are strictly synchronous; `write` and `sync` must return `undefined`, and Promise-returning
-implementations are rejected rather than acknowledged.
-
-The current Harper path is owner-worker-only. It does not yet provide non-owner read handles,
-cross-worker refresh, generation retirement, or scheduled physical reclamation. Those lifecycle
-pieces and representative performance results are required before release enablement.
+Native opaque checkpoint publication/readback, real Harper replay and worker handoff, cross-worker
+query visibility, generation retirement, and representative benchmarks remain implementation gates.
+The native example above describes the API implemented today; the design's proposed `publish`
+operation is not yet part of that native API.
 
 ## Development
 
@@ -113,7 +109,7 @@ durability points; it materially affects throughput and peak memory because repl
 upserts include delete terms. CI runs only the correctness smoke profile; timing comparisons
 require controlled hardware.
 
-The `kv-directory` benchmark measures the caller-visible buffered write path, empty and dirty
+The historical `kv-directory` benchmark measures the caller-visible buffered write path, empty and dirty
 flushes, 256 KiB chunk publication, closed- and active-writer deletion, retained and churned read
 handle opens, distinct-file read-open and write concurrency at one, two, four, and eight threads,
 and shared-file read-open concurrency at two, four, and eight threads. It reports percentiles across

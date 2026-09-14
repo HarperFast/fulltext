@@ -1,5 +1,10 @@
 # Bounded Directory reclamation
 
+Historical KV Directory work, retired from release scope September 14, 2026. Use
+[Native Tantivy storage and Harper derived indexes](native-storage-integration.md).
+Native generation cleanup uses Harper lifecycle and Tantivy files; this chunk collector is not
+a native-storage requirement.
+
 Issue: [Implement Harper-backed Tantivy Directory mapping and atomic publication #11](https://github.com/HarperFast/fulltext/issues/11).
 
 Reclamation may delete a chunk or tail only when no current logical binding, open file handle, or
