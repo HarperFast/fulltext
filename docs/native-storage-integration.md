@@ -27,6 +27,10 @@ fuzzy matching, autocomplete, configurable positions and surface terms, and opti
 highlighting disabled by default. Harper continues to expose search through `Table.search()` and REST.
 These are feature requirements, not claims that every query feature is implemented today.
 
+The detailed [Harper schema, analysis, and query design](https://github.com/HarperFast/harper/blob/codex/full-text-search-design/docs/native-full-text-search.md)
+and [shared HNSW/fulltext coordination](https://github.com/HarperFast/harper/blob/codex/full-text-search-design/docs/hnsw-fulltext-coordination.md)
+complement this architecture. Their earlier storage-specific drafts are archived, not release requirements.
+
 ## Architecture
 
 ```mermaid
