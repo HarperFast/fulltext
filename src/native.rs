@@ -83,6 +83,8 @@ struct Runtime {
 	closed: Arc<CompletionSignal>,
 	#[cfg(feature = "test-panic")]
 	publish_fault: AtomicU8,
+	#[cfg(feature = "test-panic")]
+	poison_before_admission: AtomicBool,
 	#[cfg(feature = "host-storage")]
 	host_transport: Option<Arc<HostTransport>>,
 }
@@ -309,7 +311,7 @@ pub fn native_reload(handle: u32, callback: JsFunction) -> boundary::Result<()> 
 pub fn native_search(handle: u32, packed_request: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
-		runtime.require_open()?;
+		runtime.require_open().map_err(fulltext_napi_error)?;
 		validate_search_header(&packed_request).map_err(fulltext_napi_error)?;
 		runtime
 			.search_queue
@@ -333,16 +335,20 @@ pub fn native_close(handle: u32, rollback: bool, callback: JsFunction) -> bounda
 			.state
 			.compare_exchange(STATE_OPEN, STATE_CLOSING, Ordering::AcqRel, Ordering::Acquire)
 		{
-			Ok(_) => runtime
-				.writer_queue
-				.push_force(
-					WriterCommand {
-						operation: WriterOperation::Close { rollback },
-						completion,
-					},
-					0,
-				)
-				.map_err(fulltext_napi_error),
+			Ok(_) => {
+				#[cfg(feature = "test-panic")]
+				runtime.poison_before_admission();
+				runtime
+					.writer_queue
+					.push_force(
+						WriterCommand {
+							operation: WriterOperation::Close { rollback },
+							completion,
+						},
+						0,
+					)
+					.map_err(fulltext_napi_error)
+			}
 			Err(STATE_CLOSED) => {
 				completion.success(Vec::new());
 				Ok(())
@@ -371,6 +377,15 @@ pub fn test_poison_native_handle(handle: u32) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
 		runtime.poison(FulltextError::new("E_POISONED", "test poison"));
+		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testPoisonBeforeNextAdmission")]
+pub fn test_poison_before_next_admission(handle: u32) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		runtime(handle)?.poison_before_admission.store(true, Ordering::Release);
 		Ok(())
 	})?
 }
@@ -425,6 +440,8 @@ impl Runtime {
 			closed: Arc::new(CompletionSignal::new()),
 			#[cfg(feature = "test-panic")]
 			publish_fault: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
+			poison_before_admission: AtomicBool::new(false),
 			#[cfg(feature = "host-storage")]
 			host_transport: parts.host_transport,
 		});
@@ -454,23 +471,28 @@ impl Runtime {
 		Ok(runtime)
 	}
 
-	fn require_open(&self) -> boundary::Result<()> {
+	fn require_open(&self) -> Result<()> {
 		match self.state.load(Ordering::Acquire) {
 			STATE_OPEN => Ok(()),
-			STATE_POISONED => Err(fulltext_napi_error(FulltextError::new(
-				"E_POISONED",
-				"index is poisoned",
-			))),
-			_ => Err(fulltext_napi_error(FulltextError::new(
-				"E_CLOSED",
-				"index is closing or closed",
-			))),
+			STATE_POISONED => Err(FulltextError::new("E_POISONED", "index is poisoned")),
+			_ => Err(FulltextError::new("E_CLOSED", "index is closing or closed")),
 		}
 	}
 
 	fn enqueue_writer(&self, command: WriterCommand, bytes: usize) -> boundary::Result<()> {
-		self.require_open()?;
-		self.writer_queue.try_push(command, bytes).map_err(fulltext_napi_error)
+		self.require_open().map_err(fulltext_napi_error)?;
+		#[cfg(feature = "test-panic")]
+		self.poison_before_admission();
+		self.writer_queue
+			.try_push_if(command, bytes, || self.require_open())
+			.map_err(fulltext_napi_error)
+	}
+
+	#[cfg(feature = "test-panic")]
+	fn poison_before_admission(&self) {
+		if self.poison_before_admission.swap(false, Ordering::AcqRel) {
+			self.poison(FulltextError::new("E_POISONED", "test poison before admission"));
+		}
 	}
 
 	fn force_close(&self) {
@@ -576,7 +598,12 @@ impl<T> BoundedQueue<T> {
 	}
 
 	fn try_push(&self, value: T, bytes: usize) -> Result<()> {
+		self.try_push_if(value, bytes, || Ok(()))
+	}
+
+	fn try_push_if(&self, value: T, bytes: usize, admit: impl FnOnce() -> Result<()>) -> Result<()> {
 		let mut state = lock(&self.state);
+		admit()?;
 		self.validate_capacity(&state, bytes)?;
 		state.bytes += bytes;
 		state.items.push_back(Queued {
@@ -786,13 +813,19 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 					.map_err(FulltextError::native),
 			),
 			WriterOperation::Close { rollback } => {
-				if !rollback && runtime.uncommitted_mutations.load(Ordering::Acquire) > 0 {
-					runtime.state.store(STATE_OPEN, Ordering::Release);
+				let dirty = runtime.uncommitted_mutations.load(Ordering::Acquire) > 0;
+				if !rollback
+					&& dirty && runtime
+					.state
+					.compare_exchange(STATE_CLOSING, STATE_OPEN, Ordering::AcqRel, Ordering::Acquire)
+					.is_ok()
+				{
 					WriterOutcome::Continue(Err(FulltextError::new(
 						"E_DIRTY_CLOSE",
 						"index has uncommitted mutations; publish (or commit if uncheckpointed), or close with rollback",
 					)))
 				} else {
+					let rollback = rollback || dirty || runtime.state.load(Ordering::Acquire) == STATE_POISONED;
 					let close_result = writer
 						.take()
 						.ok_or_else(|| FulltextError::new("E_POISONED", "writer is unavailable"))
@@ -1320,4 +1353,70 @@ fn napi_error(code: &'static str, error: impl std::fmt::Display) -> napi::Error<
 
 fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 	FulltextError::new("E_STORAGE", error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::mpsc;
+
+	#[test]
+	fn admission_validator_runs_under_the_queue_mutex() {
+		let queue = BoundedQueue::new(1, 8);
+		queue
+			.try_push_if(1, 8, || {
+				assert!(queue.state.try_lock().is_err());
+				Ok(())
+			})
+			.unwrap();
+		assert_eq!(queue.queued_commands.load(Ordering::Relaxed), 1);
+		assert_eq!(queue.queued_bytes.load(Ordering::Relaxed), 8);
+		assert_eq!(queue.try_push_if(2, 1, || Ok(())).unwrap_err().code, "E_QUEUE_FULL");
+		assert_eq!(queue.pop().unwrap().value, 1);
+		assert_eq!(queue.queued_bytes.load(Ordering::Relaxed), 0);
+	}
+
+	#[test]
+	fn terminal_admission_cannot_follow_a_completed_drain() {
+		let queue = Arc::new(BoundedQueue::new(1, 8));
+		let open = Arc::new(AtomicBool::new(true));
+		queue.try_push(1, 8).unwrap();
+		let (checked, after_check) = mpsc::channel();
+		let (resume, after_drain) = mpsc::channel();
+		let producer_queue = queue.clone();
+		let producer_open = open.clone();
+		let producer = thread::spawn(move || {
+			assert!(producer_open.load(Ordering::Acquire));
+			checked.send(()).unwrap();
+			after_drain.recv_timeout(Duration::from_secs(5)).unwrap();
+			producer_queue.try_push_if(2, 8, || {
+				if producer_open.load(Ordering::Acquire) {
+					Ok(())
+				} else {
+					Err(FulltextError::new("E_POISONED", "terminal generation"))
+				}
+			})
+		});
+		after_check.recv_timeout(Duration::from_secs(5)).unwrap();
+		open.store(false, Ordering::Release);
+		assert_eq!(queue.drain().len(), 1);
+		resume.send(()).unwrap();
+		assert_eq!(producer.join().unwrap().unwrap_err().code, "E_POISONED");
+		assert_eq!(queue.queued_commands.load(Ordering::Relaxed), 0);
+		assert_eq!(queue.queued_bytes.load(Ordering::Relaxed), 0);
+		queue.push_force(3, 0).unwrap();
+		assert_eq!(queue.pop().unwrap().value, 3);
+	}
+
+	#[test]
+	fn close_control_bypasses_capacity_but_not_a_closed_queue() {
+		let queue = BoundedQueue::new(1, 8);
+		queue.try_push(1, 8).unwrap();
+		queue.push_force(2, 0).unwrap();
+		assert_eq!(queue.pop().unwrap().value, 1);
+		assert_eq!(queue.pop().unwrap().value, 2);
+		queue.close();
+		assert_eq!(queue.try_push(3, 0).unwrap_err().code, "E_CLOSED");
+		assert_eq!(queue.push_force(3, 0).unwrap_err().code, "E_CLOSED");
+	}
 }
