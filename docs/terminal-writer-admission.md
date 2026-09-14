@@ -4,17 +4,17 @@
 
 This fixes the shared native runtime's writer admission race before broader concurrent Harper integration. It changes no public API signature, ABI, storage format, queue limits, or Harper protocol. Late writer requests now reject with `E_POISONED` instead of executing on a terminal generation. Native Tantivy files remain the delivery target.
 
-**Invariant:** once poison has drained the writer queue, a request that previously observed an open runtime cannot enter that queue. Close remains available to release the writer, with rollback after poison.
+**Invariant:** once poison has drained the writer queue, a request that previously observed an open runtime cannot enter that queue. Close remains available to release the writer and cannot reopen a generation that has become poisoned.
 
-## Current behavior
+## Failure on the baseline
 
-Traced against `origin/main` at `d188ecc` in `src/native.rs`:
+Before this fix, traced at commit `d188ecc` in `src/native.rs`:
 
 - `Runtime::enqueue_writer` checks `require_open()` before `BoundedQueue::try_push` takes the queue mutex. Apply, commit, publish, and reload share this path.
 - `Runtime::poison` stores `STATE_POISONED`, drains the writer queue under its mutex, and preserves one queued close by converting it to rollback.
 - A producer can pass the state check, pause, and enqueue after that drain. The writer loop does not revalidate such a command before executing it.
 - Search poison closes its queue permanently. Writer poison cannot use that mechanism unchanged: the writer actor still needs to receive close.
-- Normal close changes the runtime state before force-enqueuing its control command. Admission checked under the queue mutex ensures either rejection or placement before that close command.
+- Normal close changes the runtime state before force-enqueuing its control command.
 - A dirty close currently stores `STATE_OPEN` unconditionally. If poison occurs after close's state transition but before close enters the queue, that command misses the drain and can reopen a terminal generation.
 
 ## Approaches considered
@@ -28,15 +28,17 @@ Traced against `origin/main` at `d188ecc` in `src/native.rs`:
 
 If insertion wins the queue mutex and observes open, the command is admitted before the drain and is either already dequeued or drained on poison. If the drain wins, subsequent insertion sees poisoned while holding the same mutex and fails. The state store precedes the drain, so no producer can pass the guarded check and insert after a completed drain. Already-dequeued operations are not made cancelable by this change.
 
+If ordinary close races admission, a request either observes closing under the queue mutex and rejects, or is inserted before the close command can acquire that mutex. A dirty `require-clean` close returns `E_DIRTY_CLOSE` only if it successfully restores `CLOSING` to `OPEN`. Losing that transition to poison instead rolls back and tears down, matching default close on an already-poisoned handle. Successful close acknowledges teardown, not publication of pending writes. An already-running clean close may finish concurrently with a later poison without calling rollback; close does not commit staged writes.
+
 The added successful-path work is one atomic state load under a mutex already acquired for each writer insertion. No I/O, callbacks, decoding, or native work runs inside the validator. Rejection builds the existing error type, as capacity rejection already does; there is no new error representation. Completion failures and close preservation remain outside the queue lock. Capacity checks and counters retain their existing semantics. Search error codes are unchanged.
 
 ## Verification
 
-- Add a test-build-only, one-shot per-handle fault seam that poisons immediately after the early writer check, before queue insertion. The same seam fires after close's state transition and before its control insertion. It never executes while holding the queue mutex. This deterministically models both reported interleavings without sleeps or relying on scheduler luck.
-- Exercise apply, commit, publish, and reload through the real Node addon. Each must reject with `E_POISONED`; queued commands/bytes remain zero, close succeeds, and reopen retains exactly the previously committed documents and checkpoint.
-- Record a local negative-control run with the original production ordering plus only the test seam; all five new Node cases must fail on their intended assertions, then pass with the fix. The fixed tests run in CI; the negative-control edit is a local verification step, not a shipped alternate implementation.
-- Use Rust queue tests to assert the validator runs under the mutex, force a producer across a completed drain with channels, and check capacity accounting and the close-only bypass. These supplement rather than replace the real-addon cases.
-- Verify a dirty close missing the poison drain forces rollback and releases the native writer lock. Existing dirty-close, worker teardown, publication failure, bounded-admission, and independent-index tests remain part of the full suite. This does not claim complete coverage of every close/search-panic interleaving.
-- Run the repository's `npm test` (Rust, Node integration, packed-consumer), formatting, lint, native-only compile, and native benchmark smoke. The smoke verifies execution, not a new large-catalog latency claim.
+- `test/native-admission.test.mjs` uses a test-build-only, one-shot per-handle fault seam immediately after the early writer check, before queue insertion. The same seam fires after close's state transition and before its control insertion. It never executes while holding the queue mutex.
+- The four writer cases reject with `E_POISONED`, retain zero queued commands/bytes in these no-close-queued fixtures, and preserve the saved checkpoint. Both those cases and raced dirty close verify native handle removal and reopen with exactly the saved document set.
+- The local negative-control run used the baseline production logic with only the fault seam added. All five Node cases failed on their intended assertions. The fixed tests run in CI; the negative-control source was not retained as a shipped alternate implementation.
+- Rust queue tests assert the validator runs under the mutex, force a producer across a completed drain with channels, and check capacity accounting and the close-only bypass. These supplement rather than replace the real-addon cases.
+- Existing dirty-close, worker teardown, publication failure, bounded-admission, and independent-index tests remain part of `npm test`. This does not claim complete coverage of every close/search-panic interleaving.
+- The full gates are `npm run format:check`, `npm run lint`, and `npm test` (Rust, Node integration, packed-consumer). Native-only compilation uses `cargo check --locked --no-default-features --features node-api`; `npm run benchmark:smoke` verifies benchmark execution, not a large-catalog latency target.
 
 Process-wide budgets, general shutdown-state redesign, panic cleanup, and Harper lifecycle wiring remain separate work under the existing execution and integration issues. This change does not complete the broader bounded-execution issue.

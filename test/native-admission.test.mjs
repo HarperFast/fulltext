@@ -8,6 +8,7 @@ import { encodeMutationBatch, NativeFullTextIndex, openNativeFullTextIndex } fro
 import { encodeOpen } from '../dist/codec.js';
 import { invoke } from '../dist/invoke.js';
 import { loadAddon } from '../dist/load-addon.js';
+import { normalizeNativeError } from '../dist/errors.js';
 
 const batch = (id) => encodeMutationBatch({ upserts: [{ id, fields: { title: 'catalog product' } }] });
 const hasCode = (code) => (error) => error.code === code;
@@ -83,6 +84,10 @@ for (const operation of ['apply', 'commit', 'publish', 'reload']) {
 			assert.strictEqual(index.committedPayload, 'saved checkpoint');
 			await assert.rejects(index.search({ text: 'catalog' }), hasCode('E_POISONED'));
 			await index.close();
+			assert.throws(
+				() => addon.__nativeStatus(handle),
+				(error) => normalizeNativeError(error).code === 'E_CLOSED',
+			);
 			await verifyReopen(options);
 		},
 	);
@@ -96,7 +101,10 @@ test(
 		await index.apply(batch('pending'));
 		addon.__testPoisonBeforeNextAdmission(handle);
 		await index.close();
-		assert.strictEqual(index.status().state, 'closed');
+		assert.throws(
+			() => addon.__nativeStatus(handle),
+			(error) => normalizeNativeError(error).code === 'E_CLOSED',
+		);
 		await assert.rejects(index.apply(batch('late')), hasCode('E_CLOSED'));
 		await verifyReopen(options);
 	},
