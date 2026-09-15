@@ -30,8 +30,8 @@ of `npm pack` into a temporary consumer project.
 - Harper integration and source-data lifecycle belong in Harper rather than this package.
 - Do not expose generated Node-API declarations as the public TypeScript API.
 - Keep CPU and sustained I/O work off the Node.js event loop. The promise-shaped capability call may
-  synchronously load the addon once; no search, indexing, commit, or storage operation gets that
-  exception.
+  synchronously load the addon once. Bounded, synchronous native index inspection is permitted only
+  for lifecycle ownership changes; search, indexing, commit, and request-path storage remain async.
 - Add a direct test for each source module.
 
 Open an issue before changing a public package entry point, native ABI, persistence contract, or

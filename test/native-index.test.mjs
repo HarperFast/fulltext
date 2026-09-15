@@ -1,5 +1,14 @@
 import assert from 'node:assert';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -205,6 +214,35 @@ test('inspection remains consistent while checkpoints publish', async (context) 
 	await index.close();
 });
 
+test('classifies a corrupt committed segment as rebuildable when opening', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.apply(encodeMutationBatch({ upserts: [{ id: 'one', fields: { title: 'running shoe' } }] }));
+	await index.publish('cursor-1');
+	await index.close();
+
+	const termPath = committedSegmentPath(indexPath, '.term');
+	const bytes = readFileSync(termPath);
+	bytes[bytes.length - 1] ^= 0xff;
+	writeFileSync(termPath, bytes);
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), { state: 'ready', committedPayload: 'cursor-1' });
+	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INDEX_CORRUPT');
+});
+
+test('classifies a missing committed segment as rebuildable when opening', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.apply(encodeMutationBatch({ upserts: [{ id: 'one', fields: { title: 'running shoe' } }] }));
+	await index.publish('cursor-1');
+	await index.close();
+
+	unlinkSync(committedSegmentPath(indexPath, '.term'));
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), { state: 'ready', committedPayload: 'cursor-1' });
+	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INDEX_CORRUPT');
+});
+
 test('reports accepted mutation count for absent deletes', async (context) => {
 	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
 	assert.strictEqual(await index.apply(encodeMutationBatch({ deletes: ['not-indexed'] })), 1);
@@ -371,4 +409,10 @@ function fileSnapshot(directory, prefix = '') {
 		}
 	}
 	return snapshot;
+}
+
+function committedSegmentPath(directory, extension) {
+	const name = readdirSync(directory).find((entry) => entry.endsWith(extension));
+	assert(name, `expected a committed ${extension} segment`);
+	return path.join(directory, name);
 }

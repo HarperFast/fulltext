@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use tantivy::collector::{Count, TopDocs};
+use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
 use tantivy::query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions};
@@ -501,6 +502,30 @@ fn index_error(error: tantivy::TantivyError) -> FulltextError {
 		tantivy::TantivyError::LockFailure(tantivy::directory::error::LockError::LockBusy, _) => {
 			FulltextError::new("E_LOCK_BUSY", "another writer owns the Tantivy index lock")
 		}
+		tantivy::TantivyError::DataCorruption(_) => FulltextError::new("E_INDEX_CORRUPT", error.to_string()),
+		tantivy::TantivyError::IncompatibleIndex(_)
+		| tantivy::TantivyError::OpenReadError(OpenReadError::IncompatibleIndex(_)) => {
+			FulltextError::new("E_INDEX_FORMAT_INCOMPATIBLE", error.to_string())
+		}
+		tantivy::TantivyError::OpenReadError(OpenReadError::FileDoesNotExist(_)) => {
+			FulltextError::new("E_INDEX_CORRUPT", error.to_string())
+		}
+		tantivy::TantivyError::OpenReadError(OpenReadError::IoError { ref io_error, .. })
+			if matches!(
+				io_error.kind(),
+				std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+			) =>
+		{
+			FulltextError::new("E_INDEX_CORRUPT", error.to_string())
+		}
+		tantivy::TantivyError::IoError(ref io_error)
+			if matches!(
+				io_error.kind(),
+				std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+			) =>
+		{
+			FulltextError::new("E_INDEX_CORRUPT", error.to_string())
+		}
 		tantivy::TantivyError::OpenDirectoryError(_)
 		| tantivy::TantivyError::OpenReadError(_)
 		| tantivy::TantivyError::OpenWriteError(_)
@@ -510,13 +535,7 @@ fn index_error(error: tantivy::TantivyError) -> FulltextError {
 }
 
 fn inspection_index_error(error: tantivy::TantivyError) -> FulltextError {
-	match error {
-		tantivy::TantivyError::DataCorruption(_) => FulltextError::new("E_INDEX_CORRUPT", error.to_string()),
-		tantivy::TantivyError::IncompatibleIndex(_) => {
-			FulltextError::new("E_INDEX_FORMAT_INCOMPATIBLE", error.to_string())
-		}
-		other => index_error(other),
-	}
+	index_error(error)
 }
 
 #[cfg(test)]

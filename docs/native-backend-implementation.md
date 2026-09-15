@@ -279,10 +279,13 @@ compares the Rust error table with the TypeScript allowlist, while integration t
 representative synchronous and asynchronous failures. No Rust type or Tantivy object crosses the
 public API or Node worker.
 
-Inspection returns structural incompatibilities as data so a derived-index owner can choose a
+Inspection returns metadata incompatibilities as data so a derived-index owner can choose a
 rebuild. This includes corrupt metadata, unsupported Tantivy index formats, and persisted commit
-payloads beyond Fulltext's 64 KiB bound. Storage and native failures still throw; they are not
-silently reclassified as a rebuild.
+payloads beyond Fulltext's 64 KiB bound. A `ready` inspection result proves compatible committed
+metadata, not that every referenced segment is readable. Callers must open successfully before
+serving queries; open maps missing, corrupt, or incompatible committed segment files to rebuildable
+codes. Permission, device, and other operational storage failures still throw and are not silently
+reclassified as rebuilds.
 Missing storage returns `missing` without creating the requested directory. A read-only integration
 test snapshots file names, bytes, sizes, and modification times before and after inspection.
 

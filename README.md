@@ -109,12 +109,15 @@ succeeded before reader reload failed. The handle becomes terminal and `committe
 handle. Do not infer recovery progress from `status()` counters. Validation and queue admission
 failures do not themselves poison the handle or invalidate a known checkpoint.
 
-`inspectNativeFullTextIndex(options)` synchronously validates an existing index without creating
-files, reserving a handle, starting actors, or acquiring the Tantivy writer. It returns `missing`,
-`cursorless`, `ready` with the committed payload, or `incompatible` with a stable identity/schema
-or corrupt-format code. Operational storage failures throw. This is intended for short lifecycle
-checks such as derived-index election, not request hot paths. Its options intentionally omit writer,
-queue, and search limits because inspection creates none of those resources.
+`inspectNativeFullTextIndex(options)` synchronously validates an existing index's identity, schema,
+metadata, and committed payload without creating files, reserving a handle, starting actors, or
+acquiring the Tantivy writer. It returns `missing`, `cursorless`, `ready` with the committed payload,
+or `incompatible` with a stable identity/schema or corrupt-format code. `ready` means the committed
+metadata is compatible; callers must still open the index successfully before serving queries.
+Opening maps missing, corrupt, or incompatible committed segment files to rebuildable error codes.
+Operational storage failures throw. Inspection is intended for short lifecycle checks such as
+derived-index election, not request hot paths. Its options intentionally omit writer, queue, and
+search limits because inspection creates none of those resources.
 
 This API uses native ABI 3. The loader rejects older addon binaries; persisted index identity and
 Tantivy file formats are unchanged by the ABI update.
