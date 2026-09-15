@@ -118,7 +118,7 @@ The registry's existing physical-directory entry becomes a reservation state:
 ```text
 vacant -> open(handle) -> vacant
 vacant -> resetting    -> vacant
-open(handle) -> unproven(path + physical identity + logical ID quarantine) -> process restart
+open(handle) -> unproven(path quarantine) -> process restart
 ```
 
 The transition is made under the existing registry mutex, but canonicalization, metadata reads,
@@ -152,11 +152,17 @@ in-place deletion.
   rebuild through a live owner.
 - A failed close does not prove quiescence. Tantivy 0.26.1 can return early from
   `wait_merging_threads()` after an indexing-worker failure without joining every remaining worker.
-  The wrapper therefore removes the unusable handle and quarantines the canonical path, physical
-  directory identity, and logical index ID until process restart. This prevents a rename from
-  bypassing the quarantine on systems with stable physical-directory identities; the logical ID is
-  the cross-platform backstop. Harper keeps the index unavailable; availability is not allowed to
-  weaken the file-lifetime invariant.
+  The wrapper therefore removes the unusable handle and quarantines its canonical path until process
+  restart. The quarantine is deliberately path-scoped so another index using the same logical ID is
+  unaffected. Callers must not rename or remove an unproven directory; external filesystem mutation
+  is outside this lifecycle protocol and cannot establish safety. Harper keeps the affected index
+  unavailable; availability is not allowed to weaken the file-lifetime invariant.
+- Close has no internal timeout. Resolving while a writer or merge thread may still own files would
+  violate the barrier. Node-environment cleanup logs after its bounded wait, while process shutdown
+  remains the hard-stop mechanism for a native thread that never returns.
+- A directory containing `meta.json` without the identity sidecar fails closed. Current creation
+  writes and syncs the sidecar before Tantivy metadata, so this state cannot identify the index that
+  owns it and is not safe for reset to retire automatically.
 - Reset does not interpret or validate checkpoint payloads. Inspection remains the cursor and
   compatibility boundary.
 - Reset does not select or delete a retired generation, open a new writer, or make queries ready.

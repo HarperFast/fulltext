@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { mkdtempSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -119,16 +119,8 @@ test('an unproven close releases environment tracking and quarantines the index'
 		resetNativeFullTextIndex({ path: indexPath, indexId: 'quiescence-failed' }),
 		(error) => error.code === 'E_QUIESCENCE_FAILED',
 	);
-	const movedPath = path.join(parent, 'moved');
-	renameSync(indexPath, movedPath);
-	await assert.rejects(
-		resetNativeFullTextIndex({ path: movedPath, indexId: 'quiescence-failed' }),
-		(error) => error.code === 'E_QUIESCENCE_FAILED',
-	);
-	await assert.rejects(
-		openNativeFullTextIndex(nativeOptions(movedPath, 'quiescence-failed')),
-		(error) => error.code === 'E_QUIESCENCE_FAILED',
-	);
+	const healthy = await openNativeFullTextIndex(nativeOptions(path.join(parent, 'healthy'), 'quiescence-failed'));
+	await healthy.close();
 });
 
 async function testIndex(indexPath, indexId) {

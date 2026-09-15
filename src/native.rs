@@ -41,8 +41,6 @@ struct Registry {
 	handles: HashMap<u32, Arc<Runtime>>,
 	paths: HashMap<PathIdentity, PathReservation>,
 	unproven_paths: HashSet<PathBuf>,
-	unproven_identities: HashSet<PathIdentity>,
-	unproven_index_ids: HashSet<String>,
 	opening: HashSet<u32>,
 	cancelled: HashSet<u32>,
 	environments: HashMap<usize, Weak<EnvironmentState>>,
@@ -977,7 +975,6 @@ fn finish_runtime(
 			runtime.handle,
 			&runtime.path,
 			&runtime.path_identity,
-			&runtime.config.identity.index_id,
 			&runtime.environment,
 		);
 	}
@@ -996,7 +993,6 @@ fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
 		runtime.handle,
 		&runtime.path,
 		&runtime.path_identity,
-		&runtime.config.identity.index_id,
 		&runtime.environment,
 	);
 	runtime.signal_closed();
@@ -1007,7 +1003,7 @@ fn close_result(outcome: WriterCloseOutcome) -> Result<Vec<u8>> {
 		(true, None) => Ok(Vec::new()),
 		(true, Some(error)) => Err(FulltextError::new(
 			"E_CLOSE_FAILED",
-			format!("native resources were released, but writer shutdown reported: {error}"),
+			format!("native resources were released, but shutdown reported: {error}"),
 		)),
 		(false, Some(error)) => Err(quiescence_error(error)),
 		(false, None) => Err(quiescence_error(FulltextError::new(
@@ -1181,10 +1177,7 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 	let physical_identity = path_identity(&canonical)?;
 	{
 		let mut registry = registry();
-		if registry.unproven_paths.contains(&quiescence_key(&canonical))
-			|| registry.unproven_identities.contains(&physical_identity)
-			|| registry.unproven_index_ids.contains(&reset.index_id)
-		{
+		if registry.unproven_paths.contains(&quiescence_key(&canonical)) {
 			return Err(quiescence_error(FulltextError::new(
 				"E_LOCK_BUSY",
 				"this native index was not proven quiescent; restart is required",
@@ -1349,7 +1342,7 @@ fn lifecycle_lock_error(error: tantivy::directory::error::LockError) -> Fulltext
 
 fn rename_error(error: std::io::Error) -> FulltextError {
 	#[cfg(windows)]
-	if matches!(error.raw_os_error(), Some(5 | 32)) {
+	if error.raw_os_error() == Some(32) {
 		return FulltextError::new("E_LOCK_BUSY", "the native index directory is still in use");
 	}
 	storage_error(error)
@@ -1381,10 +1374,7 @@ fn open_runtime_with_directory(
 				"Node environment closed during index open",
 			));
 		}
-		if registry.unproven_paths.contains(&quiescence_key(&canonical))
-			|| registry.unproven_identities.contains(&physical_identity)
-			|| registry.unproven_index_ids.contains(&config.identity.index_id)
-		{
+		if registry.unproven_paths.contains(&quiescence_key(&canonical)) {
 			return Err(quiescence_error(FulltextError::new(
 				"E_LOCK_BUSY",
 				"this native index was not proven quiescent; restart is required",
@@ -1582,21 +1572,13 @@ fn release_runtime(handle: u32, path_identity: &PathIdentity, environment: &Envi
 	environment.release(handle);
 }
 
-fn release_runtime_handle(
-	handle: u32,
-	path: &Path,
-	path_identity: &PathIdentity,
-	index_id: &str,
-	environment: &EnvironmentState,
-) {
+fn release_runtime_handle(handle: u32, path: &Path, path_identity: &PathIdentity, environment: &EnvironmentState) {
 	let mut registry = registry();
 	registry.handles.remove(&handle);
 	if registry.paths.get(path_identity) == Some(&PathReservation::Open(handle)) {
 		registry.paths.remove(path_identity);
 	}
 	registry.unproven_paths.insert(quiescence_key(path));
-	registry.unproven_identities.insert(path_identity.clone());
-	registry.unproven_index_ids.insert(index_id.to_owned());
 	drop(registry);
 	environment.release(handle);
 }
