@@ -13,8 +13,8 @@ import {
 
 const smoke = process.argv.includes('--smoke');
 const sizes = integerListArgument('--indexes', smoke ? [1, 10] : [1, 10, 100, 1_000]);
-if (sizes.reduce((total, value) => total + value, 0) > 10_000)
-	throw new Error('--indexes must request no more than 10,000 total indexes');
+if (2 * sizes.reduce((total, value) => total + value, 0) > 10_000)
+	throw new Error('--indexes must create no more than 10,000 total benchmark directories');
 const commits = integerArgument('--commits', smoke ? 2 : 64);
 const warmRounds = integerArgument('--warm-rounds', smoke ? 3 : 10);
 const root = await mkdtemp(path.join(tmpdir(), 'harper-fulltext-inspect-'));
@@ -112,7 +112,7 @@ function measureInspections(paths, options, rounds) {
 			const inspectionStarted = performance.now();
 			const result = inspectNativeFullTextIndex({ ...options, path: indexPath });
 			latencies.push(performance.now() - inspectionStarted);
-			assert.deepStrictEqual(result, { state: 'ready', committedPayload: `cursor-${commits - 1}` });
+			assert.deepStrictEqual(result, { state: 'checkpointed', committedPayload: `cursor-${commits - 1}` });
 		}
 	}
 	const totalMilliseconds = performance.now() - started;

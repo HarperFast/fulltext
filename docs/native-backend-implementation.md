@@ -120,7 +120,7 @@ interface FullTextStatus {
 type NativeFullTextIndexInspection =
 	| { state: 'missing' }
 	| { state: 'cursorless' }
-	| { state: 'ready'; committedPayload: string }
+	| { state: 'checkpointed'; committedPayload: string }
 	| {
 			state: 'incompatible';
 			code:
@@ -281,11 +281,12 @@ public API or Node worker.
 
 Inspection returns metadata incompatibilities as data so a derived-index owner can choose a
 rebuild. This includes corrupt metadata, unsupported Tantivy index formats, and persisted commit
-payloads beyond Fulltext's 64 KiB bound. A `ready` inspection result proves compatible committed
-metadata, not that every referenced segment is readable. Callers must open successfully before
-serving queries; open maps missing, corrupt, or incompatible committed segment files to rebuildable
-codes. Permission, device, and other operational storage failures still throw and are not silently
-reclassified as rebuilds.
+payloads beyond Fulltext's 64 KiB bound. A `checkpointed` inspection result proves compatible
+committed metadata, not that every referenced segment is readable. Callers must open successfully
+before serving queries; initialization maps missing segment files and unreadable segment metadata
+or footers to rebuildable codes. Permission, device, and other operational storage failures still
+throw and are not silently reclassified as rebuilds. Errors after an index is open retain the
+ordinary live-operation classification rather than triggering an automatic rebuild decision.
 Missing storage returns `missing` without creating the requested directory. A read-only integration
 test snapshots file names, bytes, sizes, and modification times before and after inspection.
 

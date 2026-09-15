@@ -12,7 +12,7 @@ use tantivy::tokenizer::{
 use tantivy::{Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, Searcher, Term};
 
 use crate::error::{FulltextError, Result};
-use crate::protocol::{EngineConfig, MutationBatch, SearchOperator, SearchRequest};
+use crate::protocol::{EngineConfig, EngineIdentityConfig, MutationBatch, SearchOperator, SearchRequest};
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
 const IDENTITY_PATH: &str = ".harper-fulltext-identity";
@@ -77,7 +77,7 @@ pub struct SearchResult {
 }
 
 impl Engine {
-	pub fn inspect<D: Directory + Clone>(directory: D, config: &EngineConfig) -> Result<InspectionResult> {
+	pub fn inspect<D: Directory + Clone>(directory: D, config: &EngineIdentityConfig) -> Result<InspectionResult> {
 		let (expected_schema, _, _) = build_schema(config)?;
 		let expected_identity = identity_bytes(config);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
@@ -102,28 +102,22 @@ impl Engine {
 		if !meta_exists {
 			return Ok(InspectionResult::Cursorless);
 		}
-		let index = Index::open(directory).map_err(inspection_index_error)?;
+		let index = Index::open(directory).map_err(recovery_index_error)?;
 		if index.schema() != expected_schema {
 			return Err(FulltextError::new(
 				"E_SCHEMA_MISMATCH",
 				"the persisted Tantivy schema does not match the requested configuration",
 			));
 		}
-		Ok(match index.load_metas().map_err(inspection_index_error)?.payload {
-			Some(payload) if payload.len() > MAX_COMMIT_PAYLOAD_BYTES => {
-				return Err(FulltextError::new(
-					"E_INDEX_CORRUPT",
-					"the persisted commit payload exceeds the supported bound",
-				));
-			}
+		Ok(match validated_committed_payload(&index)? {
 			Some(payload) => InspectionResult::Payload(payload),
 			None => InspectionResult::Cursorless,
 		})
 	}
 
 	pub fn open<D: Directory + Clone>(directory: D, config: &EngineConfig) -> Result<Self> {
-		let (schema, id_field, fields) = build_schema(config)?;
-		let expected_identity = identity_bytes(config);
+		let (schema, id_field, fields) = build_schema(&config.identity)?;
+		let expected_identity = identity_bytes(&config.identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
 		let meta_exists = directory.exists(Path::new(META_PATH)).map_err(storage_error)?;
 
@@ -148,7 +142,7 @@ impl Engine {
 		}
 
 		let index = if meta_exists {
-			Index::open(directory).map_err(index_error)?
+			Index::open(directory).map_err(recovery_index_error)?
 		} else {
 			Index::create(directory, schema.clone(), IndexSettings::default()).map_err(index_error)?
 		};
@@ -158,7 +152,7 @@ impl Engine {
 				"the persisted Tantivy schema does not match the requested configuration",
 			));
 		}
-		let analyzer = build_analyzer(config.stop_words)?;
+		let analyzer = build_analyzer(config.identity.stop_words)?;
 		index.tokenizers().register(ANALYZER_NAME, analyzer.clone());
 		let field_lookup = fields
 			.iter()
@@ -175,14 +169,23 @@ impl Engine {
 	}
 
 	pub fn writer(&self, config: &EngineConfig) -> Result<Writer> {
-		self.writer_with_payload(config).map(|(writer, _)| writer)
+		self.writer_with_payload_using(config, index_error)
+			.map(|(writer, _)| writer)
 	}
 
 	pub(crate) fn writer_with_payload(&self, config: &EngineConfig) -> Result<(Writer, Option<String>)> {
+		self.writer_with_payload_using(config, recovery_index_error)
+	}
+
+	fn writer_with_payload_using(
+		&self,
+		config: &EngineConfig,
+		map_error: fn(tantivy::TantivyError) -> FulltextError,
+	) -> Result<(Writer, Option<String>)> {
 		let inner = self
 			.index
 			.writer_with_num_threads(config.limits.indexing_threads, config.limits.writer_memory_bytes)
-			.map_err(index_error)?;
+			.map_err(map_error)?;
 		// A competing process can publish until we acquire the writer lock.
 		let payload = self.committed_payload()?;
 		Ok((
@@ -198,15 +201,23 @@ impl Engine {
 	}
 
 	pub fn reader(&self) -> Result<IndexReader> {
+		self.reader_using(index_error)
+	}
+
+	pub(crate) fn reader_for_open(&self) -> Result<IndexReader> {
+		self.reader_using(recovery_index_error)
+	}
+
+	fn reader_using(&self, map_error: fn(tantivy::TantivyError) -> FulltextError) -> Result<IndexReader> {
 		self.index
 			.reader_builder()
 			.reload_policy(ReloadPolicy::Manual)
 			.try_into()
-			.map_err(index_error)
+			.map_err(map_error)
 	}
 
 	pub fn committed_payload(&self) -> Result<Option<String>> {
-		Ok(self.index.load_metas().map_err(index_error)?.payload)
+		validated_committed_payload(&self.index)
 	}
 
 	pub fn search(&self, searcher: &Searcher, request: &SearchRequest) -> Result<SearchResult> {
@@ -427,7 +438,7 @@ impl Writer {
 	}
 }
 
-fn build_schema(config: &EngineConfig) -> Result<(Schema, Field, Vec<EngineField>)> {
+fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Vec<EngineField>)> {
 	let mut builder = Schema::builder();
 	let id_indexing = TextFieldIndexing::default()
 		.set_tokenizer("raw")
@@ -471,7 +482,7 @@ fn build_analyzer(stop_words: bool) -> Result<TextAnalyzer> {
 	Ok(builder.filter_dynamic(Stemmer::new(Language::English)).build())
 }
 
-fn identity_bytes(config: &EngineConfig) -> Vec<u8> {
+fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 	let mut bytes = b"HTFI\x01\x00".to_vec();
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
@@ -502,6 +513,16 @@ fn index_error(error: tantivy::TantivyError) -> FulltextError {
 		tantivy::TantivyError::LockFailure(tantivy::directory::error::LockError::LockBusy, _) => {
 			FulltextError::new("E_LOCK_BUSY", "another writer owns the Tantivy index lock")
 		}
+		tantivy::TantivyError::OpenDirectoryError(_)
+		| tantivy::TantivyError::OpenReadError(_)
+		| tantivy::TantivyError::OpenWriteError(_)
+		| tantivy::TantivyError::IoError(_) => storage_error(error),
+		other => FulltextError::native(other),
+	}
+}
+
+fn recovery_index_error(error: tantivy::TantivyError) -> FulltextError {
+	match error {
 		tantivy::TantivyError::DataCorruption(_) => FulltextError::new("E_INDEX_CORRUPT", error.to_string()),
 		tantivy::TantivyError::IncompatibleIndex(_)
 		| tantivy::TantivyError::OpenReadError(OpenReadError::IncompatibleIndex(_)) => {
@@ -526,16 +547,22 @@ fn index_error(error: tantivy::TantivyError) -> FulltextError {
 		{
 			FulltextError::new("E_INDEX_CORRUPT", error.to_string())
 		}
-		tantivy::TantivyError::OpenDirectoryError(_)
-		| tantivy::TantivyError::OpenReadError(_)
-		| tantivy::TantivyError::OpenWriteError(_)
-		| tantivy::TantivyError::IoError(_) => storage_error(error),
-		other => FulltextError::native(other),
+		other => index_error(other),
 	}
 }
 
-fn inspection_index_error(error: tantivy::TantivyError) -> FulltextError {
-	index_error(error)
+fn validated_committed_payload(index: &Index) -> Result<Option<String>> {
+	let payload = index.load_metas().map_err(recovery_index_error)?.payload;
+	if payload
+		.as_ref()
+		.is_some_and(|payload| payload.len() > MAX_COMMIT_PAYLOAD_BYTES)
+	{
+		return Err(FulltextError::new(
+			"E_INDEX_CORRUPT",
+			"the persisted commit payload exceeds the supported bound",
+		));
+	}
+	Ok(payload)
 }
 
 #[cfg(test)]
@@ -613,22 +640,24 @@ mod tests {
 
 	fn config() -> EngineConfig {
 		EngineConfig {
-			index_id: "products".to_owned(),
-			generation: "one".to_owned(),
-			fields: vec![
-				FieldConfig {
-					name: "title".to_owned(),
-					weight: 3.0,
-				},
-				FieldConfig {
-					name: "description".to_owned(),
-					weight: 1.0,
-				},
-			],
-			analyzer: ANALYZER_NAME.to_owned(),
-			stop_words: true,
-			positions: true,
-			surface_terms: false,
+			identity: EngineIdentityConfig {
+				index_id: "products".to_owned(),
+				generation: "one".to_owned(),
+				fields: vec![
+					FieldConfig {
+						name: "title".to_owned(),
+						weight: 3.0,
+					},
+					FieldConfig {
+						name: "description".to_owned(),
+						weight: 1.0,
+					},
+				],
+				analyzer: ANALYZER_NAME.to_owned(),
+				stop_words: true,
+				positions: true,
+				surface_terms: false,
+			},
 			limits: Limits {
 				indexing_threads: 1,
 				search_threads: 2,
@@ -698,7 +727,7 @@ mod tests {
 		let config = config();
 		Engine::open(directory.clone(), &config).unwrap();
 		let mut different = config;
-		different.generation = "two".to_owned();
+		different.identity.generation = "two".to_owned();
 		let error = match Engine::open(directory, &different) {
 			Ok(_) => panic!("identity mismatch was accepted"),
 			Err(error) => error,
@@ -711,7 +740,7 @@ mod tests {
 		let directory = RamDirectory::create();
 		let config = config();
 		assert_eq!(
-			Engine::inspect(directory.clone(), &config).unwrap(),
+			Engine::inspect(directory.clone(), &config.identity).unwrap(),
 			InspectionResult::Missing
 		);
 		assert!(!directory.exists(Path::new(IDENTITY_PATH)).unwrap());
@@ -719,35 +748,42 @@ mod tests {
 
 		let engine = Engine::open(directory.clone(), &config).unwrap();
 		assert_eq!(
-			Engine::inspect(directory.clone(), &config).unwrap(),
+			Engine::inspect(directory.clone(), &config.identity).unwrap(),
 			InspectionResult::Cursorless
 		);
 		let mut writer = engine.writer(&config).unwrap();
 		writer.commit_with_payload(Some("cursor-v1")).unwrap();
 		assert_eq!(
-			Engine::inspect(directory.clone(), &config).unwrap(),
+			Engine::inspect(directory.clone(), &config.identity).unwrap(),
 			InspectionResult::Payload("cursor-v1".to_owned())
 		);
 		writer.close().unwrap();
 
 		let mut different = config;
-		different.generation = "two".to_owned();
+		different.identity.generation = "two".to_owned();
 		assert_eq!(
-			Engine::inspect(directory, &different).unwrap_err().code,
+			Engine::inspect(directory, &different.identity).unwrap_err().code,
 			"E_IDENTITY_MISMATCH"
 		);
 	}
 
 	#[test]
-	fn inspection_maps_tantivy_format_incompatibility() {
+	fn recovery_maps_tantivy_format_incompatibility() {
 		let error =
 			tantivy::TantivyError::IncompatibleIndex(tantivy::directory::error::Incompatibility::CompressionMismatch {
 				library_compression_format: "zstd".to_owned(),
 				index_compression_format: "lz4".to_owned(),
 			});
-		assert_eq!(inspection_index_error(error).code, "E_INDEX_FORMAT_INCOMPATIBLE");
+		assert_eq!(recovery_index_error(error).code, "E_INDEX_FORMAT_INCOMPATIBLE");
 		let error = tantivy::TantivyError::DataCorruption(tantivy::error::DataCorruption::comment_only("broken meta"));
-		assert_eq!(inspection_index_error(error).code, "E_INDEX_CORRUPT");
+		assert_eq!(recovery_index_error(error).code, "E_INDEX_CORRUPT");
+		let missing = || {
+			tantivy::TantivyError::OpenReadError(OpenReadError::FileDoesNotExist(
+				Path::new("missing.term").to_path_buf(),
+			))
+		};
+		assert_eq!(recovery_index_error(missing()).code, "E_INDEX_CORRUPT");
+		assert_eq!(index_error(missing()).code, "E_STORAGE");
 	}
 
 	#[test]
@@ -844,7 +880,7 @@ mod tests {
 		let directory = RamDirectory::create();
 		let config = config();
 		directory
-			.atomic_write(Path::new(IDENTITY_PATH), &identity_bytes(&config))
+			.atomic_write(Path::new(IDENTITY_PATH), &identity_bytes(&config.identity))
 			.unwrap();
 		Engine::open(directory.clone(), &config).unwrap();
 		assert!(directory.exists(Path::new(META_PATH)).unwrap());
@@ -854,7 +890,7 @@ mod tests {
 	fn rejects_meta_without_an_identity_sidecar() {
 		let directory = RamDirectory::create();
 		let config = config();
-		let (schema, _, _) = build_schema(&config).unwrap();
+		let (schema, _, _) = build_schema(&config.identity).unwrap();
 		Index::create(directory.clone(), schema, IndexSettings::default()).unwrap();
 		let error = match Engine::open(directory, &config) {
 			Ok(_) => panic!("meta without an identity sidecar was accepted"),

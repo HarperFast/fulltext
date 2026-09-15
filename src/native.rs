@@ -915,7 +915,7 @@ fn inspect_runtime(bytes: &[u8]) -> Result<InspectionResult> {
 		Err(error) => return Err(storage_error(error)),
 	};
 	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
-	Engine::inspect(directory, &open.engine)
+	Engine::inspect(directory, &open.identity)
 }
 
 fn open_runtime_with_directory(
@@ -945,7 +945,7 @@ fn open_runtime_with_directory(
 	let result = (|| {
 		let engine = Engine::open(directory, &config)?;
 		let (writer, committed_payload) = engine.writer_with_payload(&config)?;
-		let reader = engine.reader()?;
+		let reader = engine.reader_for_open()?;
 		let runtime = Runtime::start(
 			handle,
 			environment.clone(),

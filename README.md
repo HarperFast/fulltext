@@ -51,14 +51,13 @@ await index.close();
 
 console.log(
 	inspectNativeFullTextIndex({
-		// The same persisted identity options used to open the index.
 		path: './search/products',
 		indexId: 'products',
 		generation: 'v1',
 		fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
 		analyzer: 'english@1',
 	}),
-); // { state: 'ready', committedPayload: 'source-checkpoint-42' }
+); // { state: 'checkpointed', committedPayload: 'source-checkpoint-42' }
 ```
 
 Mutation batches are versioned packed values, so indexing crosses Node-API once per batch rather
@@ -111,10 +110,11 @@ failures do not themselves poison the handle or invalidate a known checkpoint.
 
 `inspectNativeFullTextIndex(options)` synchronously validates an existing index's identity, schema,
 metadata, and committed payload without creating files, reserving a handle, starting actors, or
-acquiring the Tantivy writer. It returns `missing`, `cursorless`, `ready` with the committed payload,
-or `incompatible` with a stable identity/schema or corrupt-format code. `ready` means the committed
-metadata is compatible; callers must still open the index successfully before serving queries.
-Opening maps missing, corrupt, or incompatible committed segment files to rebuildable error codes.
+acquiring the Tantivy writer. It returns `missing`, `cursorless`, `checkpointed` with the committed
+payload, or `incompatible` with a stable identity/schema or corrupt-format code. `checkpointed`
+means the committed metadata is compatible; callers must still open the index successfully before
+serving queries. Opening maps missing segment files and unreadable segment metadata or footers to
+rebuildable error codes.
 Operational storage failures throw. Inspection is intended for short lifecycle checks such as
 derived-index election, not request hot paths. Its options intentionally omit writer, queue, and
 search limits because inspection creates none of those resources.
@@ -148,16 +148,16 @@ npm run benchmark:inspect -- --indexes 1,10,100,1000 --commits 64 --warm-rounds 
 The benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
 JSON record. It reports packing, apply, durable end-to-end ingestion, actor queue and execution
 time, commit distributions, reload cost, warm and cold BM25 p50/p95/p99, exact-total overhead,
-index bytes, and periodically sampled process RSS. `--commit-every` sets the target number of mutations between
-durability points; it materially affects throughput and peak memory because replacement-safe
-upserts include delete terms. CI runs only the correctness smoke profile; timing comparisons
-require controlled hardware.
+index bytes, and periodically sampled process RSS. `--commit-every` sets the target number of
+mutations between durability points; it materially affects throughput and peak memory because
+replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
+comparisons require controlled hardware.
 
 The inspection benchmark compares synchronous read-only inspection with full writer reopen across
 multiple index counts. It reports equivalent first-pass and warm p50/p95/p99/max latency,
 synchronous wall time per inspection sweep, metadata size, and the actual segment count produced by
-the seed workload. It does not claim to model OS-cold storage. `--indexes` accepts at most 10,000
-total indexes to bound the number of temporary directories it creates.
+the seed workload. It does not claim to model OS-cold storage. `--indexes` accepts configurations
+that create at most 10,000 temporary index directories across both benchmark paths.
 
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.

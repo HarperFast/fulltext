@@ -42,7 +42,7 @@ export type NativeFullTextIndexInspectionOptions = Omit<NativeFullTextIndexOptio
 export type NativeFullTextIndexInspection =
 	| { state: 'missing' }
 	| { state: 'cursorless' }
-	| { state: 'ready'; committedPayload: string }
+	| { state: 'checkpointed'; committedPayload: string }
 	| {
 			state: 'incompatible';
 			code:
@@ -264,7 +264,7 @@ export function inspectNativeFullTextIndex(
 		if (state === 2) {
 			const committedPayload = cursor.string();
 			cursor.finish();
-			return { state: 'ready', committedPayload };
+			return { state: 'checkpointed', committedPayload };
 		}
 		throw new FulltextError('E_NATIVE_FAILURE', `Unknown native inspection state ${state}`);
 	} catch (error) {

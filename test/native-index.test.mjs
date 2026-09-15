@@ -104,7 +104,7 @@ test('inspects committed payloads without taking the writer', async (context) =>
 	assert.deepStrictEqual(inspectNativeFullTextIndex(config), { state: 'cursorless' });
 	await index.publish('cursor-1');
 	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
-		state: 'ready',
+		state: 'checkpointed',
 		committedPayload: 'cursor-1',
 	});
 	await index.close();
@@ -121,7 +121,7 @@ test('inspection does not modify native files', async (context) => {
 	await index.publish('stable');
 	const before = fileSnapshot(indexPath);
 	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
-		state: 'ready',
+		state: 'checkpointed',
 		committedPayload: 'stable',
 	});
 	assert.deepStrictEqual(fileSnapshot(indexPath), before);
@@ -151,6 +151,7 @@ test('reports corrupt metadata as incompatible', async (context) => {
 		state: 'incompatible',
 		code: 'E_INDEX_CORRUPT',
 	});
+	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INDEX_CORRUPT');
 });
 
 test('reports persisted schema drift as incompatible', async (context) => {
@@ -169,7 +170,7 @@ test('reports persisted schema drift as incompatible', async (context) => {
 	});
 });
 
-test('bounds persisted commit payloads during inspection', async (context) => {
+test('bounds persisted commit payloads during inspection and open', async (context) => {
 	const indexPath = temporaryIndex(context);
 	const config = options(indexPath);
 	const index = await openNativeFullTextIndex(config);
@@ -183,6 +184,7 @@ test('bounds persisted commit payloads during inspection', async (context) => {
 		state: 'incompatible',
 		code: 'E_INDEX_CORRUPT',
 	});
+	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INDEX_CORRUPT');
 });
 
 test('inspection remains consistent while checkpoints publish', async (context) => {
@@ -196,7 +198,7 @@ test('inspection remains consistent while checkpoints publish', async (context) 
 		);
 		const publication = index.publish(`cursor-${checkpoint}`);
 		const during = inspectNativeFullTextIndex(config);
-		if (during.state === 'ready') {
+		if (during.state === 'checkpointed') {
 			const value = Number(during.committedPayload.slice('cursor-'.length));
 			assert(value >= observed && value <= checkpoint);
 			observed = value;
@@ -206,7 +208,7 @@ test('inspection remains consistent while checkpoints publish', async (context) 
 		}
 		await publication;
 		assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
-			state: 'ready',
+			state: 'checkpointed',
 			committedPayload: `cursor-${checkpoint}`,
 		});
 		observed = checkpoint;
@@ -214,7 +216,7 @@ test('inspection remains consistent while checkpoints publish', async (context) 
 	await index.close();
 });
 
-test('classifies a corrupt committed segment as rebuildable when opening', async (context) => {
+test('classifies an unreadable committed segment footer as rebuildable when opening', async (context) => {
 	const indexPath = temporaryIndex(context);
 	const config = options(indexPath);
 	const index = await openNativeFullTextIndex(config);
@@ -226,7 +228,10 @@ test('classifies a corrupt committed segment as rebuildable when opening', async
 	const bytes = readFileSync(termPath);
 	bytes[bytes.length - 1] ^= 0xff;
 	writeFileSync(termPath, bytes);
-	assert.deepStrictEqual(inspectNativeFullTextIndex(config), { state: 'ready', committedPayload: 'cursor-1' });
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+		state: 'checkpointed',
+		committedPayload: 'cursor-1',
+	});
 	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INDEX_CORRUPT');
 });
 
@@ -239,7 +244,10 @@ test('classifies a missing committed segment as rebuildable when opening', async
 	await index.close();
 
 	unlinkSync(committedSegmentPath(indexPath, '.term'));
-	assert.deepStrictEqual(inspectNativeFullTextIndex(config), { state: 'ready', committedPayload: 'cursor-1' });
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+		state: 'checkpointed',
+		committedPayload: 'cursor-1',
+	});
 	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INDEX_CORRUPT');
 });
 

@@ -21,7 +21,7 @@ pub struct Limits {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct EngineConfig {
+pub struct EngineIdentityConfig {
 	pub index_id: String,
 	pub generation: String,
 	pub fields: Vec<FieldConfig>,
@@ -29,38 +29,24 @@ pub struct EngineConfig {
 	pub stop_words: bool,
 	pub positions: bool,
 	pub surface_terms: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineConfig {
+	pub identity: EngineIdentityConfig,
 	pub limits: Limits,
-}
-
-struct EngineIdentityConfig {
-	index_id: String,
-	generation: String,
-	fields: Vec<FieldConfig>,
-	analyzer: String,
-	stop_words: bool,
-	positions: bool,
-	surface_terms: bool,
-}
-
-impl EngineIdentityConfig {
-	fn with_limits(self, limits: Limits) -> EngineConfig {
-		EngineConfig {
-			index_id: self.index_id,
-			generation: self.generation,
-			fields: self.fields,
-			analyzer: self.analyzer,
-			stop_words: self.stop_words,
-			positions: self.positions,
-			surface_terms: self.surface_terms,
-			limits,
-		}
-	}
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeOpenConfig {
 	pub path: String,
 	pub engine: EngineConfig,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeInspectConfig {
+	pub path: String,
+	pub identity: EngineIdentityConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,33 +79,26 @@ pub struct SearchRequest {
 
 pub fn decode_open(bytes: &[u8]) -> Result<NativeOpenConfig> {
 	let mut cursor = Cursor::new(bytes, *b"FTOP")?;
-	let path = cursor.string()?;
+	let path = validate_path(cursor.string()?)?;
 	let engine = decode_engine_config(&mut cursor)?;
 	cursor.finish()?;
-	validate_path(path, engine)
+	Ok(NativeOpenConfig { path, engine })
 }
 
-pub fn decode_inspect(bytes: &[u8]) -> Result<NativeOpenConfig> {
+pub fn decode_inspect(bytes: &[u8]) -> Result<NativeInspectConfig> {
 	let mut cursor = Cursor::new(bytes, *b"FTIP")?;
-	let path = cursor.string()?;
+	let path = validate_path(cursor.string()?)?;
 	let identity = decode_engine_identity_config(&mut cursor)?;
 	cursor.finish()?;
-	let engine = identity.with_limits(Limits {
-		indexing_threads: 1,
-		search_threads: 1,
-		writer_memory_bytes: 15_000_000,
-		max_queued_commands: 1,
-		max_queued_bytes: 1,
-		max_batch_bytes: 1,
-	});
-	validate_path(path, validate_config(engine)?)
+	validate_identity_config(&identity)?;
+	Ok(NativeInspectConfig { path, identity })
 }
 
-fn validate_path(path: String, engine: EngineConfig) -> Result<NativeOpenConfig> {
+fn validate_path(path: String) -> Result<String> {
 	if path.is_empty() {
 		return Err(FulltextError::invalid("path must not be empty"));
 	}
-	Ok(NativeOpenConfig { path, engine })
+	Ok(path)
 }
 
 fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
@@ -132,7 +111,7 @@ fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
 		max_queued_bytes: cursor.u64_usize()?,
 		max_batch_bytes: cursor.u64_usize()?,
 	};
-	validate_config(identity.with_limits(limits))
+	validate_config(EngineConfig { identity, limits })
 }
 
 fn decode_engine_identity_config(cursor: &mut Cursor<'_>) -> Result<EngineIdentityConfig> {
@@ -276,25 +255,7 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 }
 
 fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
-	if config.index_id.is_empty() || config.generation.is_empty() {
-		return Err(FulltextError::invalid("indexId and generation must not be empty"));
-	}
-	if config.index_id.len() > 4_096 || config.generation.len() > 4_096 {
-		return Err(FulltextError::invalid(
-			"indexId and generation must not exceed 4096 UTF-8 bytes",
-		));
-	}
-	if config.analyzer != "english@1" {
-		return Err(FulltextError::invalid("only analyzer english@1 is supported"));
-	}
-	let mut names = std::collections::HashSet::with_capacity(config.fields.len());
-	for field in &config.fields {
-		if field.name.is_empty() || field.name == "__fulltext_id" || !names.insert(field.name.as_str()) {
-			return Err(FulltextError::invalid(
-				"field names must be non-empty, unique, and not reserved",
-			));
-		}
-	}
+	validate_identity_config(&config.identity)?;
 	let limits = &config.limits;
 	if limits.indexing_threads == 0 || limits.search_threads == 0 || limits.max_queued_commands == 0 {
 		return Err(FulltextError::invalid(
@@ -317,6 +278,29 @@ fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
 		));
 	}
 	Ok(config)
+}
+
+fn validate_identity_config(config: &EngineIdentityConfig) -> Result<()> {
+	if config.index_id.is_empty() || config.generation.is_empty() {
+		return Err(FulltextError::invalid("indexId and generation must not be empty"));
+	}
+	if config.index_id.len() > 4_096 || config.generation.len() > 4_096 {
+		return Err(FulltextError::invalid(
+			"indexId and generation must not exceed 4096 UTF-8 bytes",
+		));
+	}
+	if config.analyzer != "english@1" {
+		return Err(FulltextError::invalid("only analyzer english@1 is supported"));
+	}
+	let mut names = std::collections::HashSet::with_capacity(config.fields.len());
+	for field in &config.fields {
+		if field.name.is_empty() || field.name == "__fulltext_id" || !names.insert(field.name.as_str()) {
+			return Err(FulltextError::invalid(
+				"field names must be non-empty, unique, and not reserved",
+			));
+		}
+	}
+	Ok(())
 }
 
 struct Cursor<'a> {
@@ -435,7 +419,7 @@ mod tests {
 
 		let decoded = decode_inspect(&bytes).unwrap();
 		assert_eq!(decoded.path, "/tmp/index");
-		assert_eq!(decoded.engine.fields[0].name, "title");
+		assert_eq!(decoded.identity.fields[0].name, "title");
 		assert_eq!(decode_open(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
 
 		bytes.push(0);
