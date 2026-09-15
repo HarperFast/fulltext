@@ -225,11 +225,11 @@ export class NativeFullTextIndex {
 	}
 
 	async close(options: CloseOptions = {}): Promise<void> {
-		if (this.#closed) {
-			return;
-		}
 		if (this.#closePromise) {
 			return this.#closePromise;
+		}
+		if (this.#closed) {
+			return;
 		}
 		const openStatus = this.status();
 		this.#closePromise = (async () => {
@@ -245,6 +245,9 @@ export class NativeFullTextIndex {
 				if (nativeError.code === 'E_CLOSE_FAILED') {
 					this.#closed = true;
 					this.#closedStatus = { ...openStatus, state: 'closed' };
+				} else if (nativeError.code === 'E_QUIESCENCE_FAILED') {
+					this.#closed = true;
+					this.#closedStatus = { ...openStatus, state: 'poisoned' };
 				}
 				throw nativeError;
 			}

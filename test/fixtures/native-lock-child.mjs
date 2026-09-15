@@ -19,8 +19,10 @@ const index = await openNativeFullTextIndex({
 
 process.send('ready');
 process.on('message', async (message) => {
-	if (message !== 'close') return;
-	await index.close();
-	process.send('closed');
-	process.disconnect();
+	if (message === 'close') {
+		await index.close();
+		process.send('closed');
+	} else if (message === 'exit') {
+		process.disconnect();
+	}
 });

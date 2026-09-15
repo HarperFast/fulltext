@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { runtimeInfo } from '@harperfast/fulltext/native';
+import { NativeFullTextIndex, resetNativeFullTextIndex, runtimeInfo } from '@harperfast/fulltext/native';
 import { decodeResponse, encodeOpen } from '../dist/codec.js';
 import { normalizeNativeError } from '../dist/errors.js';
 import { loadAddon, platformTriple } from '../dist/load-addon.js';
@@ -86,6 +86,65 @@ test('default close tears down a poisoned native handle', async (context) => {
 	const reclosed = await invoke((callback) => addon.__nativeClose(reopenedHandle, false, callback));
 	reclosed.finish();
 });
+
+test('a close failure after resource release remains resettable', async (context) => {
+	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-close-failed-'));
+	context.after(() => rmSync(indexPath, { recursive: true, force: true }));
+	const { addon, handle, index } = await testIndex(indexPath, 'close-failed');
+	assert(addon.__testFailNextClose);
+	addon.__testFailNextClose(handle, true);
+	await assert.rejects(index.close(), (error) => error.code === 'E_CLOSE_FAILED');
+	assert.strictEqual(index.status().state, 'closed');
+	await assert.rejects(index.close(), (error) => error.code === 'E_CLOSE_FAILED');
+	assert.strictEqual((await resetNativeFullTextIndex({ path: indexPath, indexId: 'close-failed' })).state, 'reset');
+});
+
+test('an unproven close releases environment tracking but retains the path reservation', async (context) => {
+	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-quiescence-failed-'));
+	context.after(() => rmSync(indexPath, { recursive: true, force: true }));
+	const { addon, handle, index } = await testIndex(indexPath, 'quiescence-failed');
+	assert(addon.__testFailNextClose);
+	addon.__testFailNextClose(handle, false);
+	await assert.rejects(index.close(), (error) => error.code === 'E_QUIESCENCE_FAILED');
+	assert.strictEqual(index.status().state, 'poisoned');
+	await assert.rejects(index.close(), (error) => error.code === 'E_QUIESCENCE_FAILED');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: 'quiescence-failed' }),
+		(error) => error.code === 'E_LOCK_BUSY',
+	);
+});
+
+async function testIndex(indexPath, indexId) {
+	const addon = loadAddon();
+	const opened = await invoke((callback) =>
+		addon.__nativeOpen(encodeOpen(nativeOptions(indexPath, indexId)), callback),
+	);
+	const handle = opened.u32();
+	assert.strictEqual(opened.u8(), 0);
+	opened.finish();
+	return { addon, handle, index: new NativeFullTextIndex(handle) };
+}
+
+function nativeOptions(indexPath, indexId) {
+	return {
+		path: indexPath,
+		indexId,
+		generation: 'one',
+		fields: [{ name: 'title', weight: 1 }],
+		analyzer: 'english@1',
+		stopWords: true,
+		positions: true,
+		surfaceTerms: false,
+		limits: {
+			indexingThreads: 1,
+			searchThreads: 1,
+			writerMemoryBytes: 15_000_000,
+			maxQueuedCommands: 8,
+			maxQueuedBytes: 1024 * 1024,
+			maxBatchBytes: 1024 * 1024,
+		},
+	};
+}
 
 function invoke(start) {
 	return new Promise((resolve, reject) => {

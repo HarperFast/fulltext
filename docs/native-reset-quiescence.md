@@ -75,8 +75,9 @@ The operation has the following behavior:
   the retired tree; Harper schedules bounded cleanup, while a standalone caller may remove the
   returned path when appropriate.
 - Filesystem failures return `E_STORAGE`. A rename that did not complete is never reported as
-  success. A successful rename is the reset publication point; a process crash afterward leaves a
-  recognizable retired sibling rather than a partially deleted live path.
+  success. A successful rename is the reset publication point and leaves a recognizable retired
+  sibling rather than a partially deleted live path. Reset does not fsync the containing directory;
+  crash durability of that directory entry remains caller and filesystem policy.
 
 The native request receives its own protocol frame and the native ABI advances with the new addon
 capability. The TypeScript loader verifies the symbol before exposing the operation.
@@ -124,15 +125,16 @@ vacant -> resetting    -> vacant
 ```
 
 The transition is made under the existing registry mutex, but canonicalization, metadata reads,
-locking, and rename run outside it. Existing canonicalization and inode identity checks continue to
-collapse supported aliases. Rename is the critical property: an opener that observes the old inode
-before publication sees its reservation, lifecycle lock, or writer lock; an opener after publication
-creates a new directory that reset never deletes. Open acquires the same lifecycle lock, then
-re-stats the canonical live path after installing its registry entry and before accepting the
-writer. If the inode changed, it releases the entry and returns `E_LOCK_BUSY` rather than opening
-the retired tree. The lifecycle lock uses Tantivy's supported custom `Directory` lock primitive,
-not a second locking implementation. Every process that can open or reset the path must use this
-ABI version; the loader rejects an older addon in the current process.
+locking, and rename run outside it. Existing canonicalization and physical identity checks continue
+to collapse supported aliases. Rename is the critical property: an opener that observes the old
+directory before publication sees the lifecycle or writer lock; an opener after publication creates
+a new directory that reset never deletes. Open acquires the lifecycle lock before computing and
+reserving the physical identity. On Unix, the inode re-check after reservation is an additional
+defense against a changed path. On Windows, the lifecycle lock is the cross-process handoff barrier
+and the normalized canonical path is the in-process alias key. The lifecycle lock uses Tantivy's
+supported custom `Directory` lock primitive, not a second locking implementation. Every process
+that can open or reset the path must use this ABI version; the loader rejects an older addon in the
+current process.
 
 Reset work uses a synthetic operation handle and the existing Node-environment cleanup tracking. If
 environment teardown wins before reservation, reset is cancelled without mutation. Once the path is
@@ -185,28 +187,16 @@ required logical `indexId` check protects a valid neighboring index without bloc
 
 ## Verification
 
-- Real-addon tests create, mutate, publish, close, reset, inspect as missing, reopen, and search.
-- Reset while a handle is open or closing returns `E_LOCK_BUSY` and leaves committed data intact.
-- Missing-path reset is idempotent and does not create a directory.
-- Symbolic links, roots, and non-index parent directories are rejected without mutation.
-- Canonical path aliases cannot reset a live index.
-- A test-only gate holds reset after reservation while a same-path open proves busy; after rename,
-  reopen succeeds and reset never touches the new inode.
-- The reverse gate pauses open after its first inode read; reset retires that inode, and open's
-  post-registration identity check returns `E_LOCK_BUSY` rather than attaching to the retired tree.
-- Deterministic native assertions prove the search workers released the shared engine and reader
-  before close completion. A publication followed by searches on every worker proves they share the
-  reloaded reader.
-- A close followed by a direct filesystem rename succeeds on Windows. Renaming the retired directory
-  back and reopening proves the operation preserved its checkpoint and searchable documents.
-- Spawn failure, panic, sharing violation, and rename failure release the reset reservation and
-  synthetic operation state.
-- Writer panic and queue-closed exits join search actors before releasing the path. An injected
-  Tantivy close failure retains the reservation and rejects reset as busy.
-- Concurrent work on a different physical index continues while reset retires its target.
-- Worker-environment teardown waits for an admitted reset and leaves no path reservation behind.
-- Existing publication, poison, admission, crash-recovery, packaging, and benchmark smoke suites
-  remain green.
+- Real-addon tests publish, close, reset, inspect as missing, restore the retired directory, reopen,
+  and verify both the checkpoint and searchable document.
+- Reset of a live index is rejected without changing its data. A separate process proves writer-lock
+  exclusion, closes its handle, stays alive, and then permits reset.
+- Missing and empty paths, logical identity mismatch, unrelated directories, source and destination
+  symbolic links, and retirement-destination failure are covered. The failure test reopens the same
+  path afterward to prove the registry reservation was released.
+- Existing Rust, publication, poison, admission, crash-recovery, worker-cleanup, packaging, and
+  benchmark-smoke suites remain part of CI. Windows CI is required before release because local
+  development cannot prove its mapping and sharing behavior.
 
 The end-to-end route is the package's Node test suite against the built N-API addon. It exercises
 the public TypeScript API through the Rust registry, Tantivy lock, and real filesystem rename rather

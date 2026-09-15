@@ -178,8 +178,10 @@ test('reset respects Tantivy ownership in another process', async (context) => {
 	});
 	child.send('close');
 	await childMessage(child, 'closed');
-	await exited;
+	assert.strictEqual(child.exitCode, null);
 	assert.strictEqual((await resetNativeFullTextIndex({ path: indexPath, indexId: 'products' })).state, 'reset');
+	child.send('exit');
+	await exited;
 });
 
 test('reset protects neighboring identities and unrelated directories', async (context) => {
@@ -188,11 +190,12 @@ test('reset protects neighboring identities and unrelated directories', async (c
 	const config = options(indexPath);
 	const index = await openNativeFullTextIndex(config);
 	await index.close();
+	const beforeMismatch = fileSnapshot(indexPath);
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: indexPath, indexId: 'orders' }),
 		(error) => error.code === 'E_IDENTITY_MISMATCH',
 	);
-	assert.strictEqual(existsSync(indexPath), true);
+	assert.deepStrictEqual(fileSnapshot(indexPath), beforeMismatch);
 
 	const unrelatedPath = path.join(parent, 'unrelated');
 	mkdirSync(unrelatedPath);
@@ -202,6 +205,37 @@ test('reset protects neighboring identities and unrelated directories', async (c
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	assert.strictEqual(readFileSync(path.join(unrelatedPath, 'important.txt'), 'utf8'), 'keep');
+});
+
+test('a rejected retirement destination releases the reset reservation', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'products');
+	const config = options(indexPath);
+	let index = await openNativeFullTextIndex(config);
+	await index.close();
+	const retiredRoot = path.join(parent, '.fulltext-retired');
+	writeFileSync(retiredRoot, 'not a directory');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	unlinkSync(retiredRoot);
+	index = await openNativeFullTextIndex(config);
+	await index.close();
+});
+
+test('reset accepts an empty index directory', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'empty');
+	mkdirSync(indexPath);
+	const result = await resetNativeFullTextIndex({ path: indexPath, indexId: 'products' });
+	assert.strictEqual(result.state, 'reset');
+	assert.strictEqual(existsSync(indexPath), false);
+
+	const lockOnlyPath = path.join(parent, 'interrupted-open');
+	mkdirSync(lockOnlyPath);
+	writeFileSync(path.join(lockOnlyPath, '.tantivy-writer.lock'), '');
+	assert.strictEqual((await resetNativeFullTextIndex({ path: lockOnlyPath, indexId: 'products' })).state, 'reset');
 });
 
 test('reset does not follow a symbolic-link path', async (context) => {
@@ -219,6 +253,17 @@ test('reset does not follow a symbolic-link path', async (context) => {
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	assert.strictEqual(existsSync(target), true);
+
+	const indexPath = path.join(parent, 'products');
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.close();
+	symlinkSync(target, path.join(parent, '.fulltext-retired'), 'dir');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.strictEqual(existsSync(indexPath), true);
 });
 
 test('inspects committed payloads without taking the writer', async (context) => {

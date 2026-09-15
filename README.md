@@ -135,6 +135,10 @@ if (result.state === 'reset') {
 }
 ```
 
+`E_CLOSE_FAILED` means native resources were released even though shutdown reported an operational
+error, so the path is safe to reset. `E_QUIESCENCE_FAILED` means the wrapper could not prove all
+native work stopped; do not reset or remove that path until the process restarts.
+
 Reset returns `missing` without creating the path. It rejects a live owner with `E_LOCK_BUSY`, a
 different persisted logical index with `E_IDENTITY_MISMATCH`, and unrelated nonempty directories
 with `E_INVALID_ARGUMENT`. On success, it renames the live directory into a unique path below the
