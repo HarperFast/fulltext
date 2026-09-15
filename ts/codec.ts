@@ -29,18 +29,6 @@ export interface PackedOpenConfig extends PackedEngineConfig {
 	path: string;
 }
 
-export interface PackedHostOpenConfig extends PackedEngineConfig {
-	storeIdentity: readonly [bigint, bigint, bigint];
-	namespace: Uint8Array;
-	transport: {
-		maxOperations: number;
-		maxBytes: number;
-		readTimeoutMs: number;
-		maxReadResponseBytes: number;
-		maxControlResponseBytes: number;
-	};
-}
-
 export interface PackedMutationBatch {
 	upserts: Array<{ id: string; fields: Record<string, string | string[]> }>;
 	deletes: string[];
@@ -59,20 +47,6 @@ export function encodeOpen(config: PackedOpenConfig): Buffer {
 	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
 	writer.header('FTOP');
 	writer.string(config.path);
-	encodeEngine(writer, config);
-	return writer.finish();
-}
-
-export function encodeHostOpen(config: PackedHostOpenConfig): Buffer {
-	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
-	writer.header('FTHO');
-	for (const identity of config.storeIdentity) writer.u64BigInt(identity, 'storeIdentity');
-	writer.byteString(config.namespace);
-	writer.u32(config.transport.maxOperations, 'transport.maxOperations');
-	writer.u64(config.transport.maxBytes, 'transport.maxBytes');
-	writer.u64(config.transport.readTimeoutMs, 'transport.readTimeoutMs');
-	writer.u64(config.transport.maxReadResponseBytes, 'transport.maxReadResponseBytes');
-	writer.u64(config.transport.maxControlResponseBytes, 'transport.maxControlResponseBytes');
 	encodeEngine(writer, config);
 	return writer.finish();
 }
@@ -261,15 +235,6 @@ class ByteWriter {
 		this.bytes(buffer);
 	}
 
-	u64BigInt(value: bigint, name: string): void {
-		if (typeof value !== 'bigint' || value < 0n || value > 0xffff_ffff_ffff_ffffn) {
-			throw new FulltextError('E_INVALID_ARGUMENT', `${name} is outside its packed integer range`);
-		}
-		const buffer = Buffer.allocUnsafe(8);
-		buffer.writeBigUInt64LE(value);
-		this.bytes(buffer);
-	}
-
 	f32(value: number, name: string): void {
 		if (!Number.isFinite(value) || value <= 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', `${name} must be finite and greater than zero`);
@@ -285,15 +250,6 @@ class ByteWriter {
 		}
 		const bytes = Buffer.from(value, 'utf8');
 		this.u32(bytes.length, 'string byte length');
-		this.bytes(bytes);
-	}
-
-	byteString(value: Uint8Array): void {
-		if (!(value instanceof Uint8Array)) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'packed byte string values must be Uint8Array instances');
-		}
-		const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-		this.u32(bytes.length, 'byte string length');
 		this.bytes(bytes);
 	}
 

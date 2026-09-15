@@ -5,18 +5,16 @@ reviewed deliberately.
 
 ## Rust runtime and build graph
 
-| Dependency                 | Scope                            | Purpose                                                                                  |
-| -------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------- |
-| `async-trait` 0.1.92       | optional Phase 0 runtime + tests | Implements Tantivy's asynchronous `FileHandle` read contract.                            |
-| `tantivy` 0.26.1           | runtime                          | Full-text indexing and search engine, including the `Directory` contract.                |
-| `napi` 2.16.17             | optional runtime                 | Node-API values and error conversion for the addon build.                                |
-| `napi-derive` 2.16.13      | optional build/runtime boundary  | Generates Node-API exports.                                                              |
-| `napi-build` 2.4.1         | build                            | Configures platform-specific addon linking.                                              |
-| `libloading` 0.8.9         | Windows runtime                  | Resolves the Node-API type-tag check from the host, matching napi-rs's Windows strategy. |
-| `stable_deref_trait` 1.2.1 | optional Phase 0 runtime         | Lets Tantivy `OwnedBytes` retain and directly read provider-owned buffers.               |
+| Dependency            | Scope                           | Purpose                                                                                  |
+| --------------------- | ------------------------------- | ---------------------------------------------------------------------------------------- |
+| `tantivy` 0.26.1      | runtime                         | Full-text indexing and search engine, including native filesystem storage.               |
+| `napi` 2.16.17        | optional runtime                | Node-API values and error conversion for the addon build.                                |
+| `napi-derive` 2.16.13 | optional build/runtime boundary | Generates Node-API exports.                                                              |
+| `napi-build` 2.4.1    | build                           | Configures platform-specific addon linking.                                              |
+| `libloading` 0.8.9    | Windows runtime                 | Resolves the Node-API type-tag check from the host, matching napi-rs's Windows strategy. |
 
-The Rust dependency graph must not include RocksDB. The Harper integration reaches Harper-owned
-storage through its narrow host interface rather than linking a second RocksDB runtime.
+The Rust dependency graph must not include RocksDB. Harper uses the native filesystem backend for
+its rebuildable derived index rather than linking a second RocksDB runtime into this addon.
 
 napi-rs 2.16 generates an outer unwind boundary only for exports marked `catch_unwind`. Every
 fulltext function, method, and constructor uses that option to contain argument and result
@@ -32,6 +30,4 @@ error codes and per-handle poison state for package-owned operations.
 | `prettier` 3.6.2      | development | Repository formatting checks.                                         |
 | `typescript` 5.9.3    | development | Compiles the public façade and declarations.                          |
 
-Neither entry point has production npm dependencies. The Harper integration accepts a narrow host
-storage interface and does not depend on rocksdb-js; Harper supplies the implementation backed by
-its own RocksDB lifecycle.
+The public entry point has no production npm dependencies and does not depend on rocksdb-js.

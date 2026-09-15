@@ -7,14 +7,15 @@
 		"./native": {
 			"types": "./dist/native.d.ts",
 			"import": "./dist/native.js"
-		},
-		"./harper": {
-			"types": "./dist/harper.d.ts",
-			"import": "./dist/harper.js"
 		}
 	},
 	"files": [
-		"dist/",
+		"dist/codec.*",
+		"dist/errors.*",
+		"dist/invoke.*",
+		"dist/load-addon.*",
+		"dist/native.*",
+		"dist/publication.*",
 		"fulltext.*.node",
 		"README.md",
 		"LICENSE",
@@ -33,12 +34,11 @@
 	},
 	"scripts": {
 		"build": "npm run build:typescript && npm run build:native",
-		"build:debug": "npm run build:typescript && napi build --platform --js false --dts ts/addon.d.ts --features host-storage",
-		"build:native": "napi build --platform --js false --dts ts/addon.d.ts --release --features host-storage",
+		"build:debug": "npm run build:typescript && napi build --platform --js false --dts ts/addon.d.ts --features node-api",
+		"build:native": "napi build --platform --js false --dts ts/addon.d.ts --release --features node-api",
 		"build:test-native": "napi build --platform --js false --dts ts/addon.d.ts --features test-panic",
 		"build:typescript": "tsc -p tsconfig.json",
 		"benchmark:native": "npm run build && node benchmarks/native.mjs",
-		"benchmark:kv-directory": "cargo bench --locked --features phase0 --bench kv_directory --",
 		"benchmark:smoke": "node benchmarks/native.mjs --smoke",
 		"check": "npm run format:check && npm run lint && npm run test",
 		"format": "prettier --write . && cargo fmt",
@@ -57,7 +57,6 @@
 		"tantivy",
 		"full-text-search",
 		"node-api",
-		"rocksdb",
 		"harper"
 	],
 	"license": "Apache-2.0",

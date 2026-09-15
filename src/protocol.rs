@@ -38,18 +38,6 @@ pub struct NativeOpenConfig {
 	pub engine: EngineConfig,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct HostOpenConfig {
-	pub engine: EngineConfig,
-	pub store_identity: (u64, u64, u64),
-	pub namespace: Vec<u8>,
-	pub max_operations: usize,
-	pub max_transport_bytes: usize,
-	pub read_timeout: std::time::Duration,
-	pub max_read_response_bytes: usize,
-	pub max_control_response_bytes: usize,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upsert {
 	pub id: String,
@@ -87,45 +75,6 @@ pub fn decode_open(bytes: &[u8]) -> Result<NativeOpenConfig> {
 		return Err(FulltextError::invalid("path must not be empty"));
 	}
 	Ok(NativeOpenConfig { path, engine })
-}
-
-pub fn decode_host_open(bytes: &[u8]) -> Result<HostOpenConfig> {
-	let mut cursor = Cursor::new(bytes, *b"FTHO")?;
-	let store_identity = (cursor.u64()?, cursor.u64()?, cursor.u64()?);
-	if store_identity == (0, 0, 0) {
-		return Err(FulltextError::invalid("store identity must not be all zero"));
-	}
-	let namespace = cursor.bytes()?.to_vec();
-	if namespace.is_empty() {
-		return Err(FulltextError::invalid("namespace must not be empty"));
-	}
-	let max_operations = cursor.u32()? as usize;
-	let max_transport_bytes = cursor.u64_usize()?;
-	let read_timeout_ms = cursor.u64()?;
-	let max_read_response_bytes = cursor.u64_usize()?;
-	let max_control_response_bytes = cursor.u64_usize()?;
-	let engine = decode_engine_config(&mut cursor)?;
-	cursor.finish()?;
-	if max_operations == 0
-		|| max_transport_bytes == 0
-		|| read_timeout_ms == 0
-		|| max_read_response_bytes == 0
-		|| max_control_response_bytes == 0
-	{
-		return Err(FulltextError::invalid(
-			"host transport limits must be greater than zero",
-		));
-	}
-	Ok(HostOpenConfig {
-		engine,
-		store_identity,
-		namespace,
-		max_operations,
-		max_transport_bytes,
-		read_timeout: std::time::Duration::from_millis(read_timeout_ms),
-		max_read_response_bytes,
-		max_control_response_bytes,
-	})
 }
 
 fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
