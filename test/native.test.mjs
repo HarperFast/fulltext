@@ -110,7 +110,7 @@ test('an unproven close releases environment tracking but retains the path reser
 	await assert.rejects(index.close(), (error) => error.code === 'E_QUIESCENCE_FAILED');
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: indexPath, indexId: 'quiescence-failed' }),
-		(error) => error.code === 'E_LOCK_BUSY',
+		(error) => error.code === 'E_QUIESCENCE_FAILED',
 	);
 });
 

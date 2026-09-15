@@ -40,6 +40,7 @@ static LIFECYCLE_LOCK: LazyLock<Lock> = LazyLock::new(|| Lock {
 struct Registry {
 	handles: HashMap<u32, Arc<Runtime>>,
 	paths: HashMap<PathIdentity, PathReservation>,
+	unproven_paths: HashSet<PathBuf>,
 	opening: HashSet<u32>,
 	cancelled: HashSet<u32>,
 	environments: HashMap<usize, Weak<EnvironmentState>>,
@@ -61,6 +62,7 @@ enum PathIdentity {
 
 struct Runtime {
 	handle: u32,
+	path: PathBuf,
 	path_identity: PathIdentity,
 	config: EngineConfig,
 	writer_queue: Arc<BoundedQueue<WriterCommand>>,
@@ -94,6 +96,7 @@ struct ResetReservation {
 }
 
 struct RuntimeParts {
+	path: PathBuf,
 	path_identity: PathIdentity,
 	config: EngineConfig,
 	engine: Engine,
@@ -430,6 +433,7 @@ impl Runtime {
 		));
 		let runtime = Arc::new(Self {
 			handle,
+			path: parts.path,
 			path_identity: parts.path_identity,
 			config: parts.config,
 			writer_queue,
@@ -900,7 +904,7 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer, engine: Arc<Engine>, reade
 	}
 }
 
-fn close_writer(runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool) -> WriterCloseOutcome {
+fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool) -> WriterCloseOutcome {
 	let Some(mut writer) = writer.take() else {
 		return WriterCloseOutcome {
 			quiesced: false,
@@ -908,7 +912,7 @@ fn close_writer(runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool) 
 		};
 	};
 	let rollback_error = if rollback { writer.rollback().err() } else { None };
-	let mut outcome = match writer.close() {
+	let outcome = match writer.close() {
 		Ok(()) => WriterCloseOutcome {
 			quiesced: true,
 			error: rollback_error,
@@ -919,16 +923,20 @@ fn close_writer(runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool) 
 		},
 	};
 	#[cfg(feature = "test-panic")]
-	match runtime.close_fault.swap(0, Ordering::AcqRel) {
-		1 if outcome.quiesced => {
-			outcome.error = Some(FulltextError::new("E_STORAGE", "injected close failure"));
+	let outcome = {
+		let mut outcome = outcome;
+		match _runtime.close_fault.swap(0, Ordering::AcqRel) {
+			1 if outcome.quiesced => {
+				outcome.error = Some(FulltextError::new("E_STORAGE", "injected close failure"));
+			}
+			2 if outcome.quiesced => {
+				outcome.quiesced = false;
+				outcome.error = Some(FulltextError::new("E_STORAGE", "injected quiescence failure"));
+			}
+			_ => {}
 		}
-		2 if outcome.quiesced => {
-			outcome.quiesced = false;
-			outcome.error = Some(FulltextError::new("E_STORAGE", "injected quiescence failure"));
-		}
-		_ => {}
-	}
+		outcome
+	};
 	outcome
 }
 
@@ -963,7 +971,12 @@ fn finish_runtime(
 		release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
 	} else {
 		runtime.state.store(STATE_POISONED, Ordering::Release);
-		release_runtime_handle(runtime.handle, &runtime.path_identity, &runtime.environment);
+		release_runtime_handle(
+			runtime.handle,
+			&runtime.path,
+			&runtime.path_identity,
+			&runtime.environment,
+		);
 	}
 	runtime.signal_closed();
 	outcome
@@ -976,7 +989,12 @@ fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
 	}
 	runtime.writer_queue.close();
 	runtime.state.store(STATE_POISONED, Ordering::Release);
-	release_runtime_handle(runtime.handle, &runtime.path_identity, &runtime.environment);
+	release_runtime_handle(
+		runtime.handle,
+		&runtime.path,
+		&runtime.path_identity,
+		&runtime.environment,
+	);
 	runtime.signal_closed();
 }
 
@@ -1159,6 +1177,12 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 	let physical_identity = path_identity(&canonical)?;
 	{
 		let mut registry = registry();
+		if registry.unproven_paths.contains(&quiescence_key(&canonical)) {
+			return Err(quiescence_error(FulltextError::new(
+				"E_LOCK_BUSY",
+				"this path was not proven quiescent; restart is required",
+			)));
+		}
 		if registry.paths.contains_key(&physical_identity) {
 			return Err(FulltextError::new("E_LOCK_BUSY", "the physical index is still active"));
 		}
@@ -1352,6 +1376,12 @@ fn open_runtime_with_directory(
 				"Node environment closed during index open",
 			));
 		}
+		if registry.unproven_paths.contains(&quiescence_key(&canonical)) {
+			return Err(quiescence_error(FulltextError::new(
+				"E_LOCK_BUSY",
+				"this path was not proven quiescent; restart is required",
+			)));
+		}
 		if let Some(reservation) = registry.paths.get(&physical_identity) {
 			return Err(match reservation {
 				PathReservation::Open(_) => {
@@ -1381,6 +1411,7 @@ fn open_runtime_with_directory(
 			handle,
 			environment.clone(),
 			RuntimeParts {
+				path: canonical.clone(),
 				path_identity: physical_identity.clone(),
 				config,
 				engine,
@@ -1543,12 +1574,13 @@ fn release_runtime(handle: u32, path_identity: &PathIdentity, environment: &Envi
 	environment.release(handle);
 }
 
-fn release_runtime_handle(handle: u32, path_identity: &PathIdentity, environment: &EnvironmentState) {
+fn release_runtime_handle(handle: u32, path: &Path, path_identity: &PathIdentity, environment: &EnvironmentState) {
 	let mut registry = registry();
 	registry.handles.remove(&handle);
-	registry
-		.paths
-		.insert(path_identity.clone(), PathReservation::Open(handle));
+	if registry.paths.get(path_identity) == Some(&PathReservation::Open(handle)) {
+		registry.paths.remove(path_identity);
+	}
+	registry.unproven_paths.insert(quiescence_key(path));
 	drop(registry);
 	environment.release(handle);
 }
@@ -1580,6 +1612,16 @@ fn path_identity(path: &Path) -> Result<PathIdentity> {
 #[cfg(all(not(unix), not(windows)))]
 fn path_identity(path: &Path) -> Result<PathIdentity> {
 	Ok(PathIdentity::Path(path.to_path_buf()))
+}
+
+#[cfg(windows)]
+fn quiescence_key(path: &Path) -> PathBuf {
+	PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+#[cfg(not(windows))]
+fn quiescence_key(path: &Path) -> PathBuf {
+	path.to_path_buf()
 }
 
 fn next_handle() -> Result<u32> {

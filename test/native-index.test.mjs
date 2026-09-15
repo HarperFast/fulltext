@@ -135,6 +135,28 @@ test('retires a closed index, preserves its checkpoint, and permits a clean rebu
 	await index.close();
 });
 
+test('close waits for background merges before retiring native files', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'merging');
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	for (let batch = 0; batch < 20; batch++) {
+		await index.apply(
+			encodeMutationBatch({
+				upserts: Array.from({ length: 100 }, (_, offset) => ({
+					id: `${batch}-${offset}`,
+					fields: { title: `Trail running shoe ${batch}-${offset}`, description: 'merge lifecycle test' },
+				})),
+			}),
+		);
+		await index.publish(`source-checkpoint-${batch}`);
+	}
+	await index.close();
+	const retired = await resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId });
+	assert.strictEqual(retired.state, 'reset');
+	rmSync(retired.retiredPath, { recursive: true });
+});
+
 test('reset is idempotent for a missing path and does not create it', async (context) => {
 	const indexPath = path.join(temporaryIndex(context), 'missing');
 	assert.deepStrictEqual(await resetNativeFullTextIndex({ path: indexPath, indexId: 'products' }), {

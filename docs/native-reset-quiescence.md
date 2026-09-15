@@ -15,7 +15,7 @@ Once native close or reset resolves, no writer, reader, search actor, merge thre
 memory mapping, or registry reservation from the completed operation can still use the live
 physical index path.
 
-## Existing behavior verified in `origin/main`
+## Lifecycle baseline
 
 - `NativeFullTextIndex.close()` delegates to `__nativeClose` and resolves from the writer command's
   callback (`ts/native.ts`, `src/native.rs`).
@@ -35,10 +35,6 @@ physical index path.
 - Harper's derived-index runtime already treats backend shutdown as the owner handoff barrier.
   Harper decides whether to reuse, replay, rebuild, activate, or clean up derived state; the wrapper
   owns only native resource safety.
-
-These paths were checked after fetching the current `origin/main`; the relevant native lifecycle
-history through `ea8c907` includes checkpoint publication, terminal writer admission, native-only
-storage, and read-only inspection.
 
 ## Public contract
 
@@ -122,6 +118,7 @@ The registry's existing physical-directory entry becomes a reservation state:
 ```text
 vacant -> open(handle) -> vacant
 vacant -> resetting    -> vacant
+open(handle) -> unproven(path quarantine) -> process restart
 ```
 
 The transition is made under the existing registry mutex, but canonicalization, metadata reads,
@@ -155,9 +152,11 @@ in-place deletion.
   rebuild through a live owner.
 - A failed close does not prove quiescence. Tantivy 0.26.1 can return early from
   `wait_merging_threads()` after an indexing-worker failure without joining every remaining worker.
-  The wrapper therefore retains the path reservation and returns a typed quiescence failure; Harper
-  keeps the index unavailable and requires process restart before retirement. Availability is not
-  allowed to weaken the file-lifetime invariant.
+  The wrapper therefore removes the unusable handle, records a canonical-path quarantine, and
+  returns a typed quiescence failure. The quarantine does not retain the directory's inode, so reuse
+  by a different path is unaffected, but open and reset of the same path fail until process restart.
+  Harper keeps the index unavailable; availability is not allowed to weaken the file-lifetime
+  invariant.
 - Reset does not interpret or validate checkpoint payloads. Inspection remains the cursor and
   compatibility boundary.
 - Reset does not select or delete a retired generation, open a new writer, or make queries ready.
@@ -168,27 +167,25 @@ in-place deletion.
   no filesystem or Tantivy operation runs while it is held. Work on one index does not wait behind
   another index's close or reset execution.
 
-## Approaches considered
+## Boundary rationale
 
-| Axis            | Candidate and disposition                                                                                                                                                                                                                                                                                                                                                                                 |
-| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Different layer | Put generation-scoped directories and an atomic current-generation pointer inside the wrapper. Rejected because it changes the existing on-disk layout, requires migration, moves generation selection into the wrapper, and introduces a second durable commit protocol alongside Tantivy `meta.json`.                                                                                                   |
-| Deeper cause    | Wrap every directory-touching Tantivy owner in a shared path lease whose final `Drop` releases the registry entry. Rejected because Tantivy creates and clones directory owners below this wrapper boundary, so proving complete lease propagation requires a custom `Directory` implementation; the actor set is already bounded and can prove teardown through joins without replacing `MmapDirectory`. |
-| Do less         | Strengthen close and let Harper retain generation-scoped directories and external cleanup. Rejected because it preserves the selector, generation sweep, and replacement machinery being removed from #2569, while standalone same-path recovery would still have to reproduce the registry and Tantivy lock checks.                                                                                      |
-| Chosen          | Strengthen close and add one non-forcing reset that atomically renames the live directory to a returned retired sibling. This puts native handle safety in the wrapper while leaving rebuild and cleanup policy in Harper.                                                                                                                                                                                |
+The wrapper retires the live directory with a same-filesystem rename instead of deleting it in
+place. This avoids recursive deletion overlapping a new directory created at the same path, creates
+one publication point, and keeps deletion recoverable. Reset never force-closes by path because a
+caller cannot prove it owns a handle opened by another Node environment. It also does not wait or
+retry; Harper already owns that policy, and `E_LOCK_BUSY` is sufficient for standalone callers.
 
-Recursive deletion of the live path was rejected because it can overlap a new inode created at the
-same name, is not an atomic recovery boundary, and expands the API's destructive blast radius.
-Automatic force-close-by-path was rejected because a caller cannot prove it owns a handle opened by
-another Node environment. Waiting and retry orchestration were rejected because Harper already owns
-that policy; `E_LOCK_BUSY` is sufficient and avoids a second lifecycle queue. A full expected schema
-guard was rejected because schema and generation incompatibility are primary reset inputs; the
-required logical `indexId` check protects a valid neighboring index without blocking those repairs.
+Reset checks the logical `indexId`, but not the full schema or generation. Schema and generation
+incompatibility are reasons to rebuild; requiring them to match would block the repair operation.
+Generation selection and cleanup remain outside the wrapper so this API does not introduce another
+durable catalog alongside Tantivy `meta.json`.
 
 ## Verification
 
 - Real-addon tests publish, close, reset, inspect as missing, restore the retired directory, reopen,
   and verify both the checkpoint and searchable document.
+- Repeated commits create merge work before close; immediate retirement and recursive removal prove
+  the barrier has released merge-owned files and mappings.
 - Reset of a live index is rejected without changing its data. A separate process proves writer-lock
   exclusion, closes its handle, stays alive, and then permits reset.
 - Missing and empty paths, logical identity mismatch, unrelated directories, source and destination

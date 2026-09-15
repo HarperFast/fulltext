@@ -146,6 +146,9 @@ parent's `.fulltext-retired` directory. The caller owns eventual deletion of tha
 the wrapper never deletes it. A standalone caller may remove it after the reset resolves, while
 Harper schedules cleanup under its derived-index lifecycle policy.
 
+An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
+return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.
+
 This API uses native ABI 4. The loader rejects older addon binaries; persisted index identity and
 Tantivy file formats are unchanged by the ABI update.
 
