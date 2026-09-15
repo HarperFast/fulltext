@@ -20,7 +20,12 @@ targets are added only after their artifacts are loaded and tested on the target
 ## Native usage
 
 ```js
-import { encodeMutationBatch, inspectNativeFullTextIndex, openNativeFullTextIndex } from '@harperfast/fulltext/native';
+import {
+	encodeMutationBatch,
+	inspectNativeFullTextIndex,
+	openNativeFullTextIndex,
+	resetNativeFullTextIndex,
+} from '@harperfast/fulltext/native';
 
 const index = await openNativeFullTextIndex({
 	path: './search/products',
@@ -119,7 +124,25 @@ Operational storage failures throw. Inspection is intended for short lifecycle c
 derived-index election, not request hot paths. Its options intentionally omit writer, queue, and
 search limits because inspection creates none of those resources.
 
-This API uses native ABI 3. The loader rejects older addon binaries; persisted index identity and
+`close()` is also the native quiescence barrier: success means the writer, search actors, readers,
+merge threads, and memory mappings no longer use the index path. After closing an incompatible or
+corrupt local index, retire it atomically before rebuilding:
+
+```js
+const result = await resetNativeFullTextIndex({ path: './search/products', indexId: 'products' });
+if (result.state === 'reset') {
+	console.log(`retired native files at ${result.retiredPath}`);
+}
+```
+
+Reset returns `missing` without creating the path. It rejects a live owner with `E_LOCK_BUSY`, a
+different persisted logical index with `E_IDENTITY_MISMATCH`, and unrelated nonempty directories
+with `E_INVALID_ARGUMENT`. On success, it renames the live directory into a unique path below the
+parent's `.fulltext-retired` directory. The caller owns eventual deletion of that returned path;
+the wrapper never deletes it. A standalone caller may remove it after the reset resolves, while
+Harper schedules cleanup under its derived-index lifecycle policy.
+
+This API uses native ABI 4. The loader rejects older addon binaries; persisted index identity and
 Tantivy file formats are unchanged by the ABI update.
 
 ## Storage boundary

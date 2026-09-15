@@ -50,6 +50,12 @@ pub struct NativeInspectConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeResetConfig {
+	pub path: String,
+	pub index_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upsert {
 	pub id: String,
 	pub fields: Vec<(String, Vec<String>)>,
@@ -92,6 +98,17 @@ pub fn decode_inspect(bytes: &[u8]) -> Result<NativeInspectConfig> {
 	cursor.finish()?;
 	validate_identity_config(&identity)?;
 	Ok(NativeInspectConfig { path, identity })
+}
+
+pub fn decode_reset(bytes: &[u8]) -> Result<NativeResetConfig> {
+	let mut cursor = Cursor::new(bytes, *b"FTRX")?;
+	let path = validate_path(cursor.string()?)?;
+	let index_id = cursor.string()?;
+	cursor.finish()?;
+	if index_id.is_empty() {
+		return Err(FulltextError::invalid("indexId must not be empty"));
+	}
+	Ok(NativeResetConfig { path, index_id })
 }
 
 fn validate_path(path: String) -> Result<String> {
@@ -403,6 +420,27 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn reset_frame_contains_only_path_and_logical_index_id() {
+		let mut bytes = b"FTRX\x01\x00".to_vec();
+		for value in ["/tmp/index", "products"] {
+			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+			bytes.extend_from_slice(value.as_bytes());
+		}
+
+		assert_eq!(
+			decode_reset(&bytes).unwrap(),
+			NativeResetConfig {
+				path: "/tmp/index".to_owned(),
+				index_id: "products".to_owned(),
+			}
+		);
+		assert_eq!(decode_inspect(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+
+		bytes.push(0);
+		assert_eq!(decode_reset(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+	}
 
 	#[test]
 	fn inspection_frame_is_distinct_and_rejects_trailing_limits() {

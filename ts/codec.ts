@@ -36,6 +36,11 @@ export interface PackedInspectConfig extends PackedIndexIdentityConfig {
 	path: string;
 }
 
+export interface PackedResetConfig {
+	path: string;
+	indexId: string;
+}
+
 export interface PackedMutationBatch {
 	upserts: Array<{ id: string; fields: Record<string, string | string[]> }>;
 	deletes: string[];
@@ -63,6 +68,14 @@ export function encodeInspect(config: PackedInspectConfig): Buffer {
 	writer.header('FTIP');
 	writer.string(config.path);
 	encodeIndexIdentity(writer, config);
+	return writer.finish();
+}
+
+export function encodeReset(config: PackedResetConfig): Buffer {
+	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
+	writer.header('FTRX');
+	writer.string(config.path);
+	writer.string(config.indexId);
 	return writer.finish();
 }
 
