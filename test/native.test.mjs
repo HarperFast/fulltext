@@ -20,7 +20,7 @@ test('loads the artifact for the executing platform', async () => {
 	assert.deepStrictEqual(info, {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
-		nativeAbiVersion: 2,
+		nativeAbiVersion: 3,
 		storageBackends: ['native'],
 	});
 	assert.strictEqual(cargoPackageVersion, packageManifest.version);

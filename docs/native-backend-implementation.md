@@ -79,6 +79,8 @@ interface NativeFullTextIndexOptions {
 	};
 }
 
+type NativeFullTextIndexInspectionOptions = Omit<NativeFullTextIndexOptions, 'limits'>;
+
 interface FullTextMutationBatch {
 	upserts?: Array<{ id: string; fields: Record<string, string | string[]> }>;
 	deletes?: string[];
@@ -114,6 +116,20 @@ interface FullTextStatus {
 		searchExecutionNanoseconds: bigint;
 	};
 }
+
+type NativeFullTextIndexInspection =
+	| { state: 'missing' }
+	| { state: 'cursorless' }
+	| { state: 'ready'; committedPayload: string }
+	| {
+			state: 'incompatible';
+			code:
+				| 'E_IDENTITY_MISMATCH'
+				| 'E_INCOMPLETE_CREATE'
+				| 'E_INDEX_CORRUPT'
+				| 'E_INDEX_FORMAT_INCOMPATIBLE'
+				| 'E_SCHEMA_MISMATCH';
+	  };
 ```
 
 These native-only limits are required in the pre-1.0 standalone factory so measurements are
@@ -123,18 +139,21 @@ and the Harper schema will never expose them.
 
 The exported flow is:
 
-1. `openNativeFullTextIndex(options)` creates the directory when absent, canonicalizes it, reserves
+1. `inspectNativeFullTextIndex(options)` synchronously checks durable identity, schema, and commit
+   payload without creating files, reserving a handle, starting an actor, or acquiring the writer.
+   Harper validates the opaque payload against its own replay-cursor contract.
+2. `openNativeFullTextIndex(options)` creates the directory when absent, canonicalizes it, reserves
    the canonical path, and asynchronously creates or reopens Tantivy state.
-2. `encodeMutationBatch(batch)` creates the versioned packed request. `apply(packedBatch)` copies
+3. `encodeMutationBatch(batch)` creates the versioned packed request. `apply(packedBatch)` copies
    it once into Rust-owned memory, validates it once in Rust, and enqueues one command. Upsert is
    delete-by-ID followed by add, so a committed ID has at most one live document.
-3. `commit()` serializes behind earlier writer commands and publishes through Tantivy's ordinary
+4. `commit()` serializes behind earlier writer commands and publishes through Tantivy's ordinary
    commit path. It does not imply reader reload.
-4. `reload()` crosses the writer barrier and then refreshes the reader on the search executor;
+5. `reload()` crosses the writer barrier and then refreshes the reader on the search executor;
    `search()` uses one captured immutable searcher without waiting behind indexing or commit work.
-5. `close()` rejects new work, settles admitted commands, shuts down the writer, releases the path
+6. `close()` rejects new work, settles admitted commands, shuts down the writer, releases the path
    reservation, and is idempotent.
-6. `status()` reads bounded counters and state without entering either sustained-work queue.
+7. `status()` reads bounded counters and state without entering either sustained-work queue.
 
 Only English analysis is accepted. `positions` defaults to true and selects frequencies with or
 without positions. Changing that default in a future release is an index-format change, not a
@@ -195,6 +214,14 @@ eventual shared multi-environment registry, but it preserves the one-writer inva
 pretending two JavaScript handles have coordinated close ownership. The later registry issue can
 replace rejection with reference-counted shared handles without changing the index contract.
 
+Inspection is deliberately outside the handle registry and writer actor. It opens Tantivy's
+managed directory read-only long enough to validate the persisted schema and read the current
+commit payload, then drops it before returning. A small synchronous lifecycle check is preferable
+to acquiring and closing an `IndexWriter`, but it is not a request-path API: callers cache the
+result for their ownership epoch and repeat it only when lifecycle ownership changes. Tantivy's
+`MmapDirectory` constructs a dormant file-watcher value, but no watcher thread starts unless
+`Directory::watch` is invoked; inspection never invokes it.
+
 ## Schema and query behavior
 
 Each Tantivy schema contains an internal indexed string fast field for the raw ID using Tantivy's raw tokenizer
@@ -251,6 +278,13 @@ Tantivy's filesystem writer lock maps to a distinct retryable lock-busy code. A 
 compares the Rust error table with the TypeScript allowlist, while integration tests assert codes on
 representative synchronous and asynchronous failures. No Rust type or Tantivy object crosses the
 public API or Node worker.
+
+Inspection returns structural incompatibilities as data so a derived-index owner can choose a
+rebuild. This includes corrupt metadata, unsupported Tantivy index formats, and persisted commit
+payloads beyond Fulltext's 64 KiB bound. Storage and native failures still throw; they are not
+silently reclassified as a rebuild.
+Missing storage returns `missing` without creating the requested directory. A read-only integration
+test snapshots file names, bytes, sizes, and modification times before and after inspection.
 
 Successful `commit()` delegates to Tantivy 0.26.1's ordinary commit path and resolves only after it
 returns. The process-kill test verifies publication and process-crash recovery. A test directory
@@ -311,12 +345,21 @@ commit, close, and reopen assertions before validating nonzero measurements. Sha
 no timing threshold. Performance thresholds require controlled hardware and release-over-release
 history.
 
+The inspection benchmark creates one committed native seed, clones it to configurable index counts,
+and compares synchronous inspection with full writer-backed reopen. It reports first-pass and warm
+p50/p95/p99/max latency for both operations plus synchronous wall time for each inspection sweep.
+The comparison answers whether lifecycle inspection is cheap enough to remain synchronous; it is
+not a query-throughput or OS-cold-storage benchmark. Every record includes the actual segment count
+and metadata size so metadata-light runs are not presented as worst-case evidence. `--warm-rounds`
+controls repeated passes, and requested index counts are capped at 10,000 total directories.
+
 ## Verification
 
 - Rust unit tests: schema equality, analyzer behavior, batch decode bounds, upsert/delete ordering,
   query construction, close state, duplicate path rejection, and queue saturation.
 - Node tests through `@harperfast/fulltext/native`: create, apply, commit, reload, BM25 ranking,
-  reopen, mutation validation, schema mismatch, close modes, and event-loop responsiveness.
+  reopen, read-only inspection while a writer is held, mutation validation, schema mismatch, close
+  modes, and event-loop responsiveness.
 - Process tests: kill the indexer immediately after a successful commit and verify the committed
   corpus after reopen; kill before commit and verify it is absent. A worker-thread test verifies
   promises settle only into their originating Node environment.
@@ -326,7 +369,8 @@ history.
 - Decoder tests cover invalid counts, lengths, and UTF-8; randomized decoder fuzzing remains part of
   the hardening work.
 - MmapDirectory contract tests remain unchanged.
-- `npm run check` and package artifact verification run before review.
+- `npm run check`, the inspection benchmark smoke profile, and package artifact verification run
+  before review.
 - The release benchmark runs locally at two dataset sizes and commit cadences; raw JSON is retained
   with the PR verification notes. It is built explicitly in release mode before measurements are
   taken.

@@ -32,6 +32,31 @@ pub struct EngineConfig {
 	pub limits: Limits,
 }
 
+struct EngineIdentityConfig {
+	index_id: String,
+	generation: String,
+	fields: Vec<FieldConfig>,
+	analyzer: String,
+	stop_words: bool,
+	positions: bool,
+	surface_terms: bool,
+}
+
+impl EngineIdentityConfig {
+	fn with_limits(self, limits: Limits) -> EngineConfig {
+		EngineConfig {
+			index_id: self.index_id,
+			generation: self.generation,
+			fields: self.fields,
+			analyzer: self.analyzer,
+			stop_words: self.stop_words,
+			positions: self.positions,
+			surface_terms: self.surface_terms,
+			limits,
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeOpenConfig {
 	pub path: String,
@@ -71,6 +96,26 @@ pub fn decode_open(bytes: &[u8]) -> Result<NativeOpenConfig> {
 	let path = cursor.string()?;
 	let engine = decode_engine_config(&mut cursor)?;
 	cursor.finish()?;
+	validate_path(path, engine)
+}
+
+pub fn decode_inspect(bytes: &[u8]) -> Result<NativeOpenConfig> {
+	let mut cursor = Cursor::new(bytes, *b"FTIP")?;
+	let path = cursor.string()?;
+	let identity = decode_engine_identity_config(&mut cursor)?;
+	cursor.finish()?;
+	let engine = identity.with_limits(Limits {
+		indexing_threads: 1,
+		search_threads: 1,
+		writer_memory_bytes: 15_000_000,
+		max_queued_commands: 1,
+		max_queued_bytes: 1,
+		max_batch_bytes: 1,
+	});
+	validate_path(path, validate_config(engine)?)
+}
+
+fn validate_path(path: String, engine: EngineConfig) -> Result<NativeOpenConfig> {
 	if path.is_empty() {
 		return Err(FulltextError::invalid("path must not be empty"));
 	}
@@ -78,6 +123,19 @@ pub fn decode_open(bytes: &[u8]) -> Result<NativeOpenConfig> {
 }
 
 fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
+	let identity = decode_engine_identity_config(cursor)?;
+	let limits = Limits {
+		indexing_threads: cursor.u16()? as usize,
+		search_threads: cursor.u16()? as usize,
+		writer_memory_bytes: cursor.u64_usize()?,
+		max_queued_commands: cursor.u32()? as usize,
+		max_queued_bytes: cursor.u64_usize()?,
+		max_batch_bytes: cursor.u64_usize()?,
+	};
+	validate_config(identity.with_limits(limits))
+}
+
+fn decode_engine_identity_config(cursor: &mut Cursor<'_>) -> Result<EngineIdentityConfig> {
 	let index_id = cursor.string()?;
 	let generation = cursor.string()?;
 	let analyzer = cursor.string()?;
@@ -99,15 +157,7 @@ fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
 		}
 		fields.push(FieldConfig { name, weight });
 	}
-	let limits = Limits {
-		indexing_threads: cursor.u16()? as usize,
-		search_threads: cursor.u16()? as usize,
-		writer_memory_bytes: cursor.u64_usize()?,
-		max_queued_commands: cursor.u32()? as usize,
-		max_queued_bytes: cursor.u64_usize()?,
-		max_batch_bytes: cursor.u64_usize()?,
-	};
-	validate_config(EngineConfig {
+	Ok(EngineIdentityConfig {
 		index_id,
 		generation,
 		fields,
@@ -115,7 +165,6 @@ fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
 		stop_words,
 		positions,
 		surface_terms,
-		limits,
 	})
 }
 
@@ -370,6 +419,28 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn inspection_frame_is_distinct_and_rejects_trailing_limits() {
+		let mut bytes = b"FTIP\x01\x00".to_vec();
+		for value in ["/tmp/index", "products", "one", "english@1"] {
+			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+			bytes.extend_from_slice(value.as_bytes());
+		}
+		bytes.extend_from_slice(&[1, 1, 0]);
+		bytes.extend_from_slice(&1u16.to_le_bytes());
+		bytes.extend_from_slice(&5u32.to_le_bytes());
+		bytes.extend_from_slice(b"title");
+		bytes.extend_from_slice(&1f32.to_le_bytes());
+
+		let decoded = decode_inspect(&bytes).unwrap();
+		assert_eq!(decoded.path, "/tmp/index");
+		assert_eq!(decoded.engine.fields[0].name, "title");
+		assert_eq!(decode_open(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+
+		bytes.push(0);
+		assert_eq!(decode_inspect(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+	}
 
 	#[test]
 	fn rejects_counts_before_allocating() {

@@ -1,10 +1,10 @@
 import assert from 'node:assert';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { encodeMutationBatch, openNativeFullTextIndex } from '@harperfast/fulltext/native';
+import { encodeMutationBatch, inspectNativeFullTextIndex, openNativeFullTextIndex } from '@harperfast/fulltext/native';
 
 function options(indexPath, overrides = {}) {
 	return {
@@ -77,6 +77,131 @@ test('runs the public create, mutate, BM25 search, close, and reopen route', asy
 		['rack-1'],
 	);
 	assert(afterDelete.hits[0].score > 0);
+	await index.close();
+});
+
+test('inspects missing storage without creating it', (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'missing');
+	const { limits: _, ...inspectionOptions } = options(indexPath);
+	assert.deepStrictEqual(inspectNativeFullTextIndex(inspectionOptions), { state: 'missing' });
+	assert.strictEqual(existsSync(indexPath), false);
+});
+
+test('inspects committed payloads without taking the writer', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), { state: 'cursorless' });
+	await index.publish('cursor-1');
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+		state: 'ready',
+		committedPayload: 'cursor-1',
+	});
+	await index.close();
+	assert.deepStrictEqual(inspectNativeFullTextIndex(options(indexPath, { generation: 'generation-2' })), {
+		state: 'incompatible',
+		code: 'E_IDENTITY_MISMATCH',
+	});
+});
+
+test('inspection does not modify native files', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.publish('stable');
+	const before = fileSnapshot(indexPath);
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+		state: 'ready',
+		committedPayload: 'stable',
+	});
+	assert.deepStrictEqual(fileSnapshot(indexPath), before);
+	await index.close();
+	const closed = fileSnapshot(indexPath);
+	inspectNativeFullTextIndex(config);
+	assert.deepStrictEqual(fileSnapshot(indexPath), closed);
+});
+
+test('reports incomplete native storage as incompatible', (context) => {
+	const indexPath = temporaryIndex(context);
+	writeFileSync(path.join(indexPath, 'meta.json'), '{}');
+	assert.deepStrictEqual(inspectNativeFullTextIndex(options(indexPath)), {
+		state: 'incompatible',
+		code: 'E_INCOMPLETE_CREATE',
+	});
+});
+
+test('reports corrupt metadata as incompatible', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.publish('stable');
+	await index.close();
+	writeFileSync(path.join(indexPath, 'meta.json'), '{');
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+		state: 'incompatible',
+		code: 'E_INDEX_CORRUPT',
+	});
+});
+
+test('reports persisted schema drift as incompatible', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.close();
+	const metaPath = path.join(indexPath, 'meta.json');
+	const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+	assert(Array.isArray(meta.schema));
+	meta.schema[0].name = 'unexpected';
+	writeFileSync(metaPath, JSON.stringify(meta));
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+		state: 'incompatible',
+		code: 'E_SCHEMA_MISMATCH',
+	});
+});
+
+test('bounds persisted commit payloads during inspection', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.publish('stable');
+	await index.close();
+	const metaPath = path.join(indexPath, 'meta.json');
+	const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+	meta.payload = 'x'.repeat(64 * 1024 + 1);
+	writeFileSync(metaPath, JSON.stringify(meta));
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+		state: 'incompatible',
+		code: 'E_INDEX_CORRUPT',
+	});
+});
+
+test('inspection remains consistent while checkpoints publish', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	let observed = -1;
+	for (let checkpoint = 0; checkpoint < 10; checkpoint++) {
+		await index.apply(
+			encodeMutationBatch({ upserts: [{ id: `product-${checkpoint}`, fields: { title: `Product ${checkpoint}` } }] }),
+		);
+		const publication = index.publish(`cursor-${checkpoint}`);
+		const during = inspectNativeFullTextIndex(config);
+		if (during.state === 'ready') {
+			const value = Number(during.committedPayload.slice('cursor-'.length));
+			assert(value >= observed && value <= checkpoint);
+			observed = value;
+		} else {
+			assert.strictEqual(during.state, 'cursorless');
+			assert.strictEqual(checkpoint, 0);
+		}
+		await publication;
+		assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+			state: 'ready',
+			committedPayload: `cursor-${checkpoint}`,
+		});
+		observed = checkpoint;
+	}
 	await index.close();
 });
 
@@ -219,3 +344,31 @@ test('rejects overload instead of blocking the JavaScript thread', async (contex
 	assert(settled.some((result) => result.status === 'rejected' && result.reason.code === 'E_QUEUE_FULL'));
 	await index.close({ mode: 'rollback' });
 });
+
+function fileSnapshot(directory, prefix = '') {
+	const snapshot = [];
+	for (const name of readdirSync(directory).sort()) {
+		const entryPath = path.join(directory, name);
+		const stat = statSync(entryPath);
+		const relativePath = path.join(prefix, name);
+		if (stat.isDirectory()) {
+			snapshot.push({ name: relativePath, type: 'directory', mtimeMs: stat.mtimeMs });
+			snapshot.push(...fileSnapshot(entryPath, relativePath));
+		} else {
+			let bytes;
+			try {
+				bytes = readFileSync(entryPath).toString('base64');
+			} catch (error) {
+				if (error.code !== 'EBUSY') throw error;
+			}
+			snapshot.push({
+				name: relativePath,
+				type: 'file',
+				size: stat.size,
+				mtimeMs: stat.mtimeMs,
+				bytes,
+			});
+		}
+	}
+	return snapshot;
+}

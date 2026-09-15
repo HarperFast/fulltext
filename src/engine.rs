@@ -28,6 +28,13 @@ pub struct Engine {
 	analyzer: TextAnalyzer,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InspectionResult {
+	Missing,
+	Cursorless,
+	Payload(String),
+}
+
 #[derive(Clone)]
 struct EngineField {
 	name: String,
@@ -69,6 +76,50 @@ pub struct SearchResult {
 }
 
 impl Engine {
+	pub fn inspect<D: Directory + Clone>(directory: D, config: &EngineConfig) -> Result<InspectionResult> {
+		let (expected_schema, _, _) = build_schema(config)?;
+		let expected_identity = identity_bytes(config);
+		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
+		let meta_exists = directory.exists(Path::new(META_PATH)).map_err(storage_error)?;
+
+		if !sidecar_exists && !meta_exists {
+			return Ok(InspectionResult::Missing);
+		}
+		if !sidecar_exists {
+			return Err(FulltextError::new(
+				"E_INCOMPLETE_CREATE",
+				"meta.json exists without a fulltext identity sidecar",
+			));
+		}
+		let actual_identity = directory.atomic_read(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
+		if actual_identity != expected_identity {
+			return Err(FulltextError::new(
+				"E_IDENTITY_MISMATCH",
+				"the persisted index identity does not match the requested configuration",
+			));
+		}
+		if !meta_exists {
+			return Ok(InspectionResult::Cursorless);
+		}
+		let index = Index::open(directory).map_err(inspection_index_error)?;
+		if index.schema() != expected_schema {
+			return Err(FulltextError::new(
+				"E_SCHEMA_MISMATCH",
+				"the persisted Tantivy schema does not match the requested configuration",
+			));
+		}
+		Ok(match index.load_metas().map_err(inspection_index_error)?.payload {
+			Some(payload) if payload.len() > MAX_COMMIT_PAYLOAD_BYTES => {
+				return Err(FulltextError::new(
+					"E_INDEX_CORRUPT",
+					"the persisted commit payload exceeds the supported bound",
+				));
+			}
+			Some(payload) => InspectionResult::Payload(payload),
+			None => InspectionResult::Cursorless,
+		})
+	}
+
 	pub fn open<D: Directory + Clone>(directory: D, config: &EngineConfig) -> Result<Self> {
 		let (schema, id_field, fields) = build_schema(config)?;
 		let expected_identity = identity_bytes(config);
@@ -458,6 +509,16 @@ fn index_error(error: tantivy::TantivyError) -> FulltextError {
 	}
 }
 
+fn inspection_index_error(error: tantivy::TantivyError) -> FulltextError {
+	match error {
+		tantivy::TantivyError::DataCorruption(_) => FulltextError::new("E_INDEX_CORRUPT", error.to_string()),
+		tantivy::TantivyError::IncompatibleIndex(_) => {
+			FulltextError::new("E_INDEX_FORMAT_INCOMPATIBLE", error.to_string())
+		}
+		other => index_error(other),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -624,6 +685,50 @@ mod tests {
 			Err(error) => error,
 		};
 		assert_eq!(error.code, "E_IDENTITY_MISMATCH");
+	}
+
+	#[test]
+	fn inspection_is_read_only_and_reports_committed_payload() {
+		let directory = RamDirectory::create();
+		let config = config();
+		assert_eq!(
+			Engine::inspect(directory.clone(), &config).unwrap(),
+			InspectionResult::Missing
+		);
+		assert!(!directory.exists(Path::new(IDENTITY_PATH)).unwrap());
+		assert!(!directory.exists(Path::new(META_PATH)).unwrap());
+
+		let engine = Engine::open(directory.clone(), &config).unwrap();
+		assert_eq!(
+			Engine::inspect(directory.clone(), &config).unwrap(),
+			InspectionResult::Cursorless
+		);
+		let mut writer = engine.writer(&config).unwrap();
+		writer.commit_with_payload(Some("cursor-v1")).unwrap();
+		assert_eq!(
+			Engine::inspect(directory.clone(), &config).unwrap(),
+			InspectionResult::Payload("cursor-v1".to_owned())
+		);
+		writer.close().unwrap();
+
+		let mut different = config;
+		different.generation = "two".to_owned();
+		assert_eq!(
+			Engine::inspect(directory, &different).unwrap_err().code,
+			"E_IDENTITY_MISMATCH"
+		);
+	}
+
+	#[test]
+	fn inspection_maps_tantivy_format_incompatibility() {
+		let error =
+			tantivy::TantivyError::IncompatibleIndex(tantivy::directory::error::Incompatibility::CompressionMismatch {
+				library_compression_format: "zstd".to_owned(),
+				index_compression_format: "lz4".to_owned(),
+			});
+		assert_eq!(inspection_index_error(error).code, "E_INDEX_FORMAT_INCOMPATIBLE");
+		let error = tantivy::TantivyError::DataCorruption(tantivy::error::DataCorruption::comment_only("broken meta"));
+		assert_eq!(inspection_index_error(error).code, "E_INDEX_CORRUPT");
 	}
 
 	#[test]
