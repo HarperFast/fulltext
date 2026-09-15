@@ -7,7 +7,7 @@ export interface PackedFieldConfig {
 	weight: number;
 }
 
-export interface PackedEngineConfig {
+export interface PackedIndexIdentityConfig {
 	indexId: string;
 	generation: string;
 	fields: PackedFieldConfig[];
@@ -15,6 +15,9 @@ export interface PackedEngineConfig {
 	stopWords: boolean;
 	positions: boolean;
 	surfaceTerms: boolean;
+}
+
+export interface PackedEngineConfig extends PackedIndexIdentityConfig {
 	limits: {
 		indexingThreads: number;
 		searchThreads: number;
@@ -26,6 +29,10 @@ export interface PackedEngineConfig {
 }
 
 export interface PackedOpenConfig extends PackedEngineConfig {
+	path: string;
+}
+
+export interface PackedInspectConfig extends PackedIndexIdentityConfig {
 	path: string;
 }
 
@@ -51,7 +58,25 @@ export function encodeOpen(config: PackedOpenConfig): Buffer {
 	return writer.finish();
 }
 
+export function encodeInspect(config: PackedInspectConfig): Buffer {
+	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
+	writer.header('FTIP');
+	writer.string(config.path);
+	encodeIndexIdentity(writer, config);
+	return writer.finish();
+}
+
 function encodeEngine(writer: ByteWriter, config: PackedEngineConfig): void {
+	encodeIndexIdentity(writer, config);
+	writer.u16(config.limits.indexingThreads, 'limits.indexingThreads');
+	writer.u16(config.limits.searchThreads, 'limits.searchThreads');
+	writer.u64(config.limits.writerMemoryBytes, 'limits.writerMemoryBytes');
+	writer.u32(config.limits.maxQueuedCommands, 'limits.maxQueuedCommands');
+	writer.u64(config.limits.maxQueuedBytes, 'limits.maxQueuedBytes');
+	writer.u64(config.limits.maxBatchBytes, 'limits.maxBatchBytes');
+}
+
+function encodeIndexIdentity(writer: ByteWriter, config: PackedIndexIdentityConfig): void {
 	writer.string(config.indexId);
 	writer.string(config.generation);
 	writer.string(config.analyzer);
@@ -63,12 +88,6 @@ function encodeEngine(writer: ByteWriter, config: PackedEngineConfig): void {
 		writer.string(field.name);
 		writer.f32(field.weight, 'field.weight');
 	}
-	writer.u16(config.limits.indexingThreads, 'limits.indexingThreads');
-	writer.u16(config.limits.searchThreads, 'limits.searchThreads');
-	writer.u64(config.limits.writerMemoryBytes, 'limits.writerMemoryBytes');
-	writer.u32(config.limits.maxQueuedCommands, 'limits.maxQueuedCommands');
-	writer.u64(config.limits.maxQueuedBytes, 'limits.maxQueuedBytes');
-	writer.u64(config.limits.maxBatchBytes, 'limits.maxBatchBytes');
 }
 
 export function encodeBatch(batch: PackedMutationBatch, maxBytes: number): Buffer {

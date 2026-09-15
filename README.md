@@ -20,7 +20,7 @@ targets are added only after their artifacts are loaded and tested on the target
 ## Native usage
 
 ```js
-import { encodeMutationBatch, openNativeFullTextIndex } from '@harperfast/fulltext/native';
+import { encodeMutationBatch, inspectNativeFullTextIndex, openNativeFullTextIndex } from '@harperfast/fulltext/native';
 
 const index = await openNativeFullTextIndex({
 	path: './search/products',
@@ -46,7 +46,18 @@ await index.apply(
 await index.commit();
 await index.reload();
 console.log(await index.search({ text: 'waterproof running shoes', limit: 10 }));
+await index.publish('source-checkpoint-42');
 await index.close();
+
+console.log(
+	inspectNativeFullTextIndex({
+		path: './search/products',
+		indexId: 'products',
+		generation: 'v1',
+		fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
+		analyzer: 'english@1',
+	}),
+); // { state: 'checkpointed', committedPayload: 'source-checkpoint-42' }
 ```
 
 Mutation batches are versioned packed values, so indexing crosses Node-API once per batch rather
@@ -97,7 +108,18 @@ succeeded before reader reload failed. The handle becomes terminal and `committe
 handle. Do not infer recovery progress from `status()` counters. Validation and queue admission
 failures do not themselves poison the handle or invalidate a known checkpoint.
 
-This API uses native ABI 2. The loader rejects older addon binaries; persisted index identity and
+`inspectNativeFullTextIndex(options)` synchronously validates an existing index's identity, schema,
+metadata, and committed payload without creating files, reserving a handle, starting actors, or
+acquiring the Tantivy writer. It returns `missing`, `cursorless`, `checkpointed` with the committed
+payload, or `incompatible` with a stable identity/schema or corrupt-format code. `checkpointed`
+means the committed metadata is compatible; callers must still open the index successfully before
+serving queries. Opening maps missing segment files and unreadable segment metadata or footers to
+rebuildable error codes.
+Operational storage failures throw. Inspection is intended for short lifecycle checks such as
+derived-index election, not request hot paths. Its options intentionally omit writer, queue, and
+search limits because inspection creates none of those resources.
+
+This API uses native ABI 3. The loader rejects older addon binaries; persisted index identity and
 Tantivy file formats are unchanged by the ABI update.
 
 ## Storage boundary
@@ -120,15 +142,22 @@ npm test
 npm run lint
 npm run format:check
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000
+npm run benchmark:inspect -- --indexes 1,10,100,1000 --commits 64 --warm-rounds 10
 ```
 
 The benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
 JSON record. It reports packing, apply, durable end-to-end ingestion, actor queue and execution
 time, commit distributions, reload cost, warm and cold BM25 p50/p95/p99, exact-total overhead,
-index bytes, and periodically sampled process RSS. `--commit-every` sets the target number of mutations between
-durability points; it materially affects throughput and peak memory because replacement-safe
-upserts include delete terms. CI runs only the correctness smoke profile; timing comparisons
-require controlled hardware.
+index bytes, and periodically sampled process RSS. `--commit-every` sets the target number of
+mutations between durability points; it materially affects throughput and peak memory because
+replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
+comparisons require controlled hardware.
+
+The inspection benchmark compares synchronous read-only inspection with full writer reopen across
+multiple index counts. It reports equivalent first-pass and warm p50/p95/p99/max latency,
+synchronous wall time per inspection sweep, metadata size, and the actual segment count produced by
+the seed workload. It does not claim to model OS-cold storage. `--indexes` accepts configurations
+that create at most 10,000 temporary index directories across both benchmark paths.
 
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.

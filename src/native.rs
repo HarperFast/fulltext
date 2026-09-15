@@ -16,10 +16,11 @@ use tantivy::directory::MmapDirectory;
 use tantivy::IndexReader;
 
 use crate::boundary;
-use crate::engine::{Engine, SearchResult, TotalRelation, Writer};
+use crate::engine::{Engine, InspectionResult, SearchResult, TotalRelation, Writer};
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	decode_batch, decode_open, decode_search, validate_batch_header, validate_search_header, EngineConfig,
+	decode_batch, decode_inspect, decode_open, decode_search, validate_batch_header, validate_search_header,
+	EngineConfig,
 };
 
 const STATE_OPEN: u8 = 0;
@@ -165,6 +166,17 @@ pub fn native_open(env: Env, packed_config: Buffer, callback: JsFunction) -> bou
 		}
 		Ok(())
 	})?
+}
+
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeInspect")]
+pub fn native_inspect(packed_config: Buffer) -> boundary::Result<Buffer> {
+	boundary::run_stateless(|| {
+		let response = match inspect_runtime(&packed_config) {
+			Ok(result) => success_envelope(inspection_body(result)),
+			Err(error) => error_envelope(error),
+		};
+		Buffer::from(response)
+	})
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeApply")]
@@ -894,6 +906,18 @@ fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>)
 	open_runtime_with_directory(handle, path_identity, open.engine, directory, environment)
 }
 
+fn inspect_runtime(bytes: &[u8]) -> Result<InspectionResult> {
+	let open = decode_inspect(bytes)?;
+	let path = Path::new(&open.path);
+	let canonical = match fs::canonicalize(path) {
+		Ok(canonical) => canonical,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(InspectionResult::Missing),
+		Err(error) => return Err(storage_error(error)),
+	};
+	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
+	Engine::inspect(directory, &open.identity)
+}
+
 fn open_runtime_with_directory(
 	handle: u32,
 	path_identity: PathIdentity,
@@ -921,7 +945,7 @@ fn open_runtime_with_directory(
 	let result = (|| {
 		let engine = Engine::open(directory, &config)?;
 		let (writer, committed_payload) = engine.writer_with_payload(&config)?;
-		let reader = engine.reader()?;
+		let reader = engine.reader_for_open()?;
 		let runtime = Runtime::start(
 			handle,
 			environment.clone(),
@@ -1150,6 +1174,18 @@ fn open_body(handle: u32, payload: Option<&str>) -> Vec<u8> {
 		push_string(&mut bytes, payload);
 	}
 	bytes
+}
+
+fn inspection_body(result: InspectionResult) -> Vec<u8> {
+	match result {
+		InspectionResult::Missing => vec![0],
+		InspectionResult::Cursorless => vec![1],
+		InspectionResult::Payload(payload) => {
+			let mut bytes = vec![2];
+			push_string(&mut bytes, &payload);
+			bytes
+		}
+	}
 }
 
 fn u64_body(value: u64) -> Vec<u8> {

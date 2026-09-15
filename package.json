@@ -35,6 +35,8 @@
 		"build:typescript": "npm run clean:typescript && tsc -p tsconfig.json",
 		"clean:typescript": "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
 		"benchmark:native": "npm run build && node benchmarks/native.mjs",
+		"benchmark:inspect": "npm run build && node benchmarks/inspect.mjs",
+		"benchmark:inspect:smoke": "node benchmarks/inspect.mjs --smoke",
 		"benchmark:smoke": "node benchmarks/native.mjs --smoke",
 		"check": "npm run format:check && npm run lint && npm run test",
 		"format": "prettier --write . && cargo fmt",

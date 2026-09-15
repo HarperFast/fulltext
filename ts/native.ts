@@ -1,5 +1,5 @@
 import { FulltextError, normalizeNativeError } from './errors.js';
-import { decodeResponse, encodeBatch, encodeOpen, encodeSearch } from './codec.js';
+import { decodeResponse, encodeBatch, encodeInspect, encodeOpen, encodeSearch } from './codec.js';
 import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
 import { PublicationState } from './publication.js';
@@ -25,15 +25,33 @@ export interface NativeFullTextIndexOptions {
 	stopWords?: boolean;
 	positions?: boolean;
 	surfaceTerms?: boolean;
-	limits: {
-		indexingThreads: number;
-		searchThreads: number;
-		writerMemoryBytes: number;
-		maxQueuedCommands: number;
-		maxQueuedBytes: number;
-		maxBatchBytes: number;
-	};
+	limits: NativeFullTextIndexLimits;
 }
+
+export interface NativeFullTextIndexLimits {
+	indexingThreads: number;
+	searchThreads: number;
+	writerMemoryBytes: number;
+	maxQueuedCommands: number;
+	maxQueuedBytes: number;
+	maxBatchBytes: number;
+}
+
+export type NativeFullTextIndexInspectionOptions = Omit<NativeFullTextIndexOptions, 'limits'>;
+
+export type NativeFullTextIndexInspection =
+	| { state: 'missing' }
+	| { state: 'cursorless' }
+	| { state: 'checkpointed'; committedPayload: string }
+	| {
+			state: 'incompatible';
+			code:
+				| 'E_IDENTITY_MISMATCH'
+				| 'E_INCOMPLETE_CREATE'
+				| 'E_INDEX_CORRUPT'
+				| 'E_INDEX_FORMAT_INCOMPATIBLE'
+				| 'E_SCHEMA_MISMATCH';
+	  };
 
 export interface FullTextMutationBatch {
 	upserts?: Array<{ id: string; fields: Record<string, string | string[]> }>;
@@ -229,19 +247,43 @@ export function encodeMutationBatch(batch: FullTextMutationBatch, maxBytes = 8 *
 	return encodeBatch({ upserts: batch.upserts ?? [], deletes: batch.deletes ?? [] }, maxBytes);
 }
 
+export function inspectNativeFullTextIndex(
+	options: NativeFullTextIndexInspectionOptions,
+): NativeFullTextIndexInspection {
+	try {
+		const cursor = decodeResponse(loadAddon().__nativeInspect(encodeInspect(packedInspectionOptions(options))));
+		const state = cursor.u8();
+		if (state === 0) {
+			cursor.finish();
+			return { state: 'missing' };
+		}
+		if (state === 1) {
+			cursor.finish();
+			return { state: 'cursorless' };
+		}
+		if (state === 2) {
+			const committedPayload = cursor.string();
+			cursor.finish();
+			return { state: 'checkpointed', committedPayload };
+		}
+		throw new FulltextError('E_NATIVE_FAILURE', `Unknown native inspection state ${state}`);
+	} catch (error) {
+		const nativeError = normalizeNativeError(error);
+		if (
+			nativeError.code === 'E_IDENTITY_MISMATCH' ||
+			nativeError.code === 'E_INCOMPLETE_CREATE' ||
+			nativeError.code === 'E_INDEX_CORRUPT' ||
+			nativeError.code === 'E_INDEX_FORMAT_INCOMPATIBLE' ||
+			nativeError.code === 'E_SCHEMA_MISMATCH'
+		) {
+			return { state: 'incompatible', code: nativeError.code };
+		}
+		throw nativeError;
+	}
+}
+
 export async function openNativeFullTextIndex(options: NativeFullTextIndexOptions): Promise<NativeFullTextIndex> {
-	const cursor = await invoke((callback) =>
-		loadAddon().__nativeOpen(
-			encodeOpen({
-				...options,
-				fields: options.fields.map((field) => ({ name: field.name, weight: field.weight ?? 1 })),
-				stopWords: options.stopWords ?? true,
-				positions: options.positions ?? true,
-				surfaceTerms: options.surfaceTerms ?? false,
-			}),
-			callback,
-		),
-	);
+	const cursor = await invoke((callback) => loadAddon().__nativeOpen(encodeOpen(packedOptions(options)), callback));
 	const handle = cursor.u32();
 	try {
 		const hasPayload = cursor.u8();
@@ -255,6 +297,27 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 		await invoke((callback) => loadAddon().__nativeClose(handle, true, callback)).catch(() => undefined);
 		throw error;
 	}
+}
+
+function packedOptions(options: NativeFullTextIndexOptions) {
+	return {
+		...packedIndexIdentity(options),
+		limits: options.limits,
+	};
+}
+
+function packedInspectionOptions(options: NativeFullTextIndexInspectionOptions) {
+	return packedIndexIdentity(options);
+}
+
+function packedIndexIdentity(options: NativeFullTextIndexInspectionOptions) {
+	return {
+		...options,
+		fields: options.fields.map((field) => ({ name: field.name, weight: field.weight ?? 1 })),
+		stopWords: options.stopWords ?? true,
+		positions: options.positions ?? true,
+		surfaceTerms: options.surfaceTerms ?? false,
+	};
 }
 
 export async function runtimeInfo(): Promise<RuntimeInfo> {

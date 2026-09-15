@@ -21,7 +21,7 @@ pub struct Limits {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct EngineConfig {
+pub struct EngineIdentityConfig {
 	pub index_id: String,
 	pub generation: String,
 	pub fields: Vec<FieldConfig>,
@@ -29,6 +29,11 @@ pub struct EngineConfig {
 	pub stop_words: bool,
 	pub positions: bool,
 	pub surface_terms: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineConfig {
+	pub identity: EngineIdentityConfig,
 	pub limits: Limits,
 }
 
@@ -36,6 +41,12 @@ pub struct EngineConfig {
 pub struct NativeOpenConfig {
 	pub path: String,
 	pub engine: EngineConfig,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeInspectConfig {
+	pub path: String,
+	pub identity: EngineIdentityConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,16 +79,42 @@ pub struct SearchRequest {
 
 pub fn decode_open(bytes: &[u8]) -> Result<NativeOpenConfig> {
 	let mut cursor = Cursor::new(bytes, *b"FTOP")?;
-	let path = cursor.string()?;
+	let path = validate_path(cursor.string()?)?;
 	let engine = decode_engine_config(&mut cursor)?;
 	cursor.finish()?;
-	if path.is_empty() {
-		return Err(FulltextError::invalid("path must not be empty"));
-	}
 	Ok(NativeOpenConfig { path, engine })
 }
 
+pub fn decode_inspect(bytes: &[u8]) -> Result<NativeInspectConfig> {
+	let mut cursor = Cursor::new(bytes, *b"FTIP")?;
+	let path = validate_path(cursor.string()?)?;
+	let identity = decode_engine_identity_config(&mut cursor)?;
+	cursor.finish()?;
+	validate_identity_config(&identity)?;
+	Ok(NativeInspectConfig { path, identity })
+}
+
+fn validate_path(path: String) -> Result<String> {
+	if path.is_empty() {
+		return Err(FulltextError::invalid("path must not be empty"));
+	}
+	Ok(path)
+}
+
 fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
+	let identity = decode_engine_identity_config(cursor)?;
+	let limits = Limits {
+		indexing_threads: cursor.u16()? as usize,
+		search_threads: cursor.u16()? as usize,
+		writer_memory_bytes: cursor.u64_usize()?,
+		max_queued_commands: cursor.u32()? as usize,
+		max_queued_bytes: cursor.u64_usize()?,
+		max_batch_bytes: cursor.u64_usize()?,
+	};
+	validate_config(EngineConfig { identity, limits })
+}
+
+fn decode_engine_identity_config(cursor: &mut Cursor<'_>) -> Result<EngineIdentityConfig> {
 	let index_id = cursor.string()?;
 	let generation = cursor.string()?;
 	let analyzer = cursor.string()?;
@@ -99,15 +136,7 @@ fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
 		}
 		fields.push(FieldConfig { name, weight });
 	}
-	let limits = Limits {
-		indexing_threads: cursor.u16()? as usize,
-		search_threads: cursor.u16()? as usize,
-		writer_memory_bytes: cursor.u64_usize()?,
-		max_queued_commands: cursor.u32()? as usize,
-		max_queued_bytes: cursor.u64_usize()?,
-		max_batch_bytes: cursor.u64_usize()?,
-	};
-	validate_config(EngineConfig {
+	Ok(EngineIdentityConfig {
 		index_id,
 		generation,
 		fields,
@@ -115,7 +144,6 @@ fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
 		stop_words,
 		positions,
 		surface_terms,
-		limits,
 	})
 }
 
@@ -227,25 +255,7 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 }
 
 fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
-	if config.index_id.is_empty() || config.generation.is_empty() {
-		return Err(FulltextError::invalid("indexId and generation must not be empty"));
-	}
-	if config.index_id.len() > 4_096 || config.generation.len() > 4_096 {
-		return Err(FulltextError::invalid(
-			"indexId and generation must not exceed 4096 UTF-8 bytes",
-		));
-	}
-	if config.analyzer != "english@1" {
-		return Err(FulltextError::invalid("only analyzer english@1 is supported"));
-	}
-	let mut names = std::collections::HashSet::with_capacity(config.fields.len());
-	for field in &config.fields {
-		if field.name.is_empty() || field.name == "__fulltext_id" || !names.insert(field.name.as_str()) {
-			return Err(FulltextError::invalid(
-				"field names must be non-empty, unique, and not reserved",
-			));
-		}
-	}
+	validate_identity_config(&config.identity)?;
 	let limits = &config.limits;
 	if limits.indexing_threads == 0 || limits.search_threads == 0 || limits.max_queued_commands == 0 {
 		return Err(FulltextError::invalid(
@@ -268,6 +278,29 @@ fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
 		));
 	}
 	Ok(config)
+}
+
+fn validate_identity_config(config: &EngineIdentityConfig) -> Result<()> {
+	if config.index_id.is_empty() || config.generation.is_empty() {
+		return Err(FulltextError::invalid("indexId and generation must not be empty"));
+	}
+	if config.index_id.len() > 4_096 || config.generation.len() > 4_096 {
+		return Err(FulltextError::invalid(
+			"indexId and generation must not exceed 4096 UTF-8 bytes",
+		));
+	}
+	if config.analyzer != "english@1" {
+		return Err(FulltextError::invalid("only analyzer english@1 is supported"));
+	}
+	let mut names = std::collections::HashSet::with_capacity(config.fields.len());
+	for field in &config.fields {
+		if field.name.is_empty() || field.name == "__fulltext_id" || !names.insert(field.name.as_str()) {
+			return Err(FulltextError::invalid(
+				"field names must be non-empty, unique, and not reserved",
+			));
+		}
+	}
+	Ok(())
 }
 
 struct Cursor<'a> {
@@ -370,6 +403,28 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn inspection_frame_is_distinct_and_rejects_trailing_limits() {
+		let mut bytes = b"FTIP\x01\x00".to_vec();
+		for value in ["/tmp/index", "products", "one", "english@1"] {
+			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+			bytes.extend_from_slice(value.as_bytes());
+		}
+		bytes.extend_from_slice(&[1, 1, 0]);
+		bytes.extend_from_slice(&1u16.to_le_bytes());
+		bytes.extend_from_slice(&5u32.to_le_bytes());
+		bytes.extend_from_slice(b"title");
+		bytes.extend_from_slice(&1f32.to_le_bytes());
+
+		let decoded = decode_inspect(&bytes).unwrap();
+		assert_eq!(decoded.path, "/tmp/index");
+		assert_eq!(decoded.identity.fields[0].name, "title");
+		assert_eq!(decode_open(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+
+		bytes.push(0);
+		assert_eq!(decode_inspect(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+	}
 
 	#[test]
 	fn rejects_counts_before_allocating() {
