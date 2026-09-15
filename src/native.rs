@@ -1165,15 +1165,37 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 	if !metadata.is_dir() {
 		return Err(FulltextError::invalid("reset path must be a directory"));
 	}
-	let canonical = fs::canonicalize(path).map_err(storage_error)?;
+	let canonical = match fs::canonicalize(path) {
+		Ok(canonical) => canonical,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
+		Err(error) => return Err(storage_error(error)),
+	};
 	let parent = canonical
 		.parent()
 		.ok_or_else(|| FulltextError::invalid("reset path must not be a filesystem root"))?;
+	let initial_identity = path_identity_from_metadata(&canonical, &metadata);
 	validate_reset_target(&canonical, &reset.index_id)?;
 	let (lifecycle_directory, lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
+	let current_metadata = match fs::symlink_metadata(&canonical) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
+		Err(error) => return Err(storage_error(error)),
+	};
+	if current_metadata.file_type().is_symlink() || !current_metadata.is_dir() {
+		return Err(FulltextError::new(
+			"E_LOCK_BUSY",
+			"the physical index path changed before reset acquired ownership",
+		));
+	}
+	let physical_identity = path_identity_from_metadata(&canonical, &current_metadata);
+	if physical_identity != initial_identity {
+		return Err(FulltextError::new(
+			"E_LOCK_BUSY",
+			"the physical index path changed before reset acquired ownership",
+		));
+	}
 	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
 	validate_reset_target(&canonical, &reset.index_id)?;
-	let physical_identity = path_identity(&canonical)?;
 	{
 		let mut registry = registry();
 		if registry.unproven_paths.contains(&quiescence_key(&canonical)) {
@@ -1327,14 +1349,30 @@ fn acquire_lifecycle_lock(index_path: &Path) -> Result<(MmapDirectory, Directory
 		));
 	}
 	let root = parent.join(LIFECYCLE_ROOT);
-	ensure_lifecycle_root(&root)?;
-	let directory = MmapDirectory::open(root).map_err(storage_error)?;
+	ensure_lifecycle_root(&root).map_err(|error| lifecycle_storage_error(error, &root))?;
+	let directory = MmapDirectory::open(&root)
+		.map_err(storage_error)
+		.map_err(|error| lifecycle_storage_error(error, &root))?;
 	let lock = Lock {
 		filepath: PathBuf::from(lock_name),
 		is_blocking: false,
 	};
-	let guard = directory.acquire_lock(&lock).map_err(lifecycle_lock_error)?;
+	let guard = directory
+		.acquire_lock(&lock)
+		.map_err(lifecycle_lock_error)
+		.map_err(|error| lifecycle_storage_error(error, &root))?;
 	Ok((directory, guard))
+}
+
+fn lifecycle_storage_error(error: FulltextError, root: &Path) -> FulltextError {
+	FulltextError::new(
+		error.code,
+		format!(
+			"could not use lifecycle lock directory {}: {}",
+			root.display(),
+			error.message
+		),
+	)
 }
 
 fn public_path(path: &Path) -> Result<String> {
@@ -1628,19 +1666,36 @@ fn create_and_canonicalize(path: &Path) -> Result<PathBuf> {
 
 #[cfg(unix)]
 fn path_identity(path: &Path) -> Result<PathIdentity> {
-	use std::os::unix::fs::MetadataExt;
 	let metadata = fs::metadata(path).map_err(storage_error)?;
-	Ok(PathIdentity::Unix(metadata.dev(), metadata.ino()))
+	Ok(path_identity_from_metadata(path, &metadata))
 }
 
 #[cfg(windows)]
 fn path_identity(path: &Path) -> Result<PathIdentity> {
-	Ok(PathIdentity::Path(PathBuf::from(path.to_string_lossy().to_lowercase())))
+	let metadata = fs::metadata(path).map_err(storage_error)?;
+	Ok(path_identity_from_metadata(path, &metadata))
 }
 
 #[cfg(all(not(unix), not(windows)))]
 fn path_identity(path: &Path) -> Result<PathIdentity> {
-	Ok(PathIdentity::Path(path.to_path_buf()))
+	let metadata = fs::metadata(path).map_err(storage_error)?;
+	Ok(path_identity_from_metadata(path, &metadata))
+}
+
+#[cfg(unix)]
+fn path_identity_from_metadata(_path: &Path, metadata: &fs::Metadata) -> PathIdentity {
+	use std::os::unix::fs::MetadataExt;
+	PathIdentity::Unix(metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn path_identity_from_metadata(path: &Path, _metadata: &fs::Metadata) -> PathIdentity {
+	PathIdentity::Path(PathBuf::from(path.to_string_lossy().to_lowercase()))
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn path_identity_from_metadata(path: &Path, _metadata: &fs::Metadata) -> PathIdentity {
+	PathIdentity::Path(path.to_path_buf())
 }
 
 #[cfg(windows)]

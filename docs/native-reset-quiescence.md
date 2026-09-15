@@ -73,6 +73,9 @@ The operation has the following behavior:
 - A caller may immediately open a new empty index at the original path. The wrapper never deletes
   the retired tree; Harper schedules bounded cleanup, while a standalone caller may remove the
   returned path when appropriate.
+- Open and reset require a writable sibling `.fulltext-locks` directory. The wrapper creates it when
+  absent and leaves it in place; errors include its path so deployment-permission failures are
+  actionable.
 - Filesystem failures return `E_STORAGE`. A rename that did not complete is never reported as
   success. A successful rename is the reset publication point and leaves a recognizable retired
   sibling rather than a partially deleted live path. Reset does not fsync the containing directory;

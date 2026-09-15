@@ -151,7 +151,8 @@ An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.
 Lifecycle lock files are stored in the index parent's `.fulltext-locks` directory so reset can keep
 the handoff lock while renaming the native directory on Windows. The wrapper does not remove this
-lock directory.
+lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
+writable while indices are opened or reset; failures name the lock-directory path.
 
 This API uses native ABI 4. The loader rejects older addon binaries; persisted index identity and
 Tantivy file formats are unchanged by the ABI update.
