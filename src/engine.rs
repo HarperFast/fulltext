@@ -15,7 +15,7 @@ use crate::error::{FulltextError, Result};
 use crate::protocol::{EngineConfig, EngineIdentityConfig, MutationBatch, SearchOperator, SearchRequest};
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
-const IDENTITY_PATH: &str = ".harper-fulltext-identity";
+pub(crate) const IDENTITY_PATH: &str = ".harper-fulltext-identity";
 const META_PATH: &str = "meta.json";
 const ANALYZER_NAME: &str = "english@1";
 pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -499,6 +499,39 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 	bytes
 }
 
+pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
+	if bytes.get(..6)? != b"HTFI\x01\x00" {
+		return None;
+	}
+	let mut offset = 6;
+	let index_id = take_string(bytes, &mut offset)?;
+	take_string(bytes, &mut offset)?;
+	take_string(bytes, &mut offset)?;
+	if bytes
+		.get(offset..offset.checked_add(3)?)?
+		.iter()
+		.any(|value| *value > 1)
+	{
+		return None;
+	}
+	offset += 3;
+	let field_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
+	offset += 2;
+	for _ in 0..field_count {
+		take_string(bytes, &mut offset)?;
+	}
+	(offset == bytes.len()).then_some(index_id)
+}
+
+fn take_string<'a>(bytes: &'a [u8], offset: &mut usize) -> Option<&'a str> {
+	let length = u32::from_le_bytes(bytes.get(*offset..(*offset).checked_add(4)?)?.try_into().ok()?) as usize;
+	*offset += 4;
+	let end = (*offset).checked_add(length)?;
+	let value = std::str::from_utf8(bytes.get(*offset..end)?).ok()?;
+	*offset = end;
+	Some(value)
+}
+
 fn push_string(bytes: &mut Vec<u8>, value: &str) {
 	bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 	bytes.extend_from_slice(value.as_bytes());
@@ -733,6 +766,20 @@ mod tests {
 			Err(error) => error,
 		};
 		assert_eq!(error.code, "E_IDENTITY_MISMATCH");
+	}
+
+	#[test]
+	fn validates_the_complete_persisted_identity() {
+		let config = config();
+		let mut identity = identity_bytes(&config.identity);
+		assert_eq!(persisted_index_id(&identity), Some("products"));
+
+		identity.pop();
+		assert_eq!(persisted_index_id(&identity), None);
+
+		let mut identity = identity_bytes(&config.identity);
+		identity.push(0);
+		assert_eq!(persisted_index_id(&identity), None);
 	}
 
 	#[test]

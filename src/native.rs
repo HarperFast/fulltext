@@ -6,21 +6,21 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, JsFunction};
 use napi_derive::napi;
-use tantivy::directory::MmapDirectory;
+use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory, INDEX_WRITER_LOCK, META_LOCK};
 use tantivy::IndexReader;
 
 use crate::boundary;
-use crate::engine::{Engine, InspectionResult, SearchResult, TotalRelation, Writer};
+use crate::engine::{persisted_index_id, Engine, InspectionResult, SearchResult, TotalRelation, Writer, IDENTITY_PATH};
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	decode_batch, decode_inspect, decode_open, decode_search, validate_batch_header, validate_search_header,
-	EngineConfig,
+	decode_batch, decode_inspect, decode_open, decode_reset, decode_search, validate_batch_header,
+	validate_search_header, EngineConfig,
 };
 
 const STATE_OPEN: u8 = 0;
@@ -31,14 +31,24 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+const LIFECYCLE_ROOT: &str = ".fulltext-locks";
+const LEGACY_LIFECYCLE_LOCK: &str = ".harper-fulltext-lifecycle.lock";
+const RETIRED_ROOT: &str = ".fulltext-retired";
 
 #[derive(Default)]
 struct Registry {
 	handles: HashMap<u32, Arc<Runtime>>,
-	paths: HashMap<PathIdentity, u32>,
+	paths: HashMap<PathIdentity, PathReservation>,
+	unproven_paths: HashSet<PathBuf>,
 	opening: HashSet<u32>,
 	cancelled: HashSet<u32>,
 	environments: HashMap<usize, Weak<EnvironmentState>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathReservation {
+	Open(u32),
+	Reset(u32),
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -51,10 +61,9 @@ enum PathIdentity {
 
 struct Runtime {
 	handle: u32,
+	path: PathBuf,
 	path_identity: PathIdentity,
 	config: EngineConfig,
-	engine: Arc<Engine>,
-	reader: Arc<IndexReader>,
 	writer_queue: Arc<BoundedQueue<WriterCommand>>,
 	search_queue: Arc<BoundedQueue<SearchCommand>>,
 	state: AtomicU8,
@@ -71,9 +80,22 @@ struct Runtime {
 	publish_fault: AtomicU8,
 	#[cfg(feature = "test-panic")]
 	poison_before_admission: AtomicBool,
+	#[cfg(feature = "test-panic")]
+	close_fault: AtomicU8,
+}
+
+enum ResetResult {
+	Missing,
+	Reset(String),
+}
+
+struct ResetReservation {
+	operation: u32,
+	path_identity: PathIdentity,
 }
 
 struct RuntimeParts {
+	path: PathBuf,
 	path_identity: PathIdentity,
 	config: EngineConfig,
 	engine: Engine,
@@ -134,8 +156,13 @@ enum WriterOperation {
 
 enum WriterOutcome {
 	Continue(Result<Vec<u8>>),
-	Stop(Result<Vec<u8>>),
+	Stop(WriterCloseOutcome),
 	Poison(Result<Vec<u8>>, FulltextError),
+}
+
+struct WriterCloseOutcome {
+	quiesced: bool,
+	error: Option<FulltextError>,
 }
 
 struct SearchCommand {
@@ -177,6 +204,31 @@ pub fn native_inspect(packed_config: Buffer) -> boundary::Result<Buffer> {
 		};
 		Buffer::from(response)
 	})
+}
+
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeReset")]
+pub fn native_reset(env: Env, packed_config: Buffer, callback: JsFunction) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		let environment = environment_state(&env)?;
+		let reset_done = Arc::new(CompletionSignal::new());
+		let completion = completion(callback, environment.alive.clone())?;
+		let operation = next_handle().map_err(fulltext_napi_error)?;
+		registry().opening.insert(operation);
+		environment.track(operation, reset_done.clone());
+		let bytes = packed_config.to_vec();
+		let thread_reset_done = reset_done.clone();
+		let thread_environment = environment.clone();
+		if let Err(error) = thread::Builder::new()
+			.name(format!("fulltext-reset-{operation}"))
+			.spawn(move || reset_on_thread(operation, bytes, completion, thread_reset_done, thread_environment))
+		{
+			registry().opening.remove(&operation);
+			environment.release(operation);
+			reset_done.signal();
+			return Err(napi_error("E_NATIVE_FAILURE", error));
+		}
+		Ok(())
+	})?
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeApply")]
@@ -346,6 +398,17 @@ pub fn test_fail_next_publish(handle: u32, after_commit: bool) -> boundary::Resu
 	})?
 }
 
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailNextClose")]
+pub fn test_fail_next_close(handle: u32, quiesced: bool) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		runtime(handle)?
+			.close_fault
+			.store(if quiesced { 1 } else { 2 }, Ordering::Release);
+		Ok(())
+	})?
+}
+
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeStatus")]
 pub fn native_status(handle: u32) -> boundary::Result<Buffer> {
 	boundary::run_stateless(|| {
@@ -357,6 +420,8 @@ pub fn native_status(handle: u32) -> boundary::Result<Buffer> {
 impl Runtime {
 	fn start(handle: u32, environment: Arc<EnvironmentState>, parts: RuntimeParts) -> Result<Arc<Self>> {
 		let search_thread_count = parts.config.limits.search_threads;
+		let engine = Arc::new(parts.engine);
+		let reader = Arc::new(parts.reader);
 		let writer_queue = Arc::new(BoundedQueue::new(
 			parts.config.limits.max_queued_commands,
 			parts.config.limits.max_queued_bytes,
@@ -367,10 +432,9 @@ impl Runtime {
 		));
 		let runtime = Arc::new(Self {
 			handle,
+			path: parts.path,
 			path_identity: parts.path_identity,
 			config: parts.config,
-			engine: Arc::new(parts.engine),
-			reader: Arc::new(parts.reader),
 			writer_queue,
 			search_queue,
 			state: AtomicU8::new(STATE_OPEN),
@@ -387,25 +451,30 @@ impl Runtime {
 			publish_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
 			poison_before_admission: AtomicBool::new(false),
+			#[cfg(feature = "test-panic")]
+			close_fault: AtomicU8::new(0),
 		});
 		let writer_runtime = runtime.clone();
+		let writer_engine = engine.clone();
+		let writer_reader = reader.clone();
 		thread::Builder::new()
 			.name(format!("fulltext-writer-{handle}"))
-			.spawn(move || writer_loop(writer_runtime, parts.writer))
+			.spawn(move || writer_loop(writer_runtime, parts.writer, writer_engine, writer_reader))
 			.map_err(FulltextError::native)?;
 		for worker in 0..search_thread_count {
 			let search_runtime = runtime.clone();
+			let search_engine = engine.clone();
+			let search_reader = reader.clone();
 			let join = match thread::Builder::new()
 				.name(format!("fulltext-search-{handle}-{worker}"))
-				.spawn(move || search_loop(search_runtime))
+				.spawn(move || search_loop(search_runtime, search_engine, search_reader))
 			{
 				Ok(join) => join,
 				Err(error) => {
-					runtime.writer_queue.close();
-					runtime.search_queue.close();
-					for join in std::mem::take(&mut *lock(&runtime.search_threads)) {
-						let _ = join.join();
-					}
+					drop(engine);
+					drop(reader);
+					runtime.force_close();
+					let _ = runtime.wait_closed(CLEANUP_TIMEOUT);
 					return Err(FulltextError::native(error));
 				}
 			};
@@ -681,7 +750,7 @@ impl WriterCommand {
 	}
 }
 
-fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
+fn writer_loop(runtime: Arc<Runtime>, writer: Writer, engine: Arc<Engine>, reader: Arc<IndexReader>) {
 	let mut writer = Some(writer);
 	while let Some(queued) = runtime.writer_queue.pop() {
 		runtime
@@ -732,7 +801,7 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 				.and_then(|opstamp| {
 					#[cfg(feature = "test-panic")]
 					fail_publish_at(&runtime, 2)?;
-					runtime.reader.reload().map_err(FulltextError::native)?;
+					reader.reload().map_err(FulltextError::native)?;
 					Ok(opstamp)
 				}) {
 				Ok(opstamp) => {
@@ -748,13 +817,9 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 					),
 				),
 			},
-			WriterOperation::Reload => WriterOutcome::Continue(
-				runtime
-					.reader
-					.reload()
-					.map(|()| Vec::new())
-					.map_err(FulltextError::native),
-			),
+			WriterOperation::Reload => {
+				WriterOutcome::Continue(reader.reload().map(|()| Vec::new()).map_err(FulltextError::native))
+			}
 			WriterOperation::Close { rollback } => {
 				let dirty = runtime.uncommitted_mutations.load(Ordering::Acquire) > 0;
 				if !rollback
@@ -769,24 +834,7 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 					)))
 				} else {
 					let rollback = rollback || dirty || runtime.state.load(Ordering::Acquire) == STATE_POISONED;
-					let close_result = writer
-						.take()
-						.ok_or_else(|| FulltextError::new("E_POISONED", "writer is unavailable"))
-						.and_then(|mut owned_writer| {
-							if rollback {
-								owned_writer.rollback()?;
-							}
-							owned_writer.close()
-						});
-					runtime.search_queue.shutdown_after_drain();
-					for join in std::mem::take(&mut *lock(&runtime.search_threads)) {
-						let _ = join.join();
-					}
-					runtime.writer_queue.close();
-					runtime.state.store(STATE_CLOSED, Ordering::Release);
-					release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
-					runtime.signal_closed();
-					WriterOutcome::Stop(close_result.map(|()| Vec::new()))
+					WriterOutcome::Stop(close_writer(&runtime, &mut writer, rollback))
 				}
 			}
 		}));
@@ -795,8 +843,20 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 			.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
 		match outcome {
 			Ok(WriterOutcome::Continue(result)) => settle(completion, result),
-			Ok(WriterOutcome::Stop(result)) => {
-				settle(completion, result);
+			Ok(WriterOutcome::Stop(outcome)) => {
+				let cleanup_runtime = runtime.clone();
+				match catch_unwind(AssertUnwindSafe(move || {
+					finish_runtime(&cleanup_runtime, engine, reader, outcome)
+				})) {
+					Ok(outcome) => settle(completion, close_result(outcome)),
+					Err(_) => {
+						finish_unproven_runtime(&runtime);
+						completion.failure(quiescence_error(FulltextError::new(
+							"E_NATIVE_PANIC",
+							"native runtime teardown panicked",
+						)));
+					}
+				}
 				return;
 			}
 			Ok(WriterOutcome::Poison(result, poison)) => {
@@ -804,18 +864,159 @@ fn writer_loop(runtime: Arc<Runtime>, writer: Writer) {
 				runtime.poison(poison);
 			}
 			Err(_) => {
-				completion.failure(FulltextError::new("E_NATIVE_PANIC", "native writer actor panicked"));
-				runtime.poison(FulltextError::new("E_NATIVE_PANIC", "native writer actor panicked"));
-				runtime.writer_queue.close();
-				release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
-				runtime.signal_closed();
+				let panic_error = FulltextError::new("E_NATIVE_PANIC", "native writer actor panicked");
+				runtime.poison(panic_error.clone());
+				let cleanup_runtime = runtime.clone();
+				match catch_unwind(AssertUnwindSafe(move || {
+					let close = close_writer(&cleanup_runtime, &mut writer, true);
+					finish_runtime(&cleanup_runtime, engine, reader, close)
+				})) {
+					Ok(outcome) => {
+						completion.failure(if outcome.quiesced {
+							panic_error
+						} else {
+							quiescence_error(outcome.error.unwrap_or_else(|| {
+								FulltextError::new("E_NATIVE_FAILURE", "native writer shutdown failed")
+							}))
+						});
+					}
+					Err(_) => {
+						finish_unproven_runtime(&runtime);
+						completion.failure(quiescence_error(FulltextError::new(
+							"E_NATIVE_PANIC",
+							"native writer shutdown panicked",
+						)));
+					}
+				}
 				return;
 			}
 		}
 	}
-	runtime.state.store(STATE_CLOSED, Ordering::Release);
-	release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
+	let cleanup_runtime = runtime.clone();
+	if catch_unwind(AssertUnwindSafe(move || {
+		let outcome = close_writer(&cleanup_runtime, &mut writer, true);
+		finish_runtime(&cleanup_runtime, engine, reader, outcome)
+	}))
+	.is_err()
+	{
+		finish_unproven_runtime(&runtime);
+	}
+}
+
+fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool) -> WriterCloseOutcome {
+	let Some(mut writer) = writer.take() else {
+		return WriterCloseOutcome {
+			quiesced: false,
+			error: Some(FulltextError::new("E_POISONED", "writer is unavailable")),
+		};
+	};
+	let rollback_error = if rollback { writer.rollback().err() } else { None };
+	let outcome = match writer.close() {
+		Ok(()) => WriterCloseOutcome {
+			quiesced: true,
+			error: rollback_error,
+		},
+		Err(error) => WriterCloseOutcome {
+			quiesced: false,
+			error: rollback_error.or(Some(error)),
+		},
+	};
+	#[cfg(feature = "test-panic")]
+	let outcome = {
+		let mut outcome = outcome;
+		match _runtime.close_fault.swap(0, Ordering::AcqRel) {
+			1 if outcome.quiesced => {
+				outcome.error = Some(FulltextError::new("E_STORAGE", "injected close failure"));
+			}
+			2 if outcome.quiesced => {
+				outcome.quiesced = false;
+				outcome.error = Some(FulltextError::new("E_STORAGE", "injected quiescence failure"));
+			}
+			_ => {}
+		}
+		outcome
+	};
+	outcome
+}
+
+fn finish_runtime(
+	runtime: &Arc<Runtime>,
+	engine: Arc<Engine>,
+	reader: Arc<IndexReader>,
+	mut outcome: WriterCloseOutcome,
+) -> WriterCloseOutcome {
+	runtime.search_queue.shutdown_after_drain();
+	for join in std::mem::take(&mut *lock(&runtime.search_threads)) {
+		if join.join().is_err() && outcome.error.is_none() {
+			outcome.error = Some(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
+		}
+	}
+	let actors_released = Arc::strong_count(&engine) == 1 && Arc::strong_count(&reader) == 1;
+	debug_assert!(actors_released);
+	if !actors_released {
+		outcome.quiesced = false;
+		outcome.error.get_or_insert_with(|| {
+			FulltextError::new(
+				"E_NATIVE_FAILURE",
+				"native actors retained index resources after shutdown",
+			)
+		});
+	}
+	drop(reader);
+	drop(engine);
+	runtime.writer_queue.close();
+	if outcome.quiesced {
+		runtime.state.store(STATE_CLOSED, Ordering::Release);
+		release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
+	} else {
+		runtime.state.store(STATE_POISONED, Ordering::Release);
+		release_runtime_handle(
+			runtime.handle,
+			&runtime.path,
+			&runtime.path_identity,
+			&runtime.environment,
+		);
+	}
 	runtime.signal_closed();
+	outcome
+}
+
+fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
+	runtime.search_queue.shutdown_after_drain();
+	for join in std::mem::take(&mut *lock(&runtime.search_threads)) {
+		let _ = join.join();
+	}
+	runtime.writer_queue.close();
+	runtime.state.store(STATE_POISONED, Ordering::Release);
+	release_runtime_handle(
+		runtime.handle,
+		&runtime.path,
+		&runtime.path_identity,
+		&runtime.environment,
+	);
+	runtime.signal_closed();
+}
+
+fn close_result(outcome: WriterCloseOutcome) -> Result<Vec<u8>> {
+	match (outcome.quiesced, outcome.error) {
+		(true, None) => Ok(Vec::new()),
+		(true, Some(error)) => Err(FulltextError::new(
+			"E_CLOSE_FAILED",
+			format!("native resources were released, but shutdown reported: {error}"),
+		)),
+		(false, Some(error)) => Err(quiescence_error(error)),
+		(false, None) => Err(quiescence_error(FulltextError::new(
+			"E_NATIVE_FAILURE",
+			"native writer shutdown failed",
+		))),
+	}
+}
+
+fn quiescence_error(error: FulltextError) -> FulltextError {
+	FulltextError::new(
+		"E_QUIESCENCE_FAILED",
+		format!("native writer teardown did not prove quiescence: {error}"),
+	)
 }
 
 fn settle(completion: Completion, result: Result<Vec<u8>>) {
@@ -849,15 +1050,14 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 		.ok_or_else(|| FulltextError::new("E_POISONED", "writer is unavailable"))
 }
 
-fn search_loop(runtime: Arc<Runtime>) {
+fn search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
 	while let Some(queued) = runtime.search_queue.pop() {
 		runtime
 			.search_queue_nanoseconds
 			.fetch_add(duration_ns(queued.enqueued.elapsed()), Ordering::Relaxed);
 		let started = Instant::now();
 		let result = catch_unwind(AssertUnwindSafe(|| {
-			decode_search(&queued.value.request)
-				.and_then(|request| runtime.engine.search(&runtime.reader.searcher(), &request))
+			decode_search(&queued.value.request).and_then(|request| engine.search(&reader.searcher(), &request))
 		}));
 		runtime
 			.search_execution_nanoseconds
@@ -901,9 +1101,10 @@ fn open_on_thread(
 fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>) -> Result<Option<String>> {
 	let open = decode_open(&bytes)?;
 	let canonical = create_and_canonicalize(Path::new(&open.path))?;
-	let path_identity = path_identity(&canonical)?;
+	let (_lifecycle_directory, _lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
 	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
-	open_runtime_with_directory(handle, path_identity, open.engine, directory, environment)
+	let path_identity = path_identity(&canonical)?;
+	open_runtime_with_directory(handle, canonical, path_identity, open.engine, directory, environment)
 }
 
 fn inspect_runtime(bytes: &[u8]) -> Result<InspectionResult> {
@@ -918,9 +1119,316 @@ fn inspect_runtime(bytes: &[u8]) -> Result<InspectionResult> {
 	Engine::inspect(directory, &open.identity)
 }
 
+fn reset_on_thread(
+	operation: u32,
+	bytes: Vec<u8>,
+	completion: Completion,
+	reset_done: Arc<CompletionSignal>,
+	environment: Arc<EnvironmentState>,
+) {
+	let result = catch_unwind(AssertUnwindSafe(|| reset_runtime(operation, &bytes, &environment)));
+	let response = match result {
+		Ok(Ok(result)) => Ok(reset_body(result)),
+		Ok(Err(error)) => Err(error),
+		Err(_) => Err(FulltextError::new("E_NATIVE_PANIC", "native index reset panicked")),
+	};
+	settle(completion, response);
+	{
+		let mut registry = registry();
+		registry.opening.remove(&operation);
+		registry.cancelled.remove(&operation);
+	}
+	environment.release(operation);
+	reset_done.signal();
+}
+
+fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -> Result<ResetResult> {
+	let reset = decode_reset(bytes)?;
+	{
+		let mut registry = registry();
+		if registry.cancelled.remove(&operation) || !environment.alive.load(Ordering::Acquire) {
+			return Err(FulltextError::new(
+				"E_CLOSED",
+				"Node environment closed during index reset",
+			));
+		}
+	}
+	let path = Path::new(&reset.path);
+	let metadata = match fs::symlink_metadata(path) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
+		Err(error) => return Err(storage_error(error)),
+	};
+	if metadata.file_type().is_symlink() {
+		return Err(FulltextError::invalid("reset path must not be a symbolic link"));
+	}
+	if !metadata.is_dir() {
+		return Err(FulltextError::invalid("reset path must be a directory"));
+	}
+	let canonical = match fs::canonicalize(path) {
+		Ok(canonical) => canonical,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
+		Err(error) => return Err(storage_error(error)),
+	};
+	let parent = canonical
+		.parent()
+		.ok_or_else(|| FulltextError::invalid("reset path must not be a filesystem root"))?;
+	let initial_identity = path_identity_from_metadata(&canonical, &metadata);
+	let (lifecycle_directory, lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
+	let current_metadata = match fs::symlink_metadata(&canonical) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
+		Err(error) => return Err(storage_error(error)),
+	};
+	if current_metadata.file_type().is_symlink() || !current_metadata.is_dir() {
+		return Err(FulltextError::new(
+			"E_LOCK_BUSY",
+			"the physical index path changed before reset acquired ownership",
+		));
+	}
+	let physical_identity = path_identity_from_metadata(&canonical, &current_metadata);
+	if physical_identity != initial_identity {
+		return Err(FulltextError::new(
+			"E_LOCK_BUSY",
+			"the physical index path changed before reset acquired ownership",
+		));
+	}
+	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
+	validate_reset_target(&canonical, &reset.index_id)?;
+	{
+		let mut registry = registry();
+		if registry.unproven_paths.contains(&quiescence_key(&canonical)) {
+			return Err(quiescence_error(FulltextError::new(
+				"E_LOCK_BUSY",
+				"this native index was not proven quiescent; restart is required",
+			)));
+		}
+		if registry.paths.contains_key(&physical_identity) {
+			return Err(FulltextError::new("E_LOCK_BUSY", "the physical index is still active"));
+		}
+		registry
+			.paths
+			.insert(physical_identity.clone(), PathReservation::Reset(operation));
+	}
+	let reservation = ResetReservation {
+		operation,
+		path_identity: physical_identity,
+	};
+	match path_identity(&canonical) {
+		Ok(current) if current == reservation.path_identity => {}
+		_ => {
+			return Err(FulltextError::new(
+				"E_LOCK_BUSY",
+				"the physical index path changed during reset",
+			))
+		}
+	}
+	let writer_lock = directory.acquire_lock(&INDEX_WRITER_LOCK).map_err(reset_lock_error)?;
+	let retired_root = parent.join(RETIRED_ROOT);
+	ensure_retired_root(&retired_root)?;
+	let retired_path = next_retired_path(&retired_root, &canonical, operation)?;
+	let public_path = public_path(&retired_path)?;
+	drop(writer_lock);
+	drop(directory);
+	fs::rename(&canonical, &retired_path).map_err(rename_error)?;
+	drop(lifecycle_lock);
+	drop(lifecycle_directory);
+	drop(reservation);
+	Ok(ResetResult::Reset(public_path))
+}
+
+fn validate_reset_target(path: &Path, expected_index_id: &str) -> Result<()> {
+	let mut identity_found = false;
+	let mut content_found = false;
+	for entry in fs::read_dir(path).map_err(storage_error)? {
+		let entry = entry.map_err(storage_error)?;
+		let name = entry.file_name();
+		if name == IDENTITY_PATH {
+			let metadata = fs::symlink_metadata(entry.path()).map_err(storage_error)?;
+			if !metadata.is_file() || metadata.file_type().is_symlink() {
+				return Err(FulltextError::new(
+					"E_INDEX_CORRUPT",
+					"the persisted index identity is invalid",
+				));
+			}
+			let bytes = fs::read(entry.path()).map_err(storage_error)?;
+			let index_id = persisted_index_id(&bytes)
+				.ok_or_else(|| FulltextError::new("E_INDEX_CORRUPT", "the persisted index identity is invalid"))?;
+			if index_id != expected_index_id {
+				return Err(FulltextError::new(
+					"E_IDENTITY_MISMATCH",
+					"the persisted index ID does not match the reset request",
+				));
+			}
+			identity_found = true;
+		} else if name.as_os_str() != INDEX_WRITER_LOCK.filepath.as_os_str()
+			&& name.as_os_str() != META_LOCK.filepath.as_os_str()
+			&& name != LEGACY_LIFECYCLE_LOCK
+		{
+			content_found = true;
+		}
+	}
+	if content_found && !identity_found {
+		return Err(FulltextError::invalid(
+			"reset path is not an empty or recognizable Fulltext index directory",
+		));
+	}
+	Ok(())
+}
+
+fn next_retired_path(root: &Path, source: &Path, operation: u32) -> Result<PathBuf> {
+	let basename = source
+		.file_name()
+		.ok_or_else(|| FulltextError::invalid("reset path must have a final component"))?
+		.to_string_lossy();
+	let timestamp = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_nanos();
+	for attempt in 0..16u8 {
+		let candidate = root.join(format!(
+			"{basename}.{}.{}.{}.{attempt}",
+			std::process::id(),
+			operation,
+			timestamp
+		));
+		match fs::symlink_metadata(&candidate) {
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+			Ok(_) => {}
+			Err(error) => return Err(storage_error(error)),
+		}
+	}
+	Err(FulltextError::new(
+		"E_STORAGE",
+		"could not allocate a unique retired index path",
+	))
+}
+
+fn ensure_retired_root(path: &Path) -> Result<()> {
+	ensure_directory_root(path, "the .fulltext-retired path")
+}
+
+fn ensure_lifecycle_root(path: &Path) -> Result<()> {
+	ensure_directory_root(path, "the .fulltext-locks path")
+}
+
+fn ensure_directory_root(path: &Path, label: &str) -> Result<()> {
+	match fs::symlink_metadata(path) {
+		Ok(metadata) => validate_directory_root(metadata, label),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(path) {
+			Ok(()) => Ok(()),
+			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+				validate_directory_root(fs::symlink_metadata(path).map_err(storage_error)?, label)
+			}
+			Err(error) => Err(storage_error(error)),
+		},
+		Err(error) => Err(storage_error(error)),
+	}
+}
+
+fn validate_directory_root(metadata: fs::Metadata, label: &str) -> Result<()> {
+	if metadata.file_type().is_symlink() || !metadata.is_dir() {
+		return Err(FulltextError::invalid(format!(
+			"{label} must be a directory and must not be a symbolic link"
+		)));
+	}
+	Ok(())
+}
+
+fn acquire_lifecycle_lock(index_path: &Path) -> Result<(MmapDirectory, DirectoryLock)> {
+	let parent = index_path
+		.parent()
+		.ok_or_else(|| FulltextError::invalid("native index path must not be a filesystem root"))?;
+	let lock_name = index_path
+		.file_name()
+		.ok_or_else(|| FulltextError::invalid("native index path must have a final component"))?;
+	if lock_name == LIFECYCLE_ROOT || lock_name == RETIRED_ROOT {
+		return Err(FulltextError::invalid(
+			"native index path uses a reserved directory name",
+		));
+	}
+	let root = parent.join(LIFECYCLE_ROOT);
+	ensure_lifecycle_root(&root).map_err(|error| lifecycle_storage_error(error, &root))?;
+	let directory = MmapDirectory::open(&root)
+		.map_err(storage_error)
+		.map_err(|error| lifecycle_storage_error(error, &root))?;
+	let lock = Lock {
+		filepath: PathBuf::from(lock_name),
+		is_blocking: false,
+	};
+	let guard = directory
+		.acquire_lock(&lock)
+		.map_err(lifecycle_lock_error)
+		.map_err(|error| lifecycle_storage_error(error, &root))?;
+	Ok((directory, guard))
+}
+
+fn lifecycle_storage_error(error: FulltextError, root: &Path) -> FulltextError {
+	FulltextError::new(
+		error.code,
+		format!(
+			"could not use lifecycle lock directory {}: {}",
+			root.display(),
+			error.message
+		),
+	)
+}
+
+fn public_path(path: &Path) -> Result<String> {
+	let value = path
+		.to_str()
+		.ok_or_else(|| FulltextError::invalid("reset paths must contain valid Unicode"))?;
+	#[cfg(windows)]
+	{
+		if let Some(value) = value.strip_prefix("\\\\?\\UNC\\") {
+			return Ok(format!("\\\\{value}"));
+		}
+		if let Some(value) = value.strip_prefix("\\\\?\\") {
+			return Ok(value.to_owned());
+		}
+	}
+	Ok(value.to_owned())
+}
+
+fn reset_lock_error(error: tantivy::directory::error::LockError) -> FulltextError {
+	match error {
+		tantivy::directory::error::LockError::LockBusy => {
+			FulltextError::new("E_LOCK_BUSY", "another writer owns the Tantivy index lock")
+		}
+		other => storage_error(other),
+	}
+}
+
+fn lifecycle_lock_error(error: tantivy::directory::error::LockError) -> FulltextError {
+	match error {
+		tantivy::directory::error::LockError::LockBusy => {
+			FulltextError::new("E_LOCK_BUSY", "another native index lifecycle operation owns this path")
+		}
+		other => storage_error(other),
+	}
+}
+
+fn rename_error(error: std::io::Error) -> FulltextError {
+	#[cfg(windows)]
+	if error.raw_os_error() == Some(32) {
+		return FulltextError::new("E_LOCK_BUSY", "the native index directory is still in use");
+	}
+	storage_error(error)
+}
+
+impl Drop for ResetReservation {
+	fn drop(&mut self) {
+		let mut registry = registry();
+		if registry.paths.get(&self.path_identity) == Some(&PathReservation::Reset(self.operation)) {
+			registry.paths.remove(&self.path_identity);
+		}
+	}
+}
+
 fn open_runtime_with_directory(
 	handle: u32,
-	path_identity: PathIdentity,
+	canonical: PathBuf,
+	physical_identity: PathIdentity,
 	config: EngineConfig,
 	directory: MmapDirectory,
 	environment: Arc<EnvironmentState>,
@@ -934,15 +1442,34 @@ fn open_runtime_with_directory(
 				"Node environment closed during index open",
 			));
 		}
-		if registry.paths.contains_key(&path_identity) {
-			return Err(FulltextError::new(
-				"E_DUPLICATE_OPEN",
-				"the physical index is already open",
-			));
+		if registry.unproven_paths.contains(&quiescence_key(&canonical)) {
+			return Err(quiescence_error(FulltextError::new(
+				"E_LOCK_BUSY",
+				"this native index was not proven quiescent; restart is required",
+			)));
 		}
-		registry.paths.insert(path_identity.clone(), handle);
+		if let Some(reservation) = registry.paths.get(&physical_identity) {
+			return Err(match reservation {
+				PathReservation::Open(_) => {
+					FulltextError::new("E_DUPLICATE_OPEN", "the physical index is already open")
+				}
+				PathReservation::Reset(_) => FulltextError::new("E_LOCK_BUSY", "the physical index is being reset"),
+			});
+		}
+		registry
+			.paths
+			.insert(physical_identity.clone(), PathReservation::Open(handle));
 	}
 	let result = (|| {
+		match path_identity(&canonical) {
+			Ok(current) if current == physical_identity => {}
+			_ => {
+				return Err(FulltextError::new(
+					"E_LOCK_BUSY",
+					"the physical index path changed during open",
+				))
+			}
+		}
 		let engine = Engine::open(directory, &config)?;
 		let (writer, committed_payload) = engine.writer_with_payload(&config)?;
 		let reader = engine.reader_for_open()?;
@@ -950,7 +1477,8 @@ fn open_runtime_with_directory(
 			handle,
 			environment.clone(),
 			RuntimeParts {
-				path_identity: path_identity.clone(),
+				path: canonical.clone(),
+				path_identity: physical_identity.clone(),
 				config,
 				engine,
 				writer,
@@ -972,7 +1500,7 @@ fn open_runtime_with_directory(
 		Ok(committed_payload)
 	})();
 	if result.is_err() {
-		release_runtime(handle, &path_identity, &environment);
+		release_runtime(handle, &physical_identity, &environment);
 	}
 	result
 }
@@ -1105,9 +1633,20 @@ impl CleanupWait {
 fn release_runtime(handle: u32, path_identity: &PathIdentity, environment: &EnvironmentState) {
 	let mut registry = registry();
 	registry.handles.remove(&handle);
-	if registry.paths.get(path_identity) == Some(&handle) {
+	if registry.paths.get(path_identity) == Some(&PathReservation::Open(handle)) {
 		registry.paths.remove(path_identity);
 	}
+	drop(registry);
+	environment.release(handle);
+}
+
+fn release_runtime_handle(handle: u32, path: &Path, path_identity: &PathIdentity, environment: &EnvironmentState) {
+	let mut registry = registry();
+	registry.handles.remove(&handle);
+	if registry.paths.get(path_identity) == Some(&PathReservation::Open(handle)) {
+		registry.paths.remove(path_identity);
+	}
+	registry.unproven_paths.insert(quiescence_key(path));
 	drop(registry);
 	environment.release(handle);
 }
@@ -1126,19 +1665,46 @@ fn create_and_canonicalize(path: &Path) -> Result<PathBuf> {
 
 #[cfg(unix)]
 fn path_identity(path: &Path) -> Result<PathIdentity> {
-	use std::os::unix::fs::MetadataExt;
 	let metadata = fs::metadata(path).map_err(storage_error)?;
-	Ok(PathIdentity::Unix(metadata.dev(), metadata.ino()))
+	Ok(path_identity_from_metadata(path, &metadata))
 }
 
 #[cfg(windows)]
 fn path_identity(path: &Path) -> Result<PathIdentity> {
-	Ok(PathIdentity::Path(PathBuf::from(path.to_string_lossy().to_lowercase())))
+	let metadata = fs::metadata(path).map_err(storage_error)?;
+	Ok(path_identity_from_metadata(path, &metadata))
 }
 
 #[cfg(all(not(unix), not(windows)))]
 fn path_identity(path: &Path) -> Result<PathIdentity> {
-	Ok(PathIdentity::Path(path.to_path_buf()))
+	let metadata = fs::metadata(path).map_err(storage_error)?;
+	Ok(path_identity_from_metadata(path, &metadata))
+}
+
+#[cfg(unix)]
+fn path_identity_from_metadata(_path: &Path, metadata: &fs::Metadata) -> PathIdentity {
+	use std::os::unix::fs::MetadataExt;
+	PathIdentity::Unix(metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn path_identity_from_metadata(path: &Path, _metadata: &fs::Metadata) -> PathIdentity {
+	PathIdentity::Path(PathBuf::from(path.to_string_lossy().to_lowercase()))
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn path_identity_from_metadata(path: &Path, _metadata: &fs::Metadata) -> PathIdentity {
+	PathIdentity::Path(path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn quiescence_key(path: &Path) -> PathBuf {
+	PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+#[cfg(not(windows))]
+fn quiescence_key(path: &Path) -> PathBuf {
+	path.to_path_buf()
 }
 
 fn next_handle() -> Result<u32> {
@@ -1183,6 +1749,17 @@ fn inspection_body(result: InspectionResult) -> Vec<u8> {
 		InspectionResult::Payload(payload) => {
 			let mut bytes = vec![2];
 			push_string(&mut bytes, &payload);
+			bytes
+		}
+	}
+}
+
+fn reset_body(result: ResetResult) -> Vec<u8> {
+	match result {
+		ResetResult::Missing => vec![0],
+		ResetResult::Reset(path) => {
+			let mut bytes = vec![1];
+			push_string(&mut bytes, &path);
 			bytes
 		}
 	}
@@ -1240,6 +1817,21 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 mod tests {
 	use super::*;
 	use std::sync::mpsc;
+	use tantivy::directory::error::LockError;
+
+	#[test]
+	fn lifecycle_lock_excludes_other_directory_handles() {
+		let first = MmapDirectory::create_from_tempdir().unwrap();
+		let second = first.clone();
+		let lifecycle_lock = Lock {
+			filepath: PathBuf::from("index"),
+			is_blocking: false,
+		};
+		let guard = first.acquire_lock(&lifecycle_lock).unwrap();
+		assert!(matches!(second.acquire_lock(&lifecycle_lock), Err(LockError::LockBusy)));
+		drop(guard);
+		assert!(second.acquire_lock(&lifecycle_lock).is_ok());
+	}
 
 	#[test]
 	fn admission_validator_runs_under_the_queue_mutex() {

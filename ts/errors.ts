@@ -6,6 +6,7 @@ const errorCodes = [
 	'E_POISONED',
 	'E_NATIVE_FAILURE',
 	'E_CLOSED',
+	'E_CLOSE_FAILED',
 	'E_DIRTY_CLOSE',
 	'E_CHECKPOINT_REQUIRED',
 	'E_DUPLICATE_OPEN',
@@ -17,6 +18,7 @@ const errorCodes = [
 	'E_INVALID_ARGUMENT',
 	'E_LOCK_BUSY',
 	'E_QUEUE_FULL',
+	'E_QUIESCENCE_FAILED',
 	'E_SCHEMA_MISMATCH',
 	'E_STORAGE',
 ] as const;

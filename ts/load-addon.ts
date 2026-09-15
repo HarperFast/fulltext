@@ -14,6 +14,7 @@ interface NativeRuntimeInfo {
 interface NativeAddonApi {
 	runtimeInfo(): NativeRuntimeInfo;
 	__nativeInspect(config: Buffer): Buffer;
+	__nativeReset(config: Buffer, callback: NativeCallback): void;
 	__nativeOpen(config: Buffer, callback: NativeCallback): void;
 	__nativeApply(handle: number, batch: Buffer, callback: NativeCallback): void;
 	__nativeCommit(handle: number, callback: NativeCallback): void;
@@ -28,12 +29,13 @@ interface NativeAddonApi {
 	__testPoisonNativeHandle?(handle: number): void;
 	__testPoisonBeforeNextAdmission?(handle: number): void;
 	__testFailNextPublish?(handle: number, afterCommit: boolean): void;
+	__testFailNextClose?(handle: number, quiesced: boolean): void;
 }
 
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 3;
+const expectedNativeAbiVersion = 4;
 let loadedAddon: NativeAddonApi | undefined;
 
 export function loadAddon(): NativeAddonApi {
@@ -85,6 +87,12 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',
 			`Fulltext native artifact ${artifactPath} does not provide index inspection`,
+		);
+	}
+	if (typeof addon.__nativeReset !== 'function') {
+		throw new FulltextError(
+			'E_NATIVE_CAPABILITY_MISMATCH',
+			`Fulltext native artifact ${artifactPath} does not provide index reset`,
 		);
 	}
 	if (info.storageBackends.length !== 1 || info.storageBackends[0] !== 'native') {

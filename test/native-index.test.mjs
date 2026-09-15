@@ -1,19 +1,30 @@
 import assert from 'node:assert';
+import { fork } from 'node:child_process';
 import {
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
+	renameSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	unlinkSync,
 	writeFileSync,
 } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { encodeMutationBatch, inspectNativeFullTextIndex, openNativeFullTextIndex } from '@harperfast/fulltext/native';
+import {
+	encodeMutationBatch,
+	inspectNativeFullTextIndex,
+	openNativeFullTextIndex,
+	resetNativeFullTextIndex,
+} from '@harperfast/fulltext/native';
 
 function options(indexPath, overrides = {}) {
 	return {
@@ -95,6 +106,228 @@ test('inspects missing storage without creating it', (context) => {
 	const { limits: _, ...inspectionOptions } = options(indexPath);
 	assert.deepStrictEqual(inspectNativeFullTextIndex(inspectionOptions), { state: 'missing' });
 	assert.strictEqual(existsSync(indexPath), false);
+});
+
+test('retires a closed index, preserves its checkpoint, and permits a clean rebuild', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'products');
+	const config = options(indexPath);
+	let index = await openNativeFullTextIndex(config);
+	await index.apply(encodeMutationBatch({ upserts: [{ id: 'shoe-1', fields: { title: 'Trail running shoe' } }] }));
+	await index.publish('source-checkpoint-42');
+	await index.close();
+
+	const retired = await resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId });
+	assert.strictEqual(retired.state, 'reset');
+	assert.strictEqual(
+		realpathSync.native(path.dirname(retired.retiredPath)),
+		realpathSync.native(path.join(parent, '.fulltext-retired')),
+	);
+	assert.strictEqual(existsSync(indexPath), false);
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), { state: 'missing' });
+
+	renameSync(retired.retiredPath, indexPath);
+	index = await openNativeFullTextIndex(config);
+	assert.strictEqual(index.committedPayload, 'source-checkpoint-42');
+	assert.strictEqual((await index.search({ text: 'trail running', exactTotal: true })).hits[0].id, 'shoe-1');
+	await index.close();
+	await resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId });
+
+	index = await openNativeFullTextIndex(config);
+	assert.strictEqual((await index.search({ text: 'trail running', exactTotal: true })).total, 0);
+	await index.close();
+});
+
+test('close waits for background merges before retiring native files', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'merging');
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	for (let batch = 0; batch < 20; batch++) {
+		await index.apply(
+			encodeMutationBatch({
+				upserts: Array.from({ length: 100 }, (_, offset) => ({
+					id: `${batch}-${offset}`,
+					fields: { title: `Trail running shoe ${batch}-${offset}`, description: 'merge lifecycle test' },
+				})),
+			}),
+		);
+		await index.publish(`source-checkpoint-${batch}`);
+	}
+	await index.close();
+	const retired = await resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId });
+	assert.strictEqual(retired.state, 'reset');
+	rmSync(retired.retiredPath, { recursive: true });
+});
+
+test('reset is idempotent for a missing path and does not create it', async (context) => {
+	const indexPath = path.join(temporaryIndex(context), 'missing');
+	assert.deepStrictEqual(await resetNativeFullTextIndex({ path: indexPath, indexId: 'products' }), {
+		state: 'missing',
+	});
+	assert.strictEqual(existsSync(indexPath), false);
+});
+
+test('serializes concurrent resets of one native path', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'products');
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.close();
+	const results = await Promise.allSettled([
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+	]);
+	assert.strictEqual(
+		results.filter((result) => result.status === 'fulfilled' && result.value.state === 'reset').length,
+		1,
+	);
+	assert(
+		results.some(
+			(result) =>
+				(result.status === 'fulfilled' && result.value.state === 'missing') ||
+				(result.status === 'rejected' && result.reason.code === 'E_LOCK_BUSY'),
+		),
+	);
+});
+
+test('reset rejects a live index without changing its data', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.apply(encodeMutationBatch({ upserts: [{ id: 'shoe-1', fields: { title: 'Trail running shoe' } }] }));
+	await index.publish('source-checkpoint-42');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: path.join(indexPath, '.'), indexId: config.indexId }),
+		(error) => error.code === 'E_LOCK_BUSY',
+	);
+	assert.strictEqual((await index.search({ text: 'trail running', exactTotal: true })).hits[0].id, 'shoe-1');
+	await index.close();
+});
+
+test('reset respects Tantivy ownership in another process', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'products');
+	const child = fork(
+		fileURLToPath(new URL('./fixtures/native-lock-child.mjs', import.meta.url)),
+		[new URL('../dist/native.js', import.meta.url).href, indexPath],
+		{ stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
+	);
+	context.after(() => child.kill());
+	await childMessage(child, 'ready');
+
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: 'products' }),
+		(error) => error.code === 'E_LOCK_BUSY',
+	);
+	const exited = new Promise((resolve, reject) => {
+		child.once('error', reject);
+		child.once('exit', resolve);
+	});
+	child.send('close');
+	await childMessage(child, 'closed');
+	assert.strictEqual(child.exitCode, null);
+	assert.strictEqual((await resetNativeFullTextIndex({ path: indexPath, indexId: 'products' })).state, 'reset');
+	child.send('exit');
+	await exited;
+});
+
+test('reset protects neighboring identities and unrelated directories', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'products');
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.close();
+	const beforeMismatch = fileSnapshot(indexPath);
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: 'orders' }),
+		(error) => error.code === 'E_IDENTITY_MISMATCH',
+	);
+	assert.deepStrictEqual(fileSnapshot(indexPath), beforeMismatch);
+
+	const unrelatedPath = path.join(parent, 'unrelated');
+	mkdirSync(unrelatedPath);
+	writeFileSync(path.join(unrelatedPath, 'meta.json'), '{}');
+	writeFileSync(path.join(unrelatedPath, 'important.txt'), 'keep');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: unrelatedPath, indexId: 'products' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.strictEqual(readFileSync(path.join(unrelatedPath, 'important.txt'), 'utf8'), 'keep');
+
+	writeFileSync(path.join(indexPath, '.harper-fulltext-identity'), 'invalid');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_INDEX_CORRUPT',
+	);
+});
+
+test('a rejected retirement destination releases the reset reservation', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'products');
+	const config = options(indexPath);
+	let index = await openNativeFullTextIndex(config);
+	await index.close();
+	const retiredRoot = path.join(parent, '.fulltext-retired');
+	writeFileSync(retiredRoot, 'not a directory');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	unlinkSync(retiredRoot);
+	index = await openNativeFullTextIndex(config);
+	await index.close();
+});
+
+test('reset accepts an empty index directory', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'empty');
+	mkdirSync(indexPath);
+	const result = await resetNativeFullTextIndex({ path: indexPath, indexId: 'products' });
+	assert.strictEqual(result.state, 'reset');
+	assert.strictEqual(existsSync(indexPath), false);
+
+	const lockOnlyPath = path.join(parent, 'interrupted-open');
+	mkdirSync(lockOnlyPath);
+	writeFileSync(path.join(lockOnlyPath, '.tantivy-writer.lock'), '');
+	writeFileSync(path.join(lockOnlyPath, '.tantivy-meta.lock'), '');
+	assert.strictEqual((await resetNativeFullTextIndex({ path: lockOnlyPath, indexId: 'products' })).state, 'reset');
+});
+
+test('reset does not follow a symbolic-link path', async (context) => {
+	if (process.platform === 'win32') {
+		context.skip('creating directory symbolic links requires host privileges on Windows');
+		return;
+	}
+	const parent = temporaryIndex(context);
+	const target = path.join(parent, 'target');
+	const alias = path.join(parent, 'alias');
+	mkdirSync(target);
+	symlinkSync(target, alias, 'dir');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: alias, indexId: 'products' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.strictEqual(existsSync(target), true);
+
+	const indexPath = path.join(parent, 'products');
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.close();
+	const lifecycleRoot = path.join(parent, '.fulltext-locks');
+	rmSync(lifecycleRoot, { recursive: true });
+	symlinkSync(target, lifecycleRoot, 'dir');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	unlinkSync(lifecycleRoot);
+	symlinkSync(target, path.join(parent, '.fulltext-retired'), 'dir');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.strictEqual(existsSync(indexPath), true);
 });
 
 test('inspects committed payloads without taking the writer', async (context) => {
@@ -417,6 +650,37 @@ function fileSnapshot(directory, prefix = '') {
 		}
 	}
 	return snapshot;
+}
+
+function childMessage(child, expected) {
+	if (child.exitCode !== null || child.signalCode !== null) {
+		return Promise.reject(
+			new Error(`child exited before ${expected}: code=${child.exitCode} signal=${child.signalCode}`),
+		);
+	}
+	return new Promise((resolve, reject) => {
+		const cleanup = () => {
+			child.off('message', onMessage);
+			child.off('error', onError);
+			child.off('exit', onExit);
+		};
+		const onMessage = (message) => {
+			if (message !== expected) return;
+			cleanup();
+			resolve();
+		};
+		const onError = (error) => {
+			cleanup();
+			reject(error);
+		};
+		const onExit = (code, signal) => {
+			cleanup();
+			reject(new Error(`child exited before ${expected}: code=${code} signal=${signal}`));
+		};
+		child.once('error', onError);
+		child.once('exit', onExit);
+		child.on('message', onMessage);
+	});
 }
 
 function committedSegmentPath(directory, extension) {

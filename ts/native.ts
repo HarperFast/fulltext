@@ -1,5 +1,5 @@
 import { FulltextError, normalizeNativeError } from './errors.js';
-import { decodeResponse, encodeBatch, encodeInspect, encodeOpen, encodeSearch } from './codec.js';
+import { decodeResponse, encodeBatch, encodeInspect, encodeOpen, encodeReset, encodeSearch } from './codec.js';
 import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
 import { PublicationState } from './publication.js';
@@ -52,6 +52,13 @@ export type NativeFullTextIndexInspection =
 				| 'E_INDEX_FORMAT_INCOMPATIBLE'
 				| 'E_SCHEMA_MISMATCH';
 	  };
+
+export interface NativeFullTextIndexResetOptions {
+	path: string;
+	indexId: string;
+}
+
+export type NativeFullTextIndexResetResult = { state: 'missing' } | { state: 'reset'; retiredPath: string };
 
 export interface FullTextMutationBatch {
 	upserts?: Array<{ id: string; fields: Record<string, string | string[]> }>;
@@ -218,20 +225,32 @@ export class NativeFullTextIndex {
 	}
 
 	async close(options: CloseOptions = {}): Promise<void> {
-		if (this.#closed) {
-			return;
-		}
 		if (this.#closePromise) {
 			return this.#closePromise;
 		}
+		if (this.#closed) {
+			return;
+		}
 		const openStatus = this.status();
 		this.#closePromise = (async () => {
-			const cursor = await invoke((callback) =>
-				loadAddon().__nativeClose(this.#handle, options.mode === 'rollback', callback),
-			);
-			cursor.finish();
-			this.#closed = true;
-			this.#closedStatus = { ...openStatus, state: 'closed' };
+			try {
+				const cursor = await invoke((callback) =>
+					loadAddon().__nativeClose(this.#handle, options.mode === 'rollback', callback),
+				);
+				cursor.finish();
+				this.#closed = true;
+				this.#closedStatus = { ...openStatus, state: 'closed' };
+			} catch (error) {
+				const nativeError = normalizeNativeError(error);
+				if (nativeError.code === 'E_CLOSE_FAILED') {
+					this.#closed = true;
+					this.#closedStatus = { ...openStatus, state: 'closed' };
+				} else if (nativeError.code === 'E_QUIESCENCE_FAILED') {
+					this.#closed = true;
+					this.#closedStatus = { ...openStatus, state: 'poisoned' };
+				}
+				throw nativeError;
+			}
 		})();
 		try {
 			await this.#closePromise;
@@ -280,6 +299,23 @@ export function inspectNativeFullTextIndex(
 		}
 		throw nativeError;
 	}
+}
+
+export async function resetNativeFullTextIndex(
+	options: NativeFullTextIndexResetOptions,
+): Promise<NativeFullTextIndexResetResult> {
+	const cursor = await invoke((callback) => loadAddon().__nativeReset(encodeReset(options), callback));
+	const state = cursor.u8();
+	if (state === 0) {
+		cursor.finish();
+		return { state: 'missing' };
+	}
+	if (state === 1) {
+		const retiredPath = cursor.string();
+		cursor.finish();
+		return { state: 'reset', retiredPath };
+	}
+	throw new FulltextError('E_NATIVE_FAILURE', `Unknown native reset state ${state}`);
 }
 
 export async function openNativeFullTextIndex(options: NativeFullTextIndexOptions): Promise<NativeFullTextIndex> {
