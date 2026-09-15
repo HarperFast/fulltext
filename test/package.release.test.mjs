@@ -32,6 +32,7 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 	const { filename, files } = pack;
 	const includedPaths = files.map((file) => file.path);
 	assert(includedPaths.includes('dist/native.js'));
+	assert(includedPaths.includes('dist/native.d.ts'));
 	assert(!includedPaths.includes('dist/harper.js'));
 	assert(!includedPaths.includes('dist/host-storage.js'));
 	assert(includedPaths.some((file) => /^fulltext\..+\.node$/.test(file)));

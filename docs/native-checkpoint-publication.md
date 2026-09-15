@@ -7,9 +7,9 @@ Harper owns checkpoint contents, validation, replay, replication, and source-log
 
 ## Contract
 
-`publish(payload: string): Promise<bigint>` and read-only
-`committedPayload: string | undefined` to `NativeFullTextIndex`. Payloads are opaque strings,
-bounded by the existing 64 KiB UTF-8 limit. An empty string is a checkpoint; absence is not.
+`NativeFullTextIndex` exposes `publish(payload: string): Promise<bigint>` and read-only
+`committedPayload: string | undefined`. Payloads are opaque strings, bounded by the existing
+64 KiB UTF-8 limit. An empty string is a checkpoint; absence is not.
 
 Publication enters the existing bounded writer queue alongside mutations. The writer commits
 the documents and payload using Tantivy's prepared commit, reloads the shared reader, then
@@ -55,6 +55,17 @@ error: metadata may already have changed. Reopen determines whether anything per
   decisions.
 - Use only the native Tantivy filesystem entry point. There is no hosted compatibility delegate.
 
+## Verification
+
+The native publication tests cover initial absence, empty and Unicode payloads, UTF-8 size limits,
+reopen, idempotent replay by record ID, cursor-only publication, overlapping calls, queued commit
+after publication, rollback, queue rejection, and abrupt process exit before and after commit. Rust
+fault injection also covers a commit whose metadata write succeeds before an error is returned.
+
+Admission is tracked structurally by whether the native call returned normally, not by matching
+error codes. Checkpoint-required rejection happens before prepare-commit and remains nonterminal.
+Abrupt process-exit tests cover process crashes; they do not qualify power-loss durability.
+
 ## Alternatives
 
 | Approach                    | Disposition                                                                          |
@@ -62,10 +73,6 @@ error: metadata may already have changed. Reopen determines whether anything per
 | Tantivy prepared commit     | Chosen: documents and checkpoint become durable at one native commit boundary.       |
 | Separate checkpoint sidecar | Rejected: it creates a second crash-consistency and reconciliation protocol.         |
 | TypeScript-only guard       | Rejected: queued operations can establish a checkpoint after the enqueue-time check. |
-
-Admission is tracked structurally by whether the native call returned normally, not by matching
-error codes. Checkpoint-required rejection happens before prepare-commit and remains nonterminal.
-Abrupt process-exit tests cover process crashes; they do not qualify power-loss durability.
 
 Lower-layer metadata interception would couple the wrapper to Tantivy's JSON format on every
 write. A reserved checkpoint document would change schema identity and query filtering. Silently

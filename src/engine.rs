@@ -512,7 +512,7 @@ mod tests {
 
 		fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
 			self.inner.atomic_write(path, data)?;
-			if self.fail_next.swap(false, Ordering::AcqRel) {
+			if path == Path::new(META_PATH) && self.fail_next.swap(false, Ordering::AcqRel) {
 				return Err(io::Error::other("injected ambiguous atomic write"));
 			}
 			Ok(())
