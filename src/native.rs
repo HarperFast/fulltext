@@ -1174,7 +1174,6 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 		.parent()
 		.ok_or_else(|| FulltextError::invalid("reset path must not be a filesystem root"))?;
 	let initial_identity = path_identity_from_metadata(&canonical, &metadata);
-	validate_reset_target(&canonical, &reset.index_id)?;
 	let (lifecycle_directory, lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
 	let current_metadata = match fs::symlink_metadata(&canonical) {
 		Ok(metadata) => metadata,
