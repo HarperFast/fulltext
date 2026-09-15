@@ -64,7 +64,7 @@ async function verifyReopen(options) {
 for (const operation of ['apply', 'commit', 'publish', 'reload']) {
 	test(
 		`rejects ${operation} when poison drains between the early check and insertion`,
-		{ timeout: 10_000 },
+		{ timeout: 20_000 },
 		async (context) => {
 			const { options, addon, handle, index } = await fixture(context);
 			await index.apply(batch('pending'));

@@ -119,7 +119,10 @@ test('retires a closed index, preserves its checkpoint, and permits a clean rebu
 
 	const retired = await resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId });
 	assert.strictEqual(retired.state, 'reset');
-	assert.strictEqual(path.dirname(retired.retiredPath), path.join(realpathSync(parent), '.fulltext-retired'));
+	assert.strictEqual(
+		realpathSync.native(path.dirname(retired.retiredPath)),
+		realpathSync.native(path.join(parent, '.fulltext-retired')),
+	);
 	assert.strictEqual(existsSync(indexPath), false);
 	assert.deepStrictEqual(inspectNativeFullTextIndex(config), { state: 'missing' });
 
