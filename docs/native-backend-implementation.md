@@ -1,9 +1,8 @@
 # Native Tantivy backend implementation
 
-This document records the initial implementation scope. Native Tantivy files are now also the
-planned storage for Harper's derived full-text indexes; the RocksDB directory is no longer a
-delivery target. See [native checkpoint publication](native-checkpoint-publication.md) for the
-next implemented step toward that integration.
+This document records the native backend contract. Native Tantivy files are also the selected
+storage for Harper's derived full-text indexes; RocksDB is not a Fulltext delivery target. See
+[native checkpoint publication](native-checkpoint-publication.md) for its durability boundary.
 
 ## Intent
 
@@ -32,8 +31,9 @@ construction; Harper owns source projection, replay, and derived-index readiness
 
 ## Verified constraints
 
-- The package currently exports only `runtimeInfo()` from the hand-written native facade.
-  `verify: ts/native.ts:1-23, package.json:6-11`
+- The package exports one hand-written `@harperfast/fulltext/native` facade for runtime information,
+  index lifecycle, batched mutation, checkpoint publication, and search.
+  `verify: ts/native.ts, package.json:6-11`
 - The addon already contains a panic boundary and per-handle poison primitive.
   `verify: src/boundary.rs:1-38, src/lib.rs:31-53`
 - The directory harness exercises Tantivy create, write, commit, query, and reopen behavior against
@@ -355,8 +355,8 @@ global scheduler are not needed to enforce that durable compatibility invariant.
 ### Do less: expose Tantivy's existing filesystem API or query parser directly
 
 Rejected because it would expose a third-party API, permit unbounded query syntax, and create a
-public contract the Rocks and Harper integrations could not safely govern. A directory-only smoke
-also cannot provide the performance baseline Kyle requested.
+public contract Harper could not safely govern. A directory-only smoke also cannot provide the
+performance baseline required for the wrapper.
 
 ### Do less on runtime: engine benchmark plus separate per-index writer and search executors
 
@@ -385,6 +385,7 @@ yields the reference implementation used by Harper's derived index.
 - Shared handles across multiple Node worker environments.
 - A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe
   callback; this is part of the shared multi-environment runtime in issue #17.
-- Durable benchmark publication, fixed-host regression thresholds, and Rocks/native comparison.
+- Durable benchmark publication and fixed-host regression thresholds comparing standalone native,
+  Harper without full text, and Harper using the native derived index.
 - Process-wide runtime budgets, cancellation, and cursor-based
   deep pagination.
