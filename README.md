@@ -1,7 +1,6 @@
 # @harperfast/fulltext
 
-Native Tantivy full-text indexing for Node.js, with a standalone filesystem backend and an
-experimental Harper-owned storage integration.
+Native Tantivy full-text indexing for Node.js and Harper.
 
 This repository is under active development. The native entry point provides a Tantivy index
 backed by `MmapDirectory`, for standalone use and the planned Harper derived-index integration.
@@ -101,35 +100,16 @@ failures do not themselves poison the handle or invalidate a known checkpoint.
 This API uses native ABI 2. The loader rejects older addon binaries; persisted index identity and
 Tantivy file formats are unchanged by the ABI update.
 
-## Storage boundaries
+## Storage boundary
 
-The package has two explicit entry points:
+The package has one public entry point: `@harperfast/fulltext/native`. It uses Tantivy's native
+filesystem directory and has no rocksdb-js dependency. There is no hosted key-value storage entry
+point and no automatic storage fallback.
 
-- `@harperfast/fulltext/native` uses Tantivy's native directory implementation and has no
-  rocksdb-js dependency.
-- `@harperfast/fulltext/harper` is an experimental integration surface that stores Tantivy objects
-  through a synchronous Harper-owned key-value view. It exists to prove and measure the real
-  derived-index path before Harper enables a customer-facing feature.
-
-The hosted entry point remains temporarily for migration and regression coverage. It is not the
-planned Harper integration: Harper will use native Tantivy files as a locally rebuildable derived
-index, with authoritative records and replication owned by Harper. Native checkpoint publication
-is implemented here; wiring that lifecycle into Harper and removing the hosted backend are separate
-work. There is no automatic storage fallback. The fulltext addon does not link RocksDB or depend
-on rocksdb-js.
-
-The Harper opener requires a process-lifetime store identity, persistent generation, byte namespace,
-bounded transport limits, and a `HostStorage` implementation. `publish(payload)` commits the index
-and opaque payload into one Tantivy `meta.json` generation, then reloads the local reader before it
-resolves. Harper uses that payload for its derived-index cursor. `committedPayload` exposes the
-payload recovered at open or the newest successful publish. If a publish poisons the generation,
-its durable outcome can be ambiguous, so the getter throws until the index is reopened. Host storage
-methods are strictly synchronous; `write` and `sync` must return `undefined`, and Promise-returning
-implementations are rejected rather than acknowledged.
-
-The current Harper path is owner-worker-only. It does not yet provide non-owner read handles,
-cross-worker refresh, generation retirement, or scheduled physical reclamation. Those lifecycle
-pieces and representative performance results are required before release enablement.
+Harper uses the same native entry point for its locally rebuildable derived index. Harper records
+and transaction logs remain the source of truth; the local Tantivy files and their committed replay
+payload can be reused on restart or rebuilt from Harper data when necessary. The addon does not link
+RocksDB or depend on rocksdb-js.
 
 ## Development
 
@@ -140,7 +120,6 @@ npm test
 npm run lint
 npm run format:check
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000
-npm run benchmark:kv-directory -- --revision candidate
 ```
 
 The benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
@@ -151,25 +130,11 @@ durability points; it materially affects throughput and peak memory because repl
 upserts include delete terms. CI runs only the correctness smoke profile; timing comparisons
 require controlled hardware.
 
-The `kv-directory` benchmark measures the caller-visible buffered write path, empty and dirty
-flushes, 256 KiB chunk publication, closed- and active-writer deletion, retained and churned read
-handle opens, distinct-file read-open and write concurrency at one, two, four, and eight threads,
-and shared-file read-open concurrency at two, four, and eight threads. It reports percentiles across
-per-sample mean latencies and uses a deterministic in-memory store to isolate directory coordination
-from RocksDB and Node transport costs. The store permits concurrent point reads but serializes
-writes, so read-open cases isolate registration contention while write cases detect coordination
-regressions; neither predicts RocksDB scaling. The `-rw-` read-open case names establish a new
-comparison series and must not be compared with results from the earlier serialized-store cases.
-Compare two optimized builds on the same quiet host; records include the Git revision and dirty
-state, while `--revision` can add a run label and `--samples` and `--warmup` control the run. CI
-executes only `--smoke`, whose timings are not comparable to a full run, and applies no timing
-threshold.
-
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
-[docs/scaffold-design.md](docs/scaffold-design.md) for the architecture behind the initial package.
+[the native backend design](docs/native-backend-implementation.md) for implementation details.
 
 ## License
 

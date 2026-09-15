@@ -21,52 +21,12 @@ interface NativeAddonApi {
 	__nativeSearch(handle: number, request: Buffer, callback: NativeCallback): void;
 	__nativeClose(handle: number, rollback: boolean, callback: NativeCallback): void;
 	__nativeStatus(handle: number): Buffer;
-	__harperOpen(config: Buffer, handler: (dispatchId: Buffer, request: Buffer) => void, callback: NativeCallback): void;
-	__harperPublish(handle: number, payload: string, callback: NativeCallback): void;
-	__hostStorageComplete(dispatchId: Buffer, response: unknown): boolean;
-	__hostStorageFail(dispatchId: Buffer, message: string): boolean;
 	__testCreateHandle?(): number;
 	__testPanic?(id: number): void;
 	__testCheck?(id: number): boolean;
 	__testPoisonNativeHandle?(handle: number): void;
 	__testPoisonBeforeNextAdmission?(handle: number): void;
 	__testFailNextPublish?(handle: number, afterCommit: boolean): void;
-	__testOpenHostTransport?(
-		handler: (dispatchId: Buffer, request: Buffer) => void,
-		maxOperations: number,
-		maxBytes: number,
-		readTimeoutMs: number,
-	): number;
-	__testHostRoundTrip?(
-		handle: number,
-		request: Buffer,
-		responseBudget: number,
-		useTimeout: boolean,
-		lowPriority: boolean,
-		callback: NativeCallback,
-	): void;
-	__testConfigureHostTransportCleanup?(handle: number, foregroundReservedBytes: number, maxCleanupBytes: number): void;
-	__testHostTransportStats?(handle: number): string[];
-	__testHoldHostTransportCapacity?(
-		handle: number,
-		requestBytes: number,
-		responseBytes: number,
-		lowPriority: boolean,
-	): string;
-	__testReleaseHostTransportCapacity?(handle: number, requestId: string): boolean;
-	__testVerifyTantivyOnHostTransport?(
-		handle: number,
-		maxReadResponseBytes: number,
-		maxControlResponseBytes: number,
-		callback: NativeCallback,
-	): void;
-	__testReclaimOnHostTransport?(
-		handle: number,
-		maxReadResponseBytes: number,
-		maxControlResponseBytes: number,
-		callback: NativeCallback,
-	): void;
-	__testCloseHostTransport?(handle: number): boolean;
 }
 
 export type NativeCallback = (response: Buffer) => void;
@@ -120,11 +80,7 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 			`Fulltext native ABI ${info.nativeAbiVersion} from ${artifactPath} does not match ${expectedNativeAbiVersion}`,
 		);
 	}
-	if (
-		info.storageBackends.length !== 2 ||
-		info.storageBackends[0] !== 'native' ||
-		info.storageBackends[1] !== 'harper'
-	) {
+	if (info.storageBackends.length !== 1 || info.storageBackends[0] !== 'native') {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',
 			`Unexpected storage capabilities from ${artifactPath}: ${info.storageBackends.join(', ')}`,

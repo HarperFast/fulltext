@@ -1,20 +1,19 @@
 # Native checkpoint publication
 
-This unit supplies the native persistence prerequisite for Harper's derived-index integration
-([#7](https://github.com/HarperFast/fulltext/issues/7) and
-[#8](https://github.com/HarperFast/fulltext/issues/8)). It does not wire Harper, remove the
-experimental hosted backend, or change replication and source-log retention.
+Native checkpoint publication supplies the persistence boundary used by standalone callers and
+Harper's derived-index integration. Fulltext stores the opaque checkpoint in Tantivy's commit
+metadata; it does not add another checkpoint file, journal, storage provider, or RocksDB dependency.
+Harper owns checkpoint contents, validation, replay, replication, and source-log retention.
 
 ## Contract
 
-Add `publish(payload: string): Promise<bigint>` and read-only
-`committedPayload: string | undefined` to `NativeFullTextIndex`. Payloads are opaque strings,
-bounded by the existing 64 KiB UTF-8 limit. An empty string is a checkpoint; absence is not.
+`NativeFullTextIndex` exposes `publish(payload: string): Promise<bigint>` and read-only
+`committedPayload: string | undefined`. Payloads are opaque strings, bounded by the existing
+64 KiB UTF-8 limit. An empty string is a checkpoint; absence is not.
 
 Publication enters the existing bounded writer queue alongside mutations. The writer commits
 the documents and payload using Tantivy's prepared commit, reloads the shared reader, then
-acknowledges success. No additional queue, checkpoint file, journal, or storage provider is needed.
-Harper will supply its own checkpoint envelope in a later unit.
+acknowledges success.
 
 The invariant is that a generation which has committed a checkpoint cannot subsequently commit
 without one. Enforce this on the writer when the operation executes, including after reopen.
@@ -22,9 +21,9 @@ A rejected plain `commit()` returns `E_CHECKPOINT_REQUIRED` without poisoning th
 discarding staged mutations. Standalone indexes that never publish retain separate `commit()`
 and `reload()` behavior. A caller may switch such an index to checkpointed publication once.
 
-Readback comes from Tantivy commit metadata on open, not inferred queue counters. Expose it in
-the native open response using the existing optional-payload encoding. Update the native ABI
-version and TypeScript loader together so old binaries cannot misdecode the response.
+Readback comes from Tantivy commit metadata on open, not inferred queue counters. The native open
+response carries the optional payload, and the TypeScript loader rejects an incompatible ABI before
+decoding it.
 
 Publication failure after entering the writer makes the handle terminal under the existing
 poison/close path. The payload getter must not claim an older checkpoint after an ambiguous
@@ -44,48 +43,36 @@ Readback is local sequence state, not a synchronous native status call. Once pay
 commit execution begins, the writer keeps its checkpoint guard even if the commit reports an
 error: metadata may already have changed. Reopen determines whether anything persisted.
 
-## Code boundaries
+## Ownership boundaries
 
-- Reuse the hosted `WriterOperation::Publish` for native callers rather than duplicate its
-  commit/reload/error handling. Keep the existing hosted entry point as a compatibility delegate.
 - Put checkpoint-preservation state with the engine writer, initialized from committed metadata
   after acquiring the writer. One read supplies both the guard and open response, preventing
   stale readback if another process publishes before we acquire its released writer lock.
   Do not reread files on every commit merely to enforce the guard.
-- Share the TypeScript publication/readback implementation between native and hosted handles.
 - Preserve existing dirty-close, rollback, lifecycle, queue limits, metrics and search behavior.
 - Keep test fault injection behind the existing test feature and out of shipped binaries.
-
-## Alternatives
-
-| Approach                                   | Correctness                                             | Performance                          | Complexity                 | Compatibility                           |
-| ------------------------------------------ | ------------------------------------------------------- | ------------------------------------ | -------------------------- | --------------------------------------- |
-| Reuse prepared commit + shared publication | Documents and checkpoint share one commit               | Existing worker queue and one reload | Small shared API extension | ABI bump; standalone semantics retained |
-| Separate checkpoint sidecar                | Requires a second crash-consistency protocol            | Extra writes and sync                | New recovery state machine | Unnecessary storage format              |
-| TypeScript commit guard only               | Queued commit can race publication; raw ABI bypasses it | Cheap but unsafe                     | Apparent simplicity        | Cannot enforce invariant                |
-| Duplicate native publication               | Same semantics possible                                 | No benefit                           | Two paths to maintain      | Hosted drift during migration           |
+- Keep the payload opaque. Fulltext must not parse Harper cursors or make replay and rebuild
+  decisions.
+- Use only the native Tantivy filesystem entry point. There is no hosted compatibility delegate.
 
 ## Verification
 
-Exercise public Node APIs against real native files: initial absence, empty and Unicode payloads,
-boundary size validation, mutation visibility without explicit reload, reopen, idempotent replay,
-cursor-only publication, overlapping calls, queued publish followed by commit, and rollback.
-Confirm a rejected commit retains mutations and that a later publish can commit them.
+The native publication tests cover initial absence, empty and Unicode payloads, UTF-8 size limits,
+reopen, idempotent replay by record ID, cursor-only publication, overlapping calls, queued commit
+after publication, rollback, queue rejection, and abrupt process exit before and after commit. Rust
+fault injection also covers a commit whose metadata write succeeds before an error is returned.
 
-Extend process-exit tests to published documents/checkpoints and subsequent uncommitted work.
-Use deterministic test-only fault points at publication boundaries to exercise failures before
-commit and after commit/before reload; reopen must report the checkpoint actually persisted.
-Retain independent directory-failure engine tests. Test queue overload without payload poisoning.
-Run Rust tests (including native-only compilation), Node tests, packed-consumer tests, formatting
-and clippy. Review the plan and committed implementation with Claude and Gemini CLI.
+Admission is tracked structurally by whether the native call returned normally, not by matching
+error codes. Checkpoint-required rejection happens before prepare-commit and remains nonterminal.
+Abrupt process-exit tests cover process crashes; they do not qualify power-loss durability.
 
-The acceptance boundary is a tested native checkpoint API. Harper recovery coordination and
-end-to-end performance benchmarks follow; this unit makes no catalog-scale latency claim.
-Abrupt process-exit tests do not simulate power loss or prove filesystem sync ordering.
+## Alternatives
 
-The shared publication state has direct tests for reordered callbacks. Admission is tracked
-structurally by whether the native call returned normally, not by matching error codes.
-Checkpoint-required rejection is handled before prepare-commit and remains nonterminal.
+| Approach                    | Disposition                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------------ |
+| Tantivy prepared commit     | Chosen: documents and checkpoint become durable at one native commit boundary.       |
+| Separate checkpoint sidecar | Rejected: it creates a second crash-consistency and reconciliation protocol.         |
+| TypeScript-only guard       | Rejected: queued operations can establish a checkpoint after the enqueue-time check. |
 
 Lower-layer metadata interception would couple the wrapper to Tantivy's JSON format on every
 write. A reserved checkpoint document would change schema identity and query filtering. Silently

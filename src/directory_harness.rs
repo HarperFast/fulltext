@@ -779,6 +779,7 @@ mod tests {
 		assert_eq!(metrics[0].name, "immediate creation");
 		assert_eq!(metrics[1].name, "repeated flush");
 		assert!(metrics.iter().any(|case| case.logical_reads.calls > 0));
+		assert!(metrics.iter().any(|case| case.logical_reads.bytes_requested > 0));
 	}
 
 	#[test]

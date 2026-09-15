@@ -1,9 +1,8 @@
 # Native Tantivy backend implementation
 
-This document records the initial implementation scope. Native Tantivy files are now also the
-planned storage for Harper's derived full-text indexes; the RocksDB directory is no longer a
-delivery target. See [native checkpoint publication](native-checkpoint-publication.md) for the
-next implemented step toward that integration.
+This document records the native backend contract. Native Tantivy files are also the selected
+storage for Harper's derived full-text indexes; RocksDB is not a Fulltext delivery target. See
+[native checkpoint publication](native-checkpoint-publication.md) for its durability boundary.
 
 ## Intent
 
@@ -26,19 +25,20 @@ cancellation, or derived nonblocking admission.
 
 ## Invariant
 
-Every storage backend uses the same engine-facing schema, mutation, commit, search, and lifecycle
-contracts; the native backend contributes only canonical path handling and Tantivy
-`MmapDirectory` construction.
+The engine-facing schema, mutation, commit, search, and lifecycle contracts remain independent from
+Harper. The Node wrapper contributes canonical path handling and Tantivy `MmapDirectory`
+construction; Harper owns source projection, replay, and derived-index readiness.
 
 ## Verified constraints
 
-- The package currently exports only `runtimeInfo()` from the hand-written native facade.
-  `verify: ts/native.ts:1-23, package.json:6-11`
+- The package exports one hand-written `@harperfast/fulltext/native` facade for runtime information,
+  index lifecycle, batched mutation, checkpoint publication, and search.
+  `verify: ts/native.ts, package.json:6-11`
 - The addon already contains a panic boundary and per-handle poison primitive.
-  `verify: src/boundary.rs:1-38, src/lib.rs:31-53`
-- The committed Phase 0 work already exercises a complete Tantivy create, write, commit, query, and
-  reopen lifecycle through the same `Directory` contract intended for RocksDB.
-  `verify: src/directory_harness.rs:108-153`
+  `verify: src/boundary.rs:8-40`
+- The directory harness exercises Tantivy create, write, commit, query, and reopen behavior against
+  `MmapDirectory`.
+  `verify: src/directory_harness.rs`
 - Tantivy 0.26.1 is pinned and compiled into the addon. Its `Index::open` wraps a supplied directory
   in `ManagedDirectory`, while `Index::writer_with_num_threads` acquires the writer lock and divides
   the supplied memory budget across the requested indexing threads.
@@ -49,7 +49,7 @@ contracts; the native backend contributes only canonical path handling and Tanti
 - The reader uses `ReloadPolicy::Manual`, which does not call `Directory::watch`; Tantivy's mmap
   watcher starts its polling thread only when `watch()` is called. The native backend therefore
   does not add a metadata-watcher thread per open index.
-  `verify: src/engine.rs:136-141; tantivy 0.26.1 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
+  `verify: src/engine.rs:148-154; tantivy 0.26.1 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
 - napi-rs `AsyncTask` executes on the shared libuv pool, so it is not the execution primitive for
   sustained indexing or search.
   `verify: napi 2.16.17 src/task.rs:6-14`
@@ -118,8 +118,8 @@ interface FullTextStatus {
 
 These native-only limits are required in the pre-1.0 standalone factory so measurements are
 reproducible and memory is bounded without prematurely implementing #17's final process-wide budget
-allocator. The shared engine accepts resolved limits; the future runtime governor will supply them
-for both storage backends, and the Harper schema will never expose them.
+allocator. The shared engine accepts resolved limits; the future runtime governor will supply them,
+and the Harper schema will never expose them.
 
 The exported flow is:
 
@@ -171,8 +171,7 @@ N-API handle registry ── canonical path reservation
   └─ search/reload ─► bounded search queue ─► small search worker pool
                                              └─ shared IndexReader/Searcher
 
-writer actor ─► shared engine ─► MmapDirectory (native)
-                            later └─ RocksDbDirectory (same engine)
+writer actor ─► shared engine ─► MmapDirectory
 ```
 
 The native addon owns these threads and queues; no sustained operation runs on the JavaScript event
@@ -254,12 +253,12 @@ representative synchronous and asynchronous failures. No Rust type or Tantivy ob
 public API or Node worker.
 
 Successful `commit()` delegates to Tantivy 0.26.1's ordinary commit path and resolves only after it
-returns. The process-kill test verifies publication and process-crash recovery. The existing
-`KvDirectory` contract suite supplies the durable file/publication ordering checks; injecting a
-commit failure through the complete shared engine remains part of Rocks-backend hardening. Engine
-payload publication is intentionally deferred to the derived-index checkpoint work. A commit or
-post-validation mutation failure poisons the writer generation; callers close and reopen from the
-last durable commit rather than guessing which uncommitted opstamps survived.
+returns. The process-kill test verifies publication and process-crash recovery. A test directory
+that reports an error after applying an atomic metadata write verifies conservative checkpoint
+handling after an ambiguous commit. Checkpointed publication is implemented separately in
+[native-checkpoint-publication.md](native-checkpoint-publication.md). A commit or post-validation
+mutation failure poisons the writer generation; callers close and reopen from the last durable
+commit rather than guessing which uncommitted opstamps survived.
 
 `close()` defaults to require-clean: uncommitted mutations fail close rather than being silently
 committed or discarded. That failure restores the open state so the caller can commit or call
@@ -304,8 +303,8 @@ reopen must preserve results, and every operation count must match. The benchmar
 replacement-safe upserts emit delete terms, so `--commit-every` is an explicit workload dimension
 rather than allowing an unbounded final commit to masquerade as a production ingestion profile.
 The benchmark does not claim the 100-million-document or Harper p99-under-50-ms release gate; those
-remain the paired fixed-host work in issue #15. This slice establishes the native engine and N-API
-baseline that issue #15 will compare against RocksDB.
+remain paired fixed-host work. This slice establishes the standalone native baseline for comparison
+with the integrated Harper path and a no-index Harper control.
 
 CI runs correctness tests and an explicit small benchmark-smoke command that performs ranking,
 commit, close, and reopen assertions before validating nonzero measurements. Shared runners enforce
@@ -326,7 +325,7 @@ history.
   completions and releases the writer.
 - Decoder tests cover invalid counts, lengths, and UTF-8; randomized decoder fuzzing remains part of
   the hardening work.
-- Existing Directory contract tests remain unchanged.
+- MmapDirectory contract tests remain unchanged.
 - `npm run check` and package artifact verification run before review.
 - The release benchmark runs locally at two dataset sizes and commit cadences; raw JSON is retained
   with the PR verification notes. It is built explicitly in release mode before measurements are
@@ -341,9 +340,9 @@ repeats the search.
 ### Different layer: implement native storage only in Harper
 
 The candidate layer is Harper's `DerivedIndexBackend`, which could own the engine and call a thin
-native filesystem binding. Rejected because the invariant is one engine for standalone RocksDB,
-native filesystem users, and Harper-derived delivery; putting the engine in Harper would force the
-two standalone modes either to depend on Harper or to fork search/index behavior.
+native filesystem binding. Rejected because standalone users and Harper-derived delivery need the
+same search and indexing behavior; putting the engine in Harper would force standalone use to
+depend on Harper or fork those semantics.
 
 ### Deeper cause: implement the complete storage-neutral runtime before either backend
 
@@ -356,8 +355,8 @@ global scheduler are not needed to enforce that durable compatibility invariant.
 ### Do less: expose Tantivy's existing filesystem API or query parser directly
 
 Rejected because it would expose a third-party API, permit unbounded query syntax, and create a
-public contract the Rocks and Harper integrations could not safely govern. A directory-only smoke
-also cannot provide the performance baseline Kyle requested.
+public contract Harper could not safely govern. A directory-only smoke also cannot provide the
+performance baseline required for the wrapper.
 
 ### Do less on runtime: engine benchmark plus separate per-index writer and search executors
 
@@ -370,23 +369,23 @@ instead of temporary writer-queue head-of-line blocking.
 
 The sidecar is chosen. Repeating identity in every commit payload couples immutable engine identity
 to future checkpoint/watermark publication and lets any omitted `set_payload()` erase it. An
-immutable sidecar written through the same `Directory` contract prevents that failure and works for
-both `MmapDirectory` and `RocksDbDirectory` without custom filesystem code.
+immutable sidecar written through the same `Directory` contract prevents that failure and works
+with `MmapDirectory` without custom filesystem code.
 
 ### Chosen: one shared engine slice with a thin MmapDirectory constructor
 
-This is the only option that simultaneously produces a usable standalone backend, keeps native
-storage out of Harper, avoids reimplementing Tantivy filesystem primitives, establishes bounded
-off-event-loop execution, and yields an apples-to-apples reference for the Rocks directory.
+This produces a usable standalone backend, keeps Tantivy storage mechanics out of Harper, avoids
+reimplementing Tantivy filesystem primitives, establishes bounded off-event-loop execution, and
+yields the reference implementation used by Harper's derived index.
 
 ## Explicit deferrals
 
-- Derived-index delivery, checkpoints/watermarks, replay, and Harper lifecycle hooks.
-- RocksDbDirectory and rocksdb-js lease use.
+- Derived-index delivery, replay, readiness, and Harper lifecycle hooks.
 - Phrase, fuzzy, prefix, autocomplete, suggestions, highlighting, snippets, and filters.
 - Shared handles across multiple Node worker environments.
 - A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe
   callback; this is part of the shared multi-environment runtime in issue #17.
-- Durable benchmark publication, fixed-host regression thresholds, and Rocks/native comparison.
+- Durable benchmark publication and fixed-host regression thresholds comparing standalone native,
+  Harper without full text, and Harper using the native derived index.
 - Process-wide runtime budgets, cancellation, and cursor-based
   deep pagination.

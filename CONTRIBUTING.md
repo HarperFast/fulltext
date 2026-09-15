@@ -25,10 +25,9 @@ of `npm pack` into a temporary consumer project.
 
 ## Design constraints
 
-- Keep search, indexing, scheduling, and lifecycle behavior shared across storage backends.
-- Keep backend choice explicit; do not introduce automatic fallback.
-- Do not link RocksDB into this addon. Harper storage uses the bounded host transport and
-  Harper-owned RocksDB operations; the historical rocksdb-js lease remains test-only.
+- Keep search, indexing, scheduling, and lifecycle behavior independent from Harper.
+- Keep the package on Tantivy's native filesystem storage; do not add storage fallback.
+- Harper integration and source-data lifecycle belong in Harper rather than this package.
 - Do not expose generated Node-API declarations as the public TypeScript API.
 - Keep CPU and sustained I/O work off the Node.js event loop. The promise-shaped capability call may
   synchronously load the addon once; no search, indexing, commit, or storage operation gets that

@@ -13,7 +13,7 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	storageBackends: ReadonlyArray<'native' | 'harper'>;
+	storageBackends: ReadonlyArray<'native'>;
 }
 
 export interface NativeFullTextIndexOptions {
@@ -264,7 +264,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			storageBackends: ['native', 'harper'],
+			storageBackends: ['native'],
 		};
 	} catch (error) {
 		throw normalizeNativeError(error);

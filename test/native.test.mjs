@@ -15,12 +15,13 @@ const cargoPackageVersion = /^version\s*=\s*"([^"]+)"/m.exec(tomlSection(cargoMa
 const tantivyVersion = /^tantivy\s*=\s*"=([^"]+)"/m.exec(tomlSection(cargoManifest, 'dependencies'))?.[1];
 
 test('loads the artifact for the executing platform', async () => {
+	assert.deepStrictEqual(loadAddon().runtimeInfo().storageBackends, ['native']);
 	const info = await runtimeInfo();
 	assert.deepStrictEqual(info, {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
 		nativeAbiVersion: 2,
-		storageBackends: ['native', 'harper'],
+		storageBackends: ['native'],
 	});
 	assert.strictEqual(cargoPackageVersion, packageManifest.version);
 	assert.match(platformTriple(), /^(darwin|linux|win32)-(arm64|x64)(-(gnu|musl|msvc))?$/);

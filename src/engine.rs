@@ -462,7 +462,74 @@ fn index_error(error: tantivy::TantivyError) -> FulltextError {
 mod tests {
 	use super::*;
 	use crate::protocol::{FieldConfig, Limits};
-	use tantivy::directory::RamDirectory;
+	use std::io;
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::Arc;
+	use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
+	use tantivy::directory::{
+		Directory, DirectoryLock, FileHandle, RamDirectory, WatchCallback, WatchHandle, WritePtr,
+	};
+
+	#[derive(Clone, Debug)]
+	struct AmbiguousAtomicWriteDirectory {
+		inner: RamDirectory,
+		fail_next: Arc<AtomicBool>,
+	}
+
+	impl AmbiguousAtomicWriteDirectory {
+		fn new() -> Self {
+			Self {
+				inner: RamDirectory::create(),
+				fail_next: Arc::new(AtomicBool::new(false)),
+			}
+		}
+
+		fn fail_after_next_atomic_write(&self) {
+			self.fail_next.store(true, Ordering::Release);
+		}
+	}
+
+	impl Directory for AmbiguousAtomicWriteDirectory {
+		fn get_file_handle(&self, path: &Path) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
+			self.inner.get_file_handle(path)
+		}
+
+		fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> {
+			self.inner.delete(path)
+		}
+
+		fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
+			self.inner.exists(path)
+		}
+
+		fn open_write(&self, path: &Path) -> std::result::Result<WritePtr, OpenWriteError> {
+			self.inner.open_write(path)
+		}
+
+		fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
+			self.inner.atomic_read(path)
+		}
+
+		fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+			self.inner.atomic_write(path, data)?;
+			if path == Path::new(META_PATH) && self.fail_next.swap(false, Ordering::AcqRel) {
+				return Err(io::Error::other("injected ambiguous atomic write"));
+			}
+			Ok(())
+		}
+
+		fn sync_directory(&self) -> io::Result<()> {
+			self.inner.sync_directory()
+		}
+
+		fn acquire_lock(&self, lock: &tantivy::directory::Lock) -> std::result::Result<DirectoryLock, LockError> {
+			self.inner.acquire_lock(lock)
+		}
+
+		fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+			self.inner.watch(callback)
+		}
+	}
 
 	fn config() -> EngineConfig {
 		EngineConfig {
@@ -560,33 +627,6 @@ mod tests {
 	}
 
 	#[test]
-	fn same_engine_runs_on_the_kv_directory() {
-		let directory = crate::phase0::FaultingDirectory::new(crate::phase0::FaultingKv::default());
-		let config = config();
-		let engine = Engine::open(directory.clone(), &config).unwrap();
-		let mut writer = engine.writer(&config).unwrap();
-		writer.apply(batch()).unwrap();
-		writer.commit().unwrap();
-		let reader = engine.reader().unwrap();
-		let request = SearchRequest {
-			text: "running shoes".to_owned(),
-			operator: SearchOperator::All,
-			fields: Vec::new(),
-			offset: 0,
-			limit: 10,
-			exact_total: true,
-		};
-		assert_eq!(engine.search(&reader.searcher(), &request).unwrap().hits[0].id, "one");
-		writer.close().unwrap();
-		let reopened = Engine::open(directory, &config).unwrap();
-		let reopened_reader = reopened.reader().unwrap();
-		assert_eq!(
-			reopened.search(&reopened_reader.searcher(), &request).unwrap().hits[0].id,
-			"one"
-		);
-	}
-
-	#[test]
 	fn tantivy_plain_commit_erases_a_prior_payload_without_the_guard() {
 		let config = config();
 		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
@@ -634,12 +674,11 @@ mod tests {
 
 	#[test]
 	fn failed_checkpoint_commit_keeps_the_guard_conservative() {
-		let store = crate::phase0::FaultingKv::default();
-		let directory = crate::phase0::FaultingDirectory::new(store.clone());
+		let directory = AmbiguousAtomicWriteDirectory::new();
 		let config = config();
-		let engine = Engine::open(directory, &config).unwrap();
+		let engine = Engine::open(directory.clone(), &config).unwrap();
 		let mut writer = engine.writer(&config).unwrap();
-		store.fail_after_next_write();
+		directory.fail_after_next_atomic_write();
 		assert!(writer.commit_with_payload(Some("uncertain")).is_err());
 		assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("uncertain"));
 		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
