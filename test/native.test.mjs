@@ -1,10 +1,15 @@
 import assert from 'node:assert';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, renameSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { NativeFullTextIndex, resetNativeFullTextIndex, runtimeInfo } from '@harperfast/fulltext/native';
+import {
+	NativeFullTextIndex,
+	openNativeFullTextIndex,
+	resetNativeFullTextIndex,
+	runtimeInfo,
+} from '@harperfast/fulltext/native';
 import { decodeResponse, encodeOpen } from '../dist/codec.js';
 import { normalizeNativeError } from '../dist/errors.js';
 import { loadAddon, platformTriple } from '../dist/load-addon.js';
@@ -88,8 +93,9 @@ test('default close tears down a poisoned native handle', async (context) => {
 });
 
 test('a close failure after resource release remains resettable', async (context) => {
-	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-close-failed-'));
-	context.after(() => rmSync(indexPath, { recursive: true, force: true }));
+	const parent = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-close-failed-'));
+	const indexPath = path.join(parent, 'index');
+	context.after(() => rmSync(parent, { recursive: true, force: true }));
 	const { addon, handle, index } = await testIndex(indexPath, 'close-failed');
 	assert(addon.__testFailNextClose);
 	addon.__testFailNextClose(handle, true);
@@ -99,9 +105,10 @@ test('a close failure after resource release remains resettable', async (context
 	assert.strictEqual((await resetNativeFullTextIndex({ path: indexPath, indexId: 'close-failed' })).state, 'reset');
 });
 
-test('an unproven close releases environment tracking but retains the path reservation', async (context) => {
-	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-quiescence-failed-'));
-	context.after(() => rmSync(indexPath, { recursive: true, force: true }));
+test('an unproven close releases environment tracking and quarantines the index', async (context) => {
+	const parent = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-quiescence-failed-'));
+	const indexPath = path.join(parent, 'index');
+	context.after(() => rmSync(parent, { recursive: true, force: true }));
 	const { addon, handle, index } = await testIndex(indexPath, 'quiescence-failed');
 	assert(addon.__testFailNextClose);
 	addon.__testFailNextClose(handle, false);
@@ -110,6 +117,16 @@ test('an unproven close releases environment tracking but retains the path reser
 	await assert.rejects(index.close(), (error) => error.code === 'E_QUIESCENCE_FAILED');
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: indexPath, indexId: 'quiescence-failed' }),
+		(error) => error.code === 'E_QUIESCENCE_FAILED',
+	);
+	const movedPath = path.join(parent, 'moved');
+	renameSync(indexPath, movedPath);
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: movedPath, indexId: 'quiescence-failed' }),
+		(error) => error.code === 'E_QUIESCENCE_FAILED',
+	);
+	await assert.rejects(
+		openNativeFullTextIndex(nativeOptions(movedPath, 'quiescence-failed')),
 		(error) => error.code === 'E_QUIESCENCE_FAILED',
 	);
 });

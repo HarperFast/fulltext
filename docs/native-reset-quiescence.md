@@ -56,11 +56,11 @@ The operation has the following behavior:
   never force-closes a handle owned by another caller or Node environment.
 - A caller closes its owned handle first. The strengthened close resolution is the proof of native
   quiescence.
-- Reset verifies that the path is an empty directory or directly contains Tantivy `meta.json`,
-  `.managed.json`, a Tantivy writer-lock marker, the Fulltext lifecycle-lock marker, or the Fulltext
-  identity sidecar. When the sidecar is readable, its logical index ID must match `indexId`; schema
-  and generation differences remain valid reasons to reset. It rejects an empty path, a filesystem
-  root, a symbolic-link path, and a directory that does not have this shape.
+- Reset accepts an empty directory or one containing only the Tantivy writer/meta lock markers and
+  the Fulltext lifecycle-lock marker. Any other content requires a valid Fulltext identity sidecar,
+  and its logical index ID must match `indexId`; unreadable or malformed sidecars fail closed.
+  Schema and generation differences remain valid reasons to reset. It rejects a filesystem root, a
+  symbolic-link path, and a directory that does not have this shape.
 - Reset reserves the existing physical-directory identity in the process registry, acquires the
   wrapper's nonblocking lifecycle lock, and then acquires Tantivy's nonblocking writer lock. It
   renames the directory into the parent's hidden `.fulltext-retired` directory, drops its locks and
@@ -118,7 +118,7 @@ The registry's existing physical-directory entry becomes a reservation state:
 ```text
 vacant -> open(handle) -> vacant
 vacant -> resetting    -> vacant
-open(handle) -> unproven(path quarantine) -> process restart
+open(handle) -> unproven(path + physical identity + logical ID quarantine) -> process restart
 ```
 
 The transition is made under the existing registry mutex, but canonicalization, metadata reads,
@@ -152,11 +152,11 @@ in-place deletion.
   rebuild through a live owner.
 - A failed close does not prove quiescence. Tantivy 0.26.1 can return early from
   `wait_merging_threads()` after an indexing-worker failure without joining every remaining worker.
-  The wrapper therefore removes the unusable handle, records a canonical-path quarantine, and
-  returns a typed quiescence failure. The quarantine does not retain the directory's inode, so reuse
-  by a different path is unaffected, but open and reset of the same path fail until process restart.
-  Harper keeps the index unavailable; availability is not allowed to weaken the file-lifetime
-  invariant.
+  The wrapper therefore removes the unusable handle and quarantines the canonical path, physical
+  directory identity, and logical index ID until process restart. This prevents a rename from
+  bypassing the quarantine on systems with stable physical-directory identities; the logical ID is
+  the cross-platform backstop. Harper keeps the index unavailable; availability is not allowed to
+  weaken the file-lifetime invariant.
 - Reset does not interpret or validate checkpoint payloads. Inspection remains the cursor and
   compatibility boundary.
 - Reset does not select or delete a retired generation, open a new writer, or make queries ready.
@@ -184,10 +184,12 @@ durable catalog alongside Tantivy `meta.json`.
 
 - Real-addon tests publish, close, reset, inspect as missing, restore the retired directory, reopen,
   and verify both the checkpoint and searchable document.
-- Repeated commits create merge work before close; immediate retirement and recursive removal prove
-  the barrier has released merge-owned files and mappings.
+- Repeated commits create merge work before close, followed by immediate retirement and recursive
+  removal. This exercises the intended sequence but does not by itself prove operating-system file
+  lifetime behavior.
 - Reset of a live index is rejected without changing its data. A separate process proves writer-lock
-  exclusion, closes its handle, stays alive, and then permits reset.
+  exclusion, closes its handle, stays alive, and then permits reset. A Rust test independently proves
+  lifecycle-lock contention and release across directory handles.
 - Missing and empty paths, logical identity mismatch, unrelated directories, source and destination
   symbolic links, and retirement-destination failure are covered. The failure test reopens the same
   path afterward to prove the registry reservation was released.

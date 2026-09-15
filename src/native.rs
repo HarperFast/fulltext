@@ -12,11 +12,11 @@ use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, JsFunction};
 use napi_derive::napi;
-use tantivy::directory::{Directory, Lock, MmapDirectory, INDEX_WRITER_LOCK};
+use tantivy::directory::{Directory, Lock, MmapDirectory, INDEX_WRITER_LOCK, META_LOCK};
 use tantivy::IndexReader;
 
 use crate::boundary;
-use crate::engine::{Engine, InspectionResult, SearchResult, TotalRelation, Writer};
+use crate::engine::{persisted_index_id, Engine, InspectionResult, SearchResult, TotalRelation, Writer, IDENTITY_PATH};
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
 	decode_batch, decode_inspect, decode_open, decode_reset, decode_search, validate_batch_header,
@@ -41,6 +41,8 @@ struct Registry {
 	handles: HashMap<u32, Arc<Runtime>>,
 	paths: HashMap<PathIdentity, PathReservation>,
 	unproven_paths: HashSet<PathBuf>,
+	unproven_identities: HashSet<PathIdentity>,
+	unproven_index_ids: HashSet<String>,
 	opening: HashSet<u32>,
 	cancelled: HashSet<u32>,
 	environments: HashMap<usize, Weak<EnvironmentState>>,
@@ -975,6 +977,7 @@ fn finish_runtime(
 			runtime.handle,
 			&runtime.path,
 			&runtime.path_identity,
+			&runtime.config.identity.index_id,
 			&runtime.environment,
 		);
 	}
@@ -993,6 +996,7 @@ fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
 		runtime.handle,
 		&runtime.path,
 		&runtime.path_identity,
+		&runtime.config.identity.index_id,
 		&runtime.environment,
 	);
 	runtime.signal_closed();
@@ -1177,10 +1181,13 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 	let physical_identity = path_identity(&canonical)?;
 	{
 		let mut registry = registry();
-		if registry.unproven_paths.contains(&quiescence_key(&canonical)) {
+		if registry.unproven_paths.contains(&quiescence_key(&canonical))
+			|| registry.unproven_identities.contains(&physical_identity)
+			|| registry.unproven_index_ids.contains(&reset.index_id)
+		{
 			return Err(quiescence_error(FulltextError::new(
 				"E_LOCK_BUSY",
-				"this path was not proven quiescent; restart is required",
+				"this native index was not proven quiescent; restart is required",
 			)));
 		}
 		if registry.paths.contains_key(&physical_identity) {
@@ -1217,44 +1224,42 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 }
 
 fn validate_reset_target(path: &Path, expected_index_id: &str) -> Result<()> {
-	let mut recognized = false;
-	let mut unrelated = false;
+	let mut identity_found = false;
+	let mut content_found = false;
 	for entry in fs::read_dir(path).map_err(storage_error)? {
 		let entry = entry.map_err(storage_error)?;
 		let name = entry.file_name();
-		if name == ".harper-fulltext-identity" {
-			recognized = true;
-			if let Ok(bytes) = fs::read(entry.path()) {
-				if let Some(index_id) = persisted_index_id(&bytes) {
-					if index_id != expected_index_id {
-						return Err(FulltextError::new(
-							"E_IDENTITY_MISMATCH",
-							"the persisted index ID does not match the reset request",
-						));
-					}
-				}
+		if name == IDENTITY_PATH {
+			let metadata = fs::symlink_metadata(entry.path()).map_err(storage_error)?;
+			if !metadata.is_file() || metadata.file_type().is_symlink() {
+				return Err(FulltextError::new(
+					"E_INDEX_CORRUPT",
+					"the persisted index identity is invalid",
+				));
 			}
-		} else if name == "meta.json" || name == ".managed.json" {
-			recognized = true;
-		} else if name != ".tantivy-writer.lock" && name != ".harper-fulltext-lifecycle.lock" {
-			unrelated = true;
+			let bytes = fs::read(entry.path()).map_err(storage_error)?;
+			let index_id = persisted_index_id(&bytes)
+				.ok_or_else(|| FulltextError::new("E_INDEX_CORRUPT", "the persisted index identity is invalid"))?;
+			if index_id != expected_index_id {
+				return Err(FulltextError::new(
+					"E_IDENTITY_MISMATCH",
+					"the persisted index ID does not match the reset request",
+				));
+			}
+			identity_found = true;
+		} else if name.as_os_str() != INDEX_WRITER_LOCK.filepath.as_os_str()
+			&& name.as_os_str() != META_LOCK.filepath.as_os_str()
+			&& name.as_os_str() != LIFECYCLE_LOCK.filepath.as_os_str()
+		{
+			content_found = true;
 		}
 	}
-	if unrelated && !recognized {
+	if content_found && !identity_found {
 		return Err(FulltextError::invalid(
 			"reset path is not an empty or recognizable Fulltext index directory",
 		));
 	}
 	Ok(())
-}
-
-fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
-	if bytes.len() < 10 || &bytes[..6] != b"HTFI\x01\x00" {
-		return None;
-	}
-	let length = u32::from_le_bytes(bytes[6..10].try_into().ok()?) as usize;
-	let end = 10usize.checked_add(length)?;
-	std::str::from_utf8(bytes.get(10..end)?).ok()
 }
 
 fn next_retired_path(root: &Path, source: &Path, operation: u32) -> Result<PathBuf> {
@@ -1376,10 +1381,13 @@ fn open_runtime_with_directory(
 				"Node environment closed during index open",
 			));
 		}
-		if registry.unproven_paths.contains(&quiescence_key(&canonical)) {
+		if registry.unproven_paths.contains(&quiescence_key(&canonical))
+			|| registry.unproven_identities.contains(&physical_identity)
+			|| registry.unproven_index_ids.contains(&config.identity.index_id)
+		{
 			return Err(quiescence_error(FulltextError::new(
 				"E_LOCK_BUSY",
-				"this path was not proven quiescent; restart is required",
+				"this native index was not proven quiescent; restart is required",
 			)));
 		}
 		if let Some(reservation) = registry.paths.get(&physical_identity) {
@@ -1574,13 +1582,21 @@ fn release_runtime(handle: u32, path_identity: &PathIdentity, environment: &Envi
 	environment.release(handle);
 }
 
-fn release_runtime_handle(handle: u32, path: &Path, path_identity: &PathIdentity, environment: &EnvironmentState) {
+fn release_runtime_handle(
+	handle: u32,
+	path: &Path,
+	path_identity: &PathIdentity,
+	index_id: &str,
+	environment: &EnvironmentState,
+) {
 	let mut registry = registry();
 	registry.handles.remove(&handle);
 	if registry.paths.get(path_identity) == Some(&PathReservation::Open(handle)) {
 		registry.paths.remove(path_identity);
 	}
 	registry.unproven_paths.insert(quiescence_key(path));
+	registry.unproven_identities.insert(path_identity.clone());
+	registry.unproven_index_ids.insert(index_id.to_owned());
 	drop(registry);
 	environment.release(handle);
 }
@@ -1734,6 +1750,17 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 mod tests {
 	use super::*;
 	use std::sync::mpsc;
+	use tantivy::directory::error::LockError;
+
+	#[test]
+	fn lifecycle_lock_excludes_other_directory_handles() {
+		let first = MmapDirectory::create_from_tempdir().unwrap();
+		let second = first.clone();
+		let guard = first.acquire_lock(&LIFECYCLE_LOCK).unwrap();
+		assert!(matches!(second.acquire_lock(&LIFECYCLE_LOCK), Err(LockError::LockBusy)));
+		drop(guard);
+		assert!(second.acquire_lock(&LIFECYCLE_LOCK).is_ok());
+	}
 
 	#[test]
 	fn admission_validator_runs_under_the_queue_mutex() {

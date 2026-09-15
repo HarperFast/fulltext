@@ -141,10 +141,11 @@ native work stopped; do not reset or remove that path until the process restarts
 
 Reset returns `missing` without creating the path. It rejects a live owner with `E_LOCK_BUSY`, a
 different persisted logical index with `E_IDENTITY_MISMATCH`, and unrelated nonempty directories
-with `E_INVALID_ARGUMENT`. On success, it renames the live directory into a unique path below the
-parent's `.fulltext-retired` directory. The caller owns eventual deletion of that returned path;
-the wrapper never deletes it. A standalone caller may remove it after the reset resolves, while
-Harper schedules cleanup under its derived-index lifecycle policy.
+with `E_INVALID_ARGUMENT`. A malformed identity sidecar fails closed with `E_INDEX_CORRUPT`. On
+success, reset renames the live directory into a unique path below the parent's `.fulltext-retired`
+directory. The caller owns eventual deletion of that returned path; the wrapper never deletes it. A
+standalone caller may remove it after the reset resolves, while Harper schedules cleanup under its
+derived-index lifecycle policy.
 
 An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.

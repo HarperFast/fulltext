@@ -221,12 +221,19 @@ test('reset protects neighboring identities and unrelated directories', async (c
 
 	const unrelatedPath = path.join(parent, 'unrelated');
 	mkdirSync(unrelatedPath);
+	writeFileSync(path.join(unrelatedPath, 'meta.json'), '{}');
 	writeFileSync(path.join(unrelatedPath, 'important.txt'), 'keep');
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: unrelatedPath, indexId: 'products' }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	assert.strictEqual(readFileSync(path.join(unrelatedPath, 'important.txt'), 'utf8'), 'keep');
+
+	writeFileSync(path.join(indexPath, '.harper-fulltext-identity'), 'invalid');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_INDEX_CORRUPT',
+	);
 });
 
 test('a rejected retirement destination releases the reset reservation', async (context) => {
@@ -257,6 +264,7 @@ test('reset accepts an empty index directory', async (context) => {
 	const lockOnlyPath = path.join(parent, 'interrupted-open');
 	mkdirSync(lockOnlyPath);
 	writeFileSync(path.join(lockOnlyPath, '.tantivy-writer.lock'), '');
+	writeFileSync(path.join(lockOnlyPath, '.tantivy-meta.lock'), '');
 	assert.strictEqual((await resetNativeFullTextIndex({ path: lockOnlyPath, indexId: 'products' })).state, 'reset');
 });
 
@@ -611,14 +619,32 @@ function fileSnapshot(directory, prefix = '') {
 }
 
 function childMessage(child, expected) {
+	if (child.exitCode !== null || child.signalCode !== null) {
+		return Promise.reject(
+			new Error(`child exited before ${expected}: code=${child.exitCode} signal=${child.signalCode}`),
+		);
+	}
 	return new Promise((resolve, reject) => {
+		const cleanup = () => {
+			child.off('message', onMessage);
+			child.off('error', onError);
+			child.off('exit', onExit);
+		};
 		const onMessage = (message) => {
 			if (message !== expected) return;
-			child.off('message', onMessage);
-			child.off('error', reject);
+			cleanup();
 			resolve();
 		};
-		child.once('error', reject);
+		const onError = (error) => {
+			cleanup();
+			reject(error);
+		};
+		const onExit = (code, signal) => {
+			cleanup();
+			reject(new Error(`child exited before ${expected}: code=${code} signal=${signal}`));
+		};
+		child.once('error', onError);
+		child.once('exit', onExit);
 		child.on('message', onMessage);
 	});
 }
