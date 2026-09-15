@@ -35,7 +35,7 @@ construction; Harper owns source projection, replay, and derived-index readiness
   index lifecycle, batched mutation, checkpoint publication, and search.
   `verify: ts/native.ts, package.json:6-11`
 - The addon already contains a panic boundary and per-handle poison primitive.
-  `verify: src/boundary.rs:1-38, src/lib.rs:31-53`
+  `verify: src/boundary.rs:8-40`
 - The directory harness exercises Tantivy create, write, commit, query, and reopen behavior against
   `MmapDirectory`.
   `verify: src/directory_harness.rs`
@@ -49,7 +49,7 @@ construction; Harper owns source projection, replay, and derived-index readiness
 - The reader uses `ReloadPolicy::Manual`, which does not call `Directory::watch`; Tantivy's mmap
   watcher starts its polling thread only when `watch()` is called. The native backend therefore
   does not add a metadata-watcher thread per open index.
-  `verify: src/engine.rs:136-141; tantivy 0.26.1 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
+  `verify: src/engine.rs:148-154; tantivy 0.26.1 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
 - napi-rs `AsyncTask` executes on the shared libuv pool, so it is not the execution primitive for
   sustained indexing or search.
   `verify: napi 2.16.17 src/task.rs:6-14`

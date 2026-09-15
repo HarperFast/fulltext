@@ -5,13 +5,12 @@ reviewed deliberately.
 
 ## Rust runtime and build graph
 
-| Dependency            | Scope                           | Purpose                                                                                  |
-| --------------------- | ------------------------------- | ---------------------------------------------------------------------------------------- |
-| `tantivy` 0.26.1      | runtime                         | Full-text indexing and search engine, including native filesystem storage.               |
-| `napi` 2.16.17        | optional runtime                | Node-API values and error conversion for the addon build.                                |
-| `napi-derive` 2.16.13 | optional build/runtime boundary | Generates Node-API exports.                                                              |
-| `napi-build` 2.4.1    | build                           | Configures platform-specific addon linking.                                              |
-| `libloading` 0.8.9    | Windows runtime                 | Resolves the Node-API type-tag check from the host, matching napi-rs's Windows strategy. |
+| Dependency            | Scope                           | Purpose                                                                    |
+| --------------------- | ------------------------------- | -------------------------------------------------------------------------- |
+| `tantivy` 0.26.1      | runtime                         | Full-text indexing and search engine, including native filesystem storage. |
+| `napi` 2.16.17        | optional runtime                | Node-API values and error conversion for the addon build.                  |
+| `napi-derive` 2.16.13 | optional build/runtime boundary | Generates Node-API exports.                                                |
+| `napi-build` 2.4.1    | build                           | Configures platform-specific addon linking.                                |
 
 The Rust dependency graph must not include RocksDB. Harper uses the native filesystem backend for
 its rebuildable derived index rather than linking a second RocksDB runtime into this addon.

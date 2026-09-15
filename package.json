@@ -10,12 +10,7 @@
 		}
 	},
 	"files": [
-		"dist/codec.*",
-		"dist/errors.*",
-		"dist/invoke.*",
-		"dist/load-addon.*",
-		"dist/native.*",
-		"dist/publication.*",
+		"dist/",
 		"fulltext.*.node",
 		"README.md",
 		"LICENSE",
@@ -37,7 +32,8 @@
 		"build:debug": "npm run build:typescript && napi build --platform --js false --dts ts/addon.d.ts --features node-api",
 		"build:native": "napi build --platform --js false --dts ts/addon.d.ts --release --features node-api",
 		"build:test-native": "napi build --platform --js false --dts ts/addon.d.ts --features test-panic",
-		"build:typescript": "tsc -p tsconfig.json",
+		"build:typescript": "npm run clean:typescript && tsc -p tsconfig.json",
+		"clean:typescript": "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
 		"benchmark:native": "npm run build && node benchmarks/native.mjs",
 		"benchmark:smoke": "node benchmarks/native.mjs --smoke",
 		"check": "npm run format:check && npm run lint && npm run test",

@@ -20,9 +20,6 @@ napi = { version = "=2.16.17", default-features = false, features = ["napi8"], o
 napi-derive = { version = "=2.16.13", optional = true }
 tantivy = "=0.26.1"
 
-[target.'cfg(windows)'.dependencies]
-libloading = "=0.8.9"
-
 [build-dependencies]
 napi-build = "=2.4.1"
 
