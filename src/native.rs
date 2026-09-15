@@ -4,7 +4,7 @@ use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,7 @@ use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, JsFunction};
 use napi_derive::napi;
-use tantivy::directory::{Directory, Lock, MmapDirectory, INDEX_WRITER_LOCK, META_LOCK};
+use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory, INDEX_WRITER_LOCK, META_LOCK};
 use tantivy::IndexReader;
 
 use crate::boundary;
@@ -31,10 +31,9 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
-static LIFECYCLE_LOCK: LazyLock<Lock> = LazyLock::new(|| Lock {
-	filepath: PathBuf::from(".harper-fulltext-lifecycle.lock"),
-	is_blocking: false,
-});
+const LIFECYCLE_ROOT: &str = ".fulltext-locks";
+const LEGACY_LIFECYCLE_LOCK: &str = ".harper-fulltext-lifecycle.lock";
+const RETIRED_ROOT: &str = ".fulltext-retired";
 
 #[derive(Default)]
 struct Registry {
@@ -1102,8 +1101,8 @@ fn open_on_thread(
 fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>) -> Result<Option<String>> {
 	let open = decode_open(&bytes)?;
 	let canonical = create_and_canonicalize(Path::new(&open.path))?;
+	let (_lifecycle_directory, _lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
 	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
-	let _lifecycle_lock = directory.acquire_lock(&LIFECYCLE_LOCK).map_err(lifecycle_lock_error)?;
 	let path_identity = path_identity(&canonical)?;
 	open_runtime_with_directory(handle, canonical, path_identity, open.engine, directory, environment)
 }
@@ -1171,8 +1170,8 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 		.parent()
 		.ok_or_else(|| FulltextError::invalid("reset path must not be a filesystem root"))?;
 	validate_reset_target(&canonical, &reset.index_id)?;
+	let (lifecycle_directory, lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
 	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
-	let lifecycle_lock = directory.acquire_lock(&LIFECYCLE_LOCK).map_err(lifecycle_lock_error)?;
 	validate_reset_target(&canonical, &reset.index_id)?;
 	let physical_identity = path_identity(&canonical)?;
 	{
@@ -1204,14 +1203,15 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 		}
 	}
 	let writer_lock = directory.acquire_lock(&INDEX_WRITER_LOCK).map_err(reset_lock_error)?;
-	let retired_root = parent.join(".fulltext-retired");
+	let retired_root = parent.join(RETIRED_ROOT);
 	ensure_retired_root(&retired_root)?;
 	let retired_path = next_retired_path(&retired_root, &canonical, operation)?;
 	let public_path = public_path(&retired_path)?;
-	fs::rename(&canonical, &retired_path).map_err(rename_error)?;
 	drop(writer_lock);
-	drop(lifecycle_lock);
 	drop(directory);
+	fs::rename(&canonical, &retired_path).map_err(rename_error)?;
+	drop(lifecycle_lock);
+	drop(lifecycle_directory);
 	drop(reservation);
 	Ok(ResetResult::Reset(public_path))
 }
@@ -1242,7 +1242,7 @@ fn validate_reset_target(path: &Path, expected_index_id: &str) -> Result<()> {
 			identity_found = true;
 		} else if name.as_os_str() != INDEX_WRITER_LOCK.filepath.as_os_str()
 			&& name.as_os_str() != META_LOCK.filepath.as_os_str()
-			&& name.as_os_str() != LIFECYCLE_LOCK.filepath.as_os_str()
+			&& name != LEGACY_LIFECYCLE_LOCK
 		{
 			content_found = true;
 		}
@@ -1284,12 +1284,20 @@ fn next_retired_path(root: &Path, source: &Path, operation: u32) -> Result<PathB
 }
 
 fn ensure_retired_root(path: &Path) -> Result<()> {
+	ensure_directory_root(path, "the .fulltext-retired path")
+}
+
+fn ensure_lifecycle_root(path: &Path) -> Result<()> {
+	ensure_directory_root(path, "the .fulltext-locks path")
+}
+
+fn ensure_directory_root(path: &Path, label: &str) -> Result<()> {
 	match fs::symlink_metadata(path) {
-		Ok(metadata) => validate_retired_root(metadata),
+		Ok(metadata) => validate_directory_root(metadata, label),
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(path) {
 			Ok(()) => Ok(()),
 			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-				validate_retired_root(fs::symlink_metadata(path).map_err(storage_error)?)
+				validate_directory_root(fs::symlink_metadata(path).map_err(storage_error)?, label)
 			}
 			Err(error) => Err(storage_error(error)),
 		},
@@ -1297,13 +1305,36 @@ fn ensure_retired_root(path: &Path) -> Result<()> {
 	}
 }
 
-fn validate_retired_root(metadata: fs::Metadata) -> Result<()> {
+fn validate_directory_root(metadata: fs::Metadata, label: &str) -> Result<()> {
 	if metadata.file_type().is_symlink() || !metadata.is_dir() {
-		return Err(FulltextError::invalid(
-			"the .fulltext-retired path must be a directory and must not be a symbolic link",
-		));
+		return Err(FulltextError::invalid(format!(
+			"{label} must be a directory and must not be a symbolic link"
+		)));
 	}
 	Ok(())
+}
+
+fn acquire_lifecycle_lock(index_path: &Path) -> Result<(MmapDirectory, DirectoryLock)> {
+	let parent = index_path
+		.parent()
+		.ok_or_else(|| FulltextError::invalid("native index path must not be a filesystem root"))?;
+	let lock_name = index_path
+		.file_name()
+		.ok_or_else(|| FulltextError::invalid("native index path must have a final component"))?;
+	if lock_name == LIFECYCLE_ROOT || lock_name == RETIRED_ROOT {
+		return Err(FulltextError::invalid(
+			"native index path uses a reserved directory name",
+		));
+	}
+	let root = parent.join(LIFECYCLE_ROOT);
+	ensure_lifecycle_root(&root)?;
+	let directory = MmapDirectory::open(root).map_err(storage_error)?;
+	let lock = Lock {
+		filepath: PathBuf::from(lock_name),
+		is_blocking: false,
+	};
+	let guard = directory.acquire_lock(&lock).map_err(lifecycle_lock_error)?;
+	Ok((directory, guard))
 }
 
 fn public_path(path: &Path) -> Result<String> {
@@ -1738,10 +1769,14 @@ mod tests {
 	fn lifecycle_lock_excludes_other_directory_handles() {
 		let first = MmapDirectory::create_from_tempdir().unwrap();
 		let second = first.clone();
-		let guard = first.acquire_lock(&LIFECYCLE_LOCK).unwrap();
-		assert!(matches!(second.acquire_lock(&LIFECYCLE_LOCK), Err(LockError::LockBusy)));
+		let lifecycle_lock = Lock {
+			filepath: PathBuf::from("index"),
+			is_blocking: false,
+		};
+		let guard = first.acquire_lock(&lifecycle_lock).unwrap();
+		assert!(matches!(second.acquire_lock(&lifecycle_lock), Err(LockError::LockBusy)));
 		drop(guard);
-		assert!(second.acquire_lock(&LIFECYCLE_LOCK).is_ok());
+		assert!(second.acquire_lock(&lifecycle_lock).is_ok());
 	}
 
 	#[test]

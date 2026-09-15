@@ -27,8 +27,8 @@ physical index path.
 - The process registry rejects a second live writer for the same canonical physical directory.
   Environment cleanup force-closes tracked handles and waits on their completion signals
   (`src/native.rs`). Tantivy's writer lock excludes established writers across processes; this
-  change adds a Tantivy-directory lifecycle lock to also cover the interval before open acquires
-  its writer lock.
+  change adds a Tantivy-directory lifecycle lock in the parent `.fulltext-locks` directory to cover
+  the interval before open acquires its writer lock and the reset publication window.
 - `inspectNativeFullTextIndex()` is synchronous and read-only. It validates native identity,
   schema, metadata, and checkpoint payload without registering a handle or acquiring a writer
   (`ts/native.ts`, `src/native.rs`, `src/engine.rs`).
@@ -56,17 +56,20 @@ The operation has the following behavior:
   never force-closes a handle owned by another caller or Node environment.
 - A caller closes its owned handle first. The strengthened close resolution is the proof of native
   quiescence.
-- Reset accepts an empty directory or one containing only the Tantivy writer/meta lock markers and
-  the Fulltext lifecycle-lock marker. Any other content requires a valid Fulltext identity sidecar,
-  and its logical index ID must match `indexId`; unreadable or malformed sidecars fail closed.
-  Schema and generation differences remain valid reasons to reset. It rejects a filesystem root, a
-  symbolic-link path, and a directory that does not have this shape.
-- Reset reserves the existing physical-directory identity in the process registry, acquires the
-  wrapper's nonblocking lifecycle lock, and then acquires Tantivy's nonblocking writer lock. It
-  renames the directory into the parent's hidden `.fulltext-retired` directory, drops its locks and
-  directory handles, releases the registry reservation, and returns the retired path. The name
-  includes the source basename, process ID, monotonic operation ID, and nanosecond timestamp; an
-  existing candidate is skipped with a bounded retry rather than replaced.
+- Reset accepts an empty directory or one containing only Tantivy lock markers or the legacy inline
+  Fulltext lifecycle-lock marker. Any other content requires a valid Fulltext identity sidecar, and
+  its logical index ID must match `indexId`; unreadable or malformed sidecars fail closed. Schema and
+  generation differences remain valid reasons to reset. It rejects a filesystem root, a
+  symbolic-link path, reserved `.fulltext-locks` and `.fulltext-retired` names, and a directory that
+  does not have this shape.
+- Reset acquires the wrapper's nonblocking lifecycle lock from the parent `.fulltext-locks`
+  directory, reserves the existing physical-directory identity in the process registry, and then
+  acquires Tantivy's nonblocking writer lock. Once ownership is established it releases the writer
+  lock and live-directory handle, while retaining the external lifecycle lock, and renames the
+  directory into the parent's hidden `.fulltext-retired` directory. It then releases the lifecycle
+  lock and registry reservation and returns the retired path. The name includes the source basename,
+  process ID, monotonic operation ID, and nanosecond timestamp; an existing candidate is skipped
+  with a bounded retry rather than replaced.
 - A caller may immediately open a new empty index at the original path. The wrapper never deletes
   the retired tree; Harper schedules bounded cleanup, while a standalone caller may remove the
   returned path when appropriate.
@@ -96,11 +99,13 @@ sequenceDiagram
 	Actors-->>Wrapper: close complete
 	Wrapper-->>Harper: quiescence proven
 	Harper->>Wrapper: resetNativeFullTextIndex({ path, indexId })
+	Wrapper->>Disk: acquire external Fulltext lifecycle lock
 	Wrapper->>Registry: reserve physical identity
 	Registry-->>Wrapper: reserved or E_LOCK_BUSY
-	Wrapper->>Disk: acquire Fulltext lifecycle lock
 	Wrapper->>Disk: acquire Tantivy writer lock
+	Wrapper->>Disk: release writer lock and live-directory handle
 	Wrapper->>Disk: rename path to unique retired sibling
+	Wrapper->>Disk: release lifecycle lock
 	Wrapper->>Registry: release reset reservation
 	Wrapper-->>Harper: { state: "reset", retiredPath }
 ```
@@ -125,13 +130,13 @@ The transition is made under the existing registry mutex, but canonicalization, 
 locking, and rename run outside it. Existing canonicalization and physical identity checks continue
 to collapse supported aliases. Rename is the critical property: an opener that observes the old
 directory before publication sees the lifecycle or writer lock; an opener after publication creates
-a new directory that reset never deletes. Open acquires the lifecycle lock before computing and
-reserving the physical identity. On Unix, the inode re-check after reservation is an additional
-defense against a changed path. On Windows, the lifecycle lock is the cross-process handoff barrier
-and the normalized canonical path is the in-process alias key. The lifecycle lock uses Tantivy's
-supported custom `Directory` lock primitive, not a second locking implementation. Every process
-that can open or reset the path must use this ABI version; the loader rejects an older addon in the
-current process.
+a new directory that reset never deletes. Open acquires the lifecycle lock from a stable sibling
+directory before computing and reserving the physical identity. On Unix, the inode re-check after
+reservation is an additional defense against a changed path. On Windows, the external lifecycle
+lock is the cross-process handoff barrier and the normalized canonical path is the in-process alias
+key. The lifecycle lock uses Tantivy's supported custom `Directory` lock primitive, not a second
+locking implementation. Every process that can open or reset the path must use this ABI version;
+the loader rejects an older addon in the current process.
 
 Reset work uses a synthetic operation handle and the existing Node-environment cleanup tracking. If
 environment teardown wins before reservation, reset is cancelled without mutation. Once the path is
@@ -139,12 +144,14 @@ reserved, teardown waits for the bounded rename operation to finish. An RAII res
 releases registry and cancellation state after ordinary failure, thread panic, or callback loss.
 A spawn failure is handled before any path reservation exists.
 
-Reset keeps both lifecycle and writer locks through rename on every platform. Windows is a required
-CI gate; there is no unlock-before-rename fallback because that would admit an external opener or
-writer into the handoff window. A sharing violation fails without publication and is surfaced as
-`E_LOCK_BUSY`. `EXDEV`, mount-point rename, and permission failures surface as `E_STORAGE`; Harper
-leaves the index unready and requires path or operator remediation rather than falling back to
-in-place deletion.
+Reset holds the external lifecycle lock through rename on every platform. It releases Tantivy's
+internal writer lock immediately before publication because Windows does not permit renaming the
+directory while that lock-file handle is open inside it. This is safe for supported callers because
+every opener acquires the external lifecycle lock before requesting a writer; direct access by an
+older addon or an independent Tantivy writer is outside the ABI contract. A sharing violation fails
+without publication and is surfaced as `E_LOCK_BUSY`. `EXDEV`, mount-point rename, and permission
+failures surface as `E_STORAGE`; Harper leaves the index unready and requires path or operator
+remediation rather than falling back to in-place deletion.
 
 ## Failure and ownership rules
 

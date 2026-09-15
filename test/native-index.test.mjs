@@ -165,6 +165,29 @@ test('reset is idempotent for a missing path and does not create it', async (con
 	assert.strictEqual(existsSync(indexPath), false);
 });
 
+test('serializes concurrent resets of one native path', async (context) => {
+	const parent = temporaryIndex(context);
+	const indexPath = path.join(parent, 'products');
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.close();
+	const results = await Promise.allSettled([
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+	]);
+	assert.strictEqual(
+		results.filter((result) => result.status === 'fulfilled' && result.value.state === 'reset').length,
+		1,
+	);
+	assert(
+		results.some(
+			(result) =>
+				(result.status === 'fulfilled' && result.value.state === 'missing') ||
+				(result.status === 'rejected' && result.reason.code === 'E_LOCK_BUSY'),
+		),
+	);
+});
+
 test('reset rejects a live index without changing its data', async (context) => {
 	const indexPath = temporaryIndex(context);
 	const config = options(indexPath);
@@ -288,6 +311,14 @@ test('reset does not follow a symbolic-link path', async (context) => {
 	const config = options(indexPath);
 	const index = await openNativeFullTextIndex(config);
 	await index.close();
+	const lifecycleRoot = path.join(parent, '.fulltext-locks');
+	rmSync(lifecycleRoot, { recursive: true });
+	symlinkSync(target, lifecycleRoot, 'dir');
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	unlinkSync(lifecycleRoot);
 	symlinkSync(target, path.join(parent, '.fulltext-retired'), 'dir');
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
