@@ -89,4 +89,3 @@ jobs:
       - run: npm run build:native
       - run: npm run build:typescript
       - run: npm run benchmark:smoke
-      - run: npm run benchmark:kv-directory -- --smoke
