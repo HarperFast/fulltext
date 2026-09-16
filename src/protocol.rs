@@ -490,6 +490,46 @@ mod tests {
 	}
 
 	#[test]
+	fn rejects_a_batch_limit_that_cannot_hold_the_header() {
+		let identity = EngineIdentityConfig {
+			index_id: "products".to_owned(),
+			generation: "one".to_owned(),
+			fields: vec![FieldConfig {
+				name: "title".to_owned(),
+				weight: 1.0,
+			}],
+			analyzer: "english@1".to_owned(),
+			stop_words: true,
+			positions: true,
+			surface_terms: false,
+		};
+		let limits = Limits {
+			indexing_threads: 1,
+			search_threads: 1,
+			writer_memory_bytes: 15_000_000,
+			max_queued_commands: 1,
+			max_queued_bytes: 1024,
+			max_batch_bytes: MUTATION_BATCH_HEADER_BYTES,
+		};
+		assert_eq!(
+			validate_config(EngineConfig {
+				identity: identity.clone(),
+				limits: limits.clone(),
+			})
+				.unwrap_err()
+				.code,
+			"E_INVALID_ARGUMENT"
+		);
+		let mut accepted = limits;
+		accepted.max_batch_bytes = MUTATION_BATCH_HEADER_BYTES + 1;
+		assert!(validate_config(EngineConfig {
+			identity,
+			limits: accepted,
+		})
+		.is_ok());
+	}
+
+	#[test]
 	fn rejects_invalid_utf8() {
 		let mut bytes = b"FTSQ\x01\x00".to_vec();
 		bytes.extend_from_slice(&1u32.to_le_bytes());

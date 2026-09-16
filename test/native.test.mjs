@@ -26,6 +26,7 @@ test('loads the artifact for the executing platform', async () => {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
 		nativeAbiVersion: 4,
+		mutationBatchApiVersion: 2,
 		storageBackends: ['native'],
 	});
 	assert.strictEqual(cargoPackageVersion, packageManifest.version);

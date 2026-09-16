@@ -621,17 +621,47 @@ test('returns a consumed prefix when total output reaches the caller ceiling', a
 		{ id: 'one', fields: { title: 'catalog '.repeat(20) } },
 		{ id: 'two', fields: { title: 'catalog '.repeat(20) } },
 	];
-	const first = index.encodeMutationBatches({ upserts }, { maxTotalBytes: 300 });
-	assert.strictEqual(first.consumedRecords, 1);
+	assert.throws(
+		() => index.encodeMutationBatches({ upserts }, { maxTotalBytes: 300 }),
+		(error) => error.code === 'E_BATCH_TOO_LARGE',
+	);
+	const first = index.encodeMutationBatches({ upserts }, { maxTotalBytes: 300, allowPartial: true });
+	assert.strictEqual(first.consumedUpserts, 1);
+	assert.strictEqual(first.consumedDeletes, 0);
 	assert.strictEqual(
 		first.batches.reduce((count, batch) => count + batch.mutationCount, 0),
 		1,
 	);
-	const second = index.encodeMutationBatches({ upserts: upserts.slice(first.consumedRecords) }, { maxTotalBytes: 300 });
-	assert.strictEqual(second.consumedRecords, 1);
+	const second = index.encodeMutationBatches(
+		{ upserts: upserts.slice(first.consumedUpserts) },
+		{ maxTotalBytes: 300, allowPartial: true },
+	);
+	assert.strictEqual(second.consumedUpserts, 1);
+	assert.strictEqual(second.consumedDeletes, 0);
 	for (const batch of [...first.batches, ...second.batches]) await index.apply(batch.bytes);
 	await index.publish('prefixes');
 	assert.strictEqual((await index.search({ text: 'catalog', exactTotal: true })).total, 2);
+	await index.close();
+});
+
+test('requires a boolean to opt into partial mutation results', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 256 };
+	const index = await openNativeFullTextIndex(config);
+	const batch = {
+		upserts: [
+			{ id: 'one', fields: { title: 'catalog '.repeat(20) } },
+			{ id: 'two', fields: { title: 'catalog '.repeat(20) } },
+		],
+	};
+	assert.throws(
+		() => index.encodeMutationBatches(batch, { maxTotalBytes: 300, allowPartial: 'false' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.throws(
+		() => index.encodeMutationBatches(batch, { maxTotalBytes: 300, allowPartial: 1 }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
 	await index.close();
 });
 
@@ -641,10 +671,11 @@ test('keeps a caller total ceiling below the configured frame ceiling', async (c
 	const index = await openNativeFullTextIndex(config);
 	const one = index.encodeMutationBatches(
 		{ upserts: [{ id: 'one', fields: { title: 'x'.repeat(128) } }] },
-		{ maxTotalBytes: 256 },
+		{ maxTotalBytes: 256, allowPartial: true },
 	);
 	assert.strictEqual(one.rejected.length, 0);
-	assert.strictEqual(one.consumedRecords, 1);
+	assert.strictEqual(one.consumedUpserts, 1);
+	assert.strictEqual(one.consumedDeletes, 0);
 	assert(one.batches.every((batch) => batch.bytes.byteLength <= 256));
 	const two = index.encodeMutationBatches(
 		{
@@ -653,9 +684,10 @@ test('keeps a caller total ceiling below the configured frame ceiling', async (c
 				{ id: 'two', fields: { title: 'x'.repeat(128) } },
 			],
 		},
-		{ maxTotalBytes: 256 },
+		{ maxTotalBytes: 256, allowPartial: true },
 	);
-	assert.strictEqual(two.consumedRecords, 1);
+	assert.strictEqual(two.consumedUpserts, 1);
+	assert.strictEqual(two.consumedDeletes, 0);
 	await index.close();
 });
 

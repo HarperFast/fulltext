@@ -23,6 +23,7 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
+	mutationBatchApiVersion: 2;
 	storageBackends: ReadonlyArray<'native'>;
 }
 
@@ -90,12 +91,13 @@ export interface EncodedFullTextMutationBatch {
 export interface EncodedFullTextMutationBatches {
 	batches: EncodedFullTextMutationBatch[];
 	rejected: FullTextMutationBatchRejection[];
-	/** Leading mutations consumed from the input, with upserts preceding deletes. */
-	consumedRecords: number;
+	consumedUpserts: number;
+	consumedDeletes: number;
 }
 
 export interface EncodeFullTextMutationBatchesOptions {
 	maxTotalBytes?: number;
+	allowPartial?: boolean;
 }
 
 export interface SearchRequest {
@@ -170,12 +172,23 @@ export class NativeFullTextIndex {
 		options: EncodeFullTextMutationBatchesOptions = {},
 	): EncodedFullTextMutationBatches {
 		try {
-			return encodeBatchPartitions(
-				{ upserts: batch.upserts ?? [], deletes: batch.deletes ?? [] },
+			if (options.allowPartial !== undefined && typeof options.allowPartial !== 'boolean') {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'allowPartial must be a boolean');
+			}
+			const logical = { upserts: batch.upserts ?? [], deletes: batch.deletes ?? [] };
+			const encoded = encodeBatchPartitions(
+				logical,
 				this.#maxBatchBytes,
 				options.maxTotalBytes ?? 64 * 1024 * 1024,
 				this.#fieldNames,
 			);
+			if (
+				options.allowPartial !== true &&
+				(encoded.consumedUpserts < logical.upserts.length || encoded.consumedDeletes < logical.deletes.length)
+			) {
+				throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
+			}
+			return encoded;
 		} catch (error) {
 			if (error instanceof FulltextError) throw error;
 			throw normalizeNativeError(error);
@@ -442,6 +455,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
+			mutationBatchApiVersion: 2,
 			storageBackends: ['native'],
 		};
 	} catch (error) {

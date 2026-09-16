@@ -88,6 +88,7 @@ interface FullTextMutationBatch {
 
 interface EncodeFullTextMutationBatchesOptions {
 	maxTotalBytes?: number;
+	allowPartial?: boolean;
 }
 
 interface SearchRequest {
@@ -180,13 +181,16 @@ N-API plus result-decoding time so storage and boundary costs cannot be confused
 Both encoders perform UTF-8 encoding synchronously on the caller's JavaScript thread.
 `encodeMutationBatches()` binds frame size to the opened handle, validates IDs and field names,
 requires IDs to be distinct across the logical batch, and defaults the total returned-byte ceiling
-to 64 MiB. A caller can lower that ceiling with `maxTotalBytes`. The result reports the leading
-mutation count consumed under that ceiling so a caller can apply the frames and continue with the
-remaining suffix without re-encoding earlier records. Aggregate frame overflow creates
+to 64 MiB. A caller can lower that ceiling with `maxTotalBytes`; exceeding it throws by default.
+With `allowPartial: true`, the result reports the leading upsert and delete counts consumed under
+that ceiling so a caller can apply the frames and continue with each array's remaining suffix
+without re-encoding earlier records. Aggregate frame overflow creates
 more frames; a mutation that cannot fit alone is reported to the caller. The call performs no native
 work. `apply()` then makes one
 required copy into Rust-owned memory before asynchronous admission. Callers apply every frame and
 commit or publish only after all succeed; otherwise they rollback-close the staged writer window.
+One caller owns that complete apply-and-publication sequence per handle; the low-level frame API
+does not provide a logical-batch fence between concurrent publishers. Searches remain concurrent.
 The benchmark reports encoding separately and pre-encodes its engine-only corpus so directory
 results exclude both JavaScript encoding and the N-API copy.
 

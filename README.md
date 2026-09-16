@@ -78,14 +78,20 @@ zero-based index in the corresponding input array. It is never dropped automatic
 
 Encoding is synchronous and runs on the JavaScript thread. The total encoded output of one logical
 call defaults to 64 MiB and can be lowered with `encodeMutationBatches(batch, { maxTotalBytes })`.
-When the ceiling is reached, `consumedRecords` identifies the leading mutations represented by the
-returned frames and rejections; callers can continue with the remaining suffix.
+The default behavior throws `E_BATCH_TOO_LARGE` when the complete logical batch exceeds that
+ceiling. Callers that pass `allowPartial: true` instead receive a leading prefix;
+`consumedUpserts` and `consumedDeletes` identify the mutations represented by the returned frames
+and rejections so they can continue with each array's remaining suffix.
 Producers should keep logical batches comfortably below that limit. Applying multiple frames stages
 them in one Tantivy writer. Commit or publish only
 after every frame succeeds; on a later failure, close with rollback rather than publishing the
 partial logical batch. Concurrent callers should leave queue-byte headroom for commit or publish.
 A successful `apply()` resolves to the number of accepted mutation commands, including deletes for
 IDs that are not currently indexed.
+
+One caller must own a handle's complete apply-and-publish sequence at a time. The low-level frame
+API does not infer logical batch boundaries, so interleaving another publisher between frames can
+make a partial logical batch durable. Searches may still run concurrently with that writer sequence.
 
 Search uses BM25. `total` is a bounded result by default so Tantivy can retain block-max WAND
 pruning. Set `exactTotal: true` only when an exact match count is worth a second full-match

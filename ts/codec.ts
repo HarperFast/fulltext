@@ -5,6 +5,7 @@ const maxStringBytes = 1 << 20;
 export const maxFields = 1_024;
 export const mutationBatchHeaderBytes = 14;
 const maxPendingWriterChunks = 1_024;
+const invalidSurrogate = /[\uD800-\uDFFF]/u;
 
 export interface PackedFieldConfig {
 	name: string;
@@ -64,7 +65,8 @@ export interface PackedMutationBatchPartition {
 export interface PackedMutationBatchPartitions {
 	batches: PackedMutationBatchPartition[];
 	rejected: PackedMutationBatchRejection[];
-	consumedRecords: number;
+	consumedUpserts: number;
+	consumedDeletes: number;
 }
 
 export interface PackedSearchRequest {
@@ -164,17 +166,13 @@ export function encodeBatchPartitions(
 		throw new FulltextError('E_INVALID_ARGUMENT', 'maxTotalBytes is too small for a mutation batch');
 	}
 	const maxFrameBytes = Math.min(maxBytes, maxTotalBytes);
-	const ids = new Set<string>();
+	const encodedIds = new Map<string, Buffer>();
 	const checkDuplicate = (id: unknown) => {
-		if (
-			typeof id !== 'string' ||
-			id.length === 0 ||
-			/[\uD800-\uDFFF]/u.test(id) ||
-			Buffer.byteLength(id, 'utf8') > maxStringBytes
-		)
-			return;
-		if (ids.has(id)) throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch IDs must be distinct');
-		ids.add(id);
+		if (typeof id !== 'string' || id.length === 0 || invalidSurrogate.test(id)) return;
+		const bytes = Buffer.from(id, 'utf8');
+		if (bytes.length > maxStringBytes) return;
+		if (encodedIds.has(id)) throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch IDs must be distinct');
+		encodedIds.set(id, bytes);
 	};
 	for (const upsert of batch.upserts) checkDuplicate(upsert?.id);
 	for (const id of batch.deletes) checkDuplicate(id);
@@ -215,12 +213,8 @@ export function encodeBatchPartitions(
 	};
 
 	const validateId = (id: unknown, operation: 'upsert' | 'delete', index: number): Buffer | undefined => {
-		if (typeof id !== 'string' || id.length === 0 || /[\uD800-\uDFFF]/u.test(id)) {
-			rejected.push({ operation, index, code: 'E_INVALID_ARGUMENT' });
-			return;
-		}
-		const bytes = Buffer.from(id, 'utf8');
-		if (bytes.length > maxStringBytes) {
+		const bytes = typeof id === 'string' ? encodedIds.get(id) : undefined;
+		if (!bytes) {
 			rejected.push({ operation, index, code: 'E_INVALID_ARGUMENT' });
 			return;
 		}
@@ -296,7 +290,7 @@ export function encodeBatchPartitions(
 			consumedDeletes++;
 		}
 	finish();
-	return { batches, rejected, consumedRecords: consumedUpserts + consumedDeletes };
+	return { batches, rejected, consumedUpserts, consumedDeletes };
 }
 
 function encodeBatchHeader(upserts: number, deletes: number): Buffer {
