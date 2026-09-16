@@ -125,13 +125,21 @@ test('an unproven close releases environment tracking and quarantines the index'
 
 async function testIndex(indexPath, indexId) {
 	const addon = loadAddon();
-	const opened = await invoke((callback) =>
-		addon.__nativeOpen(encodeOpen(nativeOptions(indexPath, indexId)), callback),
-	);
+	const options = nativeOptions(indexPath, indexId);
+	const opened = await invoke((callback) => addon.__nativeOpen(encodeOpen(options), callback));
 	const handle = opened.u32();
 	assert.strictEqual(opened.u8(), 0);
 	opened.finish();
-	return { addon, handle, index: new NativeFullTextIndex(handle) };
+	return {
+		addon,
+		handle,
+		index: new NativeFullTextIndex({
+			handle,
+			maxBatchBytes: options.limits.maxBatchBytes,
+			maxQueuedBytes: options.limits.maxQueuedBytes,
+			fieldNames: options.fields.map((field) => field.name),
+		}),
+	};
 }
 
 function nativeOptions(indexPath, indexId) {

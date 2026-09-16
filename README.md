@@ -21,7 +21,6 @@ targets are added only after their artifacts are loaded and tested on the target
 
 ```js
 import {
-	encodeMutationBatch,
 	inspectNativeFullTextIndex,
 	openNativeFullTextIndex,
 	resetNativeFullTextIndex,
@@ -43,11 +42,11 @@ const index = await openNativeFullTextIndex({
 	},
 });
 
-await index.apply(
-	encodeMutationBatch({
-		upserts: [{ id: 'shoe-1', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
-	}),
-);
+const encoded = index.encodeMutationBatches({
+	upserts: [{ id: 'shoe-1', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
+});
+if (encoded.rejected.length) throw new Error('A product could not be indexed');
+for (const batch of encoded.batches) await index.apply(batch.bytes);
 await index.commit();
 await index.reload();
 console.log(await index.search({ text: 'waterproof running shoes', limit: 10 }));
@@ -70,11 +69,20 @@ than once per document. One dedicated actor owns Tantivy's single writer for eac
 search pool shares immutable searchers and can execute reads while indexing or commit work is in
 progress. Queue limits reject overload with `E_QUEUE_FULL` rather than blocking the JavaScript
 thread. `encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
-`E_BATCH_TOO_LARGE`; `maxBytes` defaults to 8 MiB and callers should normally pass the index's
-configured `maxBatchBytes`. `apply()` independently rejects a packed batch beyond the index's
-`maxBatchBytes` with the same code. Callers can split either rejection without treating the record
-contents as invalid. A successful `apply()` resolves to the number of accepted mutation commands,
-including deletes for IDs that are not currently indexed.
+`E_BATCH_TOO_LARGE`; `maxBytes` defaults to 8 MiB and is intended for low-level callers producing a
+single native frame. For logical batches, use `index.encodeMutationBatches()`. It uses the limit from
+the index's open configuration, validates IDs and fields against that handle, and greedily emits
+admissible frames. IDs must be distinct across the logical batch. Aggregate size creates more
+frames; a single invalid or unencodable mutation is returned in `rejected` with its operation and
+zero-based index in the corresponding input array. It is never dropped automatically.
+
+Encoding is synchronous and runs on the JavaScript thread. The total encoded output of one logical
+call is bounded by `maxQueuedBytes`; producers should keep their own logical batches comfortably
+below that limit. Applying multiple frames stages them in one Tantivy writer. Commit or publish only
+after every frame succeeds; on a later failure, close with rollback rather than publishing the
+partial logical batch. Concurrent callers should leave queue-byte headroom for commit or publish.
+A successful `apply()` resolves to the number of accepted mutation commands, including deletes for
+IDs that are not currently indexed.
 
 Search uses BM25. `total` is a bounded result by default so Tantivy can retain block-max WAND
 pruning. Set `exactTotal: true` only when an exact match count is worth a second full-match
@@ -92,7 +100,10 @@ Use `publish(payload)` when a consumer needs to resume from a durable checkpoint
 
 ```js
 console.log(index.committedPayload); // undefined on a new index; recovered from files on reopen
-await index.apply(encodeMutationBatch({ upserts: [{ id: 'shoe-1', fields: { title: 'Trail shoes' } }] }));
+const encoded = index.encodeMutationBatches({
+	upserts: [{ id: 'shoe-1', fields: { title: 'Trail shoes' } }],
+});
+for (const batch of encoded.batches) await index.apply(batch.bytes);
 await index.publish('source-checkpoint-42');
 // Both the mutations and the checkpoint are committed; searches now see that commit.
 ```

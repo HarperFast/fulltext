@@ -38,7 +38,12 @@ async function fixture(context) {
 	const handle = opened.u32();
 	assert.strictEqual(opened.u8(), 0);
 	opened.finish();
-	const index = new NativeFullTextIndex(handle);
+	const index = new NativeFullTextIndex({
+		handle,
+		maxBatchBytes: options.limits.maxBatchBytes,
+		maxQueuedBytes: options.limits.maxQueuedBytes,
+		fieldNames: options.fields.map((field) => field.name),
+	});
 	context.after(async () => {
 		await index.close({ mode: 'rollback' });
 		rmSync(options.path, { recursive: true, force: true });

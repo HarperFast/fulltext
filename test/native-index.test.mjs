@@ -509,6 +509,85 @@ test('distinguishes oversized mutation batches from invalid input', async (conte
 	await index.close();
 });
 
+test('partitions a Harper maximum-key delete workload into admissible native frames', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxQueuedBytes: 64 * 1024 * 1024 };
+	let index = await openNativeFullTextIndex(config);
+	const id = `1.${Buffer.alloc(1978, 1).toString('base64url')}`;
+	const deletes = Array.from({ length: 4096 }, (_, position) => `${position}.${id}`);
+	const encoded = index.encodeMutationBatches({ deletes });
+	assert.strictEqual(encoded.rejected.length, 0);
+	assert(encoded.batches.length > 1);
+	assert(encoded.batches.every((batch) => batch.bytes.byteLength <= config.limits.maxBatchBytes));
+	let applied = 0;
+	for (const batch of encoded.batches) {
+		assert.strictEqual(await index.apply(batch.bytes), batch.mutationCount);
+		applied += batch.mutationCount;
+	}
+	assert.strictEqual(applied, deletes.length);
+	await index.publish('delete-boundary');
+	await index.close();
+	index = await openNativeFullTextIndex(config);
+	assert.strictEqual(index.committedPayload, 'delete-boundary');
+	await index.close();
+});
+
+test('reports only explicit record validation failures during partitioning', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxQueuedBytes: 64 * 1024 * 1024 };
+	const index = await openNativeFullTextIndex(config);
+	const boundary = 'x'.repeat(1 << 20);
+	const encoded = index.encodeMutationBatches({
+		upserts: [
+			{ id: 'valid-boundary', fields: { title: boundary } },
+			{ id: 'too-long', fields: { title: `${boundary}x` } },
+			{ id: 'unknown', fields: { missing: 'value' } },
+			{ id: 'whole-record', fields: { title: boundary, description: boundary } },
+			{ id: '\ud800', fields: { title: 'invalid id' } },
+		],
+	});
+	assert.deepStrictEqual(encoded.rejected, [
+		{ operation: 'upsert', index: 1, code: 'E_INVALID_ARGUMENT' },
+		{ operation: 'upsert', index: 2, code: 'E_INVALID_ARGUMENT' },
+		{ operation: 'upsert', index: 4, code: 'E_INVALID_ARGUMENT' },
+	]);
+	assert.strictEqual(
+		encoded.batches.reduce((count, batch) => count + batch.mutationCount, 0),
+		2,
+	);
+	for (const batch of encoded.batches) await index.apply(batch.bytes);
+	await index.close({ mode: 'rollback' });
+});
+
+test('reports a record that cannot fit one configured frame', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 1024, maxQueuedBytes: 8192 };
+	const index = await openNativeFullTextIndex(config);
+	const encoded = index.encodeMutationBatches({
+		upserts: [
+			{ id: 'valid', fields: { title: 'small' } },
+			{ id: 'oversized', fields: { title: 'x'.repeat(2048) } },
+		],
+	});
+	assert.deepStrictEqual(encoded.rejected, [{ operation: 'upsert', index: 1, code: 'E_BATCH_TOO_LARGE' }]);
+	assert.strictEqual(encoded.batches.length, 1);
+	assert.strictEqual(encoded.batches[0].mutationCount, 1);
+	await index.close();
+});
+
+test('rejects duplicate encoded IDs before partitioning', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	assert.throws(
+		() =>
+			index.encodeMutationBatches({
+				upserts: [{ id: 'same', fields: { title: 'value' } }],
+				deletes: ['same'],
+			}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await index.close();
+});
+
 test('preserves clean-close state after a rejected batch', async (context) => {
 	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
 	await assert.rejects(

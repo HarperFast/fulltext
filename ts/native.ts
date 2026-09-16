@@ -1,5 +1,13 @@
 import { FulltextError, normalizeNativeError } from './errors.js';
-import { decodeResponse, encodeBatch, encodeInspect, encodeOpen, encodeReset, encodeSearch } from './codec.js';
+import {
+	decodeResponse,
+	encodeBatch,
+	encodeBatchPartitions,
+	encodeInspect,
+	encodeOpen,
+	encodeReset,
+	encodeSearch,
+} from './codec.js';
 import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
 import { PublicationState } from './publication.js';
@@ -65,6 +73,23 @@ export interface FullTextMutationBatch {
 	deletes?: string[];
 }
 
+export interface FullTextMutationBatchRejection {
+	operation: 'upsert' | 'delete';
+	/** Zero-based index in the corresponding `upserts` or `deletes` input array. */
+	index: number;
+	code: 'E_INVALID_ARGUMENT' | 'E_BATCH_TOO_LARGE';
+}
+
+export interface EncodedFullTextMutationBatch {
+	bytes: Uint8Array;
+	mutationCount: number;
+}
+
+export interface EncodedFullTextMutationBatches {
+	batches: EncodedFullTextMutationBatch[];
+	rejected: FullTextMutationBatchRejection[];
+}
+
 export interface SearchRequest {
 	text: string;
 	operator?: 'any' | 'all';
@@ -103,13 +128,25 @@ export interface CloseOptions {
 export class NativeFullTextIndex {
 	readonly #handle: number;
 	readonly #publication: PublicationState;
+	readonly #maxBatchBytes: number;
+	readonly #maxQueuedBytes: number;
+	readonly #fieldNames: ReadonlySet<string>;
 	#closed = false;
 	#closedStatus?: FullTextStatus;
 	#closePromise?: Promise<void>;
 
-	constructor(handle: number, committedPayload?: string) {
-		this.#handle = handle;
-		this.#publication = new PublicationState(committedPayload);
+	constructor(options: {
+		handle: number;
+		committedPayload?: string;
+		maxBatchBytes: number;
+		maxQueuedBytes: number;
+		fieldNames: Iterable<string>;
+	}) {
+		this.#handle = options.handle;
+		this.#publication = new PublicationState(options.committedPayload);
+		this.#maxBatchBytes = options.maxBatchBytes;
+		this.#maxQueuedBytes = options.maxQueuedBytes;
+		this.#fieldNames = new Set(options.fieldNames);
 	}
 
 	get committedPayload(): string | undefined {
@@ -121,6 +158,20 @@ export class NativeFullTextIndex {
 		const count = safeNumber(cursor.u64(), 'mutation count');
 		cursor.finish();
 		return count;
+	}
+
+	encodeMutationBatches(batch: FullTextMutationBatch): EncodedFullTextMutationBatches {
+		try {
+			return encodeBatchPartitions(
+				{ upserts: batch.upserts ?? [], deletes: batch.deletes ?? [] },
+				this.#maxBatchBytes,
+				this.#maxQueuedBytes,
+				this.#fieldNames,
+			);
+		} catch (error) {
+			if (error instanceof FulltextError) throw error;
+			throw new FulltextError('E_INVALID_ARGUMENT', error instanceof Error ? error.message : String(error), error);
+		}
 	}
 
 	async commit(): Promise<bigint> {
@@ -328,7 +379,13 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 		}
 		const payload = hasPayload === 1 ? cursor.string() : undefined;
 		cursor.finish();
-		return new NativeFullTextIndex(handle, payload);
+		return new NativeFullTextIndex({
+			handle,
+			committedPayload: payload,
+			maxBatchBytes: options.limits.maxBatchBytes,
+			maxQueuedBytes: options.limits.maxQueuedBytes,
+			fieldNames: options.fields.map((field) => field.name),
+		});
 	} catch (error) {
 		await invoke((callback) => loadAddon().__nativeClose(handle, true, callback)).catch(() => undefined);
 		throw error;

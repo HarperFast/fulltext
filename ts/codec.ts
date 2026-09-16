@@ -1,6 +1,9 @@
 import { FulltextError, type FulltextErrorCode } from './errors.js';
 
 const protocolVersion = 1;
+const maxStringBytes = 1 << 20;
+const maxFields = 1_024;
+const mutationBatchHeaderBytes = 14;
 
 export interface PackedFieldConfig {
 	name: string;
@@ -44,6 +47,22 @@ export interface PackedResetConfig {
 export interface PackedMutationBatch {
 	upserts: Array<{ id: string; fields: Record<string, string | string[]> }>;
 	deletes: string[];
+}
+
+export interface PackedMutationBatchRejection {
+	operation: 'upsert' | 'delete';
+	index: number;
+	code: 'E_INVALID_ARGUMENT' | 'E_BATCH_TOO_LARGE';
+}
+
+export interface PackedMutationBatchPartition {
+	bytes: Buffer;
+	mutationCount: number;
+}
+
+export interface PackedMutationBatchPartitions {
+	batches: PackedMutationBatchPartition[];
+	rejected: PackedMutationBatchRejection[];
 }
 
 export interface PackedSearchRequest {
@@ -125,6 +144,142 @@ export function encodeBatch(batch: PackedMutationBatch, maxBytes: number): Buffe
 		writer.string(id);
 	}
 	return writer.finish();
+}
+
+export function encodeBatchPartitions(
+	batch: PackedMutationBatch,
+	maxBytes: number,
+	maxTotalBytes: number,
+	fieldNames: ReadonlySet<string>,
+): PackedMutationBatchPartitions {
+	if (!Array.isArray(batch.upserts) || !Array.isArray(batch.deletes)) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch arrays are required');
+	}
+	if (!Number.isSafeInteger(maxBytes) || maxBytes <= mutationBatchHeaderBytes) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'maxBytes is too small for a mutation batch');
+	}
+	if (!Number.isSafeInteger(maxTotalBytes) || maxTotalBytes < maxBytes) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'maxTotalBytes must be a safe integer no smaller than maxBytes');
+	}
+
+	type EncodedRecord = {
+		operation: 'upsert' | 'delete';
+		index: number;
+		chunks: Buffer[];
+		byteLength: number;
+	};
+	const records: EncodedRecord[] = [];
+	const rejected: PackedMutationBatchRejection[] = [];
+	const ids = new Set<string>();
+
+	const validateId = (id: unknown, operation: 'upsert' | 'delete', index: number): Buffer | undefined => {
+		if (typeof id !== 'string' || id.length === 0 || /[\uD800-\uDFFF]/u.test(id)) {
+			rejected.push({ operation, index, code: 'E_INVALID_ARGUMENT' });
+			return;
+		}
+		const bytes = Buffer.from(id, 'utf8');
+		if (bytes.length > maxStringBytes) {
+			rejected.push({ operation, index, code: 'E_INVALID_ARGUMENT' });
+			return;
+		}
+		const key = bytes.toString('base64');
+		if (ids.has(key)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch IDs must be distinct');
+		}
+		ids.add(key);
+		return bytes;
+	};
+
+	for (let index = 0; index < batch.upserts.length; index++) {
+		const upsert = batch.upserts[index];
+		const id = validateId(upsert?.id, 'upsert', index);
+		if (!id) continue;
+		try {
+			if (!upsert.fields || typeof upsert.fields !== 'object' || Array.isArray(upsert.fields)) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'upsert fields must be an object');
+			}
+			const names = Object.keys(upsert.fields);
+			if (names.length > maxFields) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'upsert field count exceeds the supported limit');
+			}
+			const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
+			writer.encodedString(id);
+			writer.u16(names.length, 'upsert field count');
+			for (const name of names) {
+				if (!fieldNames.has(name)) {
+					throw new FulltextError('E_INVALID_ARGUMENT', 'upsert contains an unknown field');
+				}
+				writer.string(name);
+				const value = upsert.fields[name];
+				const values = Array.isArray(value) ? value : [value];
+				writer.u16(values.length, 'field value count');
+				for (const entry of values) writer.string(entry);
+			}
+			const encoded = writer.take();
+			if (mutationBatchHeaderBytes + encoded.byteLength > maxBytes) {
+				rejected.push({ operation: 'upsert', index, code: 'E_BATCH_TOO_LARGE' });
+				continue;
+			}
+			records.push({ operation: 'upsert', index, ...encoded });
+		} catch (error) {
+			if (!(error instanceof FulltextError) || error.code !== 'E_INVALID_ARGUMENT') throw error;
+			rejected.push({ operation: 'upsert', index, code: 'E_INVALID_ARGUMENT' });
+		}
+	}
+
+	for (let index = 0; index < batch.deletes.length; index++) {
+		const id = validateId(batch.deletes[index], 'delete', index);
+		if (!id) continue;
+		const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
+		writer.encodedString(id);
+		const encoded = writer.take();
+		if (mutationBatchHeaderBytes + encoded.byteLength > maxBytes) {
+			rejected.push({ operation: 'delete', index, code: 'E_BATCH_TOO_LARGE' });
+			continue;
+		}
+		records.push({ operation: 'delete', index, ...encoded });
+	}
+
+	let totalBytes = 0;
+	const batches: PackedMutationBatchPartition[] = [];
+	let chunks: Buffer[] = [];
+	let byteLength = mutationBatchHeaderBytes;
+	let upsertCount = 0;
+	let deleteCount = 0;
+	const finish = () => {
+		if (upsertCount + deleteCount === 0) return;
+		if (totalBytes + byteLength > maxTotalBytes) {
+			throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
+		}
+		const header = encodeBatchHeader(upsertCount, deleteCount);
+		const bytes = Buffer.concat([header, ...chunks], byteLength);
+		batches.push({ bytes, mutationCount: upsertCount + deleteCount });
+		totalBytes += byteLength;
+		chunks = [];
+		byteLength = mutationBatchHeaderBytes;
+		upsertCount = 0;
+		deleteCount = 0;
+	};
+
+	for (const record of records) {
+		if (byteLength + record.byteLength > maxBytes) finish();
+		chunks.push(...record.chunks);
+		byteLength += record.byteLength;
+		if (record.operation === 'upsert') upsertCount++;
+		else deleteCount++;
+	}
+	finish();
+	return { batches, rejected };
+}
+
+function encodeBatchHeader(upserts: number, deletes: number): Buffer {
+	const header = Buffer.allocUnsafe(mutationBatchHeaderBytes);
+	let offset = header.write('FTMB', 0, 'ascii');
+	offset = header.writeUInt16LE(protocolVersion, offset);
+	offset = header.writeUInt32LE(upserts, offset);
+	offset = header.writeUInt32LE(deletes, offset);
+	if (offset !== header.length) throw new FulltextError('E_NATIVE_FAILURE', 'mutation batch header length mismatch');
+	return header;
 }
 
 export function encodeSearch(request: PackedSearchRequest): Buffer {
@@ -281,12 +436,23 @@ class ByteWriter {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'packed string values must be strings');
 		}
 		const bytes = Buffer.from(value, 'utf8');
+		if (bytes.length > maxStringBytes) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `packed string exceeds ${maxStringBytes} UTF-8 bytes`);
+		}
+		this.encodedString(bytes);
+	}
+
+	encodedString(bytes: Buffer): void {
 		this.u32(bytes.length, 'string byte length');
 		this.bytes(bytes);
 	}
 
 	finish(): Buffer {
 		return Buffer.concat(this.#chunks, this.#length);
+	}
+
+	take(): { chunks: Buffer[]; byteLength: number } {
+		return { chunks: this.#chunks, byteLength: this.#length };
 	}
 
 	private integer(
