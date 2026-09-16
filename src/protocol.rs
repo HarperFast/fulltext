@@ -290,9 +290,7 @@ fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
 			u32::MAX
 		)));
 	}
-	if limits.max_batch_bytes <= MUTATION_BATCH_HEADER_BYTES
-		|| limits.max_batch_bytes > limits.max_queued_bytes
-	{
+	if limits.max_batch_bytes <= MUTATION_BATCH_HEADER_BYTES || limits.max_batch_bytes > limits.max_queued_bytes {
 		return Err(FulltextError::invalid(
 			"maxBatchBytes must exceed the mutation batch header and be no larger than maxQueuedBytes",
 		));
@@ -516,8 +514,8 @@ mod tests {
 				identity: identity.clone(),
 				limits: limits.clone(),
 			})
-				.unwrap_err()
-				.code,
+			.unwrap_err()
+			.code,
 			"E_INVALID_ARGUMENT"
 		);
 		let mut accepted = limits;
