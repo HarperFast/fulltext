@@ -169,7 +169,7 @@ export class NativeFullTextIndex {
 			return encodeBatchPartitions(
 				{ upserts: batch.upserts ?? [], deletes: batch.deletes ?? [] },
 				this.#maxBatchBytes,
-				options.maxTotalBytes ?? Math.max(this.#maxBatchBytes, 64 * 1024 * 1024),
+				options.maxTotalBytes ?? 64 * 1024 * 1024,
 				this.#fieldNames,
 			);
 		} catch (error) {

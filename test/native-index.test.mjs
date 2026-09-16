@@ -627,6 +627,44 @@ test('bounds total logical output independently from native queue capacity', asy
 	await index.close();
 });
 
+test('keeps a caller total ceiling below the configured frame ceiling', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 1024 };
+	const index = await openNativeFullTextIndex(config);
+	const one = index.encodeMutationBatches(
+		{ upserts: [{ id: 'one', fields: { title: 'x'.repeat(128) } }] },
+		{ maxTotalBytes: 256 },
+	);
+	assert.strictEqual(one.rejected.length, 0);
+	assert(one.batches.every((batch) => batch.bytes.byteLength <= 256));
+	assert.throws(
+		() =>
+			index.encodeMutationBatches(
+				{
+					upserts: [
+						{ id: 'one', fields: { title: 'x'.repeat(128) } },
+						{ id: 'two', fields: { title: 'x'.repeat(128) } },
+					],
+				},
+				{ maxTotalBytes: 256 },
+			),
+		(error) => error.code === 'E_BATCH_TOO_LARGE',
+	);
+	await index.close();
+});
+
+test('encodes a dense frame of small records without per-record frame chunks', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	const deletes = Array.from({ length: 100_000 }, (_, id) => `deleted-${id}`);
+	const encoded = index.encodeMutationBatches({ deletes });
+	assert.strictEqual(encoded.rejected.length, 0);
+	assert.strictEqual(
+		encoded.batches.reduce((count, batch) => count + batch.mutationCount, 0),
+		deletes.length,
+	);
+	await index.close();
+});
+
 test('encodes a large multi-valued field without spreading codec chunks onto the stack', async (context) => {
 	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
 	const encoded = index.encodeMutationBatches({

@@ -159,9 +159,10 @@ export function encodeBatchPartitions(
 	if (!Number.isSafeInteger(maxBytes) || maxBytes <= mutationBatchHeaderBytes) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'maxBytes is too small for a mutation batch');
 	}
-	if (!Number.isSafeInteger(maxTotalBytes) || maxTotalBytes < maxBytes) {
-		throw new FulltextError('E_INVALID_ARGUMENT', 'maxTotalBytes must be a safe integer no smaller than maxBytes');
+	if (!Number.isSafeInteger(maxTotalBytes) || maxTotalBytes <= mutationBatchHeaderBytes) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'maxTotalBytes is too small for a mutation batch');
 	}
+	const maxFrameBytes = Math.min(maxBytes, maxTotalBytes);
 
 	type EncodedRecord = {
 		operation: 'upsert' | 'delete';
@@ -173,7 +174,7 @@ export function encodeBatchPartitions(
 	const ids = new Set<string>();
 	let totalBytes = 0;
 	const batches: PackedMutationBatchPartition[] = [];
-	let chunks: Buffer[] = [];
+	let frameWriter = new ByteWriter(maxFrameBytes - mutationBatchHeaderBytes, 'E_BATCH_TOO_LARGE');
 	let byteLength = mutationBatchHeaderBytes;
 	let upsertCount = 0;
 	let deleteCount = 0;
@@ -183,20 +184,21 @@ export function encodeBatchPartitions(
 			throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
 		}
 		const header = encodeBatchHeader(upsertCount, deleteCount);
-		const bytes = Buffer.concat([header, ...chunks], byteLength);
+		const frame = frameWriter.take();
+		const bytes = Buffer.concat([header, ...frame.chunks], byteLength);
 		batches.push({ bytes, mutationCount: upsertCount + deleteCount });
 		totalBytes += byteLength;
-		chunks = [];
+		frameWriter = new ByteWriter(maxFrameBytes - mutationBatchHeaderBytes, 'E_BATCH_TOO_LARGE');
 		byteLength = mutationBatchHeaderBytes;
 		upsertCount = 0;
 		deleteCount = 0;
 	};
 	const append = (record: EncodedRecord) => {
-		if (byteLength + record.byteLength > maxBytes) finish();
+		if (byteLength + record.byteLength > maxFrameBytes) finish();
 		if (totalBytes + byteLength + record.byteLength > maxTotalBytes) {
 			throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
 		}
-		for (const chunk of record.chunks) chunks.push(chunk);
+		frameWriter.encodedBytes(record.chunks);
 		byteLength += record.byteLength;
 		if (record.operation === 'upsert') upsertCount++;
 		else deleteCount++;
@@ -237,7 +239,7 @@ export function encodeBatchPartitions(
 					throw new FulltextError('E_SCHEMA_MISMATCH', 'upsert contains a field outside the opened schema');
 				}
 			}
-			const writer = new ByteWriter(maxBytes - mutationBatchHeaderBytes, 'E_BATCH_TOO_LARGE');
+			const writer = new ByteWriter(maxFrameBytes - mutationBatchHeaderBytes, 'E_BATCH_TOO_LARGE');
 			writer.encodedString(id);
 			writer.u16(names.length, 'upsert field count');
 			for (const name of names) {
@@ -267,7 +269,7 @@ export function encodeBatchPartitions(
 		const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
 		writer.encodedString(id);
 		const encoded = writer.take();
-		if (mutationBatchHeaderBytes + encoded.byteLength > maxBytes) {
+		if (mutationBatchHeaderBytes + encoded.byteLength > maxFrameBytes) {
 			rejected.push({ operation: 'delete', index, code: 'E_BATCH_TOO_LARGE' });
 			continue;
 		}
@@ -452,6 +454,10 @@ class ByteWriter {
 	encodedString(bytes: Buffer): void {
 		this.u32(bytes.length, 'string byte length');
 		this.bytes(bytes);
+	}
+
+	encodedBytes(chunks: readonly Buffer[]): void {
+		for (const chunk of chunks) this.bytes(chunk);
 	}
 
 	finish(): Buffer {
