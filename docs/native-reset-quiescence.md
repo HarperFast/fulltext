@@ -47,6 +47,11 @@ interface NativeFullTextIndexResetOptions {
 type NativeFullTextIndexResetResult = { state: 'missing' } | { state: 'reset'; retiredPath: string };
 
 function resetNativeFullTextIndex(options: NativeFullTextIndexResetOptions): Promise<NativeFullTextIndexResetResult>;
+
+function reclaimRetiredNativeFullTextIndexes(options: { path: string }): Promise<{
+	removed: number;
+	failed: number;
+}>;
 ```
 
 The operation has the following behavior:
@@ -68,11 +73,12 @@ The operation has the following behavior:
   lock and live-directory handle, while retaining the external lifecycle lock, and renames the
   directory into the parent's hidden `.fulltext-retired` directory. It then releases the lifecycle
   lock and registry reservation and returns the retired path. The name includes the source basename,
-  process ID, monotonic operation ID, and nanosecond timestamp; an existing candidate is skipped
-  with a bounded retry rather than replaced.
-- A caller may immediately open a new empty index at the original path. The wrapper never deletes
-  the retired tree; Harper schedules bounded cleanup, while a standalone caller may remove the
-  returned path when appropriate.
+  process ID, monotonic operation ID, nanosecond timestamp, and collision attempt; an existing
+  candidate is skipped with a bounded retry rather than replaced.
+- A caller may immediately open a new empty index at the original path. Reset never deletes the
+  retired tree. The wrapper's separate reclaimer removes only generated retired names belonging to
+  the requested live path and ignores unrelated entries. Applications decide when to invoke it;
+  Harper does so during derived-index initialization and after reset.
 - Open and reset require a writable sibling `.fulltext-locks` directory. The wrapper creates it when
   absent and leaves it in place; errors include its path so deployment-permission failures are
   actionable.

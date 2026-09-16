@@ -206,6 +206,17 @@ pub fn native_inspect(packed_config: Buffer) -> boundary::Result<Buffer> {
 	})
 }
 
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeValidateOpen")]
+pub fn native_validate_open(packed_config: Buffer) -> boundary::Result<Buffer> {
+	boundary::run_stateless(|| {
+		let response = match decode_open(&packed_config) {
+			Ok(_) => success_envelope(Vec::new()),
+			Err(error) => error_envelope(error),
+		};
+		Buffer::from(response)
+	})
+}
+
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeReset")]
 pub fn native_reset(env: Env, packed_config: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {

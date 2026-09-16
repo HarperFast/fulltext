@@ -8,5 +8,9 @@ export interface RuntimeInfo {
   tantivyVersion: string
   nativeAbiVersion: number
   storageBackends: Array<string>
+  limits: RuntimeLimits
+}
+export interface RuntimeLimits {
+  maxCommitPayloadBytes: number
 }
 export declare function runtimeInfo(): RuntimeInfo

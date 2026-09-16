@@ -23,7 +23,9 @@ import {
 	encodeMutationBatch,
 	inspectNativeFullTextIndex,
 	openNativeFullTextIndex,
+	reclaimRetiredNativeFullTextIndexes,
 	resetNativeFullTextIndex,
+	validateNativeFullTextIndexOptions,
 } from '@harperfast/fulltext/native';
 
 function options(indexPath, overrides = {}) {
@@ -112,6 +114,80 @@ test('rejects a mutation frame limit that cannot hold its header', async (contex
 	const config = options(temporaryIndex(context));
 	config.limits = { ...config.limits, maxBatchBytes: 14 };
 	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INVALID_ARGUMENT');
+});
+
+test('validates native configuration without creating index storage', (context) => {
+	const indexPath = path.join(temporaryIndex(context), 'invalid');
+	const config = options(indexPath);
+	config.limits = { ...config.limits, writerMemoryBytes: 14_999_999 };
+	assert.throws(
+		() => validateNativeFullTextIndexOptions(config),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.strictEqual(existsSync(indexPath), false);
+});
+
+test('reclaims only retired trees generated for the requested index', async (context) => {
+	const parent = temporaryIndex(context);
+	const productsPath = path.join(parent, 'products');
+	const ordersPath = path.join(parent, 'orders');
+	for (const [indexPath, indexId] of [
+		[productsPath, 'products'],
+		[ordersPath, 'orders'],
+	]) {
+		const index = await openNativeFullTextIndex(options(indexPath, { indexId }));
+		await index.close();
+	}
+	const products = await resetNativeFullTextIndex({ path: productsPath, indexId: 'products' });
+	const orders = await resetNativeFullTextIndex({ path: ordersPath, indexId: 'orders' });
+	assert.strictEqual(products.state, 'reset');
+	assert.strictEqual(orders.state, 'reset');
+	const unrelated = path.join(parent, '.fulltext-retired', 'keep');
+	mkdirSync(unrelated);
+
+	assert.deepStrictEqual(await reclaimRetiredNativeFullTextIndexes({ path: productsPath }), {
+		removed: 1,
+		failed: 0,
+	});
+	assert.strictEqual(existsSync(products.retiredPath), false);
+	assert.strictEqual(existsSync(orders.retiredPath), true);
+	assert.strictEqual(existsSync(unrelated), true);
+	assert.deepStrictEqual(await reclaimRetiredNativeFullTextIndexes({ path: ordersPath }), {
+		removed: 1,
+		failed: 0,
+	});
+});
+
+test('refuses a symbolic-link retirement root', async (context) => {
+	const parent = temporaryIndex(context);
+	const target = path.join(parent, 'target');
+	const marker = path.join(target, 'must-remain');
+	mkdirSync(target);
+	writeFileSync(marker, 'retained');
+	symlinkSync(target, path.join(parent, '.fulltext-retired'), process.platform === 'win32' ? 'junction' : 'dir');
+	await assert.rejects(
+		reclaimRetiredNativeFullTextIndexes({ path: path.join(parent, 'products') }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.strictEqual(readFileSync(marker, 'utf8'), 'retained');
+});
+
+test('removes a generated-name symbolic link without following it', async (context) => {
+	const parent = temporaryIndex(context);
+	const target = path.join(parent, 'target');
+	const marker = path.join(target, 'must-remain');
+	const retiredRoot = path.join(parent, '.fulltext-retired');
+	const retiredLink = path.join(retiredRoot, 'products.1.2.3.4');
+	mkdirSync(target);
+	mkdirSync(retiredRoot);
+	writeFileSync(marker, 'retained');
+	symlinkSync(target, retiredLink, process.platform === 'win32' ? 'junction' : 'dir');
+	assert.deepStrictEqual(await reclaimRetiredNativeFullTextIndexes({ path: path.join(parent, 'products') }), {
+		removed: 1,
+		failed: 0,
+	});
+	assert.strictEqual(existsSync(retiredLink), false);
+	assert.strictEqual(readFileSync(marker, 'utf8'), 'retained');
 });
 
 test('retires a closed index, preserves its checkpoint, and permits a clean rebuild', async (context) => {

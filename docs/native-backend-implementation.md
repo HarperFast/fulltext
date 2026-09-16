@@ -323,7 +323,9 @@ handle always permits rollback close, and a default close after a terminal commi
 the same forced teardown because there is no valid writer state left to preserve. A successful close
 joins Tantivy's merge threads, stops the search executor, and only then releases the canonical path.
 Closing transitions through open, closing, and closed states; it settles admitted commands, and
-repeated successful close calls resolve. Process exit does not promise an implicit final commit.
+repeated successful close calls resolve. A post-quiescence operational cleanup failure also resolves
+and is returned as `cleanupError`; rejection means quiescence was not proven or the caller must
+explicitly resolve uncommitted data. Process exit does not promise an implicit final commit.
 
 Each Node environment registers one N-API asynchronous cleanup hook, shared by every index it opens.
 Environment teardown stops accepting work, detaches JavaScript completions, schedules rollback close

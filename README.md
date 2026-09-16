@@ -23,7 +23,9 @@ targets are added only after their artifacts are loaded and tested on the target
 import {
 	inspectNativeFullTextIndex,
 	openNativeFullTextIndex,
+	reclaimRetiredNativeFullTextIndexes,
 	resetNativeFullTextIndex,
+	validateNativeFullTextIndexOptions,
 } from '@harperfast/fulltext/native';
 
 const index = await openNativeFullTextIndex({
@@ -145,9 +147,12 @@ Operational storage failures throw. Inspection is intended for short lifecycle c
 derived-index election, not request hot paths. Its options intentionally omit writer, queue, and
 search limits because inspection creates none of those resources.
 
-`close()` is also the native quiescence barrier: success means the writer, search actors, readers,
-merge threads, and memory mappings no longer use the index path. After closing an incompatible or
-corrupt local index, retire it atomically before rebuilding:
+`validateNativeFullTextIndexOptions(options)` runs the same native configuration decoder as open
+without creating files or starting actors. This is intended for activation-time validation.
+
+`close()` is also the native quiescence barrier. A resolved result means the writer, search actors,
+readers, merge threads, and memory mappings no longer use the index path. After closing an
+incompatible or corrupt local index, retire it atomically before rebuilding:
 
 ```js
 const result = await resetNativeFullTextIndex({ path: './search/products', indexId: 'products' });
@@ -156,17 +161,21 @@ if (result.state === 'reset') {
 }
 ```
 
-`E_CLOSE_FAILED` means native resources were released even though shutdown reported an operational
-error, so the path is safe to reset. `E_QUIESCENCE_FAILED` means the wrapper could not prove all
-native work stopped; do not reset, remove, or rename that path until the process restarts.
+The resolved close result is `{}` normally. If native resources were released but shutdown also
+reported an operational cleanup error, it is `{ cleanupError }` and that error has code
+`E_CLOSE_FAILED`; the path is still safe to reset. `E_QUIESCENCE_FAILED` rejects because the wrapper
+could not prove all native work stopped. Do not reset, remove, or rename that path until the process
+restarts.
 
 Reset returns `missing` without creating the path. It rejects a live owner with `E_LOCK_BUSY`, a
 different persisted logical index with `E_IDENTITY_MISMATCH`, and unrelated nonempty directories
 with `E_INVALID_ARGUMENT`. A malformed identity sidecar fails closed with `E_INDEX_CORRUPT`. On
 success, reset renames the live directory into a unique path below the parent's `.fulltext-retired`
-directory. The caller owns eventual deletion of that returned path; the wrapper never deletes it. A
-standalone caller may remove it after the reset resolves, while Harper schedules cleanup under its
-derived-index lifecycle policy.
+directory. The wrapper does not delete it automatically. Call
+`reclaimRetiredNativeFullTextIndexes({ path })` at a lifecycle point chosen by the application. It
+removes only retired trees generated for that index path, ignores unrelated entries and other
+indices, and returns `{ removed, failed }`. Harper invokes it during derived-index initialization
+and after reset.
 
 An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.
@@ -175,7 +184,7 @@ the handoff lock while renaming the native directory on Windows. The wrapper doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 4. The loader rejects older addon binaries; persisted index identity and
+This API uses native ABI 5. The loader rejects older addon binaries; persisted index identity and
 Tantivy file formats are unchanged by the ABI update.
 
 ## Storage boundary

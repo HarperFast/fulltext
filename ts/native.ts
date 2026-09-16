@@ -1,3 +1,6 @@
+import { lstat, readdir, realpath, rm } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
+
 import { FulltextError, normalizeNativeError } from './errors.js';
 import {
 	decodeResponse,
@@ -7,8 +10,6 @@ import {
 	encodeOpen,
 	encodeReset,
 	encodeSearch,
-	maxFields,
-	mutationBatchHeaderBytes,
 } from './codec.js';
 import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
@@ -23,8 +24,10 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
+	lifecycleApiVersion: 1;
 	mutationBatchApiVersion: 2;
 	storageBackends: ReadonlyArray<'native'>;
+	limits: { maxCommitPayloadBytes: number };
 }
 
 export interface NativeFullTextIndexOptions {
@@ -70,6 +73,8 @@ export interface NativeFullTextIndexResetOptions {
 }
 
 export type NativeFullTextIndexResetResult = { state: 'missing' } | { state: 'reset'; retiredPath: string };
+
+export type NativeFullTextReclaimResult = { removed: number; failed: number };
 
 export interface FullTextMutationBatch {
 	upserts?: Array<{ id: string; fields: Record<string, string | string[]> }>;
@@ -135,6 +140,8 @@ export interface CloseOptions {
 	mode?: 'require-clean' | 'rollback';
 }
 
+export type CloseResult = { cleanupError?: FulltextError };
+
 export class NativeFullTextIndex {
 	readonly #handle: number;
 	readonly #publication: PublicationState;
@@ -142,7 +149,7 @@ export class NativeFullTextIndex {
 	readonly #fieldNames: ReadonlySet<string>;
 	#closed = false;
 	#closedStatus?: FullTextStatus;
-	#closePromise?: Promise<void>;
+	#closePromise?: Promise<CloseResult>;
 
 	constructor(options: {
 		handle: number;
@@ -296,12 +303,12 @@ export class NativeFullTextIndex {
 		}
 	}
 
-	async close(options: CloseOptions = {}): Promise<void> {
+	async close(options: CloseOptions = {}): Promise<CloseResult> {
 		if (this.#closePromise) {
 			return this.#closePromise;
 		}
 		if (this.#closed) {
-			return;
+			return {};
 		}
 		const openStatus = this.status();
 		this.#closePromise = (async () => {
@@ -312,11 +319,13 @@ export class NativeFullTextIndex {
 				cursor.finish();
 				this.#closed = true;
 				this.#closedStatus = { ...openStatus, state: 'closed' };
+				return {};
 			} catch (error) {
 				const nativeError = normalizeNativeError(error);
 				if (nativeError.code === 'E_CLOSE_FAILED') {
 					this.#closed = true;
 					this.#closedStatus = { ...openStatus, state: 'closed' };
+					return { cleanupError: nativeError };
 				} else if (nativeError.code === 'E_QUIESCENCE_FAILED') {
 					this.#closed = true;
 					this.#closedStatus = { ...openStatus, state: 'poisoned' };
@@ -325,7 +334,7 @@ export class NativeFullTextIndex {
 			}
 		})();
 		try {
-			await this.#closePromise;
+			return await this.#closePromise;
 		} finally {
 			if (!this.#closed) {
 				this.#closePromise = undefined;
@@ -390,23 +399,58 @@ export async function resetNativeFullTextIndex(
 	throw new FulltextError('E_NATIVE_FAILURE', `Unknown native reset state ${state}`);
 }
 
+export async function reclaimRetiredNativeFullTextIndexes(options: {
+	path: string;
+}): Promise<NativeFullTextReclaimResult> {
+	if (!options || typeof options.path !== 'string' || options.path.length === 0) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'path must not be empty');
+	}
+	const livePath = resolve(options.path);
+	const retiredRoot = join(dirname(livePath), '.fulltext-retired');
+	let canonicalRoot: string;
+	let entries;
+	try {
+		const stats = await lstat(retiredRoot);
+		if (!stats.isDirectory() || stats.isSymbolicLink()) {
+			throw new FulltextError(
+				'E_INVALID_ARGUMENT',
+				'the .fulltext-retired path must be a directory and must not be a symbolic link',
+			);
+		}
+		canonicalRoot = await realpath(retiredRoot);
+		entries = await readdir(canonicalRoot, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { removed: 0, failed: 0 };
+		if (error instanceof FulltextError) throw error;
+		throw new FulltextError('E_STORAGE', `could not inspect retired full-text indexes for ${livePath}`, error);
+	}
+	const generatedName = new RegExp(`^${escapeRegExp(basename(livePath))}\\.\\d+\\.\\d+\\.\\d+\\.\\d+$`);
+	let removed = 0;
+	let failed = 0;
+	for (const entry of entries) {
+		if (!generatedName.test(entry.name)) continue;
+		try {
+			await rm(join(canonicalRoot, entry.name), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+			removed++;
+		} catch {
+			failed++;
+		}
+	}
+	return { removed, failed };
+}
+
+export function validateNativeFullTextIndexOptions(options: NativeFullTextIndexOptions): void {
+	const cursor = decodeResponse(loadAddon().__nativeValidateOpen(packedOpenOptions(options)));
+	cursor.finish();
+}
+
 export async function openNativeFullTextIndex(options: NativeFullTextIndexOptions): Promise<NativeFullTextIndex> {
 	const config = packedOptions(options);
 	config.limits = { ...config.limits };
-	if (config.fields.length === 0 || config.fields.length > maxFields) {
-		throw new FulltextError('E_INVALID_ARGUMENT', `fields must contain between 1 and ${maxFields} entries`);
-	}
-	if (
-		!Number.isSafeInteger(config.limits.maxBatchBytes) ||
-		config.limits.maxBatchBytes <= mutationBatchHeaderBytes ||
-		config.limits.maxBatchBytes > config.limits.maxQueuedBytes
-	) {
-		throw new FulltextError(
-			'E_INVALID_ARGUMENT',
-			'maxBatchBytes must exceed the mutation batch header and be no larger than maxQueuedBytes',
-		);
-	}
-	const cursor = await invoke((callback) => loadAddon().__nativeOpen(encodeOpen(config), callback));
+	const packed = encodeOpen(config);
+	const validation = decodeResponse(loadAddon().__nativeValidateOpen(packed));
+	validation.finish();
+	const cursor = await invoke((callback) => loadAddon().__nativeOpen(packed, callback));
 	const handle = cursor.u32();
 	try {
 		const hasPayload = cursor.u8();
@@ -425,6 +469,12 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 		await invoke((callback) => loadAddon().__nativeClose(handle, true, callback)).catch(() => undefined);
 		throw error;
 	}
+}
+
+function packedOpenOptions(options: NativeFullTextIndexOptions): Buffer {
+	const config = packedOptions(options);
+	config.limits = { ...config.limits };
+	return encodeOpen(config);
 }
 
 function packedOptions(options: NativeFullTextIndexOptions) {
@@ -455,8 +505,10 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
+			lifecycleApiVersion: 1,
 			mutationBatchApiVersion: 2,
 			storageBackends: ['native'],
+			limits: { maxCommitPayloadBytes: info.limits.maxCommitPayloadBytes },
 		};
 	} catch (error) {
 		throw normalizeNativeError(error);
@@ -472,4 +524,8 @@ function safeNumber(value: bigint, name: string): number {
 		throw new FulltextError('E_NATIVE_FAILURE', `${name} exceeds JavaScript's safe integer range`);
 	}
 	return Number(value);
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

@@ -9,10 +9,12 @@ interface NativeRuntimeInfo {
 	tantivyVersion: string;
 	nativeAbiVersion: number;
 	storageBackends: Array<string>;
+	limits: { maxCommitPayloadBytes: number };
 }
 
 interface NativeAddonApi {
 	runtimeInfo(): NativeRuntimeInfo;
+	__nativeValidateOpen(config: Buffer): Buffer;
 	__nativeInspect(config: Buffer): Buffer;
 	__nativeReset(config: Buffer, callback: NativeCallback): void;
 	__nativeOpen(config: Buffer, callback: NativeCallback): void;
@@ -35,7 +37,7 @@ interface NativeAddonApi {
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 4;
+const expectedNativeAbiVersion = 5;
 let loadedAddon: NativeAddonApi | undefined;
 
 export function loadAddon(): NativeAddonApi {
@@ -87,6 +89,12 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',
 			`Fulltext native artifact ${artifactPath} does not provide index inspection`,
+		);
+	}
+	if (typeof addon.__nativeValidateOpen !== 'function') {
+		throw new FulltextError(
+			'E_NATIVE_CAPABILITY_MISMATCH',
+			`Fulltext native artifact ${artifactPath} does not provide open configuration validation`,
 		);
 	}
 	if (typeof addon.__nativeReset !== 'function') {

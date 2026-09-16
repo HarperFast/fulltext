@@ -25,9 +25,11 @@ test('loads the artifact for the executing platform', async () => {
 	assert.deepStrictEqual(info, {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
-		nativeAbiVersion: 4,
+		nativeAbiVersion: 5,
+		lifecycleApiVersion: 1,
 		mutationBatchApiVersion: 2,
 		storageBackends: ['native'],
+		limits: { maxCommitPayloadBytes: 64 * 1024 },
 	});
 	assert.strictEqual(cargoPackageVersion, packageManifest.version);
 	assert.match(platformTriple(), /^(darwin|linux|win32)-(arm64|x64)(-(gnu|musl|msvc))?$/);
@@ -100,9 +102,10 @@ test('a close failure after resource release remains resettable', async (context
 	const { addon, handle, index } = await testIndex(indexPath, 'close-failed');
 	assert(addon.__testFailNextClose);
 	addon.__testFailNextClose(handle, true);
-	await assert.rejects(index.close(), (error) => error.code === 'E_CLOSE_FAILED');
+	const result = await index.close();
+	assert.strictEqual(result.cleanupError?.code, 'E_CLOSE_FAILED');
 	assert.strictEqual(index.status().state, 'closed');
-	await assert.rejects(index.close(), (error) => error.code === 'E_CLOSE_FAILED');
+	assert.strictEqual((await index.close()).cleanupError?.code, 'E_CLOSE_FAILED');
 	assert.strictEqual((await resetNativeFullTextIndex({ path: indexPath, indexId: 'close-failed' })).state, 'reset');
 });
 
