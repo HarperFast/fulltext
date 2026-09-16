@@ -2,8 +2,8 @@ import { FulltextError, type FulltextErrorCode } from './errors.js';
 
 const protocolVersion = 1;
 const maxStringBytes = 1 << 20;
-const maxFields = 1_024;
-const mutationBatchHeaderBytes = 14;
+export const maxFields = 1_024;
+export const mutationBatchHeaderBytes = 14;
 const maxPendingWriterChunks = 1_024;
 
 export interface PackedFieldConfig {
@@ -64,6 +64,7 @@ export interface PackedMutationBatchPartition {
 export interface PackedMutationBatchPartitions {
 	batches: PackedMutationBatchPartition[];
 	rejected: PackedMutationBatchRejection[];
+	consumedRecords: number;
 }
 
 export interface PackedSearchRequest {
@@ -163,6 +164,20 @@ export function encodeBatchPartitions(
 		throw new FulltextError('E_INVALID_ARGUMENT', 'maxTotalBytes is too small for a mutation batch');
 	}
 	const maxFrameBytes = Math.min(maxBytes, maxTotalBytes);
+	const ids = new Set<string>();
+	const checkDuplicate = (id: unknown) => {
+		if (
+			typeof id !== 'string' ||
+			id.length === 0 ||
+			/[\uD800-\uDFFF]/u.test(id) ||
+			Buffer.byteLength(id, 'utf8') > maxStringBytes
+		)
+			return;
+		if (ids.has(id)) throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch IDs must be distinct');
+		ids.add(id);
+	};
+	for (const upsert of batch.upserts) checkDuplicate(upsert?.id);
+	for (const id of batch.deletes) checkDuplicate(id);
 
 	type EncodedRecord = {
 		operation: 'upsert' | 'delete';
@@ -171,7 +186,6 @@ export function encodeBatchPartitions(
 		byteLength: number;
 	};
 	const rejected: PackedMutationBatchRejection[] = [];
-	const ids = new Set<string>();
 	let totalBytes = 0;
 	const batches: PackedMutationBatchPartition[] = [];
 	let frameWriter = new ByteWriter(maxFrameBytes - mutationBatchHeaderBytes, 'E_BATCH_TOO_LARGE');
@@ -180,9 +194,6 @@ export function encodeBatchPartitions(
 	let deleteCount = 0;
 	const finish = () => {
 		if (upsertCount + deleteCount === 0) return;
-		if (totalBytes + byteLength > maxTotalBytes) {
-			throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
-		}
 		const header = encodeBatchHeader(upsertCount, deleteCount);
 		const frame = frameWriter.take();
 		const bytes = Buffer.concat([header, ...frame.chunks], byteLength);
@@ -193,15 +204,14 @@ export function encodeBatchPartitions(
 		upsertCount = 0;
 		deleteCount = 0;
 	};
-	const append = (record: EncodedRecord) => {
+	const append = (record: EncodedRecord): boolean => {
 		if (byteLength + record.byteLength > maxFrameBytes) finish();
-		if (totalBytes + byteLength + record.byteLength > maxTotalBytes) {
-			throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
-		}
+		if (totalBytes + byteLength + record.byteLength > maxTotalBytes) return false;
 		frameWriter.encodedBytes(record.chunks);
 		byteLength += record.byteLength;
 		if (record.operation === 'upsert') upsertCount++;
 		else deleteCount++;
+		return true;
 	};
 
 	const validateId = (id: unknown, operation: 'upsert' | 'delete', index: number): Buffer | undefined => {
@@ -214,17 +224,17 @@ export function encodeBatchPartitions(
 			rejected.push({ operation, index, code: 'E_INVALID_ARGUMENT' });
 			return;
 		}
-		if (ids.has(id)) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch IDs must be distinct');
-		}
-		ids.add(id);
 		return bytes;
 	};
 
+	let consumedUpserts = 0;
 	for (let index = 0; index < batch.upserts.length; index++) {
 		const upsert = batch.upserts[index];
 		const id = validateId(upsert?.id, 'upsert', index);
-		if (!id) continue;
+		if (!id) {
+			consumedUpserts++;
+			continue;
+		}
 		let encoded: { chunks: Buffer[]; byteLength: number };
 		try {
 			if (!upsert.fields || typeof upsert.fields !== 'object' || Array.isArray(upsert.fields)) {
@@ -254,29 +264,39 @@ export function encodeBatchPartitions(
 			if (!(error instanceof FulltextError)) throw error;
 			if (error.code === 'E_BATCH_TOO_LARGE') {
 				rejected.push({ operation: 'upsert', index, code: 'E_BATCH_TOO_LARGE' });
+				consumedUpserts++;
 				continue;
 			}
 			if (error.code !== 'E_INVALID_ARGUMENT') throw error;
 			rejected.push({ operation: 'upsert', index, code: error.code });
+			consumedUpserts++;
 			continue;
 		}
-		append({ operation: 'upsert', index, ...encoded });
+		if (!append({ operation: 'upsert', index, ...encoded })) break;
+		consumedUpserts++;
 	}
 
-	for (let index = 0; index < batch.deletes.length; index++) {
-		const id = validateId(batch.deletes[index], 'delete', index);
-		if (!id) continue;
-		const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
-		writer.encodedString(id);
-		const encoded = writer.take();
-		if (mutationBatchHeaderBytes + encoded.byteLength > maxFrameBytes) {
-			rejected.push({ operation: 'delete', index, code: 'E_BATCH_TOO_LARGE' });
-			continue;
+	let consumedDeletes = 0;
+	if (consumedUpserts === batch.upserts.length)
+		for (let index = 0; index < batch.deletes.length; index++) {
+			const id = validateId(batch.deletes[index], 'delete', index);
+			if (!id) {
+				consumedDeletes++;
+				continue;
+			}
+			const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
+			writer.encodedString(id);
+			const encoded = writer.take();
+			if (mutationBatchHeaderBytes + encoded.byteLength > maxFrameBytes) {
+				rejected.push({ operation: 'delete', index, code: 'E_BATCH_TOO_LARGE' });
+				consumedDeletes++;
+				continue;
+			}
+			if (!append({ operation: 'delete', index, ...encoded })) break;
+			consumedDeletes++;
 		}
-		append({ operation: 'delete', index, ...encoded });
-	}
 	finish();
-	return { batches, rejected };
+	return { batches, rejected, consumedRecords: consumedUpserts + consumedDeletes };
 }
 
 function encodeBatchHeader(upserts: number, deletes: number): Buffer {

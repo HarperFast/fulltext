@@ -7,6 +7,8 @@ import {
 	encodeOpen,
 	encodeReset,
 	encodeSearch,
+	maxFields,
+	mutationBatchHeaderBytes,
 } from './codec.js';
 import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
@@ -88,6 +90,8 @@ export interface EncodedFullTextMutationBatch {
 export interface EncodedFullTextMutationBatches {
 	batches: EncodedFullTextMutationBatch[];
 	rejected: FullTextMutationBatchRejection[];
+	/** Leading mutations consumed from the input, with upserts preceding deletes. */
+	consumedRecords: number;
 }
 
 export interface EncodeFullTextMutationBatchesOptions {
@@ -376,6 +380,19 @@ export async function resetNativeFullTextIndex(
 export async function openNativeFullTextIndex(options: NativeFullTextIndexOptions): Promise<NativeFullTextIndex> {
 	const config = packedOptions(options);
 	config.limits = { ...config.limits };
+	if (config.fields.length === 0 || config.fields.length > maxFields) {
+		throw new FulltextError('E_INVALID_ARGUMENT', `fields must contain between 1 and ${maxFields} entries`);
+	}
+	if (
+		!Number.isSafeInteger(config.limits.maxBatchBytes) ||
+		config.limits.maxBatchBytes <= mutationBatchHeaderBytes ||
+		config.limits.maxBatchBytes > config.limits.maxQueuedBytes
+	) {
+		throw new FulltextError(
+			'E_INVALID_ARGUMENT',
+			'maxBatchBytes must exceed the mutation batch header and be no larger than maxQueuedBytes',
+		);
+	}
 	const cursor = await invoke((callback) => loadAddon().__nativeOpen(encodeOpen(config), callback));
 	const handle = cursor.u32();
 	try {

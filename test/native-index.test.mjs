@@ -108,6 +108,12 @@ test('inspects missing storage without creating it', (context) => {
 	assert.strictEqual(existsSync(indexPath), false);
 });
 
+test('rejects a mutation frame limit that cannot hold its header', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 14 };
+	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INVALID_ARGUMENT');
+});
+
 test('retires a closed index, preserves its checkpoint, and permits a clean rebuild', async (context) => {
 	const parent = temporaryIndex(context);
 	const indexPath = path.join(parent, 'products');
@@ -607,23 +613,25 @@ test('fails the logical call when a mutation field is outside the opened schema'
 	await index.close();
 });
 
-test('bounds total logical output independently from native queue capacity', async (context) => {
+test('returns a consumed prefix when total output reaches the caller ceiling', async (context) => {
 	const config = options(temporaryIndex(context));
 	config.limits = { ...config.limits, maxBatchBytes: 256 };
 	const index = await openNativeFullTextIndex(config);
-	assert.throws(
-		() =>
-			index.encodeMutationBatches(
-				{
-					upserts: [
-						{ id: 'one', fields: { title: 'x'.repeat(128) } },
-						{ id: 'two', fields: { title: 'x'.repeat(128) } },
-					],
-				},
-				{ maxTotalBytes: 300 },
-			),
-		(error) => error.code === 'E_BATCH_TOO_LARGE',
+	const upserts = [
+		{ id: 'one', fields: { title: 'catalog '.repeat(20) } },
+		{ id: 'two', fields: { title: 'catalog '.repeat(20) } },
+	];
+	const first = index.encodeMutationBatches({ upserts }, { maxTotalBytes: 300 });
+	assert.strictEqual(first.consumedRecords, 1);
+	assert.strictEqual(
+		first.batches.reduce((count, batch) => count + batch.mutationCount, 0),
+		1,
 	);
+	const second = index.encodeMutationBatches({ upserts: upserts.slice(first.consumedRecords) }, { maxTotalBytes: 300 });
+	assert.strictEqual(second.consumedRecords, 1);
+	for (const batch of [...first.batches, ...second.batches]) await index.apply(batch.bytes);
+	await index.publish('prefixes');
+	assert.strictEqual((await index.search({ text: 'catalog', exactTotal: true })).total, 2);
 	await index.close();
 });
 
@@ -636,20 +644,18 @@ test('keeps a caller total ceiling below the configured frame ceiling', async (c
 		{ maxTotalBytes: 256 },
 	);
 	assert.strictEqual(one.rejected.length, 0);
+	assert.strictEqual(one.consumedRecords, 1);
 	assert(one.batches.every((batch) => batch.bytes.byteLength <= 256));
-	assert.throws(
-		() =>
-			index.encodeMutationBatches(
-				{
-					upserts: [
-						{ id: 'one', fields: { title: 'x'.repeat(128) } },
-						{ id: 'two', fields: { title: 'x'.repeat(128) } },
-					],
-				},
-				{ maxTotalBytes: 256 },
-			),
-		(error) => error.code === 'E_BATCH_TOO_LARGE',
+	const two = index.encodeMutationBatches(
+		{
+			upserts: [
+				{ id: 'one', fields: { title: 'x'.repeat(128) } },
+				{ id: 'two', fields: { title: 'x'.repeat(128) } },
+			],
+		},
+		{ maxTotalBytes: 256 },
 	);
+	assert.strictEqual(two.consumedRecords, 1);
 	await index.close();
 });
 
@@ -718,6 +724,19 @@ test('rejects duplicate encoded IDs before partitioning', async (context) => {
 				upserts: [{ id: 'same', fields: { title: 'value' } }],
 				deletes: ['same'],
 			}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.throws(
+		() =>
+			index.encodeMutationBatches(
+				{
+					upserts: [
+						{ id: 'same-prefix', fields: { title: 'x'.repeat(128) } },
+						{ id: 'same-prefix', fields: { title: 'x'.repeat(128) } },
+					],
+				},
+				{ maxTotalBytes: 256 },
+			),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	await index.close();

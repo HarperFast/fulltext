@@ -78,6 +78,8 @@ zero-based index in the corresponding input array. It is never dropped automatic
 
 Encoding is synchronous and runs on the JavaScript thread. The total encoded output of one logical
 call defaults to 64 MiB and can be lowered with `encodeMutationBatches(batch, { maxTotalBytes })`.
+When the ceiling is reached, `consumedRecords` identifies the leading mutations represented by the
+returned frames and rejections; callers can continue with the remaining suffix.
 Producers should keep logical batches comfortably below that limit. Applying multiple frames stages
 them in one Tantivy writer. Commit or publish only
 after every frame succeeds; on a later failure, close with rollback rather than publishing the
