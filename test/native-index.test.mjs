@@ -629,6 +629,24 @@ test('encodes a large multi-valued field without spreading codec chunks onto the
 	await index.close({ mode: 'rollback' });
 });
 
+test('stops encoding one oversized multi-valued record at the frame bound', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 1024 };
+	const index = await openNativeFullTextIndex(config);
+	let valuesRead = 0;
+	const values = new Proxy(Array(60_000).fill('x'), {
+		get(target, property, receiver) {
+			if (typeof property === 'string' && /^\d+$/u.test(property)) valuesRead++;
+			return Reflect.get(target, property, receiver);
+		},
+	});
+	const encoded = index.encodeMutationBatches({ upserts: [{ id: 'oversized', fields: { title: values } }] });
+	assert.deepStrictEqual(encoded.rejected, [{ operation: 'upsert', index: 0, code: 'E_BATCH_TOO_LARGE' }]);
+	assert.strictEqual(encoded.batches.length, 0);
+	assert(valuesRead < 1000, `encoder read ${valuesRead} values after the record exceeded its frame`);
+	await index.close();
+});
+
 test('reports a record that cannot fit one configured frame', async (context) => {
 	const config = options(temporaryIndex(context));
 	config.limits = { ...config.limits, maxBatchBytes: 1024, maxQueuedBytes: 8192 };
@@ -697,6 +715,21 @@ test('rejects duplicate opens and persisted identity drift', async (context) => 
 		openNativeFullTextIndex(options(indexPath, { generation: 'generation-2' })),
 		(error) => error.code === 'E_IDENTITY_MISMATCH',
 	);
+});
+
+test('snapshots schema and limits before awaiting native open', async (context) => {
+	const config = options(temporaryIndex(context));
+	const opening = openNativeFullTextIndex(config);
+	config.fields[0].name = 'mutated';
+	config.limits.maxBatchBytes = 64;
+	const index = await opening;
+	const encoded = index.encodeMutationBatches({
+		upserts: [{ id: 'original', fields: { title: 'x'.repeat(128) } }],
+	});
+	assert.strictEqual(encoded.rejected.length, 0);
+	assert.strictEqual(encoded.batches.length, 1);
+	assert(encoded.batches[0].bytes.byteLength > config.limits.maxBatchBytes);
+	await index.close();
 });
 
 test('keeps the JavaScript event loop responsive while indexing', async (context) => {

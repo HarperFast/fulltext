@@ -222,6 +222,7 @@ export function encodeBatchPartitions(
 		const upsert = batch.upserts[index];
 		const id = validateId(upsert?.id, 'upsert', index);
 		if (!id) continue;
+		let encoded: { chunks: Buffer[]; byteLength: number };
 		try {
 			if (!upsert.fields || typeof upsert.fields !== 'object' || Array.isArray(upsert.fields)) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'upsert fields must be an object');
@@ -230,7 +231,7 @@ export function encodeBatchPartitions(
 			if (names.length > maxFields) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'upsert field count exceeds the supported limit');
 			}
-			const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
+			const writer = new ByteWriter(maxBytes - mutationBatchHeaderBytes, 'E_BATCH_TOO_LARGE');
 			writer.encodedString(id);
 			writer.u16(names.length, 'upsert field count');
 			for (const name of names) {
@@ -243,16 +244,18 @@ export function encodeBatchPartitions(
 				writer.u16(values.length, 'field value count');
 				for (const entry of values) writer.string(entry);
 			}
-			const encoded = writer.take();
-			if (mutationBatchHeaderBytes + encoded.byteLength > maxBytes) {
+			encoded = writer.take();
+		} catch (error) {
+			if (!(error instanceof FulltextError)) throw error;
+			if (error.code === 'E_BATCH_TOO_LARGE') {
 				rejected.push({ operation: 'upsert', index, code: 'E_BATCH_TOO_LARGE' });
 				continue;
 			}
-			append({ operation: 'upsert', index, ...encoded });
-		} catch (error) {
-			if (!(error instanceof FulltextError) || error.code !== 'E_INVALID_ARGUMENT') throw error;
-			rejected.push({ operation: 'upsert', index, code: 'E_INVALID_ARGUMENT' });
+			if (error.code !== 'E_INVALID_ARGUMENT') throw error;
+			rejected.push({ operation: 'upsert', index, code: error.code });
+			continue;
 		}
+		append({ operation: 'upsert', index, ...encoded });
 	}
 
 	for (let index = 0; index < batch.deletes.length; index++) {

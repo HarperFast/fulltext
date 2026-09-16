@@ -374,7 +374,9 @@ export async function resetNativeFullTextIndex(
 }
 
 export async function openNativeFullTextIndex(options: NativeFullTextIndexOptions): Promise<NativeFullTextIndex> {
-	const cursor = await invoke((callback) => loadAddon().__nativeOpen(encodeOpen(packedOptions(options)), callback));
+	const config = packedOptions(options);
+	config.limits = { ...config.limits };
+	const cursor = await invoke((callback) => loadAddon().__nativeOpen(encodeOpen(config), callback));
 	const handle = cursor.u32();
 	try {
 		const hasPayload = cursor.u8();
@@ -386,8 +388,8 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 		return new NativeFullTextIndex({
 			handle,
 			committedPayload: payload,
-			maxBatchBytes: options.limits.maxBatchBytes,
-			fieldNames: options.fields.map((field) => field.name),
+			maxBatchBytes: config.limits.maxBatchBytes,
+			fieldNames: config.fields.map((field) => field.name),
 		});
 	} catch (error) {
 		await invoke((callback) => loadAddon().__nativeClose(handle, true, callback)).catch(() => undefined);
