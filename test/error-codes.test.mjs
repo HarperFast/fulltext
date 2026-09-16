@@ -27,16 +27,13 @@ test('keeps the checkpoint payload byte limit aligned across Rust and TypeScript
 test('keeps mutation batch size constants aligned across Rust and TypeScript', () => {
 	const rust = readFileSync(new URL('../src/protocol.rs', import.meta.url), 'utf8');
 	const typescript = readFileSync(new URL('../ts/codec.ts', import.meta.url), 'utf8');
-	const rustHeader = Number(/MUTATION_BATCH_HEADER_BYTES: usize = (\d+);/.exec(rust)?.[1]);
-	const rustMinimumIncrement = Number(
-		/MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES \+ (\d+);/.exec(rust)?.[1],
-	);
-	const typescriptHeader = Number(/mutationBatchHeaderBytes = (\d+);/.exec(typescript)?.[1]);
-	const typescriptMinimumIncrement = Number(
-		/minimumMutationBatchBytes = mutationBatchHeaderBytes \+ (\d+);/.exec(typescript)?.[1],
-	);
-	assert.strictEqual(rustHeader, typescriptHeader);
-	assert.strictEqual(rustMinimumIncrement, typescriptMinimumIncrement);
+	const rustHeader = /MUTATION_BATCH_HEADER_BYTES: usize = (\d+);/.exec(rust);
+	const rustMinimum = /MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES \+ (\d+);/.exec(rust);
+	const typescriptHeader = /mutationBatchHeaderBytes = (\d+);/.exec(typescript);
+	const typescriptMinimum = /minimumMutationBatchBytes = mutationBatchHeaderBytes \+ (\d+);/.exec(typescript);
+	assert(rustHeader && rustMinimum && typescriptHeader && typescriptMinimum);
+	assert.strictEqual(Number(rustHeader[1]), Number(typescriptHeader[1]));
+	assert.strictEqual(Number(rustMinimum[1]), Number(typescriptMinimum[1]));
 });
 
 function constantBlock(source, marker, terminator) {
