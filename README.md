@@ -77,8 +77,9 @@ frames; a single invalid or unencodable mutation is returned in `rejected` with 
 zero-based index in the corresponding input array. It is never dropped automatically.
 
 Encoding is synchronous and runs on the JavaScript thread. The total encoded output of one logical
-call is bounded by `maxQueuedBytes`; producers should keep their own logical batches comfortably
-below that limit. Applying multiple frames stages them in one Tantivy writer. Commit or publish only
+call defaults to 64 MiB and can be lowered with `encodeMutationBatches(batch, { maxTotalBytes })`.
+Producers should keep logical batches comfortably below that limit. Applying multiple frames stages
+them in one Tantivy writer. Commit or publish only
 after every frame succeeds; on a later failure, close with rollback rather than publishing the
 partial logical batch. Concurrent callers should leave queue-byte headroom for commit or publish.
 A successful `apply()` resolves to the number of accepted mutation commands, including deletes for

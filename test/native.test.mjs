@@ -136,7 +136,6 @@ async function testIndex(indexPath, indexId) {
 		index: new NativeFullTextIndex({
 			handle,
 			maxBatchBytes: options.limits.maxBatchBytes,
-			maxQueuedBytes: options.limits.maxQueuedBytes,
 			fieldNames: options.fields.map((field) => field.name),
 		}),
 	};

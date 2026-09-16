@@ -511,7 +511,6 @@ test('distinguishes oversized mutation batches from invalid input', async (conte
 
 test('partitions a Harper maximum-key delete workload into admissible native frames', async (context) => {
 	const config = options(temporaryIndex(context));
-	config.limits = { ...config.limits, maxQueuedBytes: 64 * 1024 * 1024 };
 	let index = await openNativeFullTextIndex(config);
 	const id = `1.${Buffer.alloc(1978, 1).toString('base64url')}`;
 	const deletes = Array.from({ length: 4096 }, (_, position) => `${position}.${id}`);
@@ -534,28 +533,65 @@ test('partitions a Harper maximum-key delete workload into admissible native fra
 
 test('reports only explicit record validation failures during partitioning', async (context) => {
 	const config = options(temporaryIndex(context));
-	config.limits = { ...config.limits, maxQueuedBytes: 64 * 1024 * 1024 };
 	const index = await openNativeFullTextIndex(config);
 	const boundary = 'x'.repeat(1 << 20);
 	const encoded = index.encodeMutationBatches({
 		upserts: [
 			{ id: 'valid-boundary', fields: { title: boundary } },
 			{ id: 'too-long', fields: { title: `${boundary}x` } },
-			{ id: 'unknown', fields: { missing: 'value' } },
 			{ id: 'whole-record', fields: { title: boundary, description: boundary } },
 			{ id: '\ud800', fields: { title: 'invalid id' } },
 		],
 	});
 	assert.deepStrictEqual(encoded.rejected, [
 		{ operation: 'upsert', index: 1, code: 'E_INVALID_ARGUMENT' },
-		{ operation: 'upsert', index: 2, code: 'E_INVALID_ARGUMENT' },
-		{ operation: 'upsert', index: 4, code: 'E_INVALID_ARGUMENT' },
+		{ operation: 'upsert', index: 3, code: 'E_INVALID_ARGUMENT' },
 	]);
 	assert.strictEqual(
 		encoded.batches.reduce((count, batch) => count + batch.mutationCount, 0),
 		2,
 	);
 	for (const batch of encoded.batches) await index.apply(batch.bytes);
+	await index.close({ mode: 'rollback' });
+});
+
+test('fails the logical call when a mutation field is outside the opened schema', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	assert.throws(
+		() => index.encodeMutationBatches({ upserts: [{ id: 'unknown', fields: { missing: 'value' } }] }),
+		(error) => error.code === 'E_SCHEMA_MISMATCH',
+	);
+	await index.close();
+});
+
+test('bounds total logical output independently from native queue capacity', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 256 };
+	const index = await openNativeFullTextIndex(config);
+	assert.throws(
+		() =>
+			index.encodeMutationBatches(
+				{
+					upserts: [
+						{ id: 'one', fields: { title: 'x'.repeat(128) } },
+						{ id: 'two', fields: { title: 'x'.repeat(128) } },
+					],
+				},
+				{ maxTotalBytes: 300 },
+			),
+		(error) => error.code === 'E_BATCH_TOO_LARGE',
+	);
+	await index.close();
+});
+
+test('encodes a large multi-valued field without spreading codec chunks onto the stack', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	const encoded = index.encodeMutationBatches({
+		upserts: [{ id: 'many', fields: { title: Array.from({ length: 60_000 }, () => 'x') } }],
+	});
+	assert.strictEqual(encoded.rejected.length, 0);
+	assert.strictEqual(encoded.batches.length, 1);
+	assert.strictEqual(await index.apply(encoded.batches[0].bytes), 1);
 	await index.close({ mode: 'rollback' });
 });
 

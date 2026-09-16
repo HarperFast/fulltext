@@ -171,6 +171,7 @@ export function encodeBatchPartitions(
 	const records: EncodedRecord[] = [];
 	const rejected: PackedMutationBatchRejection[] = [];
 	const ids = new Set<string>();
+	let encodedRecordBytes = 0;
 
 	const validateId = (id: unknown, operation: 'upsert' | 'delete', index: number): Buffer | undefined => {
 		if (typeof id !== 'string' || id.length === 0 || /[\uD800-\uDFFF]/u.test(id)) {
@@ -182,11 +183,10 @@ export function encodeBatchPartitions(
 			rejected.push({ operation, index, code: 'E_INVALID_ARGUMENT' });
 			return;
 		}
-		const key = bytes.toString('base64');
-		if (ids.has(key)) {
+		if (ids.has(id)) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch IDs must be distinct');
 		}
-		ids.add(key);
+		ids.add(id);
 		return bytes;
 	};
 
@@ -207,7 +207,7 @@ export function encodeBatchPartitions(
 			writer.u16(names.length, 'upsert field count');
 			for (const name of names) {
 				if (!fieldNames.has(name)) {
-					throw new FulltextError('E_INVALID_ARGUMENT', 'upsert contains an unknown field');
+					throw new FulltextError('E_SCHEMA_MISMATCH', 'upsert contains a field outside the opened schema');
 				}
 				writer.string(name);
 				const value = upsert.fields[name];
@@ -220,6 +220,9 @@ export function encodeBatchPartitions(
 				rejected.push({ operation: 'upsert', index, code: 'E_BATCH_TOO_LARGE' });
 				continue;
 			}
+			encodedRecordBytes += encoded.byteLength;
+			if (encodedRecordBytes > maxTotalBytes)
+				throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
 			records.push({ operation: 'upsert', index, ...encoded });
 		} catch (error) {
 			if (!(error instanceof FulltextError) || error.code !== 'E_INVALID_ARGUMENT') throw error;
@@ -237,6 +240,9 @@ export function encodeBatchPartitions(
 			rejected.push({ operation: 'delete', index, code: 'E_BATCH_TOO_LARGE' });
 			continue;
 		}
+		encodedRecordBytes += encoded.byteLength;
+		if (encodedRecordBytes > maxTotalBytes)
+			throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
 		records.push({ operation: 'delete', index, ...encoded });
 	}
 
@@ -263,7 +269,7 @@ export function encodeBatchPartitions(
 
 	for (const record of records) {
 		if (byteLength + record.byteLength > maxBytes) finish();
-		chunks.push(...record.chunks);
+		for (const chunk of record.chunks) chunks.push(chunk);
 		byteLength += record.byteLength;
 		if (record.operation === 'upsert') upsertCount++;
 		else deleteCount++;

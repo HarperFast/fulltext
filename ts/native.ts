@@ -90,6 +90,10 @@ export interface EncodedFullTextMutationBatches {
 	rejected: FullTextMutationBatchRejection[];
 }
 
+export interface EncodeFullTextMutationBatchesOptions {
+	maxTotalBytes?: number;
+}
+
 export interface SearchRequest {
 	text: string;
 	operator?: 'any' | 'all';
@@ -129,7 +133,6 @@ export class NativeFullTextIndex {
 	readonly #handle: number;
 	readonly #publication: PublicationState;
 	readonly #maxBatchBytes: number;
-	readonly #maxQueuedBytes: number;
 	readonly #fieldNames: ReadonlySet<string>;
 	#closed = false;
 	#closedStatus?: FullTextStatus;
@@ -139,13 +142,11 @@ export class NativeFullTextIndex {
 		handle: number;
 		committedPayload?: string;
 		maxBatchBytes: number;
-		maxQueuedBytes: number;
 		fieldNames: Iterable<string>;
 	}) {
 		this.#handle = options.handle;
 		this.#publication = new PublicationState(options.committedPayload);
 		this.#maxBatchBytes = options.maxBatchBytes;
-		this.#maxQueuedBytes = options.maxQueuedBytes;
 		this.#fieldNames = new Set(options.fieldNames);
 	}
 
@@ -160,17 +161,20 @@ export class NativeFullTextIndex {
 		return count;
 	}
 
-	encodeMutationBatches(batch: FullTextMutationBatch): EncodedFullTextMutationBatches {
+	encodeMutationBatches(
+		batch: FullTextMutationBatch,
+		options: EncodeFullTextMutationBatchesOptions = {},
+	): EncodedFullTextMutationBatches {
 		try {
 			return encodeBatchPartitions(
 				{ upserts: batch.upserts ?? [], deletes: batch.deletes ?? [] },
 				this.#maxBatchBytes,
-				this.#maxQueuedBytes,
+				options.maxTotalBytes ?? Math.max(this.#maxBatchBytes, 64 * 1024 * 1024),
 				this.#fieldNames,
 			);
 		} catch (error) {
 			if (error instanceof FulltextError) throw error;
-			throw new FulltextError('E_INVALID_ARGUMENT', error instanceof Error ? error.message : String(error), error);
+			throw normalizeNativeError(error);
 		}
 	}
 
@@ -383,7 +387,6 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 			handle,
 			committedPayload: payload,
 			maxBatchBytes: options.limits.maxBatchBytes,
-			maxQueuedBytes: options.limits.maxQueuedBytes,
 			fieldNames: options.fields.map((field) => field.name),
 		});
 	} catch (error) {

@@ -86,6 +86,10 @@ interface FullTextMutationBatch {
 	deletes?: string[];
 }
 
+interface EncodeFullTextMutationBatchesOptions {
+	maxTotalBytes?: number;
+}
+
 interface SearchRequest {
 	text: string;
 	operator?: 'any' | 'all';
@@ -175,9 +179,10 @@ N-API plus result-decoding time so storage and boundary costs cannot be confused
 
 Both encoders perform UTF-8 encoding synchronously on the caller's JavaScript thread.
 `encodeMutationBatches()` binds frame size to the opened handle, validates IDs and field names,
-requires IDs to be distinct across the logical batch, and bounds total returned bytes by the
-configured writer-queue byte limit. Aggregate overflow creates more frames; a mutation that cannot
-fit alone is reported to the caller. The call performs no native work. `apply()` then makes one
+requires IDs to be distinct across the logical batch, and defaults the total returned-byte ceiling
+to 64 MiB. A caller can lower that ceiling with `maxTotalBytes`. Aggregate frame overflow creates
+more frames; a mutation that cannot fit alone is reported to the caller. The call performs no native
+work. `apply()` then makes one
 required copy into Rust-owned memory before asynchronous admission. Callers apply every frame and
 commit or publish only after all succeed; otherwise they rollback-close the staged writer window.
 The benchmark reports encoding separately and pre-encodes its engine-only corpus so directory

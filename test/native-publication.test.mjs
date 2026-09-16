@@ -154,7 +154,6 @@ for (const afterCommit of [false, true]) {
 			let index = new NativeFullTextIndex({
 				handle,
 				maxBatchBytes: options.limits.maxBatchBytes,
-				maxQueuedBytes: options.limits.maxQueuedBytes,
 				fieldNames: options.fields.map((field) => field.name),
 			});
 			cleanup(context, options, () => index);
