@@ -590,9 +590,18 @@ test('reports only explicit record validation failures during partitioning', asy
 });
 
 test('fails the logical call when a mutation field is outside the opened schema', async (context) => {
-	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 256 };
+	const index = await openNativeFullTextIndex(config);
 	assert.throws(
 		() => index.encodeMutationBatches({ upserts: [{ id: 'unknown', fields: { missing: 'value' } }] }),
+		(error) => error.code === 'E_SCHEMA_MISMATCH',
+	);
+	assert.throws(
+		() =>
+			index.encodeMutationBatches({
+				upserts: [{ id: 'oversized-and-unknown', fields: { title: 'x'.repeat(512), missing: 'value' } }],
+			}),
 		(error) => error.code === 'E_SCHEMA_MISMATCH',
 	);
 	await index.close();

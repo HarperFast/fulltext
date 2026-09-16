@@ -4,6 +4,7 @@ const protocolVersion = 1;
 const maxStringBytes = 1 << 20;
 const maxFields = 1_024;
 const mutationBatchHeaderBytes = 14;
+const maxPendingWriterChunks = 1_024;
 
 export interface PackedFieldConfig {
 	name: string;
@@ -231,13 +232,15 @@ export function encodeBatchPartitions(
 			if (names.length > maxFields) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'upsert field count exceeds the supported limit');
 			}
-			const writer = new ByteWriter(maxBytes - mutationBatchHeaderBytes, 'E_BATCH_TOO_LARGE');
-			writer.encodedString(id);
-			writer.u16(names.length, 'upsert field count');
 			for (const name of names) {
 				if (!fieldNames.has(name)) {
 					throw new FulltextError('E_SCHEMA_MISMATCH', 'upsert contains a field outside the opened schema');
 				}
+			}
+			const writer = new ByteWriter(maxBytes - mutationBatchHeaderBytes, 'E_BATCH_TOO_LARGE');
+			writer.encodedString(id);
+			writer.u16(names.length, 'upsert field count');
+			for (const name of names) {
 				writer.string(name);
 				const value = upsert.fields[name];
 				const values = Array.isArray(value) ? value : [value];
@@ -382,9 +385,11 @@ export class Cursor {
 
 class ByteWriter {
 	readonly #chunks: Buffer[] = [];
+	readonly #pendingChunks: Buffer[] = [];
 	readonly #maxBytes: number;
 	readonly #sizeErrorCode: FulltextErrorCode;
 	#length = 0;
+	#pendingLength = 0;
 
 	constructor(maxBytes: number, sizeErrorCode: FulltextErrorCode) {
 		if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
@@ -450,11 +455,11 @@ class ByteWriter {
 	}
 
 	finish(): Buffer {
-		return Buffer.concat(this.#chunks, this.#length);
+		return Buffer.concat([...this.#chunks, ...this.#pendingChunks], this.#length);
 	}
 
 	take(): { chunks: Buffer[]; byteLength: number } {
-		return { chunks: this.#chunks, byteLength: this.#length };
+		return { chunks: [...this.#chunks, ...this.#pendingChunks], byteLength: this.#length };
 	}
 
 	private integer(
@@ -478,6 +483,12 @@ class ByteWriter {
 			throw new FulltextError(this.#sizeErrorCode, `packed value exceeds ${this.#maxBytes} bytes`);
 		}
 		this.#length = nextLength;
-		this.#chunks.push(value);
+		this.#pendingChunks.push(value);
+		this.#pendingLength += value.length;
+		if (this.#pendingChunks.length >= maxPendingWriterChunks) {
+			this.#chunks.push(Buffer.concat(this.#pendingChunks, this.#pendingLength));
+			this.#pendingChunks.length = 0;
+			this.#pendingLength = 0;
+		}
 	}
 }
