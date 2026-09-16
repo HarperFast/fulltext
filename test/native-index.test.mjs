@@ -110,9 +110,9 @@ test('inspects missing storage without creating it', (context) => {
 	assert.strictEqual(existsSync(indexPath), false);
 });
 
-test('rejects a mutation frame limit that cannot hold its header', async (context) => {
+test('rejects a mutation frame limit that cannot hold one mutation', async (context) => {
 	const config = options(temporaryIndex(context));
-	config.limits = { ...config.limits, maxBatchBytes: 14 };
+	config.limits = { ...config.limits, maxBatchBytes: 18 };
 	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INVALID_ARGUMENT');
 });
 
@@ -188,6 +188,21 @@ test('removes a generated-name symbolic link without following it', async (conte
 	});
 	assert.strictEqual(existsSync(retiredLink), false);
 	assert.strictEqual(readFileSync(marker, 'utf8'), 'retained');
+});
+
+test('uses the reset result when its canonical basename differs from the configured path', async (context) => {
+	const parent = temporaryIndex(context);
+	const retiredRoot = path.join(parent, '.fulltext-retired');
+	const retiredPath = path.join(retiredRoot, 'Products.1.2.3.4');
+	mkdirSync(retiredPath, { recursive: true });
+	assert.deepStrictEqual(
+		await reclaimRetiredNativeFullTextIndexes({
+			path: path.join(parent, 'products'),
+			retiredPath,
+		}),
+		{ removed: 1, failed: 0 },
+	);
+	assert.strictEqual(existsSync(retiredPath), false);
 });
 
 test('retires a closed index, preserves its checkpoint, and permits a clean rebuild', async (context) => {

@@ -401,6 +401,7 @@ export async function resetNativeFullTextIndex(
 
 export async function reclaimRetiredNativeFullTextIndexes(options: {
 	path: string;
+	retiredPath?: string;
 }): Promise<NativeFullTextReclaimResult> {
 	if (!options || typeof options.path !== 'string' || options.path.length === 0) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'path must not be empty');
@@ -424,7 +425,35 @@ export async function reclaimRetiredNativeFullTextIndexes(options: {
 		if (error instanceof FulltextError) throw error;
 		throw new FulltextError('E_STORAGE', `could not inspect retired full-text indexes for ${livePath}`, error);
 	}
-	const generatedName = new RegExp(`^${escapeRegExp(basename(livePath))}\\.\\d+\\.\\d+\\.\\d+\\.\\d+$`);
+	const sourceNames = new Set([basename(livePath)]);
+	try {
+		sourceNames.add(basename(await realpath(livePath)));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+			throw new FulltextError('E_STORAGE', `could not resolve the full-text index path ${livePath}`, error);
+		}
+	}
+	if (options.retiredPath !== undefined) {
+		if (typeof options.retiredPath !== 'string' || options.retiredPath.length === 0) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath must not be empty');
+		}
+		const retiredPath = resolve(options.retiredPath);
+		let retiredParent: string;
+		try {
+			retiredParent = await realpath(dirname(retiredPath));
+		} catch (error) {
+			throw new FulltextError('E_STORAGE', `could not resolve retired full-text path ${retiredPath}`, error);
+		}
+		if (retiredParent !== canonicalRoot) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath must be inside the index retirement directory');
+		}
+		const match = /^(.*)\.\d+\.\d+\.\d+\.\d+$/.exec(basename(retiredPath));
+		if (!match || match[1].length === 0) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath is not a generated full-text retirement path');
+		}
+		sourceNames.add(match[1]);
+	}
+	const generatedName = new RegExp(`^(?:${[...sourceNames].map(escapeRegExp).join('|')})\\.\\d+\\.\\d+\\.\\d+\\.\\d+$`);
 	let removed = 0;
 	let failed = 0;
 	for (const entry of entries) {

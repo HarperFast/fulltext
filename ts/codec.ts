@@ -4,6 +4,7 @@ const protocolVersion = 1;
 const maxStringBytes = 1 << 20;
 export const maxFields = 1_024;
 export const mutationBatchHeaderBytes = 14;
+export const minimumMutationBatchBytes = mutationBatchHeaderBytes + 5;
 const maxPendingWriterChunks = 1_024;
 const invalidSurrogate = /[\uD800-\uDFFF]/u;
 
@@ -159,10 +160,10 @@ export function encodeBatchPartitions(
 	if (!Array.isArray(batch.upserts) || !Array.isArray(batch.deletes)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch arrays are required');
 	}
-	if (!Number.isSafeInteger(maxBytes) || maxBytes <= mutationBatchHeaderBytes) {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < minimumMutationBatchBytes) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'maxBytes is too small for a mutation batch');
 	}
-	if (!Number.isSafeInteger(maxTotalBytes) || maxTotalBytes <= mutationBatchHeaderBytes) {
+	if (!Number.isSafeInteger(maxTotalBytes) || maxTotalBytes < minimumMutationBatchBytes) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'maxTotalBytes is too small for a mutation batch');
 	}
 	const maxFrameBytes = Math.min(maxBytes, maxTotalBytes);

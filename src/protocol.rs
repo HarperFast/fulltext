@@ -4,6 +4,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_STRING_BYTES: usize = 1 << 20;
 const MAX_FIELDS: usize = 1_024;
 const MUTATION_BATCH_HEADER_BYTES: usize = 14;
+const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldConfig {
@@ -290,9 +291,9 @@ fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
 			u32::MAX
 		)));
 	}
-	if limits.max_batch_bytes <= MUTATION_BATCH_HEADER_BYTES || limits.max_batch_bytes > limits.max_queued_bytes {
+	if limits.max_batch_bytes < MIN_MUTATION_BATCH_BYTES || limits.max_batch_bytes > limits.max_queued_bytes {
 		return Err(FulltextError::invalid(
-			"maxBatchBytes must exceed the mutation batch header and be no larger than maxQueuedBytes",
+			"maxBatchBytes must hold at least one mutation and be no larger than maxQueuedBytes",
 		));
 	}
 	Ok(config)
@@ -507,7 +508,7 @@ mod tests {
 			writer_memory_bytes: 15_000_000,
 			max_queued_commands: 1,
 			max_queued_bytes: 1024,
-			max_batch_bytes: MUTATION_BATCH_HEADER_BYTES,
+			max_batch_bytes: MIN_MUTATION_BATCH_BYTES - 1,
 		};
 		assert_eq!(
 			validate_config(EngineConfig {
@@ -519,7 +520,7 @@ mod tests {
 			"E_INVALID_ARGUMENT"
 		);
 		let mut accepted = limits;
-		accepted.max_batch_bytes = MUTATION_BATCH_HEADER_BYTES + 1;
+		accepted.max_batch_bytes = MIN_MUTATION_BATCH_BYTES;
 		assert!(validate_config(EngineConfig {
 			identity,
 			limits: accepted,

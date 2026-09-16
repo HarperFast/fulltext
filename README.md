@@ -172,10 +172,11 @@ different persisted logical index with `E_IDENTITY_MISMATCH`, and unrelated none
 with `E_INVALID_ARGUMENT`. A malformed identity sidecar fails closed with `E_INDEX_CORRUPT`. On
 success, reset renames the live directory into a unique path below the parent's `.fulltext-retired`
 directory. The wrapper does not delete it automatically. Call
-`reclaimRetiredNativeFullTextIndexes({ path })` at a lifecycle point chosen by the application. It
-removes only retired trees generated for that index path, ignores unrelated entries and other
-indices, and returns `{ removed, failed }`. Harper invokes it during derived-index initialization
-and after reset.
+`reclaimRetiredNativeFullTextIndexes({ path, retiredPath: result.retiredPath })` at a lifecycle point
+chosen by the application. Passing the opaque reset result preserves the canonical source basename
+when aliases or path casing differ. The reclaimer removes only retired trees generated for that
+index path, ignores unrelated entries and other indices, and returns `{ removed, failed }`. Harper
+invokes it during derived-index initialization and after reset.
 
 An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.

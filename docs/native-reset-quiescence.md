@@ -48,7 +48,7 @@ type NativeFullTextIndexResetResult = { state: 'missing' } | { state: 'reset'; r
 
 function resetNativeFullTextIndex(options: NativeFullTextIndexResetOptions): Promise<NativeFullTextIndexResetResult>;
 
-function reclaimRetiredNativeFullTextIndexes(options: { path: string }): Promise<{
+function reclaimRetiredNativeFullTextIndexes(options: { path: string; retiredPath?: string }): Promise<{
 	removed: number;
 	failed: number;
 }>;
@@ -77,8 +77,9 @@ The operation has the following behavior:
   candidate is skipped with a bounded retry rather than replaced.
 - A caller may immediately open a new empty index at the original path. Reset never deletes the
   retired tree. The wrapper's separate reclaimer removes only generated retired names belonging to
-  the requested live path and ignores unrelated entries. Applications decide when to invoke it;
-  Harper does so during derived-index initialization and after reset.
+  the requested live path and ignores unrelated entries. Passing reset's opaque `retiredPath` back
+  to the reclaimer preserves the producer's canonical basename. Applications decide when to invoke
+  it; Harper does so during derived-index initialization and after reset.
 - Open and reset require a writable sibling `.fulltext-locks` directory. The wrapper creates it when
   absent and leaves it in place; errors include its path so deployment-permission failures are
   actionable.
