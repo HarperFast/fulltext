@@ -4,7 +4,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_STRING_BYTES: usize = 1 << 20;
 const MAX_FIELDS: usize = 1_024;
 const MUTATION_BATCH_HEADER_BYTES: usize = 14;
-const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 5;
+const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 7;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldConfig {
@@ -293,7 +293,7 @@ fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
 	}
 	if limits.max_batch_bytes < MIN_MUTATION_BATCH_BYTES || limits.max_batch_bytes > limits.max_queued_bytes {
 		return Err(FulltextError::invalid(
-			"maxBatchBytes must hold at least one mutation and be no larger than maxQueuedBytes",
+			"maxBatchBytes must hold at least one upsert and be no larger than maxQueuedBytes",
 		));
 	}
 	Ok(config)

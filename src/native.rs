@@ -1237,7 +1237,7 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 	let writer_lock = directory.acquire_lock(&INDEX_WRITER_LOCK).map_err(reset_lock_error)?;
 	let retired_root = parent.join(RETIRED_ROOT);
 	ensure_retired_root(&retired_root)?;
-	let retired_path = next_retired_path(&retired_root, &canonical, operation)?;
+	let retired_path = next_retired_path(&retired_root, path, operation)?;
 	let public_path = public_path(&retired_path)?;
 	drop(writer_lock);
 	drop(directory);

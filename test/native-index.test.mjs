@@ -112,7 +112,7 @@ test('inspects missing storage without creating it', (context) => {
 
 test('rejects a mutation frame limit that cannot hold one mutation', async (context) => {
 	const config = options(temporaryIndex(context));
-	config.limits = { ...config.limits, maxBatchBytes: 18 };
+	config.limits = { ...config.limits, maxBatchBytes: 20 };
 	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INVALID_ARGUMENT');
 });
 
