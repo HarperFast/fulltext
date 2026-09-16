@@ -10,6 +10,7 @@ import {
 	encodeOpen,
 	encodeReset,
 	encodeSearch,
+	MutationBatchFrameCursor,
 } from './codec.js';
 import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
@@ -25,7 +26,7 @@ export interface RuntimeInfo {
 	tantivyVersion: string;
 	nativeAbiVersion: number;
 	lifecycleApiVersion: 1;
-	mutationBatchApiVersion: 2;
+	mutationBatchApiVersion: 3;
 	storageBackends: ReadonlyArray<'native'>;
 	limits: { maxCommitPayloadBytes: number };
 }
@@ -105,6 +106,20 @@ export interface EncodeFullTextMutationBatchesOptions {
 	allowPartial?: boolean;
 }
 
+export interface ApplyFullTextMutationBatchOptions {
+	/** The caller guarantees that IDs are distinct; behavior is undefined if that precondition is false. */
+	assumeDistinctIds?: boolean;
+	rejectedUpsert?: 'reject' | 'delete';
+}
+
+export interface AppliedFullTextMutationBatch {
+	/** Original logical mutations handled, including rejected upserts replaced by deletes. */
+	processed: number;
+	rejected: FullTextMutationBatchRejection[];
+	encodedBytes: number;
+	frames: number;
+}
+
 export interface SearchRequest {
 	text: string;
 	operator?: 'any' | 'all';
@@ -150,6 +165,7 @@ export class NativeFullTextIndex {
 	#closed = false;
 	#closedStatus?: FullTextStatus;
 	#closePromise?: Promise<CloseResult>;
+	#logicalMutationState: 'idle' | 'active' | 'incomplete' = 'idle';
 
 	constructor(options: {
 		handle: number;
@@ -168,10 +184,143 @@ export class NativeFullTextIndex {
 	}
 
 	async apply(packedBatch: Uint8Array): Promise<number> {
+		this.#assertLogicalMutationIdle();
+		return this.#applyPacked(packedBatch);
+	}
+
+	async #applyPacked(packedBatch: Uint8Array): Promise<number> {
 		const cursor = await invoke((callback) => loadAddon().__nativeApply(this.#handle, asBuffer(packedBatch), callback));
 		const count = safeNumber(cursor.u64(), 'mutation count');
 		cursor.finish();
 		return count;
+	}
+
+	async applyMutationBatch(
+		batch: FullTextMutationBatch,
+		options: ApplyFullTextMutationBatchOptions = {},
+	): Promise<AppliedFullTextMutationBatch> {
+		this.#assertLogicalMutationIdle();
+		if (!batch || typeof batch !== 'object' || Array.isArray(batch)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch must be an object');
+		}
+		if (!options || typeof options !== 'object' || Array.isArray(options)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch options must be an object');
+		}
+		if (options.assumeDistinctIds !== undefined && typeof options.assumeDistinctIds !== 'boolean') {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'assumeDistinctIds must be a boolean');
+		}
+		if (
+			options.rejectedUpsert !== undefined &&
+			options.rejectedUpsert !== 'reject' &&
+			options.rejectedUpsert !== 'delete'
+		) {
+			throw new FulltextError('E_INVALID_ARGUMENT', "rejectedUpsert must be 'reject' or 'delete'");
+		}
+		const logical = { upserts: batch.upserts ?? [], deletes: batch.deletes ?? [] };
+		const cursor = new MutationBatchFrameCursor(
+			logical,
+			this.#maxBatchBytes,
+			this.#fieldNames,
+			options.assumeDistinctIds !== true,
+		);
+		if (logical.upserts.length + logical.deletes.length === 0) {
+			return { processed: 0, rejected: [], encodedBytes: 0, frames: 0 };
+		}
+
+		this.#logicalMutationState = 'active';
+		let processed = 0;
+		let encodedBytes = 0;
+		let frames = 0;
+		let nativeAttempted = false;
+		const rejected: FullTextMutationBatchRejection[] = [];
+		try {
+			let done = false;
+			while (!done) {
+				const encoded = cursor.next();
+				const consumed = encoded.consumedUpserts + encoded.consumedDeletes;
+				if (consumed === 0) {
+					throw new FulltextError('E_NATIVE_FAILURE', 'mutation batch partitioner made no progress');
+				}
+				if (encoded.rejected.length > 0) {
+					if ((options.rejectedUpsert ?? 'reject') === 'reject') {
+						const rejection = encoded.rejected[0];
+						throw new FulltextError(
+							rejection.code,
+							`mutation batch ${rejection.operation} at index ${rejection.index} was rejected`,
+						);
+					}
+					for (const rejection of encoded.rejected) rejected.push(rejection);
+				}
+				if (encoded.batch) {
+					nativeAttempted = true;
+					const count = await this.#applyPacked(encoded.batch.bytes);
+					if (count !== encoded.batch.mutationCount) {
+						throw new FulltextError(
+							'E_NATIVE_FAILURE',
+							`native writer applied ${count} of ${encoded.batch.mutationCount} frame mutations`,
+						);
+					}
+					encodedBytes += encoded.batch.bytes.byteLength;
+					frames++;
+				}
+				if (encoded.rejected.length > 0) {
+					const replacementDeletes = encoded.rejected.map((rejection) => {
+						if (rejection.operation !== 'upsert') {
+							throw new FulltextError(rejection.code, 'a rejected delete cannot be replaced safely');
+						}
+						const id = logical.upserts[rejection.index]?.id;
+						if (typeof id !== 'string') {
+							throw new FulltextError(rejection.code, `rejected upsert at index ${rejection.index} has no usable ID`);
+						}
+						return id;
+					});
+					const replacement = await this.#applyReplacementDeletes(replacementDeletes, () => {
+						nativeAttempted = true;
+					});
+					encodedBytes += replacement.encodedBytes;
+					frames += replacement.frames;
+				}
+				processed += consumed;
+				done = encoded.done;
+			}
+			this.#logicalMutationState = 'idle';
+			return { processed, rejected, encodedBytes, frames };
+		} catch (error) {
+			this.#logicalMutationState = nativeAttempted ? 'incomplete' : 'idle';
+			throw normalizeNativeError(error);
+		}
+	}
+
+	async #applyReplacementDeletes(
+		deletes: string[],
+		onNativeAttempt: () => void,
+	): Promise<{ encodedBytes: number; frames: number }> {
+		let encodedBytes = 0;
+		let frames = 0;
+		const cursor = new MutationBatchFrameCursor({ upserts: [], deletes }, this.#maxBatchBytes, this.#fieldNames, false);
+		let done = false;
+		while (!done) {
+			const encoded = cursor.next();
+			if (encoded.rejected.length > 0 || encoded.consumedDeletes === 0 || !encoded.batch) {
+				throw new FulltextError(
+					encoded.rejected[0]?.code ?? 'E_NATIVE_FAILURE',
+					'rejected upsert IDs could not be encoded as replacement deletes',
+				);
+			}
+			const frame = encoded.batch;
+			onNativeAttempt();
+			const count = await this.#applyPacked(frame.bytes);
+			if (count !== frame.mutationCount) {
+				throw new FulltextError(
+					'E_NATIVE_FAILURE',
+					`native writer applied ${count} of ${frame.mutationCount} replacement deletes`,
+				);
+			}
+			encodedBytes += frame.bytes.byteLength;
+			frames++;
+			done = encoded.done;
+		}
+		return { encodedBytes, frames };
 	}
 
 	encodeMutationBatches(
@@ -203,6 +352,7 @@ export class NativeFullTextIndex {
 	}
 
 	async commit(): Promise<bigint> {
+		this.#assertLogicalMutationIdle();
 		const cursor = await invoke((callback) => loadAddon().__nativeCommit(this.#handle, callback));
 		const opstamp = cursor.u64();
 		cursor.finish();
@@ -210,6 +360,7 @@ export class NativeFullTextIndex {
 	}
 
 	async publish(payload: string): Promise<bigint> {
+		this.#assertLogicalMutationIdle();
 		if (typeof payload !== 'string') {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'commit payload must be a string');
 		}
@@ -310,6 +461,7 @@ export class NativeFullTextIndex {
 		if (this.#closed) {
 			return {};
 		}
+		if (options.mode !== 'rollback') this.#assertLogicalMutationIdle();
 		const openStatus = this.status();
 		this.#closePromise = (async () => {
 			try {
@@ -318,6 +470,7 @@ export class NativeFullTextIndex {
 				);
 				cursor.finish();
 				this.#closed = true;
+				this.#logicalMutationState = 'idle';
 				this.#closedStatus = { ...openStatus, state: 'closed' };
 				return {};
 			} catch (error) {
@@ -339,6 +492,17 @@ export class NativeFullTextIndex {
 			if (!this.#closed) {
 				this.#closePromise = undefined;
 			}
+		}
+	}
+
+	#assertLogicalMutationIdle(): void {
+		if (this.#logicalMutationState !== 'idle') {
+			throw new FulltextError(
+				'E_BATCH_INCOMPLETE',
+				this.#logicalMutationState === 'active'
+					? 'a logical mutation batch is active'
+					: 'a logical mutation batch failed and the index must be rollback-closed',
+			);
 		}
 	}
 }
@@ -535,7 +699,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
 			lifecycleApiVersion: 1,
-			mutationBatchApiVersion: 2,
+			mutationBatchApiVersion: 3,
 			storageBackends: ['native'],
 			limits: { maxCommitPayloadBytes: info.limits.maxCommitPayloadBytes },
 		};

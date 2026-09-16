@@ -662,6 +662,168 @@ test('makes every upsert searchable after applying a multi-frame logical batch',
 	await index.close();
 });
 
+test('applies a logical mutation batch across native frames without rereading records', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 512 };
+	const index = await openNativeFullTextIndex(config);
+	const reads = Array.from({ length: 20 }, () => 0);
+	const upserts = reads.map((_, id) => {
+		const fields = new Proxy(
+			{ title: `stateful catalog item ${id} ${'x'.repeat(100)}` },
+			{
+				get(target, property, receiver) {
+					if (property === 'title') reads[id]++;
+					return Reflect.get(target, property, receiver);
+				},
+			},
+		);
+		return { id: `stateful-${id}`, fields };
+	});
+	const result = await index.applyMutationBatch({ upserts });
+	assert.strictEqual(result.processed, upserts.length);
+	assert.deepStrictEqual(result.rejected, []);
+	assert(result.frames > 1);
+	assert(result.encodedBytes > 0);
+	assert.deepStrictEqual(
+		reads,
+		Array.from({ length: upserts.length }, () => 1),
+	);
+	await index.publish('logical-multi-frame');
+	assert.strictEqual((await index.search({ text: 'stateful catalog', exactTotal: true, limit: 20 })).total, 20);
+	await index.close();
+});
+
+test('applies a dense delete-only logical batch through bounded frames', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 1024 };
+	const index = await openNativeFullTextIndex(config);
+	const deletes = Array.from({ length: 5_000 }, (_, id) => `absent-${id}`);
+	const result = await index.applyMutationBatch({ deletes });
+	assert.strictEqual(result.processed, deletes.length);
+	assert.deepStrictEqual(result.rejected, []);
+	assert(result.frames > 1);
+	await index.close({ mode: 'rollback' });
+});
+
+test('deletes stale content when a replacement record is unindexable', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 1024 };
+	const index = await openNativeFullTextIndex(config);
+	await index.applyMutationBatch({ upserts: [{ id: 'product', fields: { title: 'stale searchable catalog' } }] });
+	await index.publish('before-rejection');
+	const result = await index.applyMutationBatch(
+		{ upserts: [{ id: 'product', fields: { title: 'x'.repeat(2048) } }] },
+		{ rejectedUpsert: 'delete' },
+	);
+	assert.deepStrictEqual(result.rejected, [{ operation: 'upsert', index: 0, code: 'E_BATCH_TOO_LARGE' }]);
+	assert.strictEqual(result.processed, 1);
+	assert.strictEqual(result.frames, 1);
+	await index.publish('after-rejection');
+	assert.strictEqual((await index.search({ text: 'stale searchable catalog', exactTotal: true })).total, 0);
+	await index.close();
+});
+
+test('latches a partially applied logical batch until rollback close', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	config.limits = { ...config.limits, maxBatchBytes: 256 };
+	let index = await openNativeFullTextIndex(config);
+	await index.applyMutationBatch({ upserts: [{ id: 'stable', fields: { title: 'stable published catalog' } }] });
+	await index.publish('stable-checkpoint');
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [
+				{ id: 'pending-one', fields: { title: `pending one ${'x'.repeat(170)}` } },
+				{ id: 'pending-two', fields: { title: `pending two ${'x'.repeat(170)}` } },
+				{ id: 'oversized', fields: { title: 'x'.repeat(512) } },
+			],
+		}),
+		(error) => error.code === 'E_BATCH_TOO_LARGE',
+	);
+	assert(index.status().uncommittedMutations > 0n);
+	await assert.rejects(index.publish('must-not-publish'), (error) => error.code === 'E_BATCH_INCOMPLETE');
+	await assert.rejects(index.commit(), (error) => error.code === 'E_BATCH_INCOMPLETE');
+	await assert.rejects(
+		index.apply(encodeMutationBatch({ deletes: ['stable'] })),
+		(error) => error.code === 'E_BATCH_INCOMPLETE',
+	);
+	await assert.rejects(
+		index.applyMutationBatch({ deletes: ['stable'] }),
+		(error) => error.code === 'E_BATCH_INCOMPLETE',
+	);
+	await assert.rejects(index.close(), (error) => error.code === 'E_BATCH_INCOMPLETE');
+	await index.close({ mode: 'rollback' });
+
+	index = await openNativeFullTextIndex(config);
+	assert.strictEqual(index.committedPayload, 'stable-checkpoint');
+	assert.strictEqual((await index.search({ text: 'stable published catalog', exactTotal: true })).total, 1);
+	assert.strictEqual((await index.search({ text: 'pending', exactTotal: true })).total, 0);
+	await index.close();
+});
+
+test('rejects low-level writer interleaving during logical apply', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 4 * 1024 * 1024, maxQueuedBytes: 4 * 1024 * 1024 };
+	const index = await openNativeFullTextIndex(config);
+	await index.applyMutationBatch({ upserts: [{ id: 'visible', fields: { title: 'visible stable product' } }] });
+	await index.publish('visible-checkpoint');
+	const logical = {
+		upserts: Array.from({ length: 15_000 }, (_, id) => ({
+			id: `logical-${id}`,
+			fields: { title: `logical catalog product ${id}` },
+		})),
+	};
+	const applying = index.applyMutationBatch(logical);
+	logical.upserts.push({ id: 'late-mutation', fields: { title: 'must not enter the active batch' } });
+	await assert.rejects(
+		index.apply(encodeMutationBatch({ deletes: ['other'] })),
+		(error) => error.code === 'E_BATCH_INCOMPLETE',
+	);
+	assert.strictEqual((await index.search({ text: 'visible stable product', exactTotal: true })).hits[0].id, 'visible');
+	assert.strictEqual((await applying).processed, 15_000);
+	await index.close({ mode: 'rollback' });
+});
+
+test('rejects duplicate logical IDs before latching the writer', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [{ id: 'same', fields: { title: 'duplicate' } }],
+			deletes: ['same'],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await index.applyMutationBatch({ upserts: [{ id: 'valid', fields: { title: 'writer remains usable' } }] });
+	await index.publish('after-duplicate');
+	await index.close();
+});
+
+test('keeps the writer usable when logical validation fails before native admission', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	await assert.rejects(
+		index.applyMutationBatch({ upserts: [{ id: 'invalid', fields: { title: 42 } }] }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.applyMutationBatch(
+			{ upserts: [{ id: '\ud800', fields: { title: 'invalid id' } }] },
+			{ rejectedUpsert: 'delete' },
+		),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.applyMutationBatch({ upserts: [null] }, { rejectedUpsert: 'delete' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.applyMutationBatch({ upserts: [{ id: 'wrong-schema', fields: { missing: 'value' } }] }),
+		(error) => error.code === 'E_SCHEMA_MISMATCH',
+	);
+	await index.applyMutationBatch({ upserts: [{ id: 'valid-after-errors', fields: { title: 'still usable' } }] });
+	await index.publish('after-validation-errors');
+	await index.close();
+});
+
 test('reports only explicit record validation failures during partitioning', async (context) => {
 	const config = options(temporaryIndex(context));
 	const index = await openNativeFullTextIndex(config);

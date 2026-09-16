@@ -44,11 +44,13 @@ const index = await openNativeFullTextIndex({
 	},
 });
 
-const encoded = index.encodeMutationBatches({
-	upserts: [{ id: 'shoe-1', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
-});
-if (encoded.rejected.length) throw new Error('A product could not be indexed');
-for (const batch of encoded.batches) await index.apply(batch.bytes);
+const applied = await index.applyMutationBatch(
+	{
+		upserts: [{ id: 'shoe-1', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
+	},
+	{ rejectedUpsert: 'delete' },
+);
+if (applied.rejected.length) console.warn(`${applied.rejected.length} products were removed from the index`);
 await index.commit();
 await index.reload();
 console.log(await index.search({ text: 'waterproof running shoes', limit: 10 }));
@@ -70,9 +72,23 @@ Mutation batches are versioned packed values, so indexing crosses Node-API once 
 than once per document. One dedicated actor owns Tantivy's single writer for each index. A bounded
 search pool shares immutable searchers and can execute reads while indexing or commit work is in
 progress. Queue limits reject overload with `E_QUEUE_FULL` rather than blocking the JavaScript
-thread. `encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
+thread. `applyMutationBatch()` is the normal logical mutation API. It partitions one logical batch
+into bounded native frames, applies them sequentially, validates native counts, and returns
+`{ processed, rejected, encodedBytes, frames }`. IDs must be distinct across the logical batch.
+By default, any rejected record fails the operation. Pass `{ rejectedUpsert: 'delete' }` when an
+unindexable replacement must delete previously searchable content for the same ID. A failure after
+native application is attempted leaves the handle incomplete: writer operations reject
+`E_BATCH_INCOMPLETE` until the handle is closed with `{ mode: 'rollback' }`. This prevents a later
+publish from exposing part of a logical batch.
+
+Trusted callers that already enforce distinct IDs may pass `assumeDistinctIds: true` to skip the
+whole-batch duplicate prepass. Supplying duplicates with that option violates the API contract.
+The wrapper snapshots the two mutation arrays, but callers must not mutate record objects, field
+maps, or nested field-value arrays until the returned promise settles.
+
+`encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
 `E_BATCH_TOO_LARGE`; `maxBytes` defaults to 8 MiB and is intended for low-level callers producing a
-single native frame. For logical batches, use `index.encodeMutationBatches()`. It uses the limit from
+single native frame. Low-level callers may use `index.encodeMutationBatches()`. It uses the limit from
 the index's open configuration, validates IDs and fields against that handle, and greedily emits
 admissible frames. IDs must be distinct across the logical batch. Aggregate size creates more
 frames; a single invalid or unencodable mutation is returned in `rejected` with its operation and
@@ -83,17 +99,20 @@ call defaults to 64 MiB and can be lowered with `encodeMutationBatches(batch, { 
 The default behavior throws `E_BATCH_TOO_LARGE` when the complete logical batch exceeds that
 ceiling. Callers that pass `allowPartial: true` instead receive a leading prefix;
 `consumedUpserts` and `consumedDeletes` identify the mutations represented by the returned frames
-and rejections so they can continue with each array's remaining suffix.
-Producers should keep logical batches comfortably below that limit. Applying multiple frames stages
-them in one Tantivy writer. Commit or publish only
-after every frame succeeds; on a later failure, close with rollback rather than publishing the
-partial logical batch. Concurrent callers should leave queue-byte headroom for commit or publish.
+and rejections so they can continue with each array's remaining suffix. The low-level API validates
+distinct IDs across the full input before applying the output ceiling, so repeated suffix calls
+repeat that validation scan. Prefer `applyMutationBatch()` for large logical batches.
+Producers using the low-level API should keep logical batches comfortably below that limit.
+Applying multiple frames stages them in one Tantivy writer. Commit or publish only after every frame
+succeeds; on a later failure, close with rollback rather than publishing the partial logical batch.
+Concurrent low-level callers should leave queue-byte headroom for commit or publish.
 A successful `apply()` resolves to the number of accepted mutation commands, including deletes for
 IDs that are not currently indexed.
 
-One caller must own a handle's complete apply-and-publish sequence at a time. The low-level frame
-API does not infer logical batch boundaries, so interleaving another publisher between frames can
-make a partial logical batch durable. Searches may still run concurrently with that writer sequence.
+One caller must own a handle's complete apply-and-publish sequence at a time. The high-level method
+blocks low-level writer interleaving while its logical batch is active. The low-level frame API does
+not infer logical batch boundaries, so callers using it remain responsible for excluding another
+publisher between frames. Searches may still run concurrently with either writer sequence.
 
 Search uses BM25. `total` is a bounded result by default so Tantivy can retain block-max WAND
 pruning. Set `exactTotal: true` only when an exact match count is worth a second full-match
@@ -111,11 +130,9 @@ Use `publish(payload)` when a consumer needs to resume from a durable checkpoint
 
 ```js
 console.log(index.committedPayload); // undefined on a new index; recovered from files on reopen
-const encoded = index.encodeMutationBatches({
+await index.applyMutationBatch({
 	upserts: [{ id: 'shoe-1', fields: { title: 'Trail shoes' } }],
 });
-if (encoded.rejected.length) throw new Error('A product could not be indexed');
-for (const batch of encoded.batches) await index.apply(batch.bytes);
 await index.publish('source-checkpoint-42');
 // Both the mutations and the checkpoint are committed; searches now see that commit.
 ```
@@ -208,14 +225,20 @@ npm test
 npm run lint
 npm run format:check
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000
+npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000 --mutation-driver low-level
 npm run benchmark:inspect -- --indexes 1,10,100,1000 --commits 64 --warm-rounds 10
 ```
 
 The benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
 JSON record. It reports packing, apply, durable end-to-end ingestion, actor queue and execution
-time, commit distributions, reload cost, warm and cold BM25 p50/p95/p99, exact-total overhead,
-index bytes, and periodically sampled process RSS. `--commit-every` sets the target number of
-mutations between durability points; it materially affects throughput and peak memory because
+time, logical-batch p50/p95/p99, frame count, commit distributions, reload cost, warm and cold BM25
+p50/p95/p99, exact-total overhead, index bytes, and periodically sampled process RSS. The default
+`--mutation-driver logical` exercises `applyMutationBatch()`; rerun the identical command with
+`--mutation-driver low-level` for the prior encode-plus-apply path. Compare
+`mutationDriverMilliseconds`, durable end-to-end throughput, logical-batch percentiles, and peak
+RSS. The component `packingMilliseconds` and `applyMilliseconds` fields are not comparable because
+the logical API performs both inside one call. `--commit-every` sets the target number of mutations
+between durability points; it materially affects throughput and peak memory because
 replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
 comparisons require controlled hardware.
 

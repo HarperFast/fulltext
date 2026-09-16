@@ -27,7 +27,7 @@ test('loads the artifact for the executing platform', async () => {
 		tantivyVersion,
 		nativeAbiVersion: 5,
 		lifecycleApiVersion: 1,
-		mutationBatchApiVersion: 2,
+		mutationBatchApiVersion: 3,
 		storageBackends: ['native'],
 		limits: { maxCommitPayloadBytes: 64 * 1024 },
 	});
