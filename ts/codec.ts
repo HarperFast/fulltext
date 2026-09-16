@@ -168,10 +168,38 @@ export function encodeBatchPartitions(
 		chunks: Buffer[];
 		byteLength: number;
 	};
-	const records: EncodedRecord[] = [];
 	const rejected: PackedMutationBatchRejection[] = [];
 	const ids = new Set<string>();
-	let encodedRecordBytes = 0;
+	let totalBytes = 0;
+	const batches: PackedMutationBatchPartition[] = [];
+	let chunks: Buffer[] = [];
+	let byteLength = mutationBatchHeaderBytes;
+	let upsertCount = 0;
+	let deleteCount = 0;
+	const finish = () => {
+		if (upsertCount + deleteCount === 0) return;
+		if (totalBytes + byteLength > maxTotalBytes) {
+			throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
+		}
+		const header = encodeBatchHeader(upsertCount, deleteCount);
+		const bytes = Buffer.concat([header, ...chunks], byteLength);
+		batches.push({ bytes, mutationCount: upsertCount + deleteCount });
+		totalBytes += byteLength;
+		chunks = [];
+		byteLength = mutationBatchHeaderBytes;
+		upsertCount = 0;
+		deleteCount = 0;
+	};
+	const append = (record: EncodedRecord) => {
+		if (byteLength + record.byteLength > maxBytes) finish();
+		if (totalBytes + byteLength + record.byteLength > maxTotalBytes) {
+			throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
+		}
+		for (const chunk of record.chunks) chunks.push(chunk);
+		byteLength += record.byteLength;
+		if (record.operation === 'upsert') upsertCount++;
+		else deleteCount++;
+	};
 
 	const validateId = (id: unknown, operation: 'upsert' | 'delete', index: number): Buffer | undefined => {
 		if (typeof id !== 'string' || id.length === 0 || /[\uD800-\uDFFF]/u.test(id)) {
@@ -220,10 +248,7 @@ export function encodeBatchPartitions(
 				rejected.push({ operation: 'upsert', index, code: 'E_BATCH_TOO_LARGE' });
 				continue;
 			}
-			encodedRecordBytes += encoded.byteLength;
-			if (encodedRecordBytes > maxTotalBytes)
-				throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
-			records.push({ operation: 'upsert', index, ...encoded });
+			append({ operation: 'upsert', index, ...encoded });
 		} catch (error) {
 			if (!(error instanceof FulltextError) || error.code !== 'E_INVALID_ARGUMENT') throw error;
 			rejected.push({ operation: 'upsert', index, code: 'E_INVALID_ARGUMENT' });
@@ -240,39 +265,7 @@ export function encodeBatchPartitions(
 			rejected.push({ operation: 'delete', index, code: 'E_BATCH_TOO_LARGE' });
 			continue;
 		}
-		encodedRecordBytes += encoded.byteLength;
-		if (encodedRecordBytes > maxTotalBytes)
-			throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
-		records.push({ operation: 'delete', index, ...encoded });
-	}
-
-	let totalBytes = 0;
-	const batches: PackedMutationBatchPartition[] = [];
-	let chunks: Buffer[] = [];
-	let byteLength = mutationBatchHeaderBytes;
-	let upsertCount = 0;
-	let deleteCount = 0;
-	const finish = () => {
-		if (upsertCount + deleteCount === 0) return;
-		if (totalBytes + byteLength > maxTotalBytes) {
-			throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
-		}
-		const header = encodeBatchHeader(upsertCount, deleteCount);
-		const bytes = Buffer.concat([header, ...chunks], byteLength);
-		batches.push({ bytes, mutationCount: upsertCount + deleteCount });
-		totalBytes += byteLength;
-		chunks = [];
-		byteLength = mutationBatchHeaderBytes;
-		upsertCount = 0;
-		deleteCount = 0;
-	};
-
-	for (const record of records) {
-		if (byteLength + record.byteLength > maxBytes) finish();
-		for (const chunk of record.chunks) chunks.push(chunk);
-		byteLength += record.byteLength;
-		if (record.operation === 'upsert') upsertCount++;
-		else deleteCount++;
+		append({ operation: 'delete', index, ...encoded });
 	}
 	finish();
 	return { batches, rejected };

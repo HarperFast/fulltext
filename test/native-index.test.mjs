@@ -531,6 +531,40 @@ test('partitions a Harper maximum-key delete workload into admissible native fra
 	await index.close();
 });
 
+test('applies one frame containing both upserts and deletes', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	const encoded = index.encodeMutationBatches({
+		upserts: [{ id: 'shoe-1', fields: { title: 'mixed frame trail shoe' } }],
+		deletes: ['absent'],
+	});
+	assert.strictEqual(encoded.rejected.length, 0);
+	assert.strictEqual(encoded.batches.length, 1);
+	assert.strictEqual(encoded.batches[0].mutationCount, 2);
+	assert.strictEqual(await index.apply(encoded.batches[0].bytes), 2);
+	await index.publish('mixed-frame');
+	assert.strictEqual((await index.search({ text: 'mixed frame', exactTotal: true })).hits[0].id, 'shoe-1');
+	await index.close();
+});
+
+test('makes every upsert searchable after applying a multi-frame logical batch', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 512 };
+	const index = await openNativeFullTextIndex(config);
+	const upserts = Array.from({ length: 20 }, (_, id) => ({
+		id: `product-${id}`,
+		fields: { title: `partitioned catalog item ${id}`, description: 'shared searchable phrase' },
+	}));
+	const encoded = index.encodeMutationBatches({ upserts });
+	assert.strictEqual(encoded.rejected.length, 0);
+	assert(encoded.batches.length > 1);
+	for (const batch of encoded.batches) assert.strictEqual(await index.apply(batch.bytes), batch.mutationCount);
+	await index.publish('multi-frame-upserts');
+	const result = await index.search({ text: 'shared searchable phrase', exactTotal: true, limit: upserts.length });
+	assert.strictEqual(result.total, upserts.length);
+	assert.strictEqual(result.hits.length, upserts.length);
+	await index.close();
+});
+
 test('reports only explicit record validation failures during partitioning', async (context) => {
 	const config = options(temporaryIndex(context));
 	const index = await openNativeFullTextIndex(config);

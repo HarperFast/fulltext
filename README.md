@@ -104,6 +104,7 @@ console.log(index.committedPayload); // undefined on a new index; recovered from
 const encoded = index.encodeMutationBatches({
 	upserts: [{ id: 'shoe-1', fields: { title: 'Trail shoes' } }],
 });
+if (encoded.rejected.length) throw new Error('A product could not be indexed');
 for (const batch of encoded.batches) await index.apply(batch.bytes);
 await index.publish('source-checkpoint-42');
 // Both the mutations and the checkpoint are committed; searches now see that commit.
