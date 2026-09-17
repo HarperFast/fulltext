@@ -670,6 +670,27 @@ test('partitions a Harper maximum-key delete workload into admissible native fra
 	await index.close();
 });
 
+test('preflights the exact replacement-delete frame boundary', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 256 };
+	const index = await openNativeFullTextIndex(config);
+	const result = await index.applyMutationBatch(
+		{ upserts: [{ id: 'a'.repeat(238), fields: { title: 'x'.repeat(512) } }] },
+		{ rejectedUpsert: 'delete' },
+	);
+	assert.deepStrictEqual(result.rejected, [{ operation: 'upsert', index: 0, code: 'E_BATCH_TOO_LARGE' }]);
+	await index.publish('replacement-delete-boundary');
+	await assert.rejects(
+		index.applyMutationBatch(
+			{ upserts: [{ id: 'a'.repeat(239), fields: { title: 'x'.repeat(512) } }] },
+			{ rejectedUpsert: 'delete' },
+		),
+		(error) => error.code === 'E_BATCH_TOO_LARGE',
+	);
+	assert.strictEqual(index.status().uncommittedMutations, 0n);
+	await index.close();
+});
+
 test('applies one frame containing both upserts and deletes', async (context) => {
 	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
 	const encoded = index.encodeMutationBatches({

@@ -81,13 +81,16 @@ native application is attempted leaves the handle incomplete: writer operations 
 `E_BATCH_INCOMPLETE` until the handle is closed with `{ mode: 'rollback' }`. A writer operation that
 only races an in-flight logical batch rejects with `E_BATCH_ACTIVE`; wait for that batch to settle
 and retry instead of rolling it back. This prevents a later publish from exposing part of a logical
-batch.
+batch. A closing or closed handle rejects every logical batch with `E_CLOSED`, including an empty
+batch, without taking the latch.
 
 Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
 as record-local rejection could remove many documents under the wrong schema. The option applies
 only to record-local `E_INVALID_ARGUMENT` and `E_BATCH_TOO_LARGE` rejections with usable IDs.
 Delete mode always preflights every ID as a bounded delete frame before native admission;
-`assumeDistinctIds` skips duplicate detection, not that feasibility scan.
+`assumeDistinctIds` skips duplicate detection, not that feasibility scan. An unusable or oversized
+ID therefore fails with nothing staged. Schema drift is detected during framing and can leave the
+handle incomplete when earlier frames were already admitted.
 
 Trusted callers that already enforce distinct IDs may pass `assumeDistinctIds: true` to skip the
 whole-batch duplicate prepass. Supplying duplicates with that option violates the API contract.

@@ -80,13 +80,10 @@ export function validateMutationBatch(
 	}
 	if (!validateDistinctIds && replacementDeleteMaxBytes === undefined) return;
 	const ids = validateDistinctIds ? new Set<string>() : undefined;
+	const replacementDeleteIdMaxBytes =
+		replacementDeleteMaxBytes === undefined ? undefined : deleteFrameIdCapacity(replacementDeleteMaxBytes);
 	const check = (id: unknown, operation: 'upsert' | 'delete', index: number) => {
-		const rejection = mutationIdRejection(
-			id,
-			replacementDeleteMaxBytes === undefined
-				? maxStringBytes
-				: replacementDeleteMaxBytes - mutationBatchHeaderBytes - 4,
-		);
+		const rejection = mutationIdRejection(id, replacementDeleteIdMaxBytes ?? maxStringBytes);
 		if (replacementDeleteMaxBytes !== undefined) {
 			if (rejection === 'E_INVALID_ARGUMENT') {
 				throw new FulltextError(
@@ -232,7 +229,7 @@ export class MutationBatchFrameCursor {
 			return;
 		}
 		const encoded = encodeDeleteRecord(id, index);
-		if (mutationBatchHeaderBytes + encoded.byteLength > this.#maxBytes) {
+		if (id.byteLength > deleteFrameIdCapacity(this.#maxBytes)) {
 			rejected.push({ operation: 'delete', index, code: 'E_BATCH_TOO_LARGE' });
 			this.#deleteIndex++;
 			return;
@@ -298,6 +295,10 @@ function encodeDeleteRecord(id: Buffer, index: number): EncodedMutationRecord {
 	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
 	writer.encodedString(id);
 	return { operation: 'delete', index, ...writer.take() };
+}
+
+function deleteFrameIdCapacity(maxBytes: number): number {
+	return maxBytes - mutationBatchHeaderBytes - 4;
 }
 
 export interface PackedSearchRequest {
