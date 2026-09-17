@@ -126,10 +126,14 @@ test('post-close logical batches do not retain the active latch', async (context
 	context.after(() => rmSync(parent, { recursive: true, force: true }));
 	const { index } = await testIndex(indexPath, 'post-close-batch');
 
-	await index.close();
-	await assert.rejects(index.applyMutationBatch({ deletes: ['closed'] }), (error) => error.code === 'E_CLOSED');
+	const closing = index.close();
+	await assert.rejects(index.applyMutationBatch({ deletes: ['closing'] }), (error) => error.code === 'E_CLOSED');
+	await closing;
+	await assert.rejects(index.applyMutationBatch({}), (error) => error.code === 'E_CLOSED');
+	const rejectedBatch = index.applyMutationBatch({ deletes: ['closed'] });
 	await assert.rejects(index.commit(), (error) => error.code === 'E_CLOSED');
-	await assert.rejects(index.applyMutationBatch({ deletes: ['closed'] }), (error) => error.code === 'E_CLOSED');
+	await assert.rejects(rejectedBatch, (error) => error.code === 'E_CLOSED');
+	await assert.rejects(index.applyMutationBatch({ deletes: ['closed-again'] }), (error) => error.code === 'E_CLOSED');
 });
 
 test('an unproven close releases environment tracking and quarantines the index', async (context) => {

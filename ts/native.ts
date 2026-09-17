@@ -204,6 +204,7 @@ export class NativeFullTextIndex {
 		batch: FullTextMutationBatch,
 		options: ApplyFullTextMutationBatchOptions = {},
 	): Promise<AppliedFullTextMutationBatch> {
+		this.#assertOpen();
 		this.#assertLogicalMutationIdle();
 		this.#logicalMutationState = 'active';
 		let nativeAttempted = false;
@@ -225,13 +226,11 @@ export class NativeFullTextIndex {
 			}
 			const logical = snapshotMutationBatch(batch);
 			const rejectedUpsert = rejectedUpsertOption ?? 'reject';
-			const cursor = new MutationBatchFrameCursor(
-				logical,
-				this.#maxBatchBytes,
-				this.#fieldNames,
-				assumeDistinctIds !== true,
-				rejectedUpsert === 'reject',
-			);
+			const cursor = new MutationBatchFrameCursor(logical, this.#maxBatchBytes, this.#fieldNames, {
+				validateDistinctIds: assumeDistinctIds !== true,
+				stopAfterFirstRejection: rejectedUpsert === 'reject',
+				requireReplacementDeletes: rejectedUpsert === 'delete',
+			});
 			if (logical.upserts.length + logical.deletes.length === 0) {
 				this.#logicalMutationState = 'idle';
 				return { processed: 0, rejected: [], encodedBytes: 0, frames: 0 };
@@ -305,7 +304,9 @@ export class NativeFullTextIndex {
 	): Promise<{ encodedBytes: number; frames: number }> {
 		let encodedBytes = 0;
 		let frames = 0;
-		const cursor = new MutationBatchFrameCursor({ upserts: [], deletes }, this.#maxBatchBytes, this.#fieldNames, false);
+		const cursor = new MutationBatchFrameCursor({ upserts: [], deletes }, this.#maxBatchBytes, this.#fieldNames, {
+			validateDistinctIds: false,
+		});
 		let done = false;
 		while (!done) {
 			const encoded = cursor.next();
@@ -516,6 +517,12 @@ export class NativeFullTextIndex {
 					? 'a logical mutation batch is active'
 					: 'a logical mutation batch failed and the index must be rollback-closed',
 			);
+		}
+	}
+
+	#assertOpen(): void {
+		if (this.#closed || this.#closePromise) {
+			throw new FulltextError('E_CLOSED', 'index is closing or closed');
 		}
 	}
 }

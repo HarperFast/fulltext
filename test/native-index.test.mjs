@@ -1039,8 +1039,13 @@ test('keeps the writer usable when logical validation fails before native admiss
 	);
 	await assert.rejects(
 		index.applyMutationBatch(
-			{ upserts: [{ id: '\ud800', fields: { title: 'invalid id' } }] },
-			{ rejectedUpsert: 'delete' },
+			{
+				upserts: [
+					{ id: 'must-not-stage', fields: { title: 'mustnotstageunique' } },
+					{ id: '\ud800', fields: { title: 'invalid id' } },
+				],
+			},
+			{ rejectedUpsert: 'delete', assumeDistinctIds: true },
 		),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
@@ -1054,6 +1059,7 @@ test('keeps the writer usable when logical validation fails before native admiss
 	);
 	await index.applyMutationBatch({ upserts: [{ id: 'valid-after-errors', fields: { title: 'still usable' } }] });
 	await index.publish('after-validation-errors');
+	assert.strictEqual((await index.search({ text: 'mustnotstageunique', exactTotal: true })).total, 0);
 	await index.close();
 });
 
