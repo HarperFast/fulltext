@@ -188,8 +188,11 @@ export class NativeFullTextIndex {
 		return this.#applyPacked(packedBatch);
 	}
 
-	async #applyPacked(packedBatch: Uint8Array): Promise<number> {
-		const cursor = await invoke((callback) => loadAddon().__nativeApply(this.#handle, asBuffer(packedBatch), callback));
+	async #applyPacked(packedBatch: Uint8Array, onAdmitted?: () => void): Promise<number> {
+		const cursor = await invoke((callback) => {
+			loadAddon().__nativeApply(this.#handle, asBuffer(packedBatch), callback);
+			onAdmitted?.();
+		});
 		const count = safeNumber(cursor.u64(), 'mutation count');
 		cursor.finish();
 		return count;
@@ -250,8 +253,9 @@ export class NativeFullTextIndex {
 					for (const rejection of encoded.rejected) rejected.push(rejection);
 				}
 				if (encoded.batch) {
-					nativeAttempted = true;
-					const count = await this.#applyPacked(encoded.batch.bytes);
+					const count = await this.#applyPacked(encoded.batch.bytes, () => {
+						nativeAttempted = true;
+					});
 					if (count !== encoded.batch.mutationCount) {
 						throw new FulltextError(
 							'E_NATIVE_FAILURE',
@@ -306,8 +310,7 @@ export class NativeFullTextIndex {
 				);
 			}
 			const frame = encoded.batch;
-			onNativeAttempt();
-			const count = await this.#applyPacked(frame.bytes);
+			const count = await this.#applyPacked(frame.bytes, onNativeAttempt);
 			if (count !== frame.mutationCount) {
 				throw new FulltextError(
 					'E_NATIVE_FAILURE',
@@ -616,7 +619,9 @@ export async function reclaimRetiredNativeFullTextIndexes(options: {
 		if (!match || match[1].length === 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath is not a generated full-text retirement path');
 		}
-		sourceNames.add(match[1]);
+		if (!sourceNames.has(match[1])) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath does not belong to the requested full-text index');
+		}
 	}
 	const generatedName = new RegExp(`^(?:${[...sourceNames].map(escapeRegExp).join('|')})\\.\\d+\\.\\d+\\.\\d+\\.\\d+$`);
 	let removed = 0;
@@ -634,8 +639,13 @@ export async function reclaimRetiredNativeFullTextIndexes(options: {
 }
 
 export function validateNativeFullTextIndexOptions(options: NativeFullTextIndexOptions): void {
-	const cursor = decodeResponse(loadAddon().__nativeValidateOpen(packedOpenOptions(options)));
-	cursor.finish();
+	try {
+		const cursor = decodeResponse(loadAddon().__nativeValidateOpen(packedOpenOptions(options)));
+		cursor.finish();
+	} catch (error) {
+		if (error instanceof TypeError) throw new FulltextError('E_INVALID_ARGUMENT', error.message, error);
+		throw normalizeNativeError(error);
+	}
 }
 
 export async function openNativeFullTextIndex(options: NativeFullTextIndexOptions): Promise<NativeFullTextIndex> {

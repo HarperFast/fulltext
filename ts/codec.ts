@@ -136,7 +136,10 @@ export class MutationBatchFrameCursor {
 
 		while (this.#upsertIndex < this.#batch.upserts.length || this.#deleteIndex < this.#batch.deletes.length) {
 			const encoded = this.#pending ?? this.#encodeCurrent(rejected);
-			if (!encoded) continue;
+			if (!encoded) {
+				if (rejected.length > 0) break;
+				continue;
+			}
 			if (upserts + deletes > 0 && byteLength + encoded.byteLength > this.#maxBytes) {
 				this.#pending = encoded;
 				break;
@@ -224,6 +227,10 @@ function encodeUpsertRecord(
 ): EncodedMutationRecord {
 	if (!upsert.fields || typeof upsert.fields !== 'object' || Array.isArray(upsert.fields)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'upsert fields must be an object');
+	}
+	const prototype = Object.getPrototypeOf(upsert.fields);
+	if (prototype !== Object.prototype && prototype !== null) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'upsert fields must be a plain object');
 	}
 	const names = Object.keys(upsert.fields);
 	if (names.length > maxFields) {

@@ -27,6 +27,7 @@ import {
 	resetNativeFullTextIndex,
 	validateNativeFullTextIndexOptions,
 } from '@harperfast/fulltext/native';
+import { loadAddon } from '../dist/load-addon.js';
 
 function options(indexPath, overrides = {}) {
 	return {
@@ -124,6 +125,10 @@ test('validates native configuration without creating index storage', (context) 
 		() => validateNativeFullTextIndexOptions(config),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
+	assert.throws(
+		() => validateNativeFullTextIndexOptions({ ...config, fields: undefined }),
+		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
+	);
 	assert.strictEqual(existsSync(indexPath), false);
 });
 
@@ -145,10 +150,13 @@ test('reclaims only retired trees generated for the requested index', async (con
 	const unrelated = path.join(parent, '.fulltext-retired', 'keep');
 	mkdirSync(unrelated);
 
-	assert.deepStrictEqual(await reclaimRetiredNativeFullTextIndexes({ path: productsPath }), {
-		removed: 1,
-		failed: 0,
-	});
+	assert.deepStrictEqual(
+		await reclaimRetiredNativeFullTextIndexes({ path: productsPath, retiredPath: products.retiredPath }),
+		{
+			removed: 1,
+			failed: 0,
+		},
+	);
 	assert.strictEqual(existsSync(products.retiredPath), false);
 	assert.strictEqual(existsSync(orders.retiredPath), true);
 	assert.strictEqual(existsSync(unrelated), true);
@@ -190,19 +198,19 @@ test('removes a generated-name symbolic link without following it', async (conte
 	assert.strictEqual(readFileSync(marker, 'utf8'), 'retained');
 });
 
-test('uses the reset result when its canonical basename differs from the configured path', async (context) => {
+test('rejects a reset result belonging to another index', async (context) => {
 	const parent = temporaryIndex(context);
 	const retiredRoot = path.join(parent, '.fulltext-retired');
-	const retiredPath = path.join(retiredRoot, 'Products.1.2.3.4');
+	const retiredPath = path.join(retiredRoot, 'orders.1.2.3.4');
 	mkdirSync(retiredPath, { recursive: true });
-	assert.deepStrictEqual(
-		await reclaimRetiredNativeFullTextIndexes({
+	await assert.rejects(
+		reclaimRetiredNativeFullTextIndexes({
 			path: path.join(parent, 'products'),
 			retiredPath,
 		}),
-		{ removed: 1, failed: 0 },
+		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
-	assert.strictEqual(existsSync(retiredPath), false);
+	assert.strictEqual(existsSync(retiredPath), true);
 });
 
 test('retires a closed index, preserves its checkpoint, and permits a clean rebuild', async (context) => {
@@ -723,6 +731,20 @@ test('deletes stale content when a replacement record is unindexable', async (co
 	await index.close();
 });
 
+test('deletes stale content for an invalid replacement when requested', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	await index.applyMutationBatch({ upserts: [{ id: 'product', fields: { title: 'staleinvalidunique' } }] });
+	await index.publish('before-invalid-replacement');
+	const result = await index.applyMutationBatch(
+		{ upserts: [{ id: 'product', fields: { title: 42 } }] },
+		{ rejectedUpsert: 'delete' },
+	);
+	assert.deepStrictEqual(result.rejected, [{ operation: 'upsert', index: 0, code: 'E_INVALID_ARGUMENT' }]);
+	await index.publish('after-invalid-replacement');
+	assert.strictEqual((await index.search({ text: 'staleinvalidunique', exactTotal: true })).total, 0);
+	await index.close();
+});
+
 test('uses the snapshotted upsert ID for a replacement delete', async (context) => {
 	const config = options(temporaryIndex(context));
 	config.limits = { ...config.limits, maxBatchBytes: 256 };
@@ -788,6 +810,29 @@ test('latches a partially applied logical batch until rollback close', async (co
 	await index.close();
 });
 
+test('keeps staged work usable when the first logical frame is not admitted', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	await index.applyMutationBatch({ upserts: [{ id: 'staged', fields: { title: 'stagedunique' } }] });
+	const addon = loadAddon();
+	const nativeApply = addon.__nativeApply;
+	try {
+		addon.__nativeApply = () => {
+			const error = new Error('writer queue is full');
+			error.code = 'E_QUEUE_FULL';
+			throw error;
+		};
+		await assert.rejects(
+			index.applyMutationBatch({ upserts: [{ id: 'rejected', fields: { title: 'not admitted' } }] }),
+			(error) => error.code === 'E_QUEUE_FULL',
+		);
+	} finally {
+		addon.__nativeApply = nativeApply;
+	}
+	await index.publish('after-admission-rejection');
+	assert.strictEqual((await index.search({ text: 'stagedunique', exactTotal: true })).hits[0].id, 'staged');
+	await index.close();
+});
+
 test('rejects low-level writer interleaving during logical apply', async (context) => {
 	const config = options(temporaryIndex(context));
 	config.limits = { ...config.limits, maxBatchBytes: 4 * 1024 * 1024, maxQueuedBytes: 4 * 1024 * 1024 };
@@ -834,6 +879,35 @@ test('keeps the writer usable when logical validation fails before native admiss
 			(error) => error.code === 'E_INVALID_ARGUMENT',
 		);
 	}
+	for (const fields of [new Map([['title', 'not a record']]), new Date()]) {
+		await assert.rejects(
+			index.applyMutationBatch({ upserts: [{ id: 'invalid-fields', fields }] }),
+			(error) => error.code === 'E_INVALID_ARGUMENT',
+		);
+		assert.deepStrictEqual(index.encodeMutationBatches({ upserts: [{ id: 'invalid-fields', fields }] }).rejected, [
+			{ operation: 'upsert', index: 0, code: 'E_INVALID_ARGUMENT' },
+		]);
+	}
+	let laterFieldsRead = false;
+	const laterFields = new Proxy(
+		{ title: 'must not be read' },
+		{
+			ownKeys(target) {
+				laterFieldsRead = true;
+				return Reflect.ownKeys(target);
+			},
+		},
+	);
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [
+				{ id: 'first-invalid', fields: { title: 42 } },
+				{ id: 'later', fields: laterFields },
+			],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.strictEqual(laterFieldsRead, false);
 	await assert.rejects(
 		index.applyMutationBatch({ upserts: [{ id: 'invalid', fields: { title: 42 } }] }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
