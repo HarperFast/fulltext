@@ -218,6 +218,7 @@ export class NativeFullTextIndex {
 		}
 		const logical = snapshotMutationBatch(batch);
 		const rejectedUpsert = options.rejectedUpsert ?? 'reject';
+		const replacementIds = rejectedUpsert === 'delete' ? logical.upserts.map((upsert) => upsert?.id) : undefined;
 		const cursor = new MutationBatchFrameCursor(
 			logical,
 			this.#maxBatchBytes,
@@ -270,7 +271,7 @@ export class NativeFullTextIndex {
 						if (rejection.operation !== 'upsert') {
 							throw new FulltextError(rejection.code, 'a rejected delete cannot be replaced safely');
 						}
-						const id = logical.upserts[rejection.index]?.id;
+						const id = replacementIds?.[rejection.index];
 						if (typeof id !== 'string') {
 							throw new FulltextError(rejection.code, `rejected upsert at index ${rejection.index} has no usable ID`);
 						}
@@ -643,17 +644,22 @@ export function validateNativeFullTextIndexOptions(options: NativeFullTextIndexO
 		const cursor = decodeResponse(loadAddon().__nativeValidateOpen(packedOpenOptions(options)));
 		cursor.finish();
 	} catch (error) {
-		if (error instanceof TypeError) throw new FulltextError('E_INVALID_ARGUMENT', error.message, error);
-		throw normalizeNativeError(error);
+		throw normalizeOptionsError(error);
 	}
 }
 
 export async function openNativeFullTextIndex(options: NativeFullTextIndexOptions): Promise<NativeFullTextIndex> {
-	const config = packedOptions(options);
-	config.limits = { ...config.limits };
-	const packed = encodeOpen(config);
-	const validation = decodeResponse(loadAddon().__nativeValidateOpen(packed));
-	validation.finish();
+	let config: ReturnType<typeof packedOptions>;
+	let packed: Buffer;
+	try {
+		config = packedOptions(options);
+		config.limits = { ...config.limits };
+		packed = encodeOpen(config);
+		const validation = decodeResponse(loadAddon().__nativeValidateOpen(packed));
+		validation.finish();
+	} catch (error) {
+		throw normalizeOptionsError(error);
+	}
 	const cursor = await invoke((callback) => loadAddon().__nativeOpen(packed, callback));
 	const handle = cursor.u32();
 	try {
@@ -700,6 +706,12 @@ function packedIndexIdentity(options: NativeFullTextIndexInspectionOptions) {
 		positions: options.positions ?? true,
 		surfaceTerms: options.surfaceTerms ?? false,
 	};
+}
+
+function normalizeOptionsError(error: unknown): FulltextError {
+	return error instanceof TypeError
+		? new FulltextError('E_INVALID_ARGUMENT', error.message, error)
+		: normalizeNativeError(error);
 }
 
 export async function runtimeInfo(): Promise<RuntimeInfo> {

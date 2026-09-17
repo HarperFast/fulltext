@@ -117,7 +117,7 @@ test('rejects a mutation frame limit that cannot hold one mutation', async (cont
 	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INVALID_ARGUMENT');
 });
 
-test('validates native configuration without creating index storage', (context) => {
+test('validates native configuration without creating index storage', async (context) => {
 	const indexPath = path.join(temporaryIndex(context), 'invalid');
 	const config = options(indexPath);
 	config.limits = { ...config.limits, writerMemoryBytes: 14_999_999 };
@@ -127,6 +127,10 @@ test('validates native configuration without creating index storage', (context) 
 	);
 	assert.throws(
 		() => validateNativeFullTextIndexOptions({ ...config, fields: undefined }),
+		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		openNativeFullTextIndex({ ...config, fields: undefined }),
 		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
 	);
 	assert.strictEqual(existsSync(indexPath), false);
@@ -756,13 +760,12 @@ test('uses the snapshotted upsert ID for a replacement delete', async (context) 
 		],
 	});
 	await index.publish('before-snapshot-rejection');
+	const rejected = { id: 'rejected', fields: { title: 'x'.repeat(512) } };
 	const logical = {
-		upserts: [
-			{ id: 'valid', fields: { title: `valid partitioned product ${'x'.repeat(140)}` } },
-			{ id: 'rejected', fields: { title: 'x'.repeat(512) } },
-		],
+		upserts: [{ id: 'valid', fields: { title: `valid partitioned product ${'x'.repeat(140)}` } }, rejected],
 	};
 	const applying = index.applyMutationBatch(logical, { rejectedUpsert: 'delete' });
+	rejected.id = 'victim';
 	logical.upserts[1] = { id: 'victim', fields: { title: 'caller replacement must not be observed' } };
 	const result = await applying;
 	assert.deepStrictEqual(result.rejected, [{ operation: 'upsert', index: 1, code: 'E_BATCH_TOO_LARGE' }]);

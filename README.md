@@ -81,6 +81,10 @@ native application is attempted leaves the handle incomplete: writer operations 
 `E_BATCH_INCOMPLETE` until the handle is closed with `{ mode: 'rollback' }`. This prevents a later
 publish from exposing part of a logical batch.
 
+Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
+as record-local rejection could remove many documents under the wrong schema. The option applies
+only to record-local `E_INVALID_ARGUMENT` and `E_BATCH_TOO_LARGE` rejections with usable IDs.
+
 Trusted callers that already enforce distinct IDs may pass `assumeDistinctIds: true` to skip the
 whole-batch duplicate prepass. Supplying duplicates with that option violates the API contract.
 The wrapper snapshots the two mutation arrays, but callers must not mutate record objects, field
@@ -191,9 +195,9 @@ success, reset renames the live directory into a unique path below the parent's 
 directory. The wrapper does not delete it automatically. Call
 `reclaimRetiredNativeFullTextIndexes({ path, retiredPath: result.retiredPath })` at a lifecycle point
 chosen by the application. Passing the opaque reset result preserves the canonical source basename
-when aliases or path casing differ. The reclaimer removes only retired trees generated for that
-index path, ignores unrelated entries and other indices, and returns `{ removed, failed }`. Harper
-invokes it during derived-index initialization and after reset.
+and verifies that the hint belongs to the requested index. The reclaimer removes only retired trees
+generated for that index path, ignores unrelated entries and other indices, and returns
+`{ removed, failed }`. Harper invokes it during derived-index initialization and after reset.
 
 An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.
