@@ -120,6 +120,18 @@ test('a close failure after resource release remains resettable', async (context
 	assert.strictEqual((await resetNativeFullTextIndex({ path: indexPath, indexId: 'close-failed' })).state, 'reset');
 });
 
+test('post-close logical batches do not retain the active latch', async (context) => {
+	const parent = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-post-close-batch-'));
+	const indexPath = path.join(parent, 'index');
+	context.after(() => rmSync(parent, { recursive: true, force: true }));
+	const { index } = await testIndex(indexPath, 'post-close-batch');
+
+	await index.close();
+	await assert.rejects(index.applyMutationBatch({ deletes: ['closed'] }), (error) => error.code === 'E_CLOSED');
+	await assert.rejects(index.commit(), (error) => error.code === 'E_CLOSED');
+	await assert.rejects(index.applyMutationBatch({ deletes: ['closed'] }), (error) => error.code === 'E_CLOSED');
+});
+
 test('an unproven close releases environment tracking and quarantines the index', async (context) => {
 	const parent = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-quiescence-failed-'));
 	const indexPath = path.join(parent, 'index');

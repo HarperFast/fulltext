@@ -294,7 +294,7 @@ export class NativeFullTextIndex {
 			this.#logicalMutationState = 'idle';
 			return { processed, rejected, encodedBytes, frames };
 		} catch (error) {
-			if (!this.#closed) this.#logicalMutationState = nativeAttempted ? 'incomplete' : 'idle';
+			this.#logicalMutationState = nativeAttempted && !this.#closed ? 'incomplete' : 'idle';
 			throw normalizeNativeError(error);
 		}
 	}
