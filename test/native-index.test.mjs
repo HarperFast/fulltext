@@ -217,6 +217,25 @@ test('rejects a reset result belonging to another index', async (context) => {
 	assert.strictEqual(existsSync(retiredPath), true);
 });
 
+test('does not broaden retirement cleanup through a symbolic-link index path', async (context) => {
+	if (process.platform === 'win32') {
+		context.skip('creating directory symbolic links requires host privileges on Windows');
+		return;
+	}
+	const parent = temporaryIndex(context);
+	const ordersPath = path.join(parent, 'orders');
+	const productsPath = path.join(parent, 'products');
+	const retiredPath = path.join(parent, '.fulltext-retired', 'orders.1.2.3.4');
+	mkdirSync(ordersPath);
+	mkdirSync(retiredPath, { recursive: true });
+	symlinkSync(ordersPath, productsPath, 'dir');
+	assert.deepStrictEqual(await reclaimRetiredNativeFullTextIndexes({ path: productsPath }), {
+		removed: 0,
+		failed: 0,
+	});
+	assert.strictEqual(existsSync(retiredPath), true);
+});
+
 test('retires a closed index, preserves its checkpoint, and permits a clean rebuild', async (context) => {
 	const parent = temporaryIndex(context);
 	const indexPath = path.join(parent, 'products');
@@ -908,8 +927,12 @@ test('rejects oversized strings before copying them into buffers', async (contex
 		return originalFrom.call(this, value, ...args);
 	};
 	try {
-		const encoded = index.encodeMutationBatches({ upserts: [{ id: 'oversized', fields: { title: oversized } }] });
-		assert.deepStrictEqual(encoded.rejected, [{ operation: 'upsert', index: 0, code: 'E_INVALID_ARGUMENT' }]);
+		const oversizedField = index.encodeMutationBatches({
+			upserts: [{ id: 'oversized-field', fields: { title: oversized } }],
+		});
+		assert.deepStrictEqual(oversizedField.rejected, [{ operation: 'upsert', index: 0, code: 'E_INVALID_ARGUMENT' }]);
+		const oversizedId = index.encodeMutationBatches({ upserts: [{ id: oversized, fields: { title: 'value' } }] });
+		assert.deepStrictEqual(oversizedId.rejected, [{ operation: 'upsert', index: 0, code: 'E_INVALID_ARGUMENT' }]);
 	} finally {
 		Buffer.from = originalFrom;
 	}

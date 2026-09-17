@@ -598,13 +598,6 @@ export async function reclaimRetiredNativeFullTextIndexes(options: {
 		throw new FulltextError('E_STORAGE', `could not inspect retired full-text indexes for ${livePath}`, error);
 	}
 	const sourceNames = new Set([basename(livePath)]);
-	try {
-		sourceNames.add(basename(await realpath(livePath)));
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-			throw new FulltextError('E_STORAGE', `could not resolve the full-text index path ${livePath}`, error);
-		}
-	}
 	if (options.retiredPath !== undefined) {
 		if (typeof options.retiredPath !== 'string' || options.retiredPath.length === 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath must not be empty');

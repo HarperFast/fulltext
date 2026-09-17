@@ -216,8 +216,9 @@ export class MutationBatchFrameCursor {
 
 function encodeMutationId(id: unknown): Buffer | undefined {
 	if (typeof id !== 'string' || id.length === 0 || invalidSurrogate.test(id)) return;
+	if (id.length > maxStringBytes || Buffer.byteLength(id, 'utf8') > maxStringBytes) return;
 	const bytes = Buffer.from(id, 'utf8');
-	return bytes.length <= maxStringBytes ? bytes : undefined;
+	return bytes;
 }
 
 function encodeUpsertRecord(
