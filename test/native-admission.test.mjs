@@ -97,6 +97,33 @@ for (const operation of ['apply', 'commit', 'publish', 'reload']) {
 	);
 }
 
+test('latches a logical batch when native admission fails asynchronously', { timeout: 10_000 }, async (context) => {
+	const { addon, handle, index } = await fixture(context);
+	const nativeApply = addon.__nativeApply;
+	let attempts = 0;
+	try {
+		addon.__nativeApply = (...arguments_) => {
+			nativeApply(...arguments_);
+			if (++attempts === 1) addon.__testPoisonBeforeNextAdmission(handle);
+		};
+		await assert.rejects(
+			index.applyMutationBatch({
+				upserts: [
+					{ id: 'pending-one', fields: { title: 'x'.repeat(700_000) } },
+					{ id: 'pending-two', fields: { title: 'x'.repeat(700_000) } },
+				],
+			}),
+			hasCode('E_POISONED'),
+		);
+	} finally {
+		addon.__nativeApply = nativeApply;
+	}
+	assert.strictEqual(attempts, 1);
+	await assert.rejects(index.commit(), hasCode('E_BATCH_INCOMPLETE'));
+	await assert.rejects(index.applyMutationBatch({ deletes: ['saved'] }), hasCode('E_BATCH_INCOMPLETE'));
+	await assert.rejects(index.close(), hasCode('E_BATCH_INCOMPLETE'));
+});
+
 test(
 	'a dirty close racing poison rolls back without reopening the terminal generation',
 	{ timeout: 10_000 },
