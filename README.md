@@ -78,8 +78,10 @@ into bounded native frames, applies them sequentially, validates native counts, 
 By default, any rejected record fails the operation. Pass `{ rejectedUpsert: 'delete' }` when an
 unindexable replacement must delete previously searchable content for the same ID. A failure after
 native application is attempted leaves the handle incomplete: writer operations reject
-`E_BATCH_INCOMPLETE` until the handle is closed with `{ mode: 'rollback' }`. This prevents a later
-publish from exposing part of a logical batch.
+`E_BATCH_INCOMPLETE` until the handle is closed with `{ mode: 'rollback' }`. A writer operation that
+only races an in-flight logical batch rejects with `E_BATCH_ACTIVE`; wait for that batch to settle
+and retry instead of rolling it back. This prevents a later publish from exposing part of a logical
+batch.
 
 Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
 as record-local rejection could remove many documents under the wrong schema. The option applies
@@ -194,10 +196,11 @@ with `E_INVALID_ARGUMENT`. A malformed identity sidecar fails closed with `E_IND
 success, reset renames the live directory into a unique path below the parent's `.fulltext-retired`
 directory. The wrapper does not delete it automatically. Call
 `reclaimRetiredNativeFullTextIndexes({ path, retiredPath: result.retiredPath })` at a lifecycle point
-chosen by the application. Passing the opaque reset result preserves the canonical source basename
-and verifies that the hint belongs to the requested index. The reclaimer removes only retired trees
-generated for that index path, ignores unrelated entries and other indices, and returns
-`{ removed, failed }`. Harper invokes it during derived-index initialization and after reset.
+chosen by the application. Passing the opaque reset result verifies that the hint belongs to the
+requested index. Use the same `path` value for reset and reclaim so generated names match. The
+reclaimer removes only retired trees generated for that index path, ignores unrelated entries and
+other indices, and returns `{ removed, failed }`. Harper invokes it during derived-index
+initialization and after reset.
 
 An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.

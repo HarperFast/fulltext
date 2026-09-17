@@ -78,8 +78,9 @@ The operation has the following behavior:
 - A caller may immediately open a new empty index at the original path. Reset never deletes the
   retired tree. The wrapper's separate reclaimer removes only generated retired names belonging to
   the requested live path and ignores unrelated entries. Passing reset's opaque `retiredPath` back
-  to the reclaimer verifies that the hint belongs to the requested index. Applications decide when
-  to invoke it; Harper does so during derived-index initialization and after reset.
+  to the reclaimer verifies that the hint belongs to the requested index. Reset and reclaim must use
+  the same `path` value so generated names match. Applications decide when to invoke it; Harper does
+  so during derived-index initialization and after reset.
 - Open and reset require a writable sibling `.fulltext-locks` directory. The wrapper creates it when
   absent and leaves it in place; errors include its path so deployment-permission failures are
   actionable.

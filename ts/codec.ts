@@ -105,6 +105,7 @@ export class MutationBatchFrameCursor {
 	readonly #batch: PackedMutationBatch;
 	readonly #maxBytes: number;
 	readonly #fieldNames: ReadonlySet<string>;
+	readonly #stopAfterFirstRejection: boolean;
 	#upsertIndex = 0;
 	#deleteIndex = 0;
 	#pending?: EncodedMutationRecord;
@@ -114,15 +115,16 @@ export class MutationBatchFrameCursor {
 		maxBytes: number,
 		fieldNames: ReadonlySet<string>,
 		validateDistinctIds: boolean,
+		stopAfterFirstRejection = false,
 	) {
-		const snapshot = { upserts: batch.upserts.slice(), deletes: batch.deletes.slice() };
-		validateMutationBatch(snapshot, validateDistinctIds);
+		validateMutationBatch(batch, validateDistinctIds);
 		if (!Number.isSafeInteger(maxBytes) || maxBytes < minimumMutationBatchBytes) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'maxBytes is too small for a mutation batch');
 		}
-		this.#batch = snapshot;
+		this.#batch = batch;
 		this.#maxBytes = maxBytes;
 		this.#fieldNames = fieldNames;
+		this.#stopAfterFirstRejection = stopAfterFirstRejection;
 	}
 
 	next(): PackedMutationBatchFrame {
@@ -137,7 +139,7 @@ export class MutationBatchFrameCursor {
 		while (this.#upsertIndex < this.#batch.upserts.length || this.#deleteIndex < this.#batch.deletes.length) {
 			const encoded = this.#pending ?? this.#encodeCurrent(rejected);
 			if (!encoded) {
-				if (rejected.length > 0) break;
+				if (rejected.length > 0 && this.#stopAfterFirstRejection) break;
 				continue;
 			}
 			if (upserts + deletes > 0 && byteLength + encoded.byteLength > this.#maxBytes) {
@@ -618,10 +620,10 @@ class ByteWriter {
 		if (typeof value !== 'string') {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'packed string values must be strings');
 		}
-		const bytes = Buffer.from(value, 'utf8');
-		if (bytes.length > maxStringBytes) {
+		if (value.length > maxStringBytes || Buffer.byteLength(value, 'utf8') > maxStringBytes) {
 			throw new FulltextError('E_INVALID_ARGUMENT', `packed string exceeds ${maxStringBytes} UTF-8 bytes`);
 		}
+		const bytes = Buffer.from(value, 'utf8');
 		this.encodedString(bytes);
 	}
 

@@ -760,14 +760,23 @@ test('uses the snapshotted upsert ID for a replacement delete', async (context) 
 		],
 	});
 	await index.publish('before-snapshot-rejection');
-	const rejected = { id: 'rejected', fields: { title: 'x'.repeat(512) } };
+	let rejectedId = 'rejected';
+	let rejectedIdReads = 0;
+	const rejected = {
+		get id() {
+			rejectedIdReads++;
+			return rejectedId;
+		},
+		fields: { title: 'x'.repeat(512) },
+	};
 	const logical = {
 		upserts: [{ id: 'valid', fields: { title: `valid partitioned product ${'x'.repeat(140)}` } }, rejected],
 	};
 	const applying = index.applyMutationBatch(logical, { rejectedUpsert: 'delete' });
-	rejected.id = 'victim';
+	rejectedId = 'victim';
 	logical.upserts[1] = { id: 'victim', fields: { title: 'caller replacement must not be observed' } };
 	const result = await applying;
+	assert.strictEqual(rejectedIdReads, 1);
 	assert.deepStrictEqual(result.rejected, [{ operation: 'upsert', index: 1, code: 'E_BATCH_TOO_LARGE' }]);
 	await index.publish('after-snapshot-rejection');
 	assert.strictEqual((await index.search({ text: 'staleunique', exactTotal: true })).total, 0);
@@ -852,11 +861,60 @@ test('rejects low-level writer interleaving during logical apply', async (contex
 	logical.upserts.push({ id: 'late-mutation', fields: { title: 'must not enter the active batch' } });
 	await assert.rejects(
 		index.apply(encodeMutationBatch({ deletes: ['other'] })),
-		(error) => error.code === 'E_BATCH_INCOMPLETE',
+		(error) => error.code === 'E_BATCH_ACTIVE',
 	);
 	assert.strictEqual((await index.search({ text: 'visible stable product', exactTotal: true })).hits[0].id, 'visible');
 	assert.strictEqual((await applying).processed, 15_000);
 	await index.close({ mode: 'rollback' });
+});
+
+test('latches before reading caller-controlled mutation getters', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	let nested;
+	const upsert = {
+		get id() {
+			nested = index.applyMutationBatch({ deletes: ['nested'] });
+			nested.catch(() => undefined);
+			return 'outer';
+		},
+		fields: { title: 'outer unique product' },
+	};
+	assert.strictEqual((await index.applyMutationBatch({ upserts: [upsert] })).processed, 1);
+	await assert.rejects(nested, (error) => error.code === 'E_BATCH_ACTIVE');
+	await index.publish('after-reentrant-getter');
+	assert.strictEqual((await index.search({ text: 'outer unique product', exactTotal: true })).hits[0].id, 'outer');
+	await index.close();
+});
+
+test('batches replacement deletes for many rejected upserts', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 1_024 };
+	const index = await openNativeFullTextIndex(config);
+	const upserts = Array.from({ length: 1_000 }, (_, id) => ({ id: `invalid-${id}`, fields: { title: 42 } }));
+	const result = await index.applyMutationBatch({ upserts }, { rejectedUpsert: 'delete' });
+	assert.strictEqual(result.processed, upserts.length);
+	assert.strictEqual(result.rejected.length, upserts.length);
+	assert(result.frames < 100, `expected bounded replacement-delete frames, got ${result.frames}`);
+	await index.close({ mode: 'rollback' });
+});
+
+test('rejects oversized strings before copying them into buffers', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	const oversized = 'x'.repeat((1 << 20) + 1);
+	const originalFrom = Buffer.from;
+	let copiedOversizedValue = false;
+	Buffer.from = function (value, ...args) {
+		if (value === oversized) copiedOversizedValue = true;
+		return originalFrom.call(this, value, ...args);
+	};
+	try {
+		const encoded = index.encodeMutationBatches({ upserts: [{ id: 'oversized', fields: { title: oversized } }] });
+		assert.deepStrictEqual(encoded.rejected, [{ operation: 'upsert', index: 0, code: 'E_INVALID_ARGUMENT' }]);
+	} finally {
+		Buffer.from = originalFrom;
+	}
+	assert.strictEqual(copiedOversizedValue, false);
+	await index.close();
 });
 
 test('rejects duplicate logical IDs before latching the writer', async (context) => {

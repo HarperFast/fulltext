@@ -203,39 +203,42 @@ export class NativeFullTextIndex {
 		options: ApplyFullTextMutationBatchOptions = {},
 	): Promise<AppliedFullTextMutationBatch> {
 		this.#assertLogicalMutationIdle();
-		if (!options || typeof options !== 'object' || Array.isArray(options)) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch options must be an object');
-		}
-		if (options.assumeDistinctIds !== undefined && typeof options.assumeDistinctIds !== 'boolean') {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'assumeDistinctIds must be a boolean');
-		}
-		if (
-			options.rejectedUpsert !== undefined &&
-			options.rejectedUpsert !== 'reject' &&
-			options.rejectedUpsert !== 'delete'
-		) {
-			throw new FulltextError('E_INVALID_ARGUMENT', "rejectedUpsert must be 'reject' or 'delete'");
-		}
-		const logical = snapshotMutationBatch(batch);
-		const rejectedUpsert = options.rejectedUpsert ?? 'reject';
-		const replacementIds = rejectedUpsert === 'delete' ? logical.upserts.map((upsert) => upsert?.id) : undefined;
-		const cursor = new MutationBatchFrameCursor(
-			logical,
-			this.#maxBatchBytes,
-			this.#fieldNames,
-			options.assumeDistinctIds !== true,
-		);
-		if (logical.upserts.length + logical.deletes.length === 0) {
-			return { processed: 0, rejected: [], encodedBytes: 0, frames: 0 };
-		}
-
 		this.#logicalMutationState = 'active';
-		let processed = 0;
-		let encodedBytes = 0;
-		let frames = 0;
 		let nativeAttempted = false;
-		const rejected: FullTextMutationBatchRejection[] = [];
 		try {
+			if (!options || typeof options !== 'object' || Array.isArray(options)) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch options must be an object');
+			}
+			const assumeDistinctIds = options.assumeDistinctIds;
+			const rejectedUpsertOption = options.rejectedUpsert;
+			if (assumeDistinctIds !== undefined && typeof assumeDistinctIds !== 'boolean') {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'assumeDistinctIds must be a boolean');
+			}
+			if (
+				rejectedUpsertOption !== undefined &&
+				rejectedUpsertOption !== 'reject' &&
+				rejectedUpsertOption !== 'delete'
+			) {
+				throw new FulltextError('E_INVALID_ARGUMENT', "rejectedUpsert must be 'reject' or 'delete'");
+			}
+			const logical = snapshotMutationBatch(batch);
+			const rejectedUpsert = rejectedUpsertOption ?? 'reject';
+			const cursor = new MutationBatchFrameCursor(
+				logical,
+				this.#maxBatchBytes,
+				this.#fieldNames,
+				assumeDistinctIds !== true,
+				rejectedUpsert === 'reject',
+			);
+			if (logical.upserts.length + logical.deletes.length === 0) {
+				this.#logicalMutationState = 'idle';
+				return { processed: 0, rejected: [], encodedBytes: 0, frames: 0 };
+			}
+
+			let processed = 0;
+			let encodedBytes = 0;
+			let frames = 0;
+			const rejected: FullTextMutationBatchRejection[] = [];
 			let done = false;
 			while (!done) {
 				const encoded = cursor.next();
@@ -271,7 +274,7 @@ export class NativeFullTextIndex {
 						if (rejection.operation !== 'upsert') {
 							throw new FulltextError(rejection.code, 'a rejected delete cannot be replaced safely');
 						}
-						const id = replacementIds?.[rejection.index];
+						const id = logical.upserts[rejection.index]?.id;
 						if (typeof id !== 'string') {
 							throw new FulltextError(rejection.code, `rejected upsert at index ${rejection.index} has no usable ID`);
 						}
@@ -503,7 +506,7 @@ export class NativeFullTextIndex {
 	#assertLogicalMutationIdle(): void {
 		if (this.#logicalMutationState !== 'idle') {
 			throw new FulltextError(
-				'E_BATCH_INCOMPLETE',
+				this.#logicalMutationState === 'active' ? 'E_BATCH_ACTIVE' : 'E_BATCH_INCOMPLETE',
 				this.#logicalMutationState === 'active'
 					? 'a logical mutation batch is active'
 					: 'a logical mutation batch failed and the index must be rollback-closed',
@@ -745,7 +748,13 @@ function snapshotMutationBatch(batch: FullTextMutationBatch): Required<FullTextM
 	if (batch.deletes !== undefined && !Array.isArray(batch.deletes)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch deletes must be an array');
 	}
-	return { upserts: batch.upserts?.slice() ?? [], deletes: batch.deletes?.slice() ?? [] };
+	return {
+		upserts:
+			batch.upserts?.map((upsert) =>
+				upsert && typeof upsert === 'object' ? { id: upsert.id, fields: upsert.fields } : upsert,
+			) ?? [],
+		deletes: batch.deletes?.slice() ?? [],
+	};
 }
 
 function safeNumber(value: bigint, name: string): number {
