@@ -200,9 +200,6 @@ export class NativeFullTextIndex {
 		options: ApplyFullTextMutationBatchOptions = {},
 	): Promise<AppliedFullTextMutationBatch> {
 		this.#assertLogicalMutationIdle();
-		if (!batch || typeof batch !== 'object' || Array.isArray(batch)) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch must be an object');
-		}
 		if (!options || typeof options !== 'object' || Array.isArray(options)) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch options must be an object');
 		}
@@ -216,7 +213,8 @@ export class NativeFullTextIndex {
 		) {
 			throw new FulltextError('E_INVALID_ARGUMENT', "rejectedUpsert must be 'reject' or 'delete'");
 		}
-		const logical = { upserts: batch.upserts ?? [], deletes: batch.deletes ?? [] };
+		const logical = snapshotMutationBatch(batch);
+		const rejectedUpsert = options.rejectedUpsert ?? 'reject';
 		const cursor = new MutationBatchFrameCursor(
 			logical,
 			this.#maxBatchBytes,
@@ -242,7 +240,7 @@ export class NativeFullTextIndex {
 					throw new FulltextError('E_NATIVE_FAILURE', 'mutation batch partitioner made no progress');
 				}
 				if (encoded.rejected.length > 0) {
-					if ((options.rejectedUpsert ?? 'reject') === 'reject') {
+					if (rejectedUpsert === 'reject') {
 						const rejection = encoded.rejected[0];
 						throw new FulltextError(
 							rejection.code,
@@ -328,10 +326,13 @@ export class NativeFullTextIndex {
 		options: EncodeFullTextMutationBatchesOptions = {},
 	): EncodedFullTextMutationBatches {
 		try {
+			if (!options || typeof options !== 'object' || Array.isArray(options)) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch options must be an object');
+			}
 			if (options.allowPartial !== undefined && typeof options.allowPartial !== 'boolean') {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'allowPartial must be a boolean');
 			}
-			const logical = { upserts: batch.upserts ?? [], deletes: batch.deletes ?? [] };
+			const logical = snapshotMutationBatch(batch);
 			const encoded = encodeBatchPartitions(
 				logical,
 				this.#maxBatchBytes,
@@ -710,6 +711,19 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 
 function asBuffer(value: Uint8Array): Buffer {
 	return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+}
+
+function snapshotMutationBatch(batch: FullTextMutationBatch): Required<FullTextMutationBatch> {
+	if (!batch || typeof batch !== 'object' || Array.isArray(batch)) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch must be an object');
+	}
+	if (batch.upserts !== undefined && !Array.isArray(batch.upserts)) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch upserts must be an array');
+	}
+	if (batch.deletes !== undefined && !Array.isArray(batch.deletes)) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch deletes must be an array');
+	}
+	return { upserts: batch.upserts?.slice() ?? [], deletes: batch.deletes?.slice() ?? [] };
 }
 
 function safeNumber(value: bigint, name: string): number {

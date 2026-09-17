@@ -723,6 +723,33 @@ test('deletes stale content when a replacement record is unindexable', async (co
 	await index.close();
 });
 
+test('uses the snapshotted upsert ID for a replacement delete', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 256 };
+	const index = await openNativeFullTextIndex(config);
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'rejected', fields: { title: 'staleunique' } },
+			{ id: 'victim', fields: { title: 'victimunique' } },
+		],
+	});
+	await index.publish('before-snapshot-rejection');
+	const logical = {
+		upserts: [
+			{ id: 'valid', fields: { title: `valid partitioned product ${'x'.repeat(140)}` } },
+			{ id: 'rejected', fields: { title: 'x'.repeat(512) } },
+		],
+	};
+	const applying = index.applyMutationBatch(logical, { rejectedUpsert: 'delete' });
+	logical.upserts[1] = { id: 'victim', fields: { title: 'caller replacement must not be observed' } };
+	const result = await applying;
+	assert.deepStrictEqual(result.rejected, [{ operation: 'upsert', index: 1, code: 'E_BATCH_TOO_LARGE' }]);
+	await index.publish('after-snapshot-rejection');
+	assert.strictEqual((await index.search({ text: 'staleunique', exactTotal: true })).total, 0);
+	assert.strictEqual((await index.search({ text: 'victimunique', exactTotal: true })).hits[0].id, 'victim');
+	await index.close();
+});
+
 test('latches a partially applied logical batch until rollback close', async (context) => {
 	const indexPath = temporaryIndex(context);
 	const config = options(indexPath);
@@ -800,6 +827,13 @@ test('rejects duplicate logical IDs before latching the writer', async (context)
 
 test('keeps the writer usable when logical validation fails before native admission', async (context) => {
 	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	for (const batch of [null, { upserts: 5 }, { deletes: {} }]) {
+		await assert.rejects(index.applyMutationBatch(batch), (error) => error.code === 'E_INVALID_ARGUMENT');
+		assert.throws(
+			() => index.encodeMutationBatches(batch),
+			(error) => error.code === 'E_INVALID_ARGUMENT',
+		);
+	}
 	await assert.rejects(
 		index.applyMutationBatch({ upserts: [{ id: 'invalid', fields: { title: 42 } }] }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
