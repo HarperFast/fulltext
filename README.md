@@ -86,6 +86,8 @@ batch.
 Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
 as record-local rejection could remove many documents under the wrong schema. The option applies
 only to record-local `E_INVALID_ARGUMENT` and `E_BATCH_TOO_LARGE` rejections with usable IDs.
+Delete mode always preflights every ID as a bounded delete frame before native admission;
+`assumeDistinctIds` skips duplicate detection, not that feasibility scan.
 
 Trusted callers that already enforce distinct IDs may pass `assumeDistinctIds: true` to skip the
 whole-batch duplicate prepass. Supplying duplicates with that option violates the API contract.

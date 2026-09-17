@@ -81,22 +81,27 @@ export function validateMutationBatch(
 	if (!validateDistinctIds && replacementDeleteMaxBytes === undefined) return;
 	const ids = validateDistinctIds ? new Set<string>() : undefined;
 	const check = (id: unknown, operation: 'upsert' | 'delete', index: number) => {
-		const byteLength = mutationIdByteLength(id);
+		const rejection = mutationIdRejection(
+			id,
+			replacementDeleteMaxBytes === undefined
+				? maxStringBytes
+				: replacementDeleteMaxBytes - mutationBatchHeaderBytes - 4,
+		);
 		if (replacementDeleteMaxBytes !== undefined) {
-			if (byteLength === undefined) {
+			if (rejection === 'E_INVALID_ARGUMENT') {
 				throw new FulltextError(
 					'E_INVALID_ARGUMENT',
-					`mutation batch ${operation} at index ${index} has no usable delete ID`,
+					`mutation batch ${operation} at index ${index} has no usable ID for a ${operation === 'upsert' ? 'replacement delete' : 'delete'}`,
 				);
 			}
-			if (mutationBatchHeaderBytes + 4 + byteLength > replacementDeleteMaxBytes) {
+			if (rejection === 'E_BATCH_TOO_LARGE') {
 				throw new FulltextError(
 					'E_BATCH_TOO_LARGE',
-					`mutation batch ${operation} at index ${index} cannot fit in a replacement-delete frame`,
+					`mutation batch ${operation} at index ${index} cannot fit in a ${operation === 'upsert' ? 'replacement-delete' : 'delete'} frame`,
 				);
 			}
 		}
-		if (byteLength === undefined || !ids) return;
+		if (rejection || !ids) return;
 		const validId = id as string;
 		if (ids.has(validId)) throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch IDs must be distinct');
 		ids.add(validId);
@@ -139,10 +144,10 @@ export class MutationBatchFrameCursor {
 			requireReplacementDeletes?: boolean;
 		},
 	) {
-		validateMutationBatch(batch, options.validateDistinctIds, options.requireReplacementDeletes ? maxBytes : undefined);
 		if (!Number.isSafeInteger(maxBytes) || maxBytes < minimumMutationBatchBytes) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'maxBytes is too small for a mutation batch');
 		}
+		validateMutationBatch(batch, options.validateDistinctIds, options.requireReplacementDeletes ? maxBytes : undefined);
 		this.#batch = batch;
 		this.#maxBytes = maxBytes;
 		this.#fieldNames = fieldNames;
@@ -237,14 +242,20 @@ export class MutationBatchFrameCursor {
 }
 
 function encodeMutationId(id: unknown): Buffer | undefined {
-	if (mutationIdByteLength(id) === undefined) return;
+	if (mutationIdRejection(id)) return;
 	return Buffer.from(id as string, 'utf8');
 }
 
-function mutationIdByteLength(id: unknown): number | undefined {
-	if (typeof id !== 'string' || id.length === 0 || id.length > maxStringBytes || invalidSurrogate.test(id)) return;
+function mutationIdRejection(
+	id: unknown,
+	maximumBytes = maxStringBytes,
+): 'E_INVALID_ARGUMENT' | 'E_BATCH_TOO_LARGE' | undefined {
+	if (typeof id !== 'string' || id.length === 0 || id.length > maxStringBytes || invalidSurrogate.test(id))
+		return 'E_INVALID_ARGUMENT';
+	if (id.length * 3 <= Math.min(maxStringBytes, maximumBytes)) return;
 	const byteLength = Buffer.byteLength(id, 'utf8');
-	return byteLength <= maxStringBytes ? byteLength : undefined;
+	if (byteLength > maxStringBytes) return 'E_INVALID_ARGUMENT';
+	if (byteLength > maximumBytes) return 'E_BATCH_TOO_LARGE';
 }
 
 function encodeUpsertRecord(

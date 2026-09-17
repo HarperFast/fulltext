@@ -130,9 +130,12 @@ test('post-close logical batches do not retain the active latch', async (context
 	await assert.rejects(index.applyMutationBatch({ deletes: ['closing'] }), (error) => error.code === 'E_CLOSED');
 	await closing;
 	await assert.rejects(index.applyMutationBatch({}), (error) => error.code === 'E_CLOSED');
-	const rejectedBatch = index.applyMutationBatch({ deletes: ['closed'] });
+	const rejectedBatch = assert.rejects(
+		index.applyMutationBatch({ deletes: ['closed'] }),
+		(error) => error.code === 'E_CLOSED',
+	);
 	await assert.rejects(index.commit(), (error) => error.code === 'E_CLOSED');
-	await assert.rejects(rejectedBatch, (error) => error.code === 'E_CLOSED');
+	await rejectedBatch;
 	await assert.rejects(index.applyMutationBatch({ deletes: ['closed-again'] }), (error) => error.code === 'E_CLOSED');
 });
 
