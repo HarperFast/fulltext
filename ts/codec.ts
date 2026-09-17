@@ -77,7 +77,7 @@ export function validateMutationBatch(batch: PackedMutationBatch, validateDistin
 	if (!validateDistinctIds) return;
 	const ids = new Set<string>();
 	const check = (id: unknown) => {
-		if (typeof id !== 'string' || id.length === 0 || invalidSurrogate.test(id)) return;
+		if (typeof id !== 'string' || id.length === 0 || id.length > maxStringBytes || invalidSurrogate.test(id)) return;
 		if (Buffer.byteLength(id) > maxStringBytes) return;
 		if (ids.has(id)) throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch IDs must be distinct');
 		ids.add(id);
@@ -215,8 +215,8 @@ export class MutationBatchFrameCursor {
 }
 
 function encodeMutationId(id: unknown): Buffer | undefined {
-	if (typeof id !== 'string' || id.length === 0 || invalidSurrogate.test(id)) return;
-	if (id.length > maxStringBytes || Buffer.byteLength(id, 'utf8') > maxStringBytes) return;
+	if (typeof id !== 'string' || id.length === 0 || id.length > maxStringBytes || invalidSurrogate.test(id)) return;
+	if (Buffer.byteLength(id, 'utf8') > maxStringBytes) return;
 	const bytes = Buffer.from(id, 'utf8');
 	return bytes;
 }
@@ -362,7 +362,7 @@ export function encodeBatchPartitions(
 	const maxFrameBytes = Math.min(maxBytes, maxTotalBytes);
 	const encodedIds = new Set<string>();
 	const checkDuplicate = (id: unknown) => {
-		if (typeof id !== 'string' || id.length === 0 || invalidSurrogate.test(id)) return;
+		if (typeof id !== 'string' || id.length === 0 || id.length > maxStringBytes || invalidSurrogate.test(id)) return;
 		if (Buffer.byteLength(id) > maxStringBytes) return;
 		if (encodedIds.has(id)) throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch IDs must be distinct');
 		encodedIds.add(id);

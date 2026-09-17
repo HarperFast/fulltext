@@ -905,6 +905,34 @@ test('latches before reading caller-controlled mutation getters', async (context
 	await index.close();
 });
 
+test('rechecks the logical latch after reading a caller-owned typed array', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 256 };
+	const index = await openNativeFullTextIndex(config);
+	let logical;
+	class ReentrantBatch extends Uint8Array {
+		get buffer() {
+			logical = index.applyMutationBatch({
+				upserts: [
+					{ id: 'logical-one', fields: { title: `logical one ${'x'.repeat(170)}` } },
+					{ id: 'logical-two', fields: { title: `logical two ${'x'.repeat(170)}` } },
+				],
+			});
+			logical.catch(() => undefined);
+			return super.buffer;
+		}
+	}
+	const lowLevel = new ReentrantBatch(
+		encodeMutationBatch({ upserts: [{ id: 'interleaved', fields: { title: 'must not be admitted' } }] }),
+	);
+	await assert.rejects(index.apply(lowLevel), (error) => error.code === 'E_BATCH_ACTIVE');
+	assert.strictEqual((await logical).processed, 2);
+	await index.publish('after-typed-array-reentrancy');
+	assert.strictEqual((await index.search({ text: 'logical', exactTotal: true })).total, 2);
+	assert.strictEqual((await index.search({ text: 'must not be admitted', exactTotal: true })).total, 0);
+	await index.close();
+});
+
 test('batches replacement deletes for many rejected upserts', async (context) => {
 	const config = options(temporaryIndex(context));
 	config.limits = { ...config.limits, maxBatchBytes: 1_024 };

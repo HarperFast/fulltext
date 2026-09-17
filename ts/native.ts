@@ -185,7 +185,9 @@ export class NativeFullTextIndex {
 
 	async apply(packedBatch: Uint8Array): Promise<number> {
 		this.#assertLogicalMutationIdle();
-		return this.#applyPacked(packedBatch);
+		const buffer = asBuffer(packedBatch);
+		this.#assertLogicalMutationIdle();
+		return this.#applyPacked(buffer);
 	}
 
 	async #applyPacked(packedBatch: Uint8Array, onAdmitted?: () => void): Promise<number> {
