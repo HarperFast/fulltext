@@ -12,6 +12,7 @@ const batchSize = integerArgument('--batch-size', smoke ? 250 : 1_000);
 const queryCount = integerArgument('--queries', smoke ? 20 : 500);
 const concurrency = integerArgument('--concurrency', 4);
 const commitEvery = integerArgument('--commit-every', documents);
+const mutationDriver = enumArgument('--mutation-driver', ['logical', 'low-level'], 'logical');
 const indexPath = await mkdtemp(path.join(tmpdir(), 'harper-fulltext-benchmark-'));
 const config = {
 	path: indexPath,
@@ -38,6 +39,9 @@ try {
 	let applyMilliseconds = 0;
 	let packedBytes = 0;
 	let uncommittedDocuments = 0;
+	let frames = 0;
+	let mutationDriverMilliseconds = 0;
+	const logicalBatchLatencies = [];
 	let peakRssBytes = process.memoryUsage.rss();
 	const rssSampler = setInterval(() => {
 		peakRssBytes = Math.max(peakRssBytes, process.memoryUsage.rss());
@@ -48,13 +52,28 @@ try {
 	for (let start = 0; start < documents; start += batchSize) {
 		const end = Math.min(start + batchSize, documents);
 		const batch = Array.from({ length: end - start }, (_, offset) => product(start + offset));
-		const packingStarted = performance.now();
-		const packed = encodeMutationBatch({ upserts: batch }, config.limits.maxBatchBytes);
-		packingMilliseconds += performance.now() - packingStarted;
-		packedBytes += packed.byteLength;
-		const applyStarted = performance.now();
-		assert.strictEqual(await index.apply(packed), batch.length);
-		applyMilliseconds += performance.now() - applyStarted;
+		const logicalBatchStarted = performance.now();
+		if (mutationDriver === 'low-level') {
+			const packingStarted = performance.now();
+			const packed = encodeMutationBatch({ upserts: batch }, config.limits.maxBatchBytes);
+			packingMilliseconds += performance.now() - packingStarted;
+			packedBytes += packed.byteLength;
+			frames++;
+			const applyStarted = performance.now();
+			assert.strictEqual(await index.apply(packed), batch.length);
+			applyMilliseconds += performance.now() - applyStarted;
+		} else {
+			const applyStarted = performance.now();
+			const result = await index.applyMutationBatch({ upserts: batch });
+			applyMilliseconds += performance.now() - applyStarted;
+			assert.strictEqual(result.processed, batch.length);
+			assert.deepStrictEqual(result.rejected, []);
+			packedBytes += result.encodedBytes;
+			frames += result.frames;
+		}
+		const logicalBatchMilliseconds = performance.now() - logicalBatchStarted;
+		logicalBatchLatencies.push(logicalBatchMilliseconds);
+		mutationDriverMilliseconds += logicalBatchMilliseconds;
 		peakRssBytes = Math.max(peakRssBytes, process.memoryUsage.rss());
 		uncommittedDocuments += batch.length;
 		if (end === documents || uncommittedDocuments >= commitEvery) {
@@ -93,6 +112,7 @@ try {
 	const cold = await measureSearch(index, queryMix, Math.min(20, queryCount), 1, false);
 	await index.close();
 	const sortedCommitLatencies = [...commitLatencies].sort((left, right) => left - right);
+	logicalBatchLatencies.sort((left, right) => left - right);
 	const output = {
 		formatVersion: 1,
 		backend: 'tantivy-mmap',
@@ -104,6 +124,7 @@ try {
 			cpus: navigator.hardwareConcurrency,
 		},
 		workload: {
+			mutationDriver,
 			documents,
 			batchSize,
 			packedBytes,
@@ -118,9 +139,14 @@ try {
 		indexing: {
 			packingMilliseconds,
 			applyMilliseconds,
+			mutationDriverMilliseconds,
 			durableEndToEndMilliseconds: durableIndexingMilliseconds,
 			durableDocumentsPerSecond: (documents * 1_000) / durableIndexingMilliseconds,
 			durablePackedMiBPerSecond: (packedBytes / 1024 / 1024) * (1_000 / durableIndexingMilliseconds),
+			frames,
+			logicalBatchP50Milliseconds: percentile(logicalBatchLatencies, 0.5),
+			logicalBatchP95Milliseconds: percentile(logicalBatchLatencies, 0.95),
+			logicalBatchP99Milliseconds: percentile(logicalBatchLatencies, 0.99),
 			writerQueueMilliseconds: Number(afterIndexing.metrics.writerQueueNanoseconds) / 1e6,
 			writerExecutionMilliseconds: Number(afterIndexing.metrics.writerExecutionNanoseconds) / 1e6,
 			commitEveryDocuments: commitEvery,
@@ -211,6 +237,14 @@ function integerArgument(name, fallback) {
 	if (!Number.isSafeInteger(value) || value <= 0) {
 		throw new Error(`${name} must be a positive integer`);
 	}
+	return value;
+}
+
+function enumArgument(name, values, fallback) {
+	const index = process.argv.indexOf(name);
+	if (index === -1) return fallback;
+	const value = process.argv[index + 1];
+	if (!values.includes(value)) throw new Error(`${name} must be one of ${values.join(', ')}`);
 	return value;
 }
 

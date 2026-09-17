@@ -151,7 +151,11 @@ for (const afterCommit of [false, true]) {
 			const handle = opened.u32();
 			assert.strictEqual(opened.u8(), 0);
 			opened.finish();
-			let index = new NativeFullTextIndex(handle);
+			let index = new NativeFullTextIndex({
+				handle,
+				maxBatchBytes: options.limits.maxBatchBytes,
+				fieldNames: options.fields.map((field) => field.name),
+			});
 			cleanup(context, options, () => index);
 			if (prior !== undefined) await index.publish(prior);
 			await index.apply(batch('one', 'recoverable catalog'));

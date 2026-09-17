@@ -3,6 +3,8 @@ use crate::error::{FulltextError, Result};
 pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_STRING_BYTES: usize = 1 << 20;
 const MAX_FIELDS: usize = 1_024;
+const MUTATION_BATCH_HEADER_BYTES: usize = 14;
+const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 7;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldConfig {
@@ -289,9 +291,9 @@ fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
 			u32::MAX
 		)));
 	}
-	if limits.max_batch_bytes == 0 || limits.max_batch_bytes > limits.max_queued_bytes {
+	if limits.max_batch_bytes < MIN_MUTATION_BATCH_BYTES || limits.max_batch_bytes > limits.max_queued_bytes {
 		return Err(FulltextError::invalid(
-			"maxBatchBytes must be greater than zero and no larger than maxQueuedBytes",
+			"maxBatchBytes must hold at least one upsert and be no larger than maxQueuedBytes",
 		));
 	}
 	Ok(config)
@@ -484,6 +486,46 @@ mod tests {
 			validate_batch_header(malformed, malformed.len()).unwrap_err().code,
 			"E_INVALID_ARGUMENT"
 		);
+	}
+
+	#[test]
+	fn rejects_a_batch_limit_that_cannot_hold_the_header() {
+		let identity = EngineIdentityConfig {
+			index_id: "products".to_owned(),
+			generation: "one".to_owned(),
+			fields: vec![FieldConfig {
+				name: "title".to_owned(),
+				weight: 1.0,
+			}],
+			analyzer: "english@1".to_owned(),
+			stop_words: true,
+			positions: true,
+			surface_terms: false,
+		};
+		let limits = Limits {
+			indexing_threads: 1,
+			search_threads: 1,
+			writer_memory_bytes: 15_000_000,
+			max_queued_commands: 1,
+			max_queued_bytes: 1024,
+			max_batch_bytes: MIN_MUTATION_BATCH_BYTES - 1,
+		};
+		assert_eq!(
+			validate_config(EngineConfig {
+				identity: identity.clone(),
+				limits: limits.clone(),
+			})
+			.unwrap_err()
+			.code,
+			"E_INVALID_ARGUMENT"
+		);
+		let mut accepted = limits;
+		accepted.max_batch_bytes = MIN_MUTATION_BATCH_BYTES;
+		assert!(validate_config(EngineConfig {
+			identity,
+			limits: accepted,
+		})
+		.is_ok());
 	}
 
 	#[test]

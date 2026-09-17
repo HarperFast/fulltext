@@ -37,7 +37,7 @@
 		"benchmark:native": "npm run build && node benchmarks/native.mjs",
 		"benchmark:inspect": "npm run build && node benchmarks/inspect.mjs",
 		"benchmark:inspect:smoke": "node benchmarks/inspect.mjs --smoke",
-		"benchmark:smoke": "node benchmarks/native.mjs --smoke",
+		"benchmark:smoke": "node benchmarks/native.mjs --smoke --mutation-driver logical && node benchmarks/native.mjs --smoke --mutation-driver low-level",
 		"check": "npm run format:check && npm run lint && npm run test",
 		"format": "prettier --write . && cargo fmt",
 		"format:check": "prettier --check . && cargo fmt --check",

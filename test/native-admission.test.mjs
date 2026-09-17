@@ -38,7 +38,11 @@ async function fixture(context) {
 	const handle = opened.u32();
 	assert.strictEqual(opened.u8(), 0);
 	opened.finish();
-	const index = new NativeFullTextIndex(handle);
+	const index = new NativeFullTextIndex({
+		handle,
+		maxBatchBytes: options.limits.maxBatchBytes,
+		fieldNames: options.fields.map((field) => field.name),
+	});
 	context.after(async () => {
 		await index.close({ mode: 'rollback' });
 		rmSync(options.path, { recursive: true, force: true });
@@ -92,6 +96,38 @@ for (const operation of ['apply', 'commit', 'publish', 'reload']) {
 		},
 	);
 }
+
+test(
+	'latches a logical batch when a later frame is refused after an earlier admission',
+	{ timeout: 10_000 },
+	async (context) => {
+		const { addon, handle, index } = await fixture(context);
+		const nativeApply = addon.__nativeApply;
+		let attempts = 0;
+		try {
+			addon.__nativeApply = (...arguments_) => {
+				attempts++;
+				nativeApply(...arguments_);
+				if (attempts === 1) addon.__testPoisonBeforeNextAdmission(handle);
+			};
+			await assert.rejects(
+				index.applyMutationBatch({
+					upserts: [
+						{ id: 'pending-one', fields: { title: 'x'.repeat(700_000) } },
+						{ id: 'pending-two', fields: { title: 'x'.repeat(700_000) } },
+					],
+				}),
+				hasCode('E_POISONED'),
+			);
+		} finally {
+			addon.__nativeApply = nativeApply;
+		}
+		assert.strictEqual(attempts, 2);
+		await assert.rejects(index.commit(), hasCode('E_BATCH_INCOMPLETE'));
+		await assert.rejects(index.applyMutationBatch({ deletes: ['saved'] }), hasCode('E_BATCH_INCOMPLETE'));
+		await assert.rejects(index.close(), hasCode('E_BATCH_INCOMPLETE'));
+	},
+);
 
 test(
 	'a dirty close racing poison rolls back without reopening the terminal generation',

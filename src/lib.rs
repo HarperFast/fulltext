@@ -23,8 +23,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "test-panic")]
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const NATIVE_ABI_VERSION: u32 = 4;
+pub const NATIVE_ABI_VERSION: u32 = 5;
 pub const TANTIVY_VERSION: &str = "0.26.1";
+
+#[cfg(feature = "node-api")]
+#[napi(object)]
+pub struct RuntimeLimits {
+	pub max_commit_payload_bytes: u32,
+}
 
 #[cfg(feature = "node-api")]
 #[napi(object)]
@@ -33,6 +39,7 @@ pub struct RuntimeInfo {
 	pub tantivy_version: String,
 	pub native_abi_version: u32,
 	pub storage_backends: Vec<String>,
+	pub limits: RuntimeLimits,
 }
 
 #[cfg(feature = "node-api")]
@@ -43,6 +50,9 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 		tantivy_version: TANTIVY_VERSION.to_owned(),
 		native_abi_version: NATIVE_ABI_VERSION,
 		storage_backends: vec!["native".to_owned()],
+		limits: RuntimeLimits {
+			max_commit_payload_bytes: engine::MAX_COMMIT_PAYLOAD_BYTES as u32,
+		},
 	})
 }
 

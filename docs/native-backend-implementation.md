@@ -86,6 +86,11 @@ interface FullTextMutationBatch {
 	deletes?: string[];
 }
 
+interface EncodeFullTextMutationBatchesOptions {
+	maxTotalBytes?: number;
+	allowPartial?: boolean;
+}
+
 interface SearchRequest {
 	text: string;
 	operator?: 'any' | 'all';
@@ -144,9 +149,13 @@ The exported flow is:
    Harper validates the opaque payload against its own replay-cursor contract.
 2. `openNativeFullTextIndex(options)` creates the directory when absent, canonicalizes it, reserves
    the canonical path, and asynchronously creates or reopens Tantivy state.
-3. `encodeMutationBatch(batch)` creates the versioned packed request. `apply(packedBatch)` copies
-   it once into Rust-owned memory, validates it once in Rust, and enqueues one command. Upsert is
-   delete-by-ID followed by add, so a committed ID has at most one live document.
+3. `index.encodeMutationBatches(batch)` validates one logical batch against the opened schema and
+   greedily creates versioned packed requests within the opened byte limits. Invalid individual
+   mutations are reported by operation and per-operation array index; they are never dropped.
+   `apply(packedBatch)` copies one frame into Rust-owned memory, validates it in Rust, and enqueues
+   one command. Upsert is delete-by-ID followed by add, so a committed ID has at most one live
+   document. The low-level `encodeMutationBatch(batch, maxBytes)` remains available for callers that
+   intentionally produce one frame.
 4. `commit()` serializes behind earlier writer commands and publishes through Tantivy's ordinary
    commit path. It does not imply reader reload.
 5. `reload()` crosses the writer barrier and then refreshes the reader on the search executor;
@@ -169,12 +178,21 @@ into bounded result objects. The N-API boundary receives one operation per batch
 per-document native calls are not exposed. The benchmark reports engine execution separately from
 N-API plus result-decoding time so storage and boundary costs cannot be confused.
 
-`encodeMutationBatch()` enforces the configured byte limit incrementally before allocation growth,
-but it is a convenience encoder, not claimed to be an event-loop-free ingestion path. It performs
-UTF-8 encoding on its caller's JavaScript thread. Production callers may build the documented
-packed format in their own worker; Harper's projection path produces it directly. `apply()` then
-makes one required copy into Rust-owned memory before asynchronous admission. Both costs are
-measured, and the benchmark pre-encodes its engine-only corpus so directory results exclude them.
+Both encoders perform UTF-8 encoding synchronously on the caller's JavaScript thread.
+`encodeMutationBatches()` binds frame size to the opened handle, validates IDs and field names,
+requires IDs to be distinct across the logical batch, and defaults the total returned-byte ceiling
+to 64 MiB. A caller can lower that ceiling with `maxTotalBytes`; exceeding it throws by default.
+With `allowPartial: true`, the result reports the leading upsert and delete counts consumed under
+that ceiling so a caller can apply the frames and continue with each array's remaining suffix
+without re-encoding earlier records. Aggregate frame overflow creates
+more frames; a mutation that cannot fit alone is reported to the caller. The call performs no native
+work. `apply()` then makes one
+required copy into Rust-owned memory before asynchronous admission. Callers apply every frame and
+commit or publish only after all succeed; otherwise they rollback-close the staged writer window.
+One caller owns that complete apply-and-publication sequence per handle; the low-level frame API
+does not provide a logical-batch fence between concurrent publishers. Searches remain concurrent.
+The benchmark reports encoding separately and pre-encodes its engine-only corpus so directory
+results exclude both JavaScript encoding and the N-API copy.
 
 ## Native architecture
 
@@ -305,7 +323,9 @@ handle always permits rollback close, and a default close after a terminal commi
 the same forced teardown because there is no valid writer state left to preserve. A successful close
 joins Tantivy's merge threads, stops the search executor, and only then releases the canonical path.
 Closing transitions through open, closing, and closed states; it settles admitted commands, and
-repeated successful close calls resolve. Process exit does not promise an implicit final commit.
+repeated successful close calls resolve. A post-quiescence operational cleanup failure also resolves
+and is returned as `cleanupError`; rejection means quiescence was not proven or the caller must
+explicitly resolve uncommitted data. Process exit does not promise an implicit final commit.
 
 Each Node environment registers one N-API asynchronous cleanup hook, shared by every index it opens.
 Environment teardown stops accepting work, detaches JavaScript completions, schedules rollback close

@@ -25,8 +25,11 @@ test('loads the artifact for the executing platform', async () => {
 	assert.deepStrictEqual(info, {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
-		nativeAbiVersion: 4,
+		nativeAbiVersion: 5,
+		lifecycleApiVersion: 1,
+		mutationBatchApiVersion: 3,
 		storageBackends: ['native'],
+		limits: { maxCommitPayloadBytes: 64 * 1024 },
 	});
 	assert.strictEqual(cargoPackageVersion, packageManifest.version);
 	assert.match(platformTriple(), /^(darwin|linux|win32)-(arm64|x64)(-(gnu|musl|msvc))?$/);
@@ -97,12 +100,43 @@ test('a close failure after resource release remains resettable', async (context
 	const indexPath = path.join(parent, 'index');
 	context.after(() => rmSync(parent, { recursive: true, force: true }));
 	const { addon, handle, index } = await testIndex(indexPath, 'close-failed');
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [
+				{ id: 'first', fields: { title: 'x'.repeat(700_000) } },
+				{ id: 'second', fields: { title: 'x'.repeat(700_000) } },
+				{ id: 'invalid', fields: { title: 'x'.repeat((1 << 20) + 1) } },
+			],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
 	assert(addon.__testFailNextClose);
 	addon.__testFailNextClose(handle, true);
-	await assert.rejects(index.close(), (error) => error.code === 'E_CLOSE_FAILED');
+	const result = await index.close({ mode: 'rollback' });
+	assert.strictEqual(result.cleanupError?.code, 'E_CLOSE_FAILED');
 	assert.strictEqual(index.status().state, 'closed');
-	await assert.rejects(index.close(), (error) => error.code === 'E_CLOSE_FAILED');
+	await assert.rejects(index.commit(), (error) => error.code === 'E_CLOSED');
+	assert.strictEqual((await index.close()).cleanupError?.code, 'E_CLOSE_FAILED');
 	assert.strictEqual((await resetNativeFullTextIndex({ path: indexPath, indexId: 'close-failed' })).state, 'reset');
+});
+
+test('post-close logical batches do not retain the active latch', async (context) => {
+	const parent = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-post-close-batch-'));
+	const indexPath = path.join(parent, 'index');
+	context.after(() => rmSync(parent, { recursive: true, force: true }));
+	const { index } = await testIndex(indexPath, 'post-close-batch');
+
+	const closing = index.close();
+	await assert.rejects(index.applyMutationBatch({ deletes: ['closing'] }), (error) => error.code === 'E_CLOSED');
+	await closing;
+	await assert.rejects(index.applyMutationBatch({}), (error) => error.code === 'E_CLOSED');
+	const rejectedBatch = assert.rejects(
+		index.applyMutationBatch({ deletes: ['closed'] }),
+		(error) => error.code === 'E_CLOSED',
+	);
+	await assert.rejects(index.commit(), (error) => error.code === 'E_CLOSED');
+	await rejectedBatch;
+	await assert.rejects(index.applyMutationBatch({ deletes: ['closed-again'] }), (error) => error.code === 'E_CLOSED');
 });
 
 test('an unproven close releases environment tracking and quarantines the index', async (context) => {
@@ -125,13 +159,20 @@ test('an unproven close releases environment tracking and quarantines the index'
 
 async function testIndex(indexPath, indexId) {
 	const addon = loadAddon();
-	const opened = await invoke((callback) =>
-		addon.__nativeOpen(encodeOpen(nativeOptions(indexPath, indexId)), callback),
-	);
+	const options = nativeOptions(indexPath, indexId);
+	const opened = await invoke((callback) => addon.__nativeOpen(encodeOpen(options), callback));
 	const handle = opened.u32();
 	assert.strictEqual(opened.u8(), 0);
 	opened.finish();
-	return { addon, handle, index: new NativeFullTextIndex(handle) };
+	return {
+		addon,
+		handle,
+		index: new NativeFullTextIndex({
+			handle,
+			maxBatchBytes: options.limits.maxBatchBytes,
+			fieldNames: options.fields.map((field) => field.name),
+		}),
+	};
 }
 
 function nativeOptions(indexPath, indexId) {

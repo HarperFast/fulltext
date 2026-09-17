@@ -206,6 +206,17 @@ pub fn native_inspect(packed_config: Buffer) -> boundary::Result<Buffer> {
 	})
 }
 
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeValidateOpen")]
+pub fn native_validate_open(packed_config: Buffer) -> boundary::Result<Buffer> {
+	boundary::run_stateless(|| {
+		let response = match decode_open(&packed_config) {
+			Ok(_) => success_envelope(Vec::new()),
+			Err(error) => error_envelope(error),
+		};
+		Buffer::from(response)
+	})
+}
+
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeReset")]
 pub fn native_reset(env: Env, packed_config: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
@@ -1226,7 +1237,7 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 	let writer_lock = directory.acquire_lock(&INDEX_WRITER_LOCK).map_err(reset_lock_error)?;
 	let retired_root = parent.join(RETIRED_ROOT);
 	ensure_retired_root(&retired_root)?;
-	let retired_path = next_retired_path(&retired_root, &canonical, operation)?;
+	let retired_path = next_retired_path(&retired_root, path, &canonical, operation)?;
 	let public_path = public_path(&retired_path)?;
 	drop(writer_lock);
 	drop(directory);
@@ -1276,9 +1287,10 @@ fn validate_reset_target(path: &Path, expected_index_id: &str) -> Result<()> {
 	Ok(())
 }
 
-fn next_retired_path(root: &Path, source: &Path, operation: u32) -> Result<PathBuf> {
+fn next_retired_path(root: &Path, source: &Path, canonical: &Path, operation: u32) -> Result<PathBuf> {
 	let basename = source
 		.file_name()
+		.or_else(|| canonical.file_name())
 		.ok_or_else(|| FulltextError::invalid("reset path must have a final component"))?
 		.to_string_lossy();
 	let timestamp = SystemTime::now()
