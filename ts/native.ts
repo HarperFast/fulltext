@@ -294,7 +294,7 @@ export class NativeFullTextIndex {
 			this.#logicalMutationState = 'idle';
 			return { processed, rejected, encodedBytes, frames };
 		} catch (error) {
-			this.#logicalMutationState = nativeAttempted ? 'incomplete' : 'idle';
+			if (!this.#closed) this.#logicalMutationState = nativeAttempted ? 'incomplete' : 'idle';
 			throw normalizeNativeError(error);
 		}
 	}
@@ -398,6 +398,7 @@ export class NativeFullTextIndex {
 	}
 
 	async reload(): Promise<void> {
+		this.#assertLogicalMutationIdle();
 		const cursor = await invoke((callback) => loadAddon().__nativeReload(this.#handle, callback));
 		cursor.finish();
 	}
@@ -487,10 +488,12 @@ export class NativeFullTextIndex {
 				const nativeError = normalizeNativeError(error);
 				if (nativeError.code === 'E_CLOSE_FAILED') {
 					this.#closed = true;
+					this.#logicalMutationState = 'idle';
 					this.#closedStatus = { ...openStatus, state: 'closed' };
 					return { cleanupError: nativeError };
 				} else if (nativeError.code === 'E_QUIESCENCE_FAILED') {
 					this.#closed = true;
+					this.#logicalMutationState = 'idle';
 					this.#closedStatus = { ...openStatus, state: 'poisoned' };
 				}
 				throw nativeError;
@@ -582,6 +585,34 @@ export async function reclaimRetiredNativeFullTextIndexes(options: {
 	}
 	const livePath = resolve(options.path);
 	const retiredRoot = join(dirname(livePath), '.fulltext-retired');
+	const sourceNames = new Set([basename(livePath)]);
+	let retiredPath: string | undefined;
+	if (options.retiredPath !== undefined) {
+		if (typeof options.retiredPath !== 'string' || options.retiredPath.length === 0) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath must not be empty');
+		}
+		retiredPath = resolve(options.retiredPath);
+		let expectedRetiredRoot: string;
+		let suppliedRetiredRoot: string;
+		try {
+			[expectedRetiredRoot, suppliedRetiredRoot] = await Promise.all([
+				canonicalSiblingPath(retiredRoot),
+				canonicalSiblingPath(dirname(retiredPath)),
+			]);
+		} catch (error) {
+			throw new FulltextError('E_STORAGE', `could not resolve retired full-text path ${retiredPath}`, error);
+		}
+		if (suppliedRetiredRoot !== expectedRetiredRoot) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath must be inside the index retirement directory');
+		}
+		const match = /^(.*)\.\d+\.\d+\.\d+\.\d+$/.exec(basename(retiredPath));
+		if (!match || match[1].length === 0) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath is not a generated full-text retirement path');
+		}
+		if (!sourceNames.has(match[1])) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath does not belong to the requested full-text index');
+		}
+	}
 	let canonicalRoot: string;
 	let entries;
 	try {
@@ -599,12 +630,7 @@ export async function reclaimRetiredNativeFullTextIndexes(options: {
 		if (error instanceof FulltextError) throw error;
 		throw new FulltextError('E_STORAGE', `could not inspect retired full-text indexes for ${livePath}`, error);
 	}
-	const sourceNames = new Set([basename(livePath)]);
-	if (options.retiredPath !== undefined) {
-		if (typeof options.retiredPath !== 'string' || options.retiredPath.length === 0) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath must not be empty');
-		}
-		const retiredPath = resolve(options.retiredPath);
+	if (retiredPath !== undefined) {
 		let retiredParent: string;
 		try {
 			retiredParent = await realpath(dirname(retiredPath));
@@ -613,13 +639,6 @@ export async function reclaimRetiredNativeFullTextIndexes(options: {
 		}
 		if (retiredParent !== canonicalRoot) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath must be inside the index retirement directory');
-		}
-		const match = /^(.*)\.\d+\.\d+\.\d+\.\d+$/.exec(basename(retiredPath));
-		if (!match || match[1].length === 0) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath is not a generated full-text retirement path');
-		}
-		if (!sourceNames.has(match[1])) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath does not belong to the requested full-text index');
 		}
 	}
 	const generatedName = new RegExp(`^(?:${[...sourceNames].map(escapeRegExp).join('|')})\\.\\d+\\.\\d+\\.\\d+\\.\\d+$`);
@@ -761,4 +780,13 @@ function safeNumber(value: bigint, name: string): number {
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function canonicalSiblingPath(value: string): Promise<string> {
+	try {
+		return join(await realpath(dirname(value)), basename(value));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return value;
+		throw error;
+	}
 }

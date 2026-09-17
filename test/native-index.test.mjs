@@ -217,6 +217,17 @@ test('rejects a reset result belonging to another index', async (context) => {
 	assert.strictEqual(existsSync(retiredPath), true);
 });
 
+test('validates a retirement hint even when the retirement root is absent', async (context) => {
+	const parent = temporaryIndex(context);
+	await assert.rejects(
+		reclaimRetiredNativeFullTextIndexes({
+			path: path.join(parent, 'products'),
+			retiredPath: path.join(parent, '.fulltext-retired', 'orders.1.2.3.4'),
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+});
+
 test('does not broaden retirement cleanup through a symbolic-link index path', async (context) => {
 	if (process.platform === 'win32') {
 		context.skip('creating directory symbolic links requires host privileges on Windows');
@@ -823,6 +834,7 @@ test('latches a partially applied logical batch until rollback close', async (co
 	assert(index.status().uncommittedMutations > 0n);
 	await assert.rejects(index.publish('must-not-publish'), (error) => error.code === 'E_BATCH_INCOMPLETE');
 	await assert.rejects(index.commit(), (error) => error.code === 'E_BATCH_INCOMPLETE');
+	await assert.rejects(index.reload(), (error) => error.code === 'E_BATCH_INCOMPLETE');
 	await assert.rejects(
 		index.apply(encodeMutationBatch({ deletes: ['stable'] })),
 		(error) => error.code === 'E_BATCH_INCOMPLETE',
@@ -882,6 +894,7 @@ test('rejects low-level writer interleaving during logical apply', async (contex
 		index.apply(encodeMutationBatch({ deletes: ['other'] })),
 		(error) => error.code === 'E_BATCH_ACTIVE',
 	);
+	await assert.rejects(index.reload(), (error) => error.code === 'E_BATCH_ACTIVE');
 	assert.strictEqual((await index.search({ text: 'visible stable product', exactTotal: true })).hits[0].id, 'visible');
 	assert.strictEqual((await applying).processed, 15_000);
 	await index.close({ mode: 'rollback' });

@@ -100,11 +100,22 @@ test('a close failure after resource release remains resettable', async (context
 	const indexPath = path.join(parent, 'index');
 	context.after(() => rmSync(parent, { recursive: true, force: true }));
 	const { addon, handle, index } = await testIndex(indexPath, 'close-failed');
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [
+				{ id: 'first', fields: { title: 'x'.repeat(700_000) } },
+				{ id: 'second', fields: { title: 'x'.repeat(700_000) } },
+				{ id: 'invalid', fields: { title: 'x'.repeat((1 << 20) + 1) } },
+			],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
 	assert(addon.__testFailNextClose);
 	addon.__testFailNextClose(handle, true);
-	const result = await index.close();
+	const result = await index.close({ mode: 'rollback' });
 	assert.strictEqual(result.cleanupError?.code, 'E_CLOSE_FAILED');
 	assert.strictEqual(index.status().state, 'closed');
+	await assert.rejects(index.commit(), (error) => error.code === 'E_CLOSED');
 	assert.strictEqual((await index.close()).cleanupError?.code, 'E_CLOSE_FAILED');
 	assert.strictEqual((await resetNativeFullTextIndex({ path: indexPath, indexId: 'close-failed' })).state, 'reset');
 });
