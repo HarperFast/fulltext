@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{Env, JsFunction};
+use napi::{Env, JsFunction, Status};
 use napi_derive::napi;
 use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory, INDEX_WRITER_LOCK, META_LOCK};
 use tantivy::IndexReader;
@@ -759,8 +759,13 @@ impl CallbackGate {
 	fn send(&self, callback: Callback, bytes: Vec<u8>) {
 		let _transition = self.transition.read().unwrap_or_else(|error| error.into_inner());
 		if self.is_alive() {
-			let _ = callback.call(bytes, ThreadsafeFunctionCallMode::NonBlocking);
-			drop(callback);
+			let status = callback.call(bytes, ThreadsafeFunctionCallMode::NonBlocking);
+			if status == Status::Closing {
+				// Node no longer guarantees the TSFN remains allocated after this status.
+				mem::forget(callback);
+			} else {
+				drop(callback);
+			}
 		} else {
 			mem::forget(callback);
 		}
