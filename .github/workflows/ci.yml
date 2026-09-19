@@ -35,7 +35,7 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Prepare Windows native crash diagnostics
+      - name: Enable Windows native crash diagnostics
         if: runner.os == 'Windows'
         shell: pwsh
         continue-on-error: true
@@ -47,29 +47,14 @@ jobs:
           New-ItemProperty -Path $registryPath -Name DumpFolder -PropertyType ExpandString -Value $dumpDirectory -Force | Out-Null
           New-ItemProperty -Path $registryPath -Name DumpType -PropertyType DWord -Value 1 -Force | Out-Null
           New-ItemProperty -Path $registryPath -Name DumpCount -PropertyType DWord -Value 4 -Force | Out-Null
-
-          $debuggerPath = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
-          if (-not (Test-Path $debuggerPath)) {
-            $sdk = Get-ItemProperty 'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
-              Where-Object { $_.DisplayName -match 'Windows Software Development Kit' } |
-              Sort-Object DisplayVersion -Descending |
-              Select-Object -First 1
-            if (-not $sdk.BundleCachePath) {
-              throw 'Windows SDK installer is unavailable; cannot install cdb.exe.'
-            }
-            $install = Start-Process -FilePath $sdk.BundleCachePath -ArgumentList @(
-              '/features', 'OptionId.WindowsDesktopDebuggers', '/q', '/norestart'
-            ) -Wait -PassThru
-            if ($install.ExitCode -ne 0 -or -not (Test-Path $debuggerPath)) {
-              throw "Windows Desktop Debuggers installation failed with exit code $($install.ExitCode)."
-            }
-          }
       - run: npm ci --ignore-scripts
       - run: npm run format:check
       - run: npm run lint
-      - run: npm test
+      - name: Test
+        id: tests
+        run: npm test
       - name: Analyze Windows native crash
-        if: failure() && runner.os == 'Windows'
+        if: always() && runner.os == 'Windows' && steps.tests.outcome == 'failure'
         shell: pwsh
         run: |
           $dumpDirectory = Join-Path $env:RUNNER_TEMP 'fulltext-crash-dumps'
@@ -84,28 +69,57 @@ jobs:
 
           $debuggerPath = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
           if (-not (Test-Path $debuggerPath)) {
-            Write-Warning 'cdb.exe is not installed on this runner.'
-            exit 0
+            $sdk = Get-ItemProperty 'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+              Where-Object { $_.DisplayName -match 'Windows Software Development Kit' } |
+              Sort-Object DisplayVersion -Descending |
+              Select-Object -First 1
+            if (-not $sdk.BundleCachePath) {
+              throw 'Windows SDK installer is unavailable; cannot install cdb.exe.'
+            }
+            $install = Start-Process -FilePath $sdk.BundleCachePath -ArgumentList @(
+              '/features', 'OptionId.WindowsDesktopDebuggers', '/q', '/norestart'
+            ) -PassThru
+            if (-not $install.WaitForExit(120000)) {
+              try {
+                $install.Kill($true)
+              } catch [System.InvalidOperationException] {
+              }
+              if (-not $install.WaitForExit(10000)) {
+                throw 'Windows Desktop Debuggers installer could not be stopped after timing out.'
+              }
+              if (-not (Test-Path $debuggerPath)) {
+                throw 'Windows Desktop Debuggers installation timed out.'
+              }
+            }
+            if ($install.ExitCode -ne 0 -or -not (Test-Path $debuggerPath)) {
+              throw "Windows Desktop Debuggers installation failed with exit code $($install.ExitCode)."
+            }
           }
           $symbolPaths = @(
             $pwd,
             (Join-Path $pwd 'target\debug'),
             (Join-Path $pwd 'target\debug\deps')
           ) -join ';'
-          $commands = ".symfix; .sympath+ $symbolPaths; .reload; !analyze -v; k; q"
+          $commands = '.reload; k; !analyze -v; q'
 
           foreach ($dump in $dumps) {
             Write-Host "Analyzing $($dump.Name)"
             $stdout = Join-Path $env:RUNNER_TEMP "$($dump.BaseName)-cdb.out"
             $stderr = Join-Path $env:RUNNER_TEMP "$($dump.BaseName)-cdb.err"
             $debugger = Start-Process -FilePath $debuggerPath -ArgumentList @(
-              '-z', $dump.FullName, '-c', $commands
+              '-sins', '-y', $symbolPaths, '-z', $dump.FullName, '-c', $commands
             ) -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
             if (-not $debugger.WaitForExit(120000)) {
-              $debugger.Kill()
+              try {
+                $debugger.Kill($true)
+              } catch [System.InvalidOperationException] {
+              }
+              if (-not $debugger.WaitForExit(10000)) {
+                Write-Warning "cdb.exe could not be stopped after timing out on $($dump.Name)."
+                continue
+              }
               Write-Warning "cdb.exe timed out while analyzing $($dump.Name)."
             }
-            $debugger.WaitForExit()
             Get-Content $stdout -ErrorAction SilentlyContinue
             Get-Content $stderr -ErrorAction SilentlyContinue
           }
