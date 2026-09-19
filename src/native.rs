@@ -4,7 +4,7 @@ use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -109,8 +109,13 @@ struct CompletionSignal {
 }
 
 struct EnvironmentState {
-	alive: Arc<AtomicBool>,
+	callbacks: Arc<CallbackGate>,
 	handles: Mutex<HashMap<u32, Arc<CompletionSignal>>>,
+}
+
+struct CallbackGate {
+	alive: AtomicBool,
+	transition: RwLock<()>,
 }
 
 struct QueueState<T> {
@@ -138,7 +143,7 @@ type Callback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
 
 struct Completion {
 	callback: Option<Callback>,
-	env_alive: Arc<AtomicBool>,
+	callbacks: Arc<CallbackGate>,
 }
 
 struct WriterCommand {
@@ -175,7 +180,7 @@ pub fn native_open(env: Env, packed_config: Buffer, callback: JsFunction) -> bou
 	boundary::run_stateless(|| {
 		let environment = environment_state(&env)?;
 		let opening_done = Arc::new(CompletionSignal::new());
-		let completion = completion(callback, environment.alive.clone())?;
+		let completion = completion(callback, environment.callbacks.clone())?;
 		let handle = next_handle().map_err(fulltext_napi_error)?;
 		registry().opening.insert(handle);
 		environment.track(handle, opening_done.clone());
@@ -222,7 +227,7 @@ pub fn native_reset(env: Env, packed_config: Buffer, callback: JsFunction) -> bo
 	boundary::run_stateless(|| {
 		let environment = environment_state(&env)?;
 		let reset_done = Arc::new(CompletionSignal::new());
-		let completion = completion(callback, environment.alive.clone())?;
+		let completion = completion(callback, environment.callbacks.clone())?;
 		let operation = next_handle().map_err(fulltext_napi_error)?;
 		registry().opening.insert(operation);
 		environment.track(operation, reset_done.clone());
@@ -251,7 +256,7 @@ pub fn native_apply(handle: u32, packed_batch: Buffer, callback: JsFunction) -> 
 			.writer_queue
 			.check_capacity(packed_batch.len())
 			.map_err(fulltext_napi_error)?;
-		let completion = completion(callback, runtime.environment.alive.clone())?;
+		let completion = completion(callback, runtime.environment.callbacks.clone())?;
 		let bytes = packed_batch.to_vec();
 		runtime.enqueue_writer(
 			WriterCommand {
@@ -267,7 +272,7 @@ pub fn native_apply(handle: u32, packed_batch: Buffer, callback: JsFunction) -> 
 pub fn native_commit(handle: u32, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.environment.alive.clone())?;
+		let completion = completion(callback, runtime.environment.callbacks.clone())?;
 		runtime.enqueue_writer(
 			WriterCommand {
 				operation: WriterOperation::Commit,
@@ -288,7 +293,7 @@ pub fn native_publish(handle: u32, payload: String, callback: JsFunction) -> bou
 			))));
 		}
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.environment.alive.clone())?;
+		let completion = completion(callback, runtime.environment.callbacks.clone())?;
 		let bytes = payload.len();
 		runtime.enqueue_writer(
 			WriterCommand {
@@ -304,7 +309,7 @@ pub fn native_publish(handle: u32, payload: String, callback: JsFunction) -> bou
 pub fn native_reload(handle: u32, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.environment.alive.clone())?;
+		let completion = completion(callback, runtime.environment.callbacks.clone())?;
 		runtime.enqueue_writer(
 			WriterCommand {
 				operation: WriterOperation::Reload,
@@ -325,7 +330,7 @@ pub fn native_search(handle: u32, packed_request: Buffer, callback: JsFunction) 
 			.search_queue
 			.check_capacity(packed_request.len())
 			.map_err(fulltext_napi_error)?;
-		let completion = completion(callback, runtime.environment.alive.clone())?;
+		let completion = completion(callback, runtime.environment.callbacks.clone())?;
 		let request = packed_request.to_vec();
 		runtime
 			.search_queue
@@ -338,7 +343,7 @@ pub fn native_search(handle: u32, packed_request: Buffer, callback: JsFunction) 
 pub fn native_close(handle: u32, rollback: bool, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.environment.alive.clone())?;
+		let completion = completion(callback, runtime.environment.callbacks.clone())?;
 		match runtime
 			.state
 			.compare_exchange(STATE_OPEN, STATE_CLOSING, Ordering::AcqRel, Ordering::Acquire)
@@ -528,7 +533,7 @@ impl Runtime {
 				operation: WriterOperation::Close { rollback: true },
 				completion: Completion {
 					callback: None,
-					env_alive: self.environment.alive.clone(),
+					callbacks: self.environment.callbacks.clone(),
 				},
 			},
 			0,
@@ -728,11 +733,35 @@ impl Completion {
 	}
 
 	fn send(&mut self, bytes: Vec<u8>) {
-		if self.env_alive.load(Ordering::Acquire) {
-			if let Some(callback) = self.callback.take() {
-				let _ = callback.call(bytes, ThreadsafeFunctionCallMode::NonBlocking);
-			}
-		} else if let Some(callback) = self.callback.take() {
+		if let Some(callback) = self.callback.take() {
+			self.callbacks.send(callback, bytes);
+		}
+	}
+}
+
+impl CallbackGate {
+	fn new() -> Self {
+		Self {
+			alive: AtomicBool::new(true),
+			transition: RwLock::new(()),
+		}
+	}
+
+	fn is_alive(&self) -> bool {
+		self.alive.load(Ordering::Acquire)
+	}
+
+	fn close(&self) {
+		let _transition = self.transition.write().unwrap_or_else(|error| error.into_inner());
+		self.alive.store(false, Ordering::Release);
+	}
+
+	fn send(&self, callback: Callback, bytes: Vec<u8>) {
+		let _transition = self.transition.read().unwrap_or_else(|error| error.into_inner());
+		if self.is_alive() {
+			let _ = callback.call(bytes, ThreadsafeFunctionCallMode::NonBlocking);
+			drop(callback);
+		} else {
 			mem::forget(callback);
 		}
 	}
@@ -1157,7 +1186,7 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 	let reset = decode_reset(bytes)?;
 	{
 		let mut registry = registry();
-		if registry.cancelled.remove(&operation) || !environment.alive.load(Ordering::Acquire) {
+		if registry.cancelled.remove(&operation) || !environment.callbacks.is_alive() {
 			return Err(FulltextError::new(
 				"E_CLOSED",
 				"Node environment closed during index reset",
@@ -1447,7 +1476,7 @@ fn open_runtime_with_directory(
 ) -> Result<Option<String>> {
 	{
 		let mut registry = registry();
-		if registry.cancelled.remove(&handle) || !environment.alive.load(Ordering::Acquire) {
+		if registry.cancelled.remove(&handle) || !environment.callbacks.is_alive() {
 			registry.opening.remove(&handle);
 			return Err(FulltextError::new(
 				"E_CLOSED",
@@ -1498,7 +1527,7 @@ fn open_runtime_with_directory(
 			},
 		)?;
 		let mut registry = registry();
-		if registry.cancelled.remove(&handle) || !environment.alive.load(Ordering::Acquire) {
+		if registry.cancelled.remove(&handle) || !environment.callbacks.is_alive() {
 			drop(registry);
 			runtime.force_close();
 			let _ = runtime.wait_closed(CLEANUP_TIMEOUT);
@@ -1517,7 +1546,7 @@ fn open_runtime_with_directory(
 	result
 }
 
-fn completion(callback: JsFunction, env_alive: Arc<AtomicBool>) -> boundary::Result<Completion> {
+fn completion(callback: JsFunction, callbacks: Arc<CallbackGate>) -> boundary::Result<Completion> {
 	let callback = callback
 		.create_threadsafe_function::<Vec<u8>, Buffer, _, ErrorStrategy::Fatal>(
 			0,
@@ -1526,7 +1555,7 @@ fn completion(callback: JsFunction, env_alive: Arc<AtomicBool>) -> boundary::Res
 		.map_err(|error| napi_error("E_NATIVE_FAILURE", error))?;
 	Ok(Completion {
 		callback: Some(callback),
-		env_alive,
+		callbacks,
 	})
 }
 
@@ -1574,7 +1603,7 @@ fn environment_state(env: &Env) -> boundary::Result<Arc<EnvironmentState>> {
 		return Ok(environment);
 	}
 	let environment = Arc::new(EnvironmentState {
-		alive: Arc::new(AtomicBool::new(true)),
+		callbacks: Arc::new(CallbackGate::new()),
 		handles: Mutex::new(HashMap::new()),
 	});
 	env.add_async_cleanup_hook(
@@ -1592,7 +1621,7 @@ fn environment_state(env: &Env) -> boundary::Result<Arc<EnvironmentState>> {
 }
 
 fn finish_environment_cleanup(data: EnvironmentHookData) {
-	data.environment.alive.store(false, Ordering::Release);
+	data.environment.callbacks.close();
 	let tracked = data.environment.take_handles();
 	let waits = tracked
 		.into_iter()
