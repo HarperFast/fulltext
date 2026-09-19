@@ -759,9 +759,10 @@ impl CallbackGate {
 	fn send(&self, callback: Callback, bytes: Vec<u8>) {
 		let _transition = self.transition.read().unwrap_or_else(|error| error.into_inner());
 		if self.is_alive() {
+			// Keep both the nonblocking call and final release inside the teardown gate.
 			let status = callback.call(bytes, ThreadsafeFunctionCallMode::NonBlocking);
 			if status == Status::Closing {
-				// Node no longer guarantees the TSFN remains allocated after this status.
+				// napi_closing already decremented the thread count; releasing again is an error.
 				mem::forget(callback);
 			} else {
 				drop(callback);
