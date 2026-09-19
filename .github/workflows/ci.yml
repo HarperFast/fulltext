@@ -85,6 +85,7 @@ jobs:
               try {
                 $install.Kill($true)
               } catch [System.InvalidOperationException] {
+              } catch [System.ComponentModel.Win32Exception] {
               }
               if (-not $install.WaitForExit(10000)) {
                 throw 'Windows Desktop Debuggers installer could not be stopped after timing out.'
@@ -143,6 +144,7 @@ jobs:
               try {
                 $debugger.Kill($true)
               } catch [System.InvalidOperationException] {
+              } catch [System.ComponentModel.Win32Exception] {
               }
               if (-not $debugger.WaitForExit(10000)) {
                 Write-Warning "cdb.exe could not be stopped after timing out on $($dump.Name)."
