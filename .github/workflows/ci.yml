@@ -35,10 +35,41 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Enable Windows native minidumps
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dumpDirectory = Join-Path $env:RUNNER_TEMP 'fulltext-crash-dumps'
+          New-Item -ItemType Directory -Force -Path $dumpDirectory | Out-Null
+          $registryPath = 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\node.exe'
+          New-Item -Path $registryPath -Force | Out-Null
+          New-ItemProperty -Path $registryPath -Name DumpFolder -PropertyType ExpandString -Value $dumpDirectory -Force | Out-Null
+          New-ItemProperty -Path $registryPath -Name DumpType -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $registryPath -Name DumpCount -PropertyType DWord -Value 4 -Force | Out-Null
       - run: npm ci --ignore-scripts
       - run: npm run format:check
       - run: npm run lint
       - run: npm test
+      - name: Analyze Windows native crash
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dump = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'fulltext-crash-dumps') -Filter '*.dmp' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $dump) {
+            Write-Warning 'Windows Error Reporting did not produce a minidump.'
+            exit 0
+          }
+          $debugger = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $debugger) {
+            Write-Warning 'cdb.exe is not installed on this runner.'
+            exit 0
+          }
+          $symbolDirectory = Join-Path $pwd 'target\debug'
+          $commands = ".symfix; .sympath+ $symbolDirectory; .reload; !analyze -v; k; q"
+          & $debugger.FullName -z $dump.FullName -c $commands
       - run: git diff --exit-code -- ts/addon.d.ts
 
   supply-chain:
