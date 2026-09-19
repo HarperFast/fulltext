@@ -105,6 +105,31 @@ jobs:
           $commands = '.reload; k; !analyze -v; q'
           $analysisFailed = $false
 
+          function Write-SharedText([string]$path) {
+            if (-not [System.IO.File]::Exists($path)) { return }
+            try {
+              $stream = [System.IO.File]::Open(
+                $path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::ReadWrite
+              )
+              try {
+                $reader = [System.IO.StreamReader]::new($stream)
+                try {
+                  $content = $reader.ReadToEnd()
+                  if ($content) { Write-Host $content -NoNewline }
+                } finally {
+                  $reader.Dispose()
+                }
+              } finally {
+                $stream.Dispose()
+              }
+            } catch {
+              Write-Warning ("Could not read debugger output {0}: {1}" -f $path, $_.Exception.Message)
+            }
+          }
+
           foreach ($dump in $dumps) {
             Write-Host "Analyzing $($dump.Name)"
             $stdout = Join-Path $env:RUNNER_TEMP "$($dump.BaseName)-cdb.out"
@@ -112,7 +137,9 @@ jobs:
             $debugger = Start-Process -FilePath $debuggerPath -ArgumentList @(
               '-sins', '-y', $symbolPaths, '-z', $dump.FullName, '-c', $commands
             ) -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-            if (-not $debugger.WaitForExit(120000)) {
+            $timedOut = -not $debugger.WaitForExit(120000)
+            if ($timedOut) {
+              $analysisFailed = $true
               try {
                 $debugger.Kill($true)
               } catch [System.InvalidOperationException] {
@@ -124,9 +151,9 @@ jobs:
                 Write-Warning "cdb.exe timed out while analyzing $($dump.Name)."
               }
             }
-            Get-Content $stdout -ErrorAction SilentlyContinue
-            Get-Content $stderr -ErrorAction SilentlyContinue
-            if ($debugger.HasExited -and $debugger.ExitCode -ne 0) {
+            Write-SharedText $stdout
+            Write-SharedText $stderr
+            if (-not $timedOut -and $debugger.HasExited -and $debugger.ExitCode -ne 0) {
               Write-Warning "cdb.exe exited with code $($debugger.ExitCode) while analyzing $($dump.Name)."
               $analysisFailed = $true
             }
