@@ -21,6 +21,7 @@ if (files.length === 0) {
 const isolatedFiles = files.filter((file) => path.basename(file) === 'native-worker.test.mjs');
 const concurrentFiles = files.filter((file) => !isolatedFiles.includes(file));
 const nodeMajorVersion = Number.parseInt(process.versions.node, 10);
+const isolatedTestTimeout = 120_000;
 for (const batch of [concurrentFiles, isolatedFiles]) {
 	if (batch.length === 0) {
 		continue;
@@ -32,11 +33,15 @@ for (const batch of [concurrentFiles, isolatedFiles]) {
 	arguments_.push(...batch);
 	const result = spawnSync(process.execPath, arguments_, {
 		stdio: 'inherit',
-		timeout: batch === isolatedFiles ? 120_000 : undefined,
+		timeout: batch === isolatedFiles ? isolatedTestTimeout : undefined,
 	});
 	const relativeBatch = () => batch.map((file) => path.relative(process.cwd(), file)).join(', ');
 	if (result.error) {
-		console.error(`Node test process failed to complete: ${relativeBatch()}`);
+		console.error(
+			result.error.code === 'ETIMEDOUT'
+				? `Node test process timed out after ${isolatedTestTimeout / 1000}s: ${relativeBatch()}`
+				: `Node test process failed to start: ${relativeBatch()}`,
+		);
 		throw result.error;
 	}
 	if (result.status !== 0) {
@@ -45,6 +50,9 @@ for (const batch of [concurrentFiles, isolatedFiles]) {
 				`Node test process failed with status ${result.status ?? 'unknown'}${result.signal ? ` and signal ${result.signal}` : ''}: ${relativeBatch()}`,
 			);
 		}
-		process.exitCode ||= result.status ?? 1;
+		const status = result.status ?? 1;
+		if (!process.exitCode || (process.exitCode === 1 && status !== 1)) {
+			process.exitCode = status;
+		}
 	}
 }
