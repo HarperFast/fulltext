@@ -35,17 +35,35 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Enable Windows native minidumps
+      - name: Prepare Windows native crash diagnostics
         if: runner.os == 'Windows'
         shell: pwsh
+        continue-on-error: true
         run: |
           $dumpDirectory = Join-Path $env:RUNNER_TEMP 'fulltext-crash-dumps'
           New-Item -ItemType Directory -Force -Path $dumpDirectory | Out-Null
-          $registryPath = 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\node.exe'
+          $registryPath = 'HKLM:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\node.exe'
           New-Item -Path $registryPath -Force | Out-Null
           New-ItemProperty -Path $registryPath -Name DumpFolder -PropertyType ExpandString -Value $dumpDirectory -Force | Out-Null
           New-ItemProperty -Path $registryPath -Name DumpType -PropertyType DWord -Value 1 -Force | Out-Null
           New-ItemProperty -Path $registryPath -Name DumpCount -PropertyType DWord -Value 4 -Force | Out-Null
+
+          $debuggerPath = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+          if (-not (Test-Path $debuggerPath)) {
+            $sdk = Get-ItemProperty 'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+              Where-Object { $_.DisplayName -match 'Windows Software Development Kit' } |
+              Sort-Object DisplayVersion -Descending |
+              Select-Object -First 1
+            if (-not $sdk.BundleCachePath) {
+              throw 'Windows SDK installer is unavailable; cannot install cdb.exe.'
+            }
+            $install = Start-Process -FilePath $sdk.BundleCachePath -ArgumentList @(
+              '/features', 'OptionId.WindowsDesktopDebuggers', '/q', '/norestart'
+            ) -Wait -PassThru
+            if ($install.ExitCode -ne 0 -or -not (Test-Path $debuggerPath)) {
+              throw "Windows Desktop Debuggers installation failed with exit code $($install.ExitCode)."
+            }
+          }
       - run: npm ci --ignore-scripts
       - run: npm run format:check
       - run: npm run lint
@@ -54,22 +72,50 @@ jobs:
         if: failure() && runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dump = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'fulltext-crash-dumps') -Filter '*.dmp' |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $dump) {
+          $dumpDirectory = Join-Path $env:RUNNER_TEMP 'fulltext-crash-dumps'
+          $dumps = if (Test-Path $dumpDirectory) {
+            Get-ChildItem $dumpDirectory -Filter '*.dmp' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime
+          }
+          if (-not $dumps) {
             Write-Warning 'Windows Error Reporting did not produce a minidump.'
             exit 0
           }
-          $debugger = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe' -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if (-not $debugger) {
+
+          $debuggerPath = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+          if (-not (Test-Path $debuggerPath)) {
             Write-Warning 'cdb.exe is not installed on this runner.'
             exit 0
           }
-          $symbolDirectory = Join-Path $pwd 'target\debug'
-          $commands = ".symfix; .sympath+ $symbolDirectory; .reload; !analyze -v; k; q"
-          & $debugger.FullName -z $dump.FullName -c $commands
+          $symbolPaths = @(
+            $pwd,
+            (Join-Path $pwd 'target\debug'),
+            (Join-Path $pwd 'target\debug\deps')
+          ) -join ';'
+          $commands = ".symfix; .sympath+ $symbolPaths; .reload; !analyze -v; k; q"
+
+          foreach ($dump in $dumps) {
+            Write-Host "Analyzing $($dump.Name)"
+            $stdout = Join-Path $env:RUNNER_TEMP "$($dump.BaseName)-cdb.out"
+            $stderr = Join-Path $env:RUNNER_TEMP "$($dump.BaseName)-cdb.err"
+            $debugger = Start-Process -FilePath $debuggerPath -ArgumentList @(
+              '-z', $dump.FullName, '-c', $commands
+            ) -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            if (-not $debugger.WaitForExit(120000)) {
+              $debugger.Kill()
+              Write-Warning "cdb.exe timed out while analyzing $($dump.Name)."
+            }
+            $debugger.WaitForExit()
+            Get-Content $stdout -ErrorAction SilentlyContinue
+            Get-Content $stderr -ErrorAction SilentlyContinue
+          }
+      - name: Remove Windows native crash diagnostics
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Remove-Item 'HKLM:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\node.exe' -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $env:RUNNER_TEMP 'fulltext-crash-dumps') -Recurse -Force -ErrorAction SilentlyContinue
       - run: git diff --exit-code -- ts/addon.d.ts
 
   supply-chain:
