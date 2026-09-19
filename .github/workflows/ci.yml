@@ -63,7 +63,7 @@ jobs:
               Sort-Object LastWriteTime
           }
           if (-not $dumps) {
-            Write-Warning 'Windows Error Reporting did not produce a minidump.'
+            Write-Host 'No WER minidump was produced; the test failure may not be a native crash.'
             exit 0
           }
           Write-Host 'Captured native crash dumps:'
@@ -71,7 +71,7 @@ jobs:
 
           $debuggerPath = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
           if (-not (Test-Path $debuggerPath)) {
-            $sdk = Get-ItemProperty 'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+            $sdk = Get-ItemProperty 'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
               Where-Object { $_.DisplayName -match 'Windows Software Development Kit' } |
               Sort-Object DisplayVersion -Descending |
               Select-Object -First 1
@@ -103,6 +103,7 @@ jobs:
             (Join-Path $pwd 'target\debug\deps')
           ) -join ';'
           $commands = '.reload; k; !analyze -v; q'
+          $analysisFailed = $false
 
           foreach ($dump in $dumps) {
             Write-Host "Analyzing $($dump.Name)"
@@ -118,12 +119,20 @@ jobs:
               }
               if (-not $debugger.WaitForExit(10000)) {
                 Write-Warning "cdb.exe could not be stopped after timing out on $($dump.Name)."
+                $analysisFailed = $true
               } else {
                 Write-Warning "cdb.exe timed out while analyzing $($dump.Name)."
               }
             }
             Get-Content $stdout -ErrorAction SilentlyContinue
             Get-Content $stderr -ErrorAction SilentlyContinue
+            if ($debugger.HasExited -and $debugger.ExitCode -ne 0) {
+              Write-Warning "cdb.exe exited with code $($debugger.ExitCode) while analyzing $($dump.Name)."
+              $analysisFailed = $true
+            }
+          }
+          if ($analysisFailed) {
+            throw 'One or more native crash dumps could not be analyzed.'
           }
       - name: Remove Windows native crash diagnostics
         if: always() && runner.os == 'Windows'
