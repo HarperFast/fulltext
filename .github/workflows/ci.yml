@@ -66,6 +66,8 @@ jobs:
             Write-Warning 'Windows Error Reporting did not produce a minidump.'
             exit 0
           }
+          Write-Host 'Captured native crash dumps:'
+          $dumps | ForEach-Object { Write-Host "  $($_.Name)" }
 
           $debuggerPath = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
           if (-not (Test-Path $debuggerPath)) {
@@ -116,9 +118,9 @@ jobs:
               }
               if (-not $debugger.WaitForExit(10000)) {
                 Write-Warning "cdb.exe could not be stopped after timing out on $($dump.Name)."
-                continue
+              } else {
+                Write-Warning "cdb.exe timed out while analyzing $($dump.Name)."
               }
-              Write-Warning "cdb.exe timed out while analyzing $($dump.Name)."
             }
             Get-Content $stdout -ErrorAction SilentlyContinue
             Get-Content $stderr -ErrorAction SilentlyContinue

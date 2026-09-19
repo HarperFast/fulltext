@@ -339,18 +339,15 @@ export class NativeFullTextIndex {
 			if (!options || typeof options !== 'object' || Array.isArray(options)) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch options must be an object');
 			}
-			if (options.allowPartial !== undefined && typeof options.allowPartial !== 'boolean') {
+			const allowPartial = options.allowPartial;
+			const maxTotalBytes = options.maxTotalBytes ?? 64 * 1024 * 1024;
+			if (allowPartial !== undefined && typeof allowPartial !== 'boolean') {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'allowPartial must be a boolean');
 			}
 			const logical = snapshotMutationBatch(batch);
-			const encoded = encodeBatchPartitions(
-				logical,
-				this.#maxBatchBytes,
-				options.maxTotalBytes ?? 64 * 1024 * 1024,
-				this.#fieldNames,
-			);
+			const encoded = encodeBatchPartitions(logical, this.#maxBatchBytes, maxTotalBytes, this.#fieldNames);
 			if (
-				options.allowPartial !== true &&
+				allowPartial !== true &&
 				(encoded.consumedUpserts < logical.upserts.length || encoded.consumedDeletes < logical.deletes.length)
 			) {
 				throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
@@ -473,13 +470,21 @@ export class NativeFullTextIndex {
 		if (this.#closed) {
 			return {};
 		}
-		if (options.mode !== 'rollback') this.#assertLogicalMutationIdle();
+		if (!options || typeof options !== 'object' || Array.isArray(options)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'close options must be an object');
+		}
+		const mode = options.mode;
+		if (mode !== undefined && mode !== 'require-clean' && mode !== 'rollback') {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'close mode must be require-clean or rollback');
+		}
+		if (this.#closePromise) return this.#closePromise;
+		if (this.#closed) return {};
+		const rollback = mode === 'rollback';
+		if (!rollback) this.#assertLogicalMutationIdle();
 		const openStatus = this.status();
 		this.#closePromise = (async () => {
 			try {
-				const cursor = await invoke((callback) =>
-					loadAddon().__nativeClose(this.#handle, options.mode === 'rollback', callback),
-				);
+				const cursor = await invoke((callback) => loadAddon().__nativeClose(this.#handle, rollback, callback));
 				cursor.finish();
 				this.#closed = true;
 				this.#logicalMutationState = 'idle';

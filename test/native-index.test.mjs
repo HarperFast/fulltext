@@ -1178,6 +1178,32 @@ test('requires a boolean to opt into partial mutation results', async (context) 
 	await index.close();
 });
 
+test('snapshots allowPartial before encoding a batch', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 256 };
+	const index = await openNativeFullTextIndex(config);
+	const batch = {
+		upserts: [
+			{ id: 'one', fields: { title: 'catalog '.repeat(20) } },
+			{ id: 'two', fields: { title: 'catalog '.repeat(20) } },
+		],
+	};
+	let reads = 0;
+	assert.throws(
+		() =>
+			index.encodeMutationBatches(batch, {
+				maxTotalBytes: 300,
+				get allowPartial() {
+					reads++;
+					return reads > 1;
+				},
+			}),
+		(error) => error.code === 'E_BATCH_TOO_LARGE',
+	);
+	assert.strictEqual(reads, 1);
+	await index.close();
+});
+
 test('keeps a caller total ceiling below the configured frame ceiling', async (context) => {
 	const config = options(temporaryIndex(context));
 	config.limits = { ...config.limits, maxBatchBytes: 1024 };
@@ -1313,6 +1339,24 @@ test('requires an explicit rollback when close would discard mutations', async (
 	await index.apply(encodeMutationBatch({ upserts: [{ id: 'one', fields: { title: 'one' } }] }));
 	await assert.rejects(index.close(), (error) => error.code === 'E_DIRTY_CLOSE');
 	assert.strictEqual(index.status().state, 'open');
+	await index.close({ mode: 'rollback' });
+});
+
+test('snapshots the close mode before checking and executing it', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	await index.apply(encodeMutationBatch({ upserts: [{ id: 'one', fields: { title: 'one' } }] }));
+	let reads = 0;
+	await assert.rejects(
+		index.close({
+			get mode() {
+				reads++;
+				return reads === 1 ? 'require-clean' : 'rollback';
+			},
+		}),
+		(error) => error.code === 'E_DIRTY_CLOSE',
+	);
+	assert.strictEqual(reads, 1);
+	assert.strictEqual(index.status().uncommittedMutations, 1n);
 	await index.close({ mode: 'rollback' });
 });
 

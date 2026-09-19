@@ -659,10 +659,13 @@ class ByteWriter {
 		if (typeof value !== 'string') {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'packed string values must be strings');
 		}
-		if (value.length > maxStringBytes || Buffer.byteLength(value, 'utf8') > maxStringBytes) {
+		if (value.length > maxStringBytes) {
 			throw new FulltextError('E_INVALID_ARGUMENT', `packed string exceeds ${maxStringBytes} UTF-8 bytes`);
 		}
 		const bytes = Buffer.from(value, 'utf8');
+		if (bytes.byteLength > maxStringBytes) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `packed string exceeds ${maxStringBytes} UTF-8 bytes`);
+		}
 		this.encodedString(bytes);
 	}
 
