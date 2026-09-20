@@ -1,5 +1,17 @@
+import { lstat, readdir, realpath, rm } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
+
 import { FulltextError, normalizeNativeError } from './errors.js';
-import { decodeResponse, encodeBatch, encodeInspect, encodeOpen, encodeReset, encodeSearch } from './codec.js';
+import {
+	decodeResponse,
+	encodeBatch,
+	encodeBatchPartitions,
+	encodeInspect,
+	encodeOpen,
+	encodeReset,
+	encodeSearch,
+	MutationBatchFrameCursor,
+} from './codec.js';
 import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
 import { PublicationState } from './publication.js';
@@ -13,7 +25,10 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
+	lifecycleApiVersion: 1;
+	mutationBatchApiVersion: 3;
 	storageBackends: ReadonlyArray<'native'>;
+	limits: { maxCommitPayloadBytes: number };
 }
 
 export interface NativeFullTextIndexOptions {
@@ -60,9 +75,49 @@ export interface NativeFullTextIndexResetOptions {
 
 export type NativeFullTextIndexResetResult = { state: 'missing' } | { state: 'reset'; retiredPath: string };
 
+export type NativeFullTextReclaimResult = { removed: number; failed: number };
+
 export interface FullTextMutationBatch {
 	upserts?: Array<{ id: string; fields: Record<string, string | string[]> }>;
 	deletes?: string[];
+}
+
+export interface FullTextMutationBatchRejection {
+	operation: 'upsert' | 'delete';
+	/** Zero-based index in the corresponding `upserts` or `deletes` input array. */
+	index: number;
+	code: 'E_INVALID_ARGUMENT' | 'E_BATCH_TOO_LARGE';
+}
+
+export interface EncodedFullTextMutationBatch {
+	bytes: Uint8Array;
+	mutationCount: number;
+}
+
+export interface EncodedFullTextMutationBatches {
+	batches: EncodedFullTextMutationBatch[];
+	rejected: FullTextMutationBatchRejection[];
+	consumedUpserts: number;
+	consumedDeletes: number;
+}
+
+export interface EncodeFullTextMutationBatchesOptions {
+	maxTotalBytes?: number;
+	allowPartial?: boolean;
+}
+
+export interface ApplyFullTextMutationBatchOptions {
+	/** The caller guarantees that IDs are distinct; behavior is undefined if that precondition is false. */
+	assumeDistinctIds?: boolean;
+	rejectedUpsert?: 'reject' | 'delete';
+}
+
+export interface AppliedFullTextMutationBatch {
+	/** Original logical mutations handled, including rejected upserts replaced by deletes. */
+	processed: number;
+	rejected: FullTextMutationBatchRejection[];
+	encodedBytes: number;
+	frames: number;
 }
 
 export interface SearchRequest {
@@ -100,16 +155,28 @@ export interface CloseOptions {
 	mode?: 'require-clean' | 'rollback';
 }
 
+export type CloseResult = { cleanupError?: FulltextError };
+
 export class NativeFullTextIndex {
 	readonly #handle: number;
 	readonly #publication: PublicationState;
+	readonly #maxBatchBytes: number;
+	readonly #fieldNames: ReadonlySet<string>;
 	#closed = false;
 	#closedStatus?: FullTextStatus;
-	#closePromise?: Promise<void>;
+	#closePromise?: Promise<CloseResult>;
+	#logicalMutationState: 'idle' | 'active' | 'incomplete' = 'idle';
 
-	constructor(handle: number, committedPayload?: string) {
-		this.#handle = handle;
-		this.#publication = new PublicationState(committedPayload);
+	constructor(options: {
+		handle: number;
+		committedPayload?: string;
+		maxBatchBytes: number;
+		fieldNames: Iterable<string>;
+	}) {
+		this.#handle = options.handle;
+		this.#publication = new PublicationState(options.committedPayload);
+		this.#maxBatchBytes = options.maxBatchBytes;
+		this.#fieldNames = new Set(options.fieldNames);
 	}
 
 	get committedPayload(): string | undefined {
@@ -117,13 +184,183 @@ export class NativeFullTextIndex {
 	}
 
 	async apply(packedBatch: Uint8Array): Promise<number> {
-		const cursor = await invoke((callback) => loadAddon().__nativeApply(this.#handle, asBuffer(packedBatch), callback));
+		this.#assertLogicalMutationIdle();
+		const buffer = asBuffer(packedBatch);
+		this.#assertLogicalMutationIdle();
+		return this.#applyPacked(buffer);
+	}
+
+	async #applyPacked(packedBatch: Uint8Array, onAdmitted?: () => void): Promise<number> {
+		const cursor = await invoke((callback) => {
+			loadAddon().__nativeApply(this.#handle, asBuffer(packedBatch), callback);
+			onAdmitted?.();
+		});
 		const count = safeNumber(cursor.u64(), 'mutation count');
 		cursor.finish();
 		return count;
 	}
 
+	async applyMutationBatch(
+		batch: FullTextMutationBatch,
+		options: ApplyFullTextMutationBatchOptions = {},
+	): Promise<AppliedFullTextMutationBatch> {
+		this.#assertOpen();
+		this.#assertLogicalMutationIdle();
+		this.#logicalMutationState = 'active';
+		let nativeAttempted = false;
+		try {
+			if (!options || typeof options !== 'object' || Array.isArray(options)) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch options must be an object');
+			}
+			const assumeDistinctIds = options.assumeDistinctIds;
+			const rejectedUpsertOption = options.rejectedUpsert;
+			if (assumeDistinctIds !== undefined && typeof assumeDistinctIds !== 'boolean') {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'assumeDistinctIds must be a boolean');
+			}
+			if (
+				rejectedUpsertOption !== undefined &&
+				rejectedUpsertOption !== 'reject' &&
+				rejectedUpsertOption !== 'delete'
+			) {
+				throw new FulltextError('E_INVALID_ARGUMENT', "rejectedUpsert must be 'reject' or 'delete'");
+			}
+			const logical = snapshotMutationBatch(batch);
+			const rejectedUpsert = rejectedUpsertOption ?? 'reject';
+			const cursor = new MutationBatchFrameCursor(logical, this.#maxBatchBytes, this.#fieldNames, {
+				validateDistinctIds: assumeDistinctIds !== true,
+				stopAfterFirstRejection: rejectedUpsert === 'reject',
+				requireReplacementDeletes: rejectedUpsert === 'delete',
+			});
+			if (logical.upserts.length + logical.deletes.length === 0) {
+				this.#logicalMutationState = 'idle';
+				return { processed: 0, rejected: [], encodedBytes: 0, frames: 0 };
+			}
+
+			let processed = 0;
+			let encodedBytes = 0;
+			let frames = 0;
+			const rejected: FullTextMutationBatchRejection[] = [];
+			let done = false;
+			while (!done) {
+				const encoded = cursor.next();
+				const consumed = encoded.consumedUpserts + encoded.consumedDeletes;
+				if (consumed === 0) {
+					throw new FulltextError('E_NATIVE_FAILURE', 'mutation batch partitioner made no progress');
+				}
+				if (encoded.rejected.length > 0) {
+					if (rejectedUpsert === 'reject') {
+						const rejection = encoded.rejected[0];
+						throw new FulltextError(
+							rejection.code,
+							`mutation batch ${rejection.operation} at index ${rejection.index} was rejected`,
+						);
+					}
+					for (const rejection of encoded.rejected) rejected.push(rejection);
+				}
+				if (encoded.batch) {
+					const count = await this.#applyPacked(encoded.batch.bytes, () => {
+						nativeAttempted = true;
+					});
+					if (count !== encoded.batch.mutationCount) {
+						throw new FulltextError(
+							'E_NATIVE_FAILURE',
+							`native writer applied ${count} of ${encoded.batch.mutationCount} frame mutations`,
+						);
+					}
+					encodedBytes += encoded.batch.bytes.byteLength;
+					frames++;
+				}
+				if (encoded.rejected.length > 0) {
+					const replacementDeletes = encoded.rejected.map((rejection) => {
+						if (rejection.operation !== 'upsert') {
+							throw new FulltextError(rejection.code, 'a rejected delete cannot be replaced safely');
+						}
+						const id = logical.upserts[rejection.index]?.id;
+						if (typeof id !== 'string') {
+							throw new FulltextError(rejection.code, `rejected upsert at index ${rejection.index} has no usable ID`);
+						}
+						return id;
+					});
+					const replacement = await this.#applyReplacementDeletes(replacementDeletes, () => {
+						nativeAttempted = true;
+					});
+					encodedBytes += replacement.encodedBytes;
+					frames += replacement.frames;
+				}
+				processed += consumed;
+				done = encoded.done;
+			}
+			this.#logicalMutationState = 'idle';
+			return { processed, rejected, encodedBytes, frames };
+		} catch (error) {
+			this.#logicalMutationState = nativeAttempted && !this.#closed ? 'incomplete' : 'idle';
+			throw normalizeNativeError(error);
+		}
+	}
+
+	async #applyReplacementDeletes(
+		deletes: string[],
+		onNativeAttempt: () => void,
+	): Promise<{ encodedBytes: number; frames: number }> {
+		let encodedBytes = 0;
+		let frames = 0;
+		const cursor = new MutationBatchFrameCursor({ upserts: [], deletes }, this.#maxBatchBytes, this.#fieldNames, {
+			validateDistinctIds: false,
+		});
+		let done = false;
+		while (!done) {
+			const encoded = cursor.next();
+			if (encoded.rejected.length > 0 || encoded.consumedDeletes === 0 || !encoded.batch) {
+				throw new FulltextError(
+					encoded.rejected[0]?.code ?? 'E_NATIVE_FAILURE',
+					'rejected upsert IDs could not be encoded as replacement deletes',
+				);
+			}
+			const frame = encoded.batch;
+			const count = await this.#applyPacked(frame.bytes, onNativeAttempt);
+			if (count !== frame.mutationCount) {
+				throw new FulltextError(
+					'E_NATIVE_FAILURE',
+					`native writer applied ${count} of ${frame.mutationCount} replacement deletes`,
+				);
+			}
+			encodedBytes += frame.bytes.byteLength;
+			frames++;
+			done = encoded.done;
+		}
+		return { encodedBytes, frames };
+	}
+
+	encodeMutationBatches(
+		batch: FullTextMutationBatch,
+		options: EncodeFullTextMutationBatchesOptions = {},
+	): EncodedFullTextMutationBatches {
+		try {
+			if (!options || typeof options !== 'object' || Array.isArray(options)) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch options must be an object');
+			}
+			const allowPartial = options.allowPartial;
+			const maxTotalBytes = options.maxTotalBytes ?? 64 * 1024 * 1024;
+			if (allowPartial !== undefined && typeof allowPartial !== 'boolean') {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'allowPartial must be a boolean');
+			}
+			const logical = snapshotMutationBatch(batch);
+			const encoded = encodeBatchPartitions(logical, this.#maxBatchBytes, maxTotalBytes, this.#fieldNames);
+			if (
+				allowPartial !== true &&
+				(encoded.consumedUpserts < logical.upserts.length || encoded.consumedDeletes < logical.deletes.length)
+			) {
+				throw new FulltextError('E_BATCH_TOO_LARGE', 'logical mutation batch exceeds its total encoding limit');
+			}
+			return encoded;
+		} catch (error) {
+			if (error instanceof FulltextError) throw error;
+			throw normalizeNativeError(error);
+		}
+	}
+
 	async commit(): Promise<bigint> {
+		this.#assertLogicalMutationIdle();
 		const cursor = await invoke((callback) => loadAddon().__nativeCommit(this.#handle, callback));
 		const opstamp = cursor.u64();
 		cursor.finish();
@@ -131,6 +368,7 @@ export class NativeFullTextIndex {
 	}
 
 	async publish(payload: string): Promise<bigint> {
+		this.#assertLogicalMutationIdle();
 		if (typeof payload !== 'string') {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'commit payload must be a string');
 		}
@@ -158,6 +396,7 @@ export class NativeFullTextIndex {
 	}
 
 	async reload(): Promise<void> {
+		this.#assertLogicalMutationIdle();
 		const cursor = await invoke((callback) => loadAddon().__nativeReload(this.#handle, callback));
 		cursor.finish();
 	}
@@ -224,40 +463,71 @@ export class NativeFullTextIndex {
 		}
 	}
 
-	async close(options: CloseOptions = {}): Promise<void> {
+	async close(options: CloseOptions = {}): Promise<CloseResult> {
 		if (this.#closePromise) {
 			return this.#closePromise;
 		}
 		if (this.#closed) {
-			return;
+			return {};
 		}
+		if (!options || typeof options !== 'object' || Array.isArray(options)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'close options must be an object');
+		}
+		const mode = options.mode;
+		if (mode !== undefined && mode !== 'require-clean' && mode !== 'rollback') {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'close mode must be require-clean or rollback');
+		}
+		if (this.#closePromise) return this.#closePromise;
+		if (this.#closed) return {};
+		const rollback = mode === 'rollback';
+		if (!rollback) this.#assertLogicalMutationIdle();
 		const openStatus = this.status();
 		this.#closePromise = (async () => {
 			try {
-				const cursor = await invoke((callback) =>
-					loadAddon().__nativeClose(this.#handle, options.mode === 'rollback', callback),
-				);
+				const cursor = await invoke((callback) => loadAddon().__nativeClose(this.#handle, rollback, callback));
 				cursor.finish();
 				this.#closed = true;
+				this.#logicalMutationState = 'idle';
 				this.#closedStatus = { ...openStatus, state: 'closed' };
+				return {};
 			} catch (error) {
 				const nativeError = normalizeNativeError(error);
 				if (nativeError.code === 'E_CLOSE_FAILED') {
 					this.#closed = true;
+					this.#logicalMutationState = 'idle';
 					this.#closedStatus = { ...openStatus, state: 'closed' };
+					return { cleanupError: nativeError };
 				} else if (nativeError.code === 'E_QUIESCENCE_FAILED') {
 					this.#closed = true;
+					this.#logicalMutationState = 'idle';
 					this.#closedStatus = { ...openStatus, state: 'poisoned' };
 				}
 				throw nativeError;
 			}
 		})();
 		try {
-			await this.#closePromise;
+			return await this.#closePromise;
 		} finally {
 			if (!this.#closed) {
 				this.#closePromise = undefined;
 			}
+		}
+	}
+
+	#assertLogicalMutationIdle(): void {
+		if (this.#logicalMutationState !== 'idle') {
+			throw new FulltextError(
+				this.#logicalMutationState === 'active' ? 'E_BATCH_ACTIVE' : 'E_BATCH_INCOMPLETE',
+				this.#logicalMutationState === 'active'
+					? 'a logical mutation batch is active'
+					: 'a logical mutation batch failed and the index must be rollback-closed',
+			);
+		}
+	}
+
+	#assertOpen(): void {
+		if (this.#closed || this.#closePromise) {
+			throw new FulltextError('E_CLOSED', 'index is closing or closed');
 		}
 	}
 }
@@ -318,8 +588,108 @@ export async function resetNativeFullTextIndex(
 	throw new FulltextError('E_NATIVE_FAILURE', `Unknown native reset state ${state}`);
 }
 
+export async function reclaimRetiredNativeFullTextIndexes(options: {
+	path: string;
+	retiredPath?: string;
+}): Promise<NativeFullTextReclaimResult> {
+	if (!options || typeof options.path !== 'string' || options.path.length === 0) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'path must not be empty');
+	}
+	const livePath = resolve(options.path);
+	const retiredRoot = join(dirname(livePath), '.fulltext-retired');
+	const sourceNames = new Set([basename(livePath)]);
+	let retiredPath: string | undefined;
+	if (options.retiredPath !== undefined) {
+		if (typeof options.retiredPath !== 'string' || options.retiredPath.length === 0) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath must not be empty');
+		}
+		retiredPath = resolve(options.retiredPath);
+		let expectedRetiredRoot: string;
+		let suppliedRetiredRoot: string;
+		try {
+			[expectedRetiredRoot, suppliedRetiredRoot] = await Promise.all([
+				canonicalSiblingPath(retiredRoot),
+				canonicalSiblingPath(dirname(retiredPath)),
+			]);
+		} catch (error) {
+			throw new FulltextError('E_STORAGE', `could not resolve retired full-text path ${retiredPath}`, error);
+		}
+		if (suppliedRetiredRoot !== expectedRetiredRoot) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath must be inside the index retirement directory');
+		}
+		const match = /^(.*)\.\d+\.\d+\.\d+\.\d+$/.exec(basename(retiredPath));
+		if (!match || match[1].length === 0) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath is not a generated full-text retirement path');
+		}
+		if (!sourceNames.has(match[1])) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath does not belong to the requested full-text index');
+		}
+	}
+	let canonicalRoot: string;
+	let entries;
+	try {
+		const stats = await lstat(retiredRoot);
+		if (!stats.isDirectory() || stats.isSymbolicLink()) {
+			throw new FulltextError(
+				'E_INVALID_ARGUMENT',
+				'the .fulltext-retired path must be a directory and must not be a symbolic link',
+			);
+		}
+		canonicalRoot = await realpath(retiredRoot);
+		entries = await readdir(canonicalRoot, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { removed: 0, failed: 0 };
+		if (error instanceof FulltextError) throw error;
+		throw new FulltextError('E_STORAGE', `could not inspect retired full-text indexes for ${livePath}`, error);
+	}
+	if (retiredPath !== undefined) {
+		let retiredParent: string;
+		try {
+			retiredParent = await realpath(dirname(retiredPath));
+		} catch (error) {
+			throw new FulltextError('E_STORAGE', `could not resolve retired full-text path ${retiredPath}`, error);
+		}
+		if (retiredParent !== canonicalRoot) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'retiredPath must be inside the index retirement directory');
+		}
+	}
+	const generatedName = new RegExp(`^(?:${[...sourceNames].map(escapeRegExp).join('|')})\\.\\d+\\.\\d+\\.\\d+\\.\\d+$`);
+	let removed = 0;
+	let failed = 0;
+	for (const entry of entries) {
+		if (!generatedName.test(entry.name)) continue;
+		try {
+			await rm(join(canonicalRoot, entry.name), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+			removed++;
+		} catch {
+			failed++;
+		}
+	}
+	return { removed, failed };
+}
+
+export function validateNativeFullTextIndexOptions(options: NativeFullTextIndexOptions): void {
+	try {
+		const cursor = decodeResponse(loadAddon().__nativeValidateOpen(packedOpenOptions(options)));
+		cursor.finish();
+	} catch (error) {
+		throw normalizeOptionsError(error);
+	}
+}
+
 export async function openNativeFullTextIndex(options: NativeFullTextIndexOptions): Promise<NativeFullTextIndex> {
-	const cursor = await invoke((callback) => loadAddon().__nativeOpen(encodeOpen(packedOptions(options)), callback));
+	let config: ReturnType<typeof packedOptions>;
+	let packed: Buffer;
+	try {
+		config = packedOptions(options);
+		config.limits = { ...config.limits };
+		packed = encodeOpen(config);
+		const validation = decodeResponse(loadAddon().__nativeValidateOpen(packed));
+		validation.finish();
+	} catch (error) {
+		throw normalizeOptionsError(error);
+	}
+	const cursor = await invoke((callback) => loadAddon().__nativeOpen(packed, callback));
 	const handle = cursor.u32();
 	try {
 		const hasPayload = cursor.u8();
@@ -328,11 +698,22 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 		}
 		const payload = hasPayload === 1 ? cursor.string() : undefined;
 		cursor.finish();
-		return new NativeFullTextIndex(handle, payload);
+		return new NativeFullTextIndex({
+			handle,
+			committedPayload: payload,
+			maxBatchBytes: config.limits.maxBatchBytes,
+			fieldNames: config.fields.map((field) => field.name),
+		});
 	} catch (error) {
 		await invoke((callback) => loadAddon().__nativeClose(handle, true, callback)).catch(() => undefined);
 		throw error;
 	}
+}
+
+function packedOpenOptions(options: NativeFullTextIndexOptions): Buffer {
+	const config = packedOptions(options);
+	config.limits = { ...config.limits };
+	return encodeOpen(config);
 }
 
 function packedOptions(options: NativeFullTextIndexOptions) {
@@ -356,6 +737,12 @@ function packedIndexIdentity(options: NativeFullTextIndexInspectionOptions) {
 	};
 }
 
+function normalizeOptionsError(error: unknown): FulltextError {
+	return error instanceof TypeError
+		? new FulltextError('E_INVALID_ARGUMENT', error.message, error)
+		: normalizeNativeError(error);
+}
+
 export async function runtimeInfo(): Promise<RuntimeInfo> {
 	try {
 		const info = loadAddon().runtimeInfo();
@@ -363,7 +750,10 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
+			lifecycleApiVersion: 1,
+			mutationBatchApiVersion: 3,
 			storageBackends: ['native'],
+			limits: { maxCommitPayloadBytes: info.limits.maxCommitPayloadBytes },
 		};
 	} catch (error) {
 		throw normalizeNativeError(error);
@@ -374,9 +764,41 @@ function asBuffer(value: Uint8Array): Buffer {
 	return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
 }
 
+function snapshotMutationBatch(batch: FullTextMutationBatch): Required<FullTextMutationBatch> {
+	if (!batch || typeof batch !== 'object' || Array.isArray(batch)) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch must be an object');
+	}
+	if (batch.upserts !== undefined && !Array.isArray(batch.upserts)) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch upserts must be an array');
+	}
+	if (batch.deletes !== undefined && !Array.isArray(batch.deletes)) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch deletes must be an array');
+	}
+	return {
+		upserts:
+			batch.upserts?.map((upsert) =>
+				upsert && typeof upsert === 'object' ? { id: upsert.id, fields: upsert.fields } : upsert,
+			) ?? [],
+		deletes: batch.deletes?.slice() ?? [],
+	};
+}
+
 function safeNumber(value: bigint, name: string): number {
 	if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
 		throw new FulltextError('E_NATIVE_FAILURE', `${name} exceeds JavaScript's safe integer range`);
 	}
 	return Number(value);
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function canonicalSiblingPath(value: string): Promise<string> {
+	try {
+		return join(await realpath(dirname(value)), basename(value));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return value;
+		throw error;
+	}
 }

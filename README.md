@@ -21,10 +21,11 @@ targets are added only after their artifacts are loaded and tested on the target
 
 ```js
 import {
-	encodeMutationBatch,
 	inspectNativeFullTextIndex,
 	openNativeFullTextIndex,
+	reclaimRetiredNativeFullTextIndexes,
 	resetNativeFullTextIndex,
+	validateNativeFullTextIndexOptions,
 } from '@harperfast/fulltext/native';
 
 const index = await openNativeFullTextIndex({
@@ -43,11 +44,13 @@ const index = await openNativeFullTextIndex({
 	},
 });
 
-await index.apply(
-	encodeMutationBatch({
+const applied = await index.applyMutationBatch(
+	{
 		upserts: [{ id: 'shoe-1', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
-	}),
+	},
+	{ rejectedUpsert: 'delete' },
 );
+if (applied.rejected.length) console.warn(`${applied.rejected.length} products were removed from the index`);
 await index.commit();
 await index.reload();
 console.log(await index.search({ text: 'waterproof running shoes', limit: 10 }));
@@ -69,12 +72,58 @@ Mutation batches are versioned packed values, so indexing crosses Node-API once 
 than once per document. One dedicated actor owns Tantivy's single writer for each index. A bounded
 search pool shares immutable searchers and can execute reads while indexing or commit work is in
 progress. Queue limits reject overload with `E_QUEUE_FULL` rather than blocking the JavaScript
-thread. `encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
-`E_BATCH_TOO_LARGE`; `maxBytes` defaults to 8 MiB and callers should normally pass the index's
-configured `maxBatchBytes`. `apply()` independently rejects a packed batch beyond the index's
-`maxBatchBytes` with the same code. Callers can split either rejection without treating the record
-contents as invalid. A successful `apply()` resolves to the number of accepted mutation commands,
-including deletes for IDs that are not currently indexed.
+thread. `applyMutationBatch()` is the normal logical mutation API. It partitions one logical batch
+into bounded native frames, applies them sequentially, validates native counts, and returns
+`{ processed, rejected, encodedBytes, frames }`. IDs must be distinct across the logical batch.
+By default, any rejected record fails the operation. Pass `{ rejectedUpsert: 'delete' }` when an
+unindexable replacement must delete previously searchable content for the same ID. A failure after
+native application is attempted leaves the handle incomplete: writer operations reject
+`E_BATCH_INCOMPLETE` until the handle is closed with `{ mode: 'rollback' }`. A writer operation that
+only races an in-flight logical batch rejects with `E_BATCH_ACTIVE`; wait for that batch to settle
+and retry instead of rolling it back. This prevents a later publish from exposing part of a logical
+batch. A closing or closed handle rejects every logical batch with `E_CLOSED`, including an empty
+batch, without taking the latch.
+
+Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
+as record-local rejection could remove many documents under the wrong schema. The option applies
+only to record-local `E_INVALID_ARGUMENT` and `E_BATCH_TOO_LARGE` rejections with usable IDs.
+Delete mode always preflights every ID as a bounded delete frame before native admission;
+`assumeDistinctIds` skips duplicate detection, not that feasibility scan. An unusable or oversized
+ID therefore fails with nothing staged. Schema drift is detected during framing and can leave the
+handle incomplete when earlier frames were already admitted.
+
+Trusted callers that already enforce distinct IDs may pass `assumeDistinctIds: true` to skip the
+whole-batch duplicate prepass. Supplying duplicates with that option violates the API contract.
+The wrapper snapshots the two mutation arrays, but callers must not mutate record objects, field
+maps, or nested field-value arrays until the returned promise settles.
+
+`encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
+`E_BATCH_TOO_LARGE`; `maxBytes` defaults to 8 MiB and is intended for low-level callers producing a
+single native frame. Low-level callers may use `index.encodeMutationBatches()`. It uses the limit from
+the index's open configuration, validates IDs and fields against that handle, and greedily emits
+admissible frames. IDs must be distinct across the logical batch. Aggregate size creates more
+frames; a single invalid or unencodable mutation is returned in `rejected` with its operation and
+zero-based index in the corresponding input array. It is never dropped automatically.
+
+Encoding is synchronous and runs on the JavaScript thread. The total encoded output of one logical
+call defaults to 64 MiB and can be lowered with `encodeMutationBatches(batch, { maxTotalBytes })`.
+The default behavior throws `E_BATCH_TOO_LARGE` when the complete logical batch exceeds that
+ceiling. Callers that pass `allowPartial: true` instead receive a leading prefix;
+`consumedUpserts` and `consumedDeletes` identify the mutations represented by the returned frames
+and rejections so they can continue with each array's remaining suffix. The low-level API validates
+distinct IDs across the full input before applying the output ceiling, so repeated suffix calls
+repeat that validation scan. Prefer `applyMutationBatch()` for large logical batches.
+Producers using the low-level API should keep logical batches comfortably below that limit.
+Applying multiple frames stages them in one Tantivy writer. Commit or publish only after every frame
+succeeds; on a later failure, close with rollback rather than publishing the partial logical batch.
+Concurrent low-level callers should leave queue-byte headroom for commit or publish.
+A successful `apply()` resolves to the number of accepted mutation commands, including deletes for
+IDs that are not currently indexed.
+
+One caller must own a handle's complete apply-and-publish sequence at a time. The high-level method
+blocks low-level writer interleaving while its logical batch is active. The low-level frame API does
+not infer logical batch boundaries, so callers using it remain responsible for excluding another
+publisher between frames. Searches may still run concurrently with either writer sequence.
 
 Search uses BM25. `total` is a bounded result by default so Tantivy can retain block-max WAND
 pruning. Set `exactTotal: true` only when an exact match count is worth a second full-match
@@ -92,7 +141,9 @@ Use `publish(payload)` when a consumer needs to resume from a durable checkpoint
 
 ```js
 console.log(index.committedPayload); // undefined on a new index; recovered from files on reopen
-await index.apply(encodeMutationBatch({ upserts: [{ id: 'shoe-1', fields: { title: 'Trail shoes' } }] }));
+await index.applyMutationBatch({
+	upserts: [{ id: 'shoe-1', fields: { title: 'Trail shoes' } }],
+});
 await index.publish('source-checkpoint-42');
 // Both the mutations and the checkpoint are committed; searches now see that commit.
 ```
@@ -124,9 +175,12 @@ Operational storage failures throw. Inspection is intended for short lifecycle c
 derived-index election, not request hot paths. Its options intentionally omit writer, queue, and
 search limits because inspection creates none of those resources.
 
-`close()` is also the native quiescence barrier: success means the writer, search actors, readers,
-merge threads, and memory mappings no longer use the index path. After closing an incompatible or
-corrupt local index, retire it atomically before rebuilding:
+`validateNativeFullTextIndexOptions(options)` runs the same native configuration decoder as open
+without creating files or starting actors. This is intended for activation-time validation.
+
+`close()` is also the native quiescence barrier. A resolved result means the writer, search actors,
+readers, merge threads, and memory mappings no longer use the index path. After closing an
+incompatible or corrupt local index, retire it atomically before rebuilding:
 
 ```js
 const result = await resetNativeFullTextIndex({ path: './search/products', indexId: 'products' });
@@ -135,17 +189,23 @@ if (result.state === 'reset') {
 }
 ```
 
-`E_CLOSE_FAILED` means native resources were released even though shutdown reported an operational
-error, so the path is safe to reset. `E_QUIESCENCE_FAILED` means the wrapper could not prove all
-native work stopped; do not reset, remove, or rename that path until the process restarts.
+The resolved close result is `{}` normally. If native resources were released but shutdown also
+reported an operational cleanup error, it is `{ cleanupError }` and that error has code
+`E_CLOSE_FAILED`; the path is still safe to reset. `E_QUIESCENCE_FAILED` rejects because the wrapper
+could not prove all native work stopped. Do not reset, remove, or rename that path until the process
+restarts.
 
 Reset returns `missing` without creating the path. It rejects a live owner with `E_LOCK_BUSY`, a
 different persisted logical index with `E_IDENTITY_MISMATCH`, and unrelated nonempty directories
 with `E_INVALID_ARGUMENT`. A malformed identity sidecar fails closed with `E_INDEX_CORRUPT`. On
 success, reset renames the live directory into a unique path below the parent's `.fulltext-retired`
-directory. The caller owns eventual deletion of that returned path; the wrapper never deletes it. A
-standalone caller may remove it after the reset resolves, while Harper schedules cleanup under its
-derived-index lifecycle policy.
+directory. The wrapper does not delete it automatically. Call
+`reclaimRetiredNativeFullTextIndexes({ path, retiredPath: result.retiredPath })` at a lifecycle point
+chosen by the application. Passing the opaque reset result verifies that the hint belongs to the
+requested index. Use the same `path` value for reset and reclaim so generated names match. The
+reclaimer removes only retired trees generated for that index path, ignores unrelated entries and
+other indices, and returns `{ removed, failed }`. Harper invokes it during derived-index
+initialization and after reset.
 
 An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.
@@ -154,7 +214,7 @@ the handoff lock while renaming the native directory on Windows. The wrapper doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 4. The loader rejects older addon binaries; persisted index identity and
+This API uses native ABI 5. The loader rejects older addon binaries; persisted index identity and
 Tantivy file formats are unchanged by the ABI update.
 
 ## Storage boundary
@@ -177,14 +237,20 @@ npm test
 npm run lint
 npm run format:check
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000
+npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000 --mutation-driver low-level
 npm run benchmark:inspect -- --indexes 1,10,100,1000 --commits 64 --warm-rounds 10
 ```
 
 The benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
 JSON record. It reports packing, apply, durable end-to-end ingestion, actor queue and execution
-time, commit distributions, reload cost, warm and cold BM25 p50/p95/p99, exact-total overhead,
-index bytes, and periodically sampled process RSS. `--commit-every` sets the target number of
-mutations between durability points; it materially affects throughput and peak memory because
+time, logical-batch p50/p95/p99, frame count, commit distributions, reload cost, warm and cold BM25
+p50/p95/p99, exact-total overhead, index bytes, and periodically sampled process RSS. The default
+`--mutation-driver logical` exercises `applyMutationBatch()`; rerun the identical command with
+`--mutation-driver low-level` for the prior encode-plus-apply path. Compare
+`mutationDriverMilliseconds`, durable end-to-end throughput, logical-batch percentiles, and peak
+RSS. The component `packingMilliseconds` and `applyMilliseconds` fields are not comparable because
+the logical API performs both inside one call. `--commit-every` sets the target number of mutations
+between durability points; it materially affects throughput and peak memory because
 replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
 comparisons require controlled hardware.
 
