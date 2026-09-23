@@ -19,6 +19,11 @@ if (scenario === 'apply') {
 	await runApply();
 	await runOpening();
 	await runMultiple();
+} else if (scenario === 'apply-stress') {
+	for (let attempt = 1; attempt <= 50; attempt++) {
+		mark(`apply:${attempt}:starting`);
+		await runApply();
+	}
 } else {
 	throw new Error(`unknown native worker scenario: ${scenario}`);
 }
