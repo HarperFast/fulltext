@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/fulltext",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Tantivy full-text indexing for Node.js and Harper",
 	"type": "module",
 	"exports": {
@@ -62,9 +62,9 @@
 		"url": "git+https://github.com/HarperFast/fulltext.git"
 	},
 	"optionalDependencies": {
-		"@harperfast/fulltext-darwin-arm64": "0.1.0",
-		"@harperfast/fulltext-linux-x64-gnu": "0.1.0",
-		"@harperfast/fulltext-win32-x64-msvc": "0.1.0"
+		"@harperfast/fulltext-darwin-arm64": "0.1.1",
+		"@harperfast/fulltext-linux-x64-gnu": "0.1.1",
+		"@harperfast/fulltext-win32-x64-msvc": "0.1.1"
 	},
 	"devDependencies": {
 		"@napi-rs/cli": "2.18.4",

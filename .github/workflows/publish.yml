@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '22.18.0'
           cache: npm
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p release-tarball
-          npm pack "release/${{ matrix.target }}" --json --pack-destination "release-tarball"
+          npm pack "./release/${{ matrix.target }}" --json --pack-destination "release-tarball"
       - uses: actions/upload-artifact@v4
         with:
           name: release-package-${{ matrix.target }}

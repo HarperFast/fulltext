@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-- Publish a binary-free `@harperfast/fulltext` facade at `0.1.0`.
+- Publish a binary-free `@harperfast/fulltext` facade at `0.1.1`.
 - Publish one exact-version optional package for each supported platform.
 - Load the platform package by default; repository tests explicitly prefer the local build.
 - Reject missing, unloadable, ABI-incompatible, capability-incompatible, or version-skewed addons
@@ -44,8 +44,11 @@ Use the established HNSW packaging model:
    published package only after its registry integrity matches the local tarball byte-for-byte.
 5. CI installs the packed root and matching packed platform package into a clean consumer with
    lifecycle scripts disabled, then loads the public `@harperfast/fulltext/native` export.
-6. The first published version is `0.1.0`. After publication, Harper will consume that exact
-   version as an optional dependency and record it in its lockfile and dependency ledger.
+6. The first published version is `0.1.1`. The `0.1.0` GitHub release failed before npm
+   publication because its platform-package path was parsed as a GitHub shorthand instead of a
+   local directory. npm returned `404` for the facade and all three platform packages on
+   2026-09-23. After publication, Harper will consume `0.1.1` as an optional dependency and record
+   it in its lockfile and dependency ledger.
 
 The initial support matrix remains Linux x64 glibc, macOS arm64, and Windows x64. Adding a target
 requires its own native runner, packed-artifact load test, and platform package.
@@ -88,7 +91,7 @@ installation.
   release artifact for RocksDB dependencies and linkage.
 - Re-run the no-RocksDB dependency and native-linkage checks on release artifacts before publish;
   publish with npm provenance.
-- **untested:** after publishing, install `@harperfast/fulltext@0.1.0` into Harper and run the
+- **untested:** after publishing, install `@harperfast/fulltext@0.1.1` into Harper and run the
   derived-index lifecycle suite against the real package rather than an injected binding.
 
 ## Approaches considered
@@ -123,9 +126,9 @@ standalone wrapper, avoids install-time compilation, and does not download irrel
 - **untested:** exercise npm publication, provenance generation, and identical-tarball retry against
   the HarperFast npm organization.
 - **untested:** confirm the repository `NPM_TOKEN` can publish all four scoped packages.
-- After `0.1.0` is published, refresh `package-lock.json` so the new platform package entries carry
+- After `0.1.1` is published, refresh `package-lock.json` so the new platform package entries carry
   registry URLs and integrity hashes.
-- Publish `0.1.0` before adding the exact optional dependency to Harper; the Harper integration test
+- Publish `0.1.1` before adding the exact optional dependency to Harper; the Harper integration test
   must use the registry artifact rather than an injected binding.
 
 ## Sources
