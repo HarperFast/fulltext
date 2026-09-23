@@ -59,6 +59,7 @@ export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
 const expectedNativeAbiVersion = 6;
+const packageManifest = require('../package.json') as { name: string; version: string };
 let loadedAddon: NativeAddonApi | undefined;
 
 export function loadAddon(): NativeAddonApi {
@@ -66,31 +67,50 @@ export function loadAddon(): NativeAddonApi {
 		return loadedAddon;
 	}
 	const triple = platformTriple();
-	const artifact = `fulltext.${triple}.node`;
-	const localPath = fileURLToPath(new URL(`../${artifact}`, import.meta.url));
-	if (existsSync(localPath)) {
-		const addon = require(localPath) as NativeAddonApi;
-		validateAddon(addon, localPath);
-		loadedAddon = addon;
+	const packageName = platformPackageName(triple);
+	if (process.env.FULLTEXT_PREFER_LOCAL_BUILD === '1') {
+		loadedAddon = loadLocalAddon(triple, true);
 		return loadedAddon;
 	}
-	throw new FulltextError('E_NATIVE_ADDON_NOT_FOUND', `No fulltext native artifact is installed for ${triple}`);
-}
-
-export function platformTriple(): string {
-	if (process.platform === 'linux') {
-		return `linux-${process.arch}-${usesGlibc() ? 'gnu' : 'musl'}`;
+	const packagedAddon = loadPlatformPackage(packageName);
+	if (packagedAddon) {
+		validateAddon(packagedAddon, packageName);
+		loadedAddon = packagedAddon;
+		return loadedAddon;
 	}
-	if (process.platform === 'darwin') {
-		return `darwin-${process.arch}`;
-	}
-	if (process.platform === 'win32') {
-		return `win32-${process.arch}-msvc`;
+	const localAddon = loadLocalAddon(triple, false);
+	if (localAddon) {
+		loadedAddon = localAddon;
+		return loadedAddon;
 	}
 	throw new FulltextError(
 		'E_NATIVE_ADDON_NOT_FOUND',
-		`Fulltext does not provide a native artifact for ${process.platform}-${process.arch}`,
+		`No fulltext native artifact is installed for ${triple}; expected optional package ${packageName}`,
 	);
+}
+
+export function platformTriple(
+	runtime: { platform?: NodeJS.Platform; architecture?: string; glibc?: boolean } = {},
+): string {
+	const platform = runtime.platform ?? process.platform;
+	const architecture = runtime.architecture ?? process.arch;
+	if (platform === 'linux') {
+		return `linux-${architecture}-${(runtime.glibc ?? usesGlibc()) ? 'gnu' : 'musl'}`;
+	}
+	if (platform === 'darwin') {
+		return `darwin-${architecture}`;
+	}
+	if (platform === 'win32') {
+		return `win32-${architecture}-msvc`;
+	}
+	throw new FulltextError(
+		'E_NATIVE_ADDON_NOT_FOUND',
+		`Fulltext does not provide a native artifact for ${platform}-${architecture}`,
+	);
+}
+
+export function platformPackageName(triple: string): string {
+	return `${packageManifest.name}-${triple}`;
 }
 
 function usesGlibc(): boolean {
@@ -98,8 +118,65 @@ function usesGlibc(): boolean {
 	return Boolean(report?.header?.glibcVersionRuntime);
 }
 
+function loadLocalAddon(triple: string, required: true): NativeAddonApi;
+function loadLocalAddon(triple: string, required: false): NativeAddonApi | undefined;
+function loadLocalAddon(triple: string, required: boolean): NativeAddonApi | undefined {
+	const localPath = fileURLToPath(new URL(`../fulltext.${triple}.node`, import.meta.url));
+	if (!existsSync(localPath)) {
+		if (required) {
+			throw new FulltextError(
+				'E_NATIVE_ADDON_NOT_FOUND',
+				`FULLTEXT_PREFER_LOCAL_BUILD is set but ${localPath} does not exist`,
+			);
+		}
+		return undefined;
+	}
+	let addon: NativeAddonApi;
+	try {
+		addon = require(localPath) as NativeAddonApi;
+	} catch (error) {
+		throw new FulltextError('E_NATIVE_LOAD_FAILED', `Failed to load fulltext native artifact ${localPath}`, error);
+	}
+	validateAddon(addon, localPath);
+	return addon;
+}
+
+function loadPlatformPackage(packageName: string): NativeAddonApi | undefined {
+	try {
+		require.resolve(packageName);
+	} catch (error) {
+		if (isMissingModule(error, packageName)) {
+			return undefined;
+		}
+		throw new FulltextError('E_NATIVE_LOAD_FAILED', `Failed to resolve fulltext native package ${packageName}`, error);
+	}
+	try {
+		return require(packageName) as NativeAddonApi;
+	} catch (error) {
+		throw new FulltextError('E_NATIVE_LOAD_FAILED', `Failed to load fulltext native package ${packageName}`, error);
+	}
+}
+
+function isMissingModule(error: unknown, packageName: string): boolean {
+	return Boolean(
+		error &&
+			typeof error === 'object' &&
+			'code' in error &&
+			error.code === 'MODULE_NOT_FOUND' &&
+			'message' in error &&
+			typeof error.message === 'string' &&
+			error.message.includes(`'${packageName}'`),
+	);
+}
+
 function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 	const info = addon.runtimeInfo();
+	if (info.packageVersion !== packageManifest.version) {
+		throw new FulltextError(
+			'E_NATIVE_CAPABILITY_MISMATCH',
+			`Fulltext package ${packageManifest.version} cannot load native package ${info.packageVersion} from ${artifactPath}`,
+		);
+	}
 	if (info.nativeAbiVersion !== expectedNativeAbiVersion) {
 		throw new FulltextError(
 			'E_NATIVE_ABI_MISMATCH',

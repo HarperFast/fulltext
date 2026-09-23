@@ -11,11 +11,13 @@ Harper remains the source of truth; each node maintains its own rebuildable Tant
 - Node.js 22.18 or newer, or Node.js 24 or newer
 - Rust 1.90 when building from source
 
-The package never compiles or downloads native code during installation. A supported prebuilt
-artifact must be present for the executing platform.
+The package never compiles or downloads native code during installation. It installs a matching
+exact-version native package through npm optional dependencies.
 
-The initial CI-qualified targets are Linux x64 glibc, macOS arm64, and Windows x64. Additional
-targets are added only after their artifacts are loaded and tested on the target runtime.
+The initial CI-qualified targets are Linux x64 with glibc 2.35 or newer, macOS arm64, and Windows
+x64. Additional targets are added only after their packed artifacts are loaded and tested on the
+target runtime. Unsupported targets fail with `E_NATIVE_ADDON_NOT_FOUND` when the native entry point
+is first used; importing the JavaScript facade does not eagerly load an addon.
 
 ## Native usage
 
@@ -311,6 +313,15 @@ that create at most 10,000 temporary index directories across both benchmark pat
 
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.
+
+## Releases
+
+The root `@harperfast/fulltext` package contains only the JavaScript and TypeScript facade. Native
+artifacts are published as exact-version platform packages and selected at runtime. Release tags
+must match both npm and Cargo versions. The release workflow builds and tests each supported native
+artifact, installs the packed root and platform tarballs in a clean consumer with lifecycle scripts
+disabled, and publishes with npm provenance. Platform packages are published before the root, so a
+root version is never available until every supported artifact has passed its consumer test.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
 [the native backend design](docs/native-backend-implementation.md) for implementation details.
