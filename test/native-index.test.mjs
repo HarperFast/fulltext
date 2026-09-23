@@ -184,6 +184,11 @@ test('runs every structured query mode and score-neutral candidate filtering', a
 	]);
 	assert.strictEqual(boundedTrace.complete, false);
 	assert.strictEqual(boundedTrace.records[0].values[0].spans.length, 1_024);
+	const overlappingPrefixTrace = await index.traceMatches({ text: 'shoe sho', mode: 'prefix' }, [
+		{ id: 'one', fields: { title: 'shoe '.repeat(513) } },
+	]);
+	assert.strictEqual(overlappingPrefixTrace.complete, true);
+	assert.strictEqual(overlappingPrefixTrace.records[0].values[0].spans.length, 513);
 	const exactEmptyTrace = await index.traceMatches({ text: 'shoe missing', mode: 'all' }, [
 		{ id: 'one', fields: { title: 'shoe '.repeat(1_100) } },
 	]);

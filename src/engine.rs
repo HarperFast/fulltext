@@ -90,7 +90,7 @@ pub struct SearchResult {
 	pub hits: Vec<SearchHit>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct TraceSpan {
 	pub start: u32,
 	pub end: u32,
@@ -572,6 +572,7 @@ impl Engine {
 		let analyzed = self.source_tokens(value, false, deadline)?;
 		let utf16_offsets = utf16_offsets(value);
 		let mut spans = Vec::new();
+		let mut seen_spans = HashSet::new();
 		let mut found = HashSet::new();
 		let mut truncated = false;
 		match plan {
@@ -584,9 +585,13 @@ impl Engine {
 						found.insert(token.text.clone());
 						truncated |= push_trace_span(
 							&mut spans,
+							&mut seen_spans,
 							source_span(&utf16_offsets, token.start, token.end),
 							max_spans,
 						);
+						if truncated && plan.record_matches(&found) {
+							break;
+						}
 					}
 				}
 			}
@@ -622,9 +627,13 @@ impl Engine {
 							found.insert("__phrase".to_owned());
 							truncated |= push_trace_span(
 								&mut spans,
+								&mut seen_spans,
 								source_span(&utf16_offsets, anchor.start, final_token.end),
 								max_spans,
 							);
+							if truncated && plan.record_matches(&found) {
+								break;
+							}
 						}
 					}
 				}
@@ -643,9 +652,13 @@ impl Engine {
 						found.insert(token.text.clone());
 						truncated |= push_trace_span(
 							&mut spans,
+							&mut seen_spans,
 							source_span(&utf16_offsets, token.start, token.end),
 							max_spans,
 						);
+						if truncated && plan.record_matches(&found) {
+							break;
+						}
 					}
 				}
 				for (index, token) in surface.iter().enumerate() {
@@ -658,9 +671,13 @@ impl Engine {
 						found.insert("__prefix".to_owned());
 						truncated |= push_trace_span(
 							&mut spans,
+							&mut seen_spans,
 							source_span(&utf16_offsets, token.start, token.end),
 							max_spans,
 						);
+						if truncated && plan.record_matches(&found) {
+							break;
+						}
 					}
 				}
 			}
@@ -681,11 +698,15 @@ impl Engine {
 							found.insert(analyzed_term.clone());
 							truncated |= push_trace_span(
 								&mut spans,
+								&mut seen_spans,
 								source_span(&utf16_offsets, token.start, token.end),
 								max_spans,
 							);
 							break;
 						}
+					}
+					if truncated && plan.record_matches(&found) {
+						break;
 					}
 				}
 			}
@@ -1171,8 +1192,17 @@ fn source_span(utf16_offsets: &Option<Vec<u32>>, start: usize, end: usize) -> Tr
 	}
 }
 
-fn push_trace_span(spans: &mut Vec<TraceSpan>, span: TraceSpan, max_spans: usize) -> bool {
+fn push_trace_span(
+	spans: &mut Vec<TraceSpan>,
+	seen: &mut HashSet<TraceSpan>,
+	span: TraceSpan,
+	max_spans: usize,
+) -> bool {
+	if seen.contains(&span) {
+		return false;
+	}
 	if spans.len() < max_spans {
+		seen.insert(span);
 		spans.push(span);
 		false
 	} else {
