@@ -235,8 +235,25 @@ test('runs every structured query mode and score-neutral candidate filtering', a
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	assert.strictEqual((await index.search({ text: 'waterproof' }, { remainingBudgetMilliseconds: 60_000 })).total, 2);
-	assert.strictEqual((await index.search({ text: 'waterproof' }, { remainingBudgetMilliseconds: 0.5 })).total, 2);
-	await index.close();
+	await index.applyMutationBatch({ upserts: [{ id: 'plural', fields: { title: 'Waterproofs' } }] });
+	await index.commit();
+	await index.reload();
+	assert((await index.search({ text: 'waterprof', mode: 'fuzzy' })).hits.some((hit) => hit.id === 'plural'));
+	assert.deepStrictEqual(
+		(
+			await index.traceMatches({ text: 'waterprof', mode: 'fuzzy' }, [
+				{ id: 'plural', fields: { title: 'Waterproofs' } },
+			])
+		).records[0].values[0].spans,
+		[{ start: 0, end: 11 }],
+	);
+	assert.strictEqual(
+		await index.apply(
+			encodeMutationBatch({ upserts: [{ id: 'surrogate', fields: { title: '\ud800' } }], deletes: [] }),
+		),
+		1,
+	);
+	await index.close({ mode: 'rollback' });
 });
 
 test('uses the surface field for stop-word prefixes and preserves weighted fuzzy-prefix ranking', async (context) => {

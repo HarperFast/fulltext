@@ -692,7 +692,11 @@ impl Engine {
 						check_deadline(deadline)?;
 					}
 					for (analyzed_term, surface_term) in terms {
-						if analyzed_by_position.get(&token.position) == Some(&analyzed_term.as_str())
+						let analyzed_matches = analyzed_by_position.get(&token.position).is_some_and(|token| {
+							*token == analyzed_term
+								|| (fuzzy_eligible(surface_term) && within_one_edit(analyzed_term, token))
+						});
+						if analyzed_matches
 							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
 						{
 							found.insert(analyzed_term.clone());
@@ -830,10 +834,10 @@ impl Engine {
 		if terms.is_empty() {
 			return Ok(Box::new(EmptyQuery));
 		}
+		self.check_clause_count(1, fields.len())?;
 		if terms.len() == 1 {
 			return Ok(self.term_group(&terms[0].1, fields));
 		}
-		self.check_clause_count(1, fields.len())?;
 		let alternatives = fields
 			.iter()
 			.map(|field| {
@@ -1211,45 +1215,51 @@ fn push_trace_span(
 }
 
 fn within_one_edit(left: &str, right: &str) -> bool {
-	let left = left.chars().collect::<Vec<_>>();
-	let right = right.chars().collect::<Vec<_>>();
-	if left.len().abs_diff(right.len()) > 1 {
+	let left_length = left.chars().count();
+	let right_length = right.chars().count();
+	if left_length.abs_diff(right_length) > 1 {
 		return false;
 	}
 	if left == right {
 		return true;
 	}
-	if left.len() == right.len() {
-		let differences = left
-			.iter()
-			.zip(&right)
-			.enumerate()
-			.filter_map(|(index, (left, right))| (left != right).then_some(index))
-			.collect::<Vec<_>>();
-		return differences.len() == 1
-			|| (differences.len() == 2
-				&& differences[1] == differences[0] + 1
-				&& left[differences[0]] == right[differences[1]]
-				&& left[differences[1]] == right[differences[0]]);
+	if left_length == right_length {
+		let mut differences = [(0usize, '\0', '\0'); 2];
+		let mut count = 0;
+		for (index, (left, right)) in left.chars().zip(right.chars()).enumerate() {
+			if left == right {
+				continue;
+			}
+			if count == differences.len() {
+				return false;
+			}
+			differences[count] = (index, left, right);
+			count += 1;
+		}
+		return count == 1
+			|| (count == 2
+				&& differences[1].0 == differences[0].0 + 1
+				&& differences[0].1 == differences[1].2
+				&& differences[1].1 == differences[0].2);
 	}
-	let (shorter, longer) = if left.len() < right.len() {
-		(&left, &right)
+	let (shorter, longer) = if left_length < right_length {
+		(left, right)
 	} else {
-		(&right, &left)
+		(right, left)
 	};
-	let mut short = 0;
-	let mut long = 0;
+	let mut shorter = shorter.chars().peekable();
+	let mut longer = longer.chars().peekable();
 	let mut edits = 0;
-	while short < shorter.len() && long < longer.len() {
-		if shorter[short] == longer[long] {
-			short += 1;
+	while let (Some(short), Some(long)) = (shorter.peek(), longer.peek()) {
+		if short == long {
+			shorter.next();
 		} else {
 			edits += 1;
 			if edits > 1 {
 				return false;
 			}
 		}
-		long += 1;
+		longer.next();
 	}
 	true
 }
@@ -1257,8 +1267,12 @@ fn within_one_edit(left: &str, right: &str) -> bool {
 fn fuzzy_prefix_matches(prefix: &str, candidate: &str) -> bool {
 	let prefix_length = prefix.chars().count();
 	(prefix_length.saturating_sub(1)..=prefix_length.saturating_add(1)).any(|length| {
-		let candidate_prefix = candidate.chars().take(length).collect::<String>();
-		within_one_edit(prefix, &candidate_prefix)
+		let end = candidate
+			.char_indices()
+			.nth(length)
+			.map_or(candidate.len(), |(index, _)| index);
+		let candidate_prefix = &candidate[..end];
+		within_one_edit(prefix, candidate_prefix)
 	})
 }
 
@@ -1657,6 +1671,36 @@ mod tests {
 			],
 			deletes: Vec::new(),
 		}
+	}
+
+	#[test]
+	fn single_term_phrases_respect_the_clause_limit() {
+		let mut config = config();
+		config.identity.fields = (0..=MAX_QUERY_CLAUSES)
+			.map(|index| FieldConfig {
+				name: format!("field_{index}"),
+				weight: 1.0,
+			})
+			.collect();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let fields = engine.fields.iter().collect::<Vec<_>>();
+		assert_eq!(
+			engine.phrase_query("shoe", &fields).unwrap_err().code,
+			"E_INVALID_ARGUMENT"
+		);
+	}
+
+	#[test]
+	fn edit_distance_helpers_handle_unicode_and_transposition_without_allocation() {
+		assert!(within_one_edit("shoe", "shoe"));
+		assert!(within_one_edit("shoe", "shoo"));
+		assert!(within_one_edit("shoe", "sohe"));
+		assert!(within_one_edit("shoe", "shoes"));
+		assert!(within_one_edit("café", "cafe"));
+		assert!(!within_one_edit("shoe", "boot"));
+		assert!(fuzzy_prefix_matches("shoe", "shoestring"));
+		assert!(fuzzy_prefix_matches("shoe", "sjoestring"));
+		assert!(!fuzzy_prefix_matches("shoe", "boots"));
 	}
 
 	#[test]

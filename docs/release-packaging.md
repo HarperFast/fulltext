@@ -17,20 +17,6 @@ toolchain or install script on every supported platform. Harper must be able to 
 wrapper version and either load the matching native artifact or receive an actionable unsupported
 platform error before an index is opened.
 
-## Verified baseline
-
-The following was verified against
-[`origin/main` at `ecbb7a5`](https://github.com/HarperFast/fulltext/commit/ecbb7a51e5b0fa929079b1de54cb1018f94b83b6):
-
-- `package.json` is still version `0.0.0` and has no platform dependencies.
-- `ts/load-addon.ts` loads only a native artifact adjacent to the TypeScript facade.
-- `prepack` builds for the publishing runner and verifies that exactly one local artifact exists.
-- CI builds and tests Linux x64 glibc, macOS arm64, and Windows x64, but no workflow publishes
-  those outputs.
-- [`HarperFast/hnsw`](https://github.com/HarperFast/hnsw) publishes a JavaScript root package with
-  exact-version platform optional dependencies. Its release workflow builds on native runners,
-  publishes the platform packages first, and publishes the root package last.
-
 ## Invariant
 
 A published root version resolves only a native artifact with the same package version for the
@@ -137,6 +123,8 @@ standalone wrapper, avoids install-time compilation, and does not download irrel
 - **untested:** exercise npm publication, provenance generation, and identical-tarball retry against
   the HarperFast npm organization.
 - **untested:** confirm the repository `NPM_TOKEN` can publish all four scoped packages.
+- After `0.1.0` is published, refresh `package-lock.json` so the new platform package entries carry
+  registry URLs and integrity hashes.
 - Publish `0.1.0` before adding the exact optional dependency to Harper; the Harper integration test
   must use the registry artifact rather than an injected binding.
 

@@ -779,6 +779,12 @@ impl<T> BoundedQueue<T> {
 	}
 
 	fn push_force(&self, value: T, bytes: usize) -> Result<()> {
+		if self.shared_budget.is_some() {
+			return Err(FulltextError::new(
+				"E_NATIVE_FAILURE",
+				"forced queue admission cannot bypass a shared budget",
+			));
+		}
 		let mut state = lock(&self.state);
 		if state.closed {
 			return Err(FulltextError::new("E_CLOSED", "operation queue is closed"));
@@ -2228,6 +2234,14 @@ mod tests {
 		ordinary.try_push(3, 4).unwrap();
 		assert_eq!(expensive.pop().unwrap().value, 2);
 		assert_eq!(ordinary.pop().unwrap().value, 3);
+	}
+
+	#[test]
+	fn forced_admission_rejects_a_shared_budget_queue() {
+		let budget = Arc::new(QueueBudget::new(1, 8));
+		let queue = BoundedQueue::new_with_budget_and_wake(1, 8, Some(budget), None);
+		assert_eq!(queue.push_force(1, 0).unwrap_err().code, "E_NATIVE_FAILURE");
+		assert_eq!(queue.queued_commands.load(Ordering::Relaxed), 0);
 	}
 
 	#[test]

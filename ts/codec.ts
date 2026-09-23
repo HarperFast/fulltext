@@ -287,7 +287,7 @@ function encodeUpsertRecord(
 		const value = upsert.fields[name];
 		const values = Array.isArray(value) ? value : [value];
 		writer.u16(values.length, 'field value count');
-		for (const entry of values) writer.string(entry);
+		for (const entry of values) writer.documentValue(entry);
 	}
 	return { operation: 'upsert', index, ...writer.take() };
 }
@@ -384,7 +384,7 @@ export function encodeBatch(batch: PackedMutationBatch, maxBytes: number): Buffe
 			const values = Array.isArray(value) ? value : [value];
 			writer.u16(values.length, 'field value count');
 			for (const entry of values) {
-				writer.string(entry);
+				writer.documentValue(entry);
 			}
 		}
 	}
@@ -561,7 +561,7 @@ export function encodeTrace(request: PackedTraceRequest): Buffer {
 		for (const field of record.fields) {
 			writer.string(field.name);
 			writer.u16(field.values.length, 'field.values.length');
-			for (const value of field.values) writer.string(value);
+			for (const value of field.values) writer.documentValue(value);
 		}
 	}
 	writer.u32(request.budgetMilliseconds, 'budgetMilliseconds');
@@ -724,13 +724,21 @@ class ByteWriter {
 	}
 
 	string(value: string): void {
+		this.utf8String(value, true);
+	}
+
+	documentValue(value: string): void {
+		this.utf8String(value, false);
+	}
+
+	private utf8String(value: string, requireWellFormedUtf16: boolean): void {
 		if (typeof value !== 'string') {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'packed string values must be strings');
 		}
 		if (value.length > maxStringBytes) {
 			throw new FulltextError('E_INVALID_ARGUMENT', `packed string exceeds ${maxStringBytes} UTF-8 bytes`);
 		}
-		if (invalidSurrogate.test(value)) {
+		if (requireWellFormedUtf16 && invalidSurrogate.test(value)) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'packed strings must contain well-formed UTF-16');
 		}
 		const bytes = Buffer.from(value, 'utf8');
