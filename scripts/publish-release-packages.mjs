@@ -70,10 +70,10 @@ export function isUnpublishedVersionError(error) {
 	return /E404|ETARGET|404 Not Found|No matching version found/i.test(detail);
 }
 
-function tarballsIn(directory) {
+export function tarballsIn(directory) {
 	const tarballs = [];
 	for (const entry of readdirSync(directory, { withFileTypes: true })) {
-		const entryPath = path.join(directory, entry.name);
+		const entryPath = path.resolve(directory, entry.name);
 		if (entry.isDirectory()) {
 			tarballs.push(...tarballsIn(entryPath));
 		} else if (entry.isFile() && entry.name.endsWith('.tgz')) {

@@ -8,6 +8,7 @@ import {
 	integrityForTarball,
 	isUnpublishedVersionError,
 	parsePublishedIntegrity,
+	tarballsIn,
 	validateReleaseManifests,
 } from '../scripts/publish-release-packages.mjs';
 import { platformPackageName, stagePlatformPackage, supportedPlatformPackages } from '../scripts/platform-packages.mjs';
@@ -87,6 +88,14 @@ test('tarball integrity is stable and content-sensitive', (context) => {
 	assert.strictEqual(integrityForTarball(tarball), first);
 	writeFileSync(tarball, 'second');
 	assert.notStrictEqual(integrityForTarball(tarball), first);
+});
+
+test('release tarballs use unambiguous absolute paths for npm publish', (context) => {
+	const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'fulltext-release-tarballs-'));
+	context.after(() => rmSync(temporaryDirectory, { recursive: true, force: true }));
+	const tarball = path.join(temporaryDirectory, 'package.tgz');
+	writeFileSync(tarball, 'package');
+	assert.deepStrictEqual(tarballsIn(path.relative(process.cwd(), temporaryDirectory)), [path.resolve(tarball)]);
 });
 
 test('npm registry responses distinguish unpublished versions from malformed metadata', () => {
