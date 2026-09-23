@@ -38,6 +38,7 @@ export interface RuntimeInfo {
 		maxQueryClauses: number;
 		maxCandidateIds: number;
 		maxCandidateBytes: number;
+		maxRecordIdBytes: number;
 		maxPrefixExpansions: number;
 		maxFuzzyTerms: number;
 		maxSearchWindow: number;
@@ -959,7 +960,7 @@ function searchBudget(value: number | undefined): number {
 	if (!Number.isFinite(value) || value <= 0) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'remainingBudgetMilliseconds must be greater than zero');
 	}
-	return Math.min(30_000, Math.floor(value));
+	return Math.min(30_000, Math.max(1, Math.floor(value)));
 }
 
 function traceFragments(

@@ -15,7 +15,7 @@ on:
     types: [published]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   native:
@@ -35,21 +35,35 @@ jobs:
         env:
           DOCUMENTS: ${{ inputs.documents || '100000' }}
           QUERIES: ${{ inputs.queries || '500' }}
+          REVISION: ${{ github.event.release.tag_name || github.sha }}
         run: >-
           node benchmarks/native.mjs
           --documents "$DOCUMENTS"
           --queries "$QUERIES"
-          --revision "${{ github.event.release.tag_name || github.sha }}"
+          --revision "$REVISION"
           --output benchmark-native.json
       - name: Store workflow result
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-native-${{ github.event.release.tag_name || github.sha }}
+          name: benchmark-native-${{ github.sha }}
           path: benchmark-native.json
           if-no-files-found: error
           retention-days: 90
+
+  publish:
+    if: github.event_name == 'release'
+    needs: native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download benchmark result
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-native-${{ github.sha }}
       - name: Attach result to the GitHub release
-        if: github.event_name == 'release'
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" benchmark-native.json --clobber
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" benchmark-native.json --clobber

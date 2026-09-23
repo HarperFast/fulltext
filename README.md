@@ -135,6 +135,9 @@ and execution ceilings. Prefix expansion fails with `E_PREFIX_TOO_BROAD` instead
 truncating the term set and returning incomplete rankings. `fuzzy-prefix` is a preview capability
 until catalog-scale benchmark qualification is complete.
 
+Record IDs are limited to 4,096 UTF-8 bytes. This is above Harper's maximum encoded record key and
+keeps deterministic tie-page sorting memory bounded for standalone callers.
+
 `total` is bounded by default so Tantivy can retain block-max WAND pruning. Set `exactTotal: true`
 only when an exact match count is worth a second full-match traversal. Ranking is score descending,
 then UTF-8 ID ascending, including ties that cross segment or page boundaries.

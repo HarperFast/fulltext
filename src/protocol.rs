@@ -2,6 +2,7 @@ use crate::error::{FulltextError, Result};
 
 pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_STRING_BYTES: usize = 1 << 20;
+pub const MAX_RECORD_ID_BYTES: usize = 4 << 10;
 const MAX_FIELDS: usize = 1_024;
 const MUTATION_BATCH_HEADER_BYTES: usize = 14;
 const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 7;
@@ -81,6 +82,18 @@ pub const MAX_AUTOCOMPLETE_RESULTS: usize = 100;
 pub const MAX_SEARCH_REQUEST_BYTES: usize = 8 << 20;
 pub const MAX_SEARCH_RESPONSE_BYTES: usize = 8 << 20;
 pub const MAX_SEARCH_BUDGET_MILLISECONDS: u32 = 30_000;
+
+pub(crate) fn validate_record_id(id: &str) -> Result<()> {
+	if id.is_empty() {
+		return Err(FulltextError::invalid("record IDs must not be empty"));
+	}
+	if id.len() > MAX_RECORD_ID_BYTES {
+		return Err(FulltextError::invalid(format!(
+			"record IDs must not exceed {MAX_RECORD_ID_BYTES} UTF-8 bytes"
+		)));
+	}
+	Ok(())
+}
 pub const MAX_TRACE_RECORDS: usize = 100;
 pub const MAX_TRACE_SOURCE_BYTES: usize = 1 << 20;
 pub const MAX_TRACE_SPANS: usize = 1_024;
@@ -286,7 +299,7 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 	}
 	let mut upserts = Vec::with_capacity(upsert_count);
 	for _ in 0..upsert_count {
-		let id = cursor.string()?;
+		let id = cursor.record_id()?;
 		let field_count = cursor.u16()? as usize;
 		if field_count > MAX_FIELDS {
 			return Err(FulltextError::invalid("upsert field count exceeds 1024"));
@@ -316,7 +329,7 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 	}
 	let mut deletes = Vec::with_capacity(delete_count);
 	for _ in 0..delete_count {
-		deletes.push(cursor.string()?);
+		deletes.push(cursor.record_id()?);
 	}
 	cursor.finish()?;
 	Ok(MutationBatch { upserts, deletes })
@@ -350,10 +363,7 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	let mut candidate_bytes = 0usize;
 	let mut candidate_ids = Vec::with_capacity(candidate_count);
 	for _ in 0..candidate_count {
-		let id = cursor.string()?;
-		if id.is_empty() {
-			return Err(FulltextError::invalid("candidate IDs must not be empty"));
-		}
+		let id = cursor.record_id()?;
 		candidate_bytes = candidate_bytes
 			.checked_add(id.len())
 			.ok_or_else(|| FulltextError::invalid("candidate ID byte count overflow"))?;
@@ -418,10 +428,7 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 	let mut candidate_bytes = 0usize;
 	let mut candidate_ids = Vec::with_capacity(candidate_count);
 	for _ in 0..candidate_count {
-		let id = cursor.string()?;
-		if id.is_empty() {
-			return Err(FulltextError::invalid("candidate IDs must not be empty"));
-		}
+		let id = cursor.record_id()?;
 		candidate_bytes = candidate_bytes.saturating_add(id.len());
 		if candidate_bytes > MAX_CANDIDATE_BYTES {
 			return Err(FulltextError::invalid("candidate IDs exceed 1048576 UTF-8 bytes"));
@@ -435,10 +442,7 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 	let mut source_bytes = 0usize;
 	let mut records = Vec::with_capacity(record_count);
 	for _ in 0..record_count {
-		let id = cursor.string()?;
-		if id.is_empty() {
-			return Err(FulltextError::invalid("trace record IDs must not be empty"));
-		}
+		let id = cursor.record_id()?;
 		let field_count = cursor.u16()? as usize;
 		if field_count > MAX_FIELDS || field_count > cursor.remaining() / 6 {
 			return Err(FulltextError::invalid(
@@ -633,6 +637,12 @@ impl<'a> Cursor<'a> {
 	fn string(&mut self) -> Result<String> {
 		let bytes = self.bytes()?;
 		String::from_utf8(bytes.to_vec()).map_err(|_| FulltextError::invalid("packed string is not valid UTF-8"))
+	}
+
+	fn record_id(&mut self) -> Result<String> {
+		let id = self.string()?;
+		validate_record_id(&id)?;
+		Ok(id)
 	}
 
 	fn finish(&self) -> Result<()> {

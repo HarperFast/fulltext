@@ -266,7 +266,9 @@ immutable sidecar is separate from Tantivy's per-commit payload, which remains a
 standalone checkpoints and derived watermarks.
 Unknown mutation fields, missing IDs, duplicate schema field names, unknown search fields, oversized
 batches, and excessive result windows fail before search/index work. Blank and stop-word-only
-queries return an exact empty result.
+queries return an exact empty result. Record IDs have a separate 4,096-byte UTF-8 ceiling; field
+values retain the general 1 MiB packed-string ceiling. The tighter ID invariant bounds the sort keys
+materialized for deterministic score-tie pagination and still admits Harper's maximum encoded key.
 
 Create treats `{sidecar, meta.json}` as a pair. If neither exists, it writes and syncs the sidecar
 first and then creates the Tantivy index. If both exist, it reopens and verifies them. A sidecar-only

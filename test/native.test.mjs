@@ -38,6 +38,7 @@ test('loads the artifact for the executing platform', async () => {
 			maxQueryClauses: 256,
 			maxCandidateIds: 1_024,
 			maxCandidateBytes: 1 << 20,
+			maxRecordIdBytes: 4 << 10,
 			maxPrefixExpansions: 50,
 			maxFuzzyTerms: 16,
 			maxSearchWindow: 10_000,

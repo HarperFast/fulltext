@@ -2,6 +2,7 @@ import { FulltextError, type FulltextErrorCode } from './errors.js';
 
 const protocolVersion = 2;
 const maxStringBytes = 1 << 20;
+export const maxRecordIdBytes = 4 << 10;
 export const maxFields = 1_024;
 export const mutationBatchHeaderBytes = 14;
 export const minimumMutationBatchBytes = mutationBatchHeaderBytes + 7;
@@ -83,7 +84,7 @@ export function validateMutationBatch(
 	const replacementDeleteIdMaxBytes =
 		replacementDeleteMaxBytes === undefined ? undefined : deleteFrameIdCapacity(replacementDeleteMaxBytes);
 	const check = (id: unknown, operation: 'upsert' | 'delete', index: number) => {
-		const rejection = mutationIdRejection(id, replacementDeleteIdMaxBytes ?? maxStringBytes);
+		const rejection = mutationIdRejection(id, replacementDeleteIdMaxBytes ?? maxRecordIdBytes);
 		if (replacementDeleteMaxBytes !== undefined) {
 			if (rejection === 'E_INVALID_ARGUMENT') {
 				throw new FulltextError(
@@ -245,13 +246,13 @@ function encodeMutationId(id: unknown): Buffer | undefined {
 
 function mutationIdRejection(
 	id: unknown,
-	maximumBytes = maxStringBytes,
+	maximumBytes = maxRecordIdBytes,
 ): 'E_INVALID_ARGUMENT' | 'E_BATCH_TOO_LARGE' | undefined {
-	if (typeof id !== 'string' || id.length === 0 || id.length > maxStringBytes || invalidSurrogate.test(id))
+	if (typeof id !== 'string' || id.length === 0 || id.length > maxRecordIdBytes || invalidSurrogate.test(id))
 		return 'E_INVALID_ARGUMENT';
-	if (id.length * 3 <= Math.min(maxStringBytes, maximumBytes)) return;
+	if (id.length * 3 <= Math.min(maxRecordIdBytes, maximumBytes)) return;
 	const byteLength = Buffer.byteLength(id, 'utf8');
-	if (byteLength > maxStringBytes) return 'E_INVALID_ARGUMENT';
+	if (byteLength > maxRecordIdBytes) return 'E_INVALID_ARGUMENT';
 	if (byteLength > maximumBytes) return 'E_BATCH_TOO_LARGE';
 }
 
@@ -411,8 +412,8 @@ export function encodeBatchPartitions(
 	const maxFrameBytes = Math.min(maxBytes, maxTotalBytes);
 	const encodedIds = new Set<string>();
 	const checkDuplicate = (id: unknown) => {
-		if (typeof id !== 'string' || id.length === 0 || id.length > maxStringBytes || invalidSurrogate.test(id)) return;
-		if (Buffer.byteLength(id) > maxStringBytes) return;
+		if (typeof id !== 'string' || id.length === 0 || id.length > maxRecordIdBytes || invalidSurrogate.test(id)) return;
+		if (Buffer.byteLength(id) > maxRecordIdBytes) return;
 		if (encodedIds.has(id)) throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch IDs must be distinct');
 		encodedIds.add(id);
 	};
@@ -541,6 +542,7 @@ export function encodeSearch(request: PackedSearchRequest): Buffer {
 
 export function encodeTrace(request: PackedTraceRequest): Buffer {
 	validateCandidateIds(request.candidateIds);
+	for (const record of request.records) validateRecordId(record.id);
 	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
 	writer.header('FTTM');
 	writer.string(request.text);
@@ -572,6 +574,16 @@ function validateCandidateIds(candidateIds: string[] | undefined): void {
 		(!Array.isArray(candidateIds) || candidateIds.some((id) => typeof id !== 'string'))
 	) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'candidateIds must be an array of strings');
+	}
+	for (const id of candidateIds ?? []) validateRecordId(id);
+}
+
+function validateRecordId(id: string): void {
+	if (mutationIdRejection(id)) {
+		throw new FulltextError(
+			'E_INVALID_ARGUMENT',
+			`record IDs must be non-empty, well-formed UTF-16, and at most ${maxRecordIdBytes} UTF-8 bytes`,
+		);
 	}
 }
 

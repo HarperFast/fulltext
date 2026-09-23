@@ -196,6 +196,10 @@ test('runs every structured query mode and score-neutral candidate filtering', a
 		index.search({ text: 'x'.repeat(40), mode: 'prefix' }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
+	assert.deepStrictEqual(
+		(await index.search({ text: `${'x'.repeat(40)} waterproof`, mode: 'prefix' })).hits.map((hit) => hit.id).sort(),
+		['one', 'two'],
+	);
 	await assert.rejects(index.search({ text: '\ud800' }), (error) => error.code === 'E_INVALID_ARGUMENT');
 	await assert.rejects(
 		index.search({ text: 'waterproof', limit: 10_001 }),
@@ -210,10 +214,23 @@ test('runs every structured query mode and score-neutral candidate filtering', a
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	await assert.rejects(
+		index.search({ text: 'waterproof', candidateIds: ['x'.repeat(4_097)] }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.traceMatches({ text: 'waterproof' }, [{ id: 'x'.repeat(4_097), fields: { title: 'waterproof' } }]),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.apply(encodeMutationBatch({ deletes: ['x'.repeat(4_097)] })),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
 		index.search({ text: 'waterproof' }, { remainingBudgetMilliseconds: 0 }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	assert.strictEqual((await index.search({ text: 'waterproof' }, { remainingBudgetMilliseconds: 60_000 })).total, 2);
+	assert.strictEqual((await index.search({ text: 'waterproof' }, { remainingBudgetMilliseconds: 0.5 })).total, 2);
 	await index.close();
 });
 

@@ -18,6 +18,7 @@ interface NativeRuntimeInfo {
 		maxQueryClauses: number;
 		maxCandidateIds: number;
 		maxCandidateBytes: number;
+		maxRecordIdBytes: number;
 		maxPrefixExpansions: number;
 		maxFuzzyTerms: number;
 		maxSearchWindow: number;

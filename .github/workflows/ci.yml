@@ -99,5 +99,5 @@ jobs:
         with:
           name: benchmark-smoke-${{ github.sha }}
           path: benchmark-*.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30

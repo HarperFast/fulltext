@@ -19,8 +19,9 @@ use tantivy::{DocAddress, Index, IndexReader, IndexSettings, IndexWriter, Order,
 
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	EngineConfig, EngineIdentityConfig, MutationBatch, SearchMode, SearchRequest, TraceRecord, MAX_FUZZY_TERMS,
-	MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES, MAX_TRACE_SPANS,
+	validate_record_id, EngineConfig, EngineIdentityConfig, MutationBatch, SearchMode, SearchRequest, TraceRecord,
+	MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES,
+	MAX_TRACE_SPANS,
 };
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
@@ -321,6 +322,11 @@ impl Engine {
 		if request.limit == 0 {
 			return Err(FulltextError::invalid("search limit must be greater than zero"));
 		}
+		if let Some(candidate_ids) = &request.candidate_ids {
+			for id in candidate_ids {
+				validate_record_id(id)?;
+			}
+		}
 		check_deadline(deadline)?;
 		let selected = self.selected_fields(&request.fields)?;
 		let query = self.query(searcher, request, &selected)?;
@@ -349,7 +355,7 @@ impl Engine {
 				})
 				.collect::<Result<Vec<_>>>()?
 		} else {
-			let ids = search_hit_ids(searcher, &scored_docs, MAX_SEARCH_RESPONSE_BYTES - 13)?;
+			let ids = search_hit_ids(searcher, &scored_docs)?;
 			let mut ranked = scored_docs
 				.iter()
 				.zip(ids)
@@ -399,6 +405,14 @@ impl Engine {
 		deadline: Option<Instant>,
 	) -> Result<TraceResult> {
 		check_deadline(deadline)?;
+		if let Some(candidate_ids) = &request.candidate_ids {
+			for id in candidate_ids {
+				validate_record_id(id)?;
+			}
+		}
+		for record in records {
+			validate_record_id(&record.id)?;
+		}
 		let selected = self.selected_fields(&request.fields)?;
 		self.require_surface_fields(&selected)?;
 		let selected_names = selected.iter().map(|field| field.name.as_str()).collect::<HashSet<_>>();
@@ -923,13 +937,13 @@ impl Engine {
 		let mut final_offset = 0;
 		while stream.advance() {
 			let token = stream.token();
-			if token.text.len() >= 40 {
-				return Err(FulltextError::invalid(
-					"prefix tokens must be shorter than 40 UTF-8 bytes",
-				));
-			}
 			final_term = Some(token.text.to_lowercase());
 			final_offset = token.offset_from;
+		}
+		if final_term.as_ref().is_some_and(|term| term.len() >= 40) {
+			return Err(FulltextError::invalid(
+				"the final prefix token must be shorter than 40 UTF-8 bytes",
+			));
 		}
 		Ok((&text[..final_offset], final_term))
 	}
@@ -1077,7 +1091,7 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
 	}
 }
 
-fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)], max_bytes: usize) -> Result<Vec<String>> {
+fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Result<Vec<String>> {
 	let mut hits_by_segment = HashMap::new();
 	for (index, (_, address)) in scored_docs.iter().enumerate() {
 		hits_by_segment
@@ -1086,7 +1100,6 @@ fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)], max_by
 			.push((index, address.doc_id));
 	}
 	let mut ids = vec![String::new(); scored_docs.len()];
-	let mut response_bytes = 0usize;
 	for (segment_ord, segment_hits) in hits_by_segment {
 		let segment = &searcher.segment_readers()[segment_ord as usize];
 		let column = segment
@@ -1114,15 +1127,6 @@ fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)], max_by
 			let id = std::str::from_utf8(&id)
 				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?
 				.to_owned();
-			response_bytes = response_bytes
-				.checked_add(8 + id.len())
-				.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))?;
-			if response_bytes > max_bytes {
-				return Err(FulltextError::new(
-					"E_RESULT_TOO_LARGE",
-					format!("search response exceeds {} bytes", max_bytes + 13),
-				));
-			}
 			ids[index] = id;
 		}
 	}
@@ -1248,15 +1252,11 @@ impl Writer {
 	pub(crate) fn prepare(&self, batch: MutationBatch) -> Result<PreparedBatch> {
 		let mutation_count = batch.upserts.len() + batch.deletes.len();
 		for id in &batch.deletes {
-			if id.is_empty() {
-				return Err(FulltextError::invalid("delete ID must not be empty"));
-			}
+			validate_record_id(id)?;
 		}
 		let mut documents = Vec::with_capacity(batch.upserts.len());
 		for upsert in batch.upserts {
-			if upsert.id.is_empty() {
-				return Err(FulltextError::invalid("upsert ID must not be empty"));
-			}
+			validate_record_id(&upsert.id)?;
 			let mut seen = HashSet::with_capacity(upsert.fields.len());
 			let mut document = TantivyDocument::default();
 			document.add_text(self.id_field, &upsert.id);
@@ -1634,6 +1634,16 @@ mod tests {
 		let config = config();
 		let engine = Engine::open(directory.clone(), &config).unwrap();
 		let mut writer = engine.writer(&config).unwrap();
+		assert_eq!(
+			writer
+				.apply(MutationBatch {
+					upserts: Vec::new(),
+					deletes: vec!["x".repeat(crate::protocol::MAX_RECORD_ID_BYTES + 1)],
+				})
+				.unwrap_err()
+				.code,
+			"E_INVALID_ARGUMENT"
+		);
 		assert_eq!(writer.apply(batch()).unwrap(), 2);
 		writer.commit().unwrap();
 		let reader = engine.reader().unwrap();
