@@ -1,6 +1,6 @@
 import { FulltextError, type FulltextErrorCode } from './errors.js';
 
-const protocolVersion = 1;
+const protocolVersion = 2;
 const maxStringBytes = 1 << 20;
 export const maxFields = 1_024;
 export const mutationBatchHeaderBytes = 14;
@@ -303,11 +303,22 @@ function deleteFrameIdCapacity(maxBytes: number): number {
 
 export interface PackedSearchRequest {
 	text: string;
-	operator: 'any' | 'all';
+	mode: 'any' | 'all' | 'phrase' | 'prefix' | 'fuzzy' | 'fuzzy-prefix';
 	fields: string[];
+	candidateIds?: string[];
 	offset: number;
 	limit: number;
 	exactTotal: boolean;
+	budgetMilliseconds: number;
+}
+
+export interface PackedTraceRequest {
+	text: string;
+	mode: PackedSearchRequest['mode'];
+	fields: string[];
+	candidateIds?: string[];
+	records: Array<{ id: string; fields: Array<{ name: string; values: string[] }> }>;
+	budgetMilliseconds: number;
 }
 
 export function encodeOpen(config: PackedOpenConfig): Buffer {
@@ -505,17 +516,51 @@ function encodeBatchHeader(upserts: number, deletes: number): Buffer {
 }
 
 export function encodeSearch(request: PackedSearchRequest): Buffer {
-	const writer = new ByteWriter(2 * 1024 * 1024, 'E_INVALID_ARGUMENT');
+	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
 	writer.header('FTSQ');
 	writer.string(request.text);
-	writer.u8(request.operator === 'all' ? 1 : 0, 'operator');
+	writer.u8(['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'].indexOf(request.mode), 'mode');
 	writer.u16(request.fields.length, 'fields.length');
 	for (const field of request.fields) {
 		writer.string(field);
 	}
+	writer.boolean(request.candidateIds !== undefined);
+	if (request.candidateIds !== undefined) {
+		writer.u16(request.candidateIds.length, 'candidateIds.length');
+		for (const id of request.candidateIds) {
+			writer.string(id);
+		}
+	}
 	writer.u32(request.offset, 'offset');
 	writer.u32(request.limit, 'limit');
 	writer.boolean(request.exactTotal);
+	writer.u32(request.budgetMilliseconds, 'budgetMilliseconds');
+	return writer.finish();
+}
+
+export function encodeTrace(request: PackedTraceRequest): Buffer {
+	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
+	writer.header('FTTM');
+	writer.string(request.text);
+	writer.u8(['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'].indexOf(request.mode), 'mode');
+	writer.u16(request.fields.length, 'fields.length');
+	for (const field of request.fields) writer.string(field);
+	writer.boolean(request.candidateIds !== undefined);
+	if (request.candidateIds !== undefined) {
+		writer.u16(request.candidateIds.length, 'candidateIds.length');
+		for (const id of request.candidateIds) writer.string(id);
+	}
+	writer.u16(request.records.length, 'records.length');
+	for (const record of request.records) {
+		writer.string(record.id);
+		writer.u16(record.fields.length, 'record.fields.length');
+		for (const field of record.fields) {
+			writer.string(field.name);
+			writer.u16(field.values.length, 'field.values.length');
+			for (const value of field.values) writer.string(value);
+		}
+	}
+	writer.u32(request.budgetMilliseconds, 'budgetMilliseconds');
 	return writer.finish();
 }
 
@@ -661,6 +706,9 @@ class ByteWriter {
 		}
 		if (value.length > maxStringBytes) {
 			throw new FulltextError('E_INVALID_ARGUMENT', `packed string exceeds ${maxStringBytes} UTF-8 bytes`);
+		}
+		if (invalidSurrogate.test(value)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'packed strings must contain well-formed UTF-16');
 		}
 		const bytes = Buffer.from(value, 'utf8');
 		if (bytes.byteLength > maxStringBytes) {

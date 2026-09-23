@@ -88,5 +88,16 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build:native
       - run: npm run build:typescript
-      - run: npm run benchmark:smoke
+      - name: Run logical mutation benchmark smoke
+        run: node benchmarks/native.mjs --smoke --mutation-driver logical --output benchmark-logical.json
+      - name: Run low-level mutation benchmark smoke
+        run: node benchmarks/native.mjs --smoke --mutation-driver low-level --output benchmark-low-level.json
       - run: npm run benchmark:inspect:smoke
+      - name: Store benchmark smoke results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke-${{ github.sha }}
+          path: benchmark-*.json
+          if-no-files-found: error
+          retention-days: 30

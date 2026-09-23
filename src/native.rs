@@ -16,11 +16,13 @@ use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory, INDEX_WR
 use tantivy::IndexReader;
 
 use crate::boundary;
-use crate::engine::{persisted_index_id, Engine, InspectionResult, SearchResult, TotalRelation, Writer, IDENTITY_PATH};
+use crate::engine::{
+	persisted_index_id, Engine, InspectionResult, SearchResult, TotalRelation, TraceResult, Writer, IDENTITY_PATH,
+};
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	decode_batch, decode_inspect, decode_open, decode_reset, decode_search, validate_batch_header,
-	validate_search_header, EngineConfig,
+	decode_batch, decode_inspect, decode_open, decode_reset, decode_search, decode_trace, search_mode, trace_mode,
+	validate_batch_header, validate_search_header, EngineConfig, PROTOCOL_VERSION,
 };
 
 const STATE_OPEN: u8 = 0;
@@ -65,7 +67,8 @@ struct Runtime {
 	path_identity: PathIdentity,
 	config: EngineConfig,
 	writer_queue: Arc<BoundedQueue<WriterCommand>>,
-	search_queue: Arc<BoundedQueue<SearchCommand>>,
+	ordinary_search_queue: Arc<BoundedQueue<SearchCommand>>,
+	expensive_search_queue: Option<Arc<BoundedQueue<SearchCommand>>>,
 	state: AtomicU8,
 	environment: Arc<EnvironmentState>,
 	uncommitted_mutations: AtomicU64,
@@ -137,6 +140,13 @@ struct BoundedQueue<T> {
 	max_bytes: usize,
 	queued_commands: AtomicU64,
 	queued_bytes: AtomicU64,
+	shared_budget: Option<Arc<QueueBudget>>,
+}
+
+struct QueueBudget {
+	state: Mutex<(usize, usize)>,
+	max_commands: usize,
+	max_bytes: usize,
 }
 
 type Callback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
@@ -171,8 +181,13 @@ struct WriterCloseOutcome {
 }
 
 struct SearchCommand {
-	request: Vec<u8>,
+	operation: SearchOperation,
 	completion: Completion,
+}
+
+enum SearchOperation {
+	Search(Vec<u8>),
+	Trace(Vec<u8>),
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeOpen")]
@@ -326,15 +341,45 @@ pub fn native_search(handle: u32, packed_request: Buffer, callback: JsFunction) 
 		let runtime = runtime(handle)?;
 		runtime.require_open().map_err(fulltext_napi_error)?;
 		validate_search_header(&packed_request).map_err(fulltext_napi_error)?;
-		runtime
-			.search_queue
+		let mode = search_mode(&packed_request).map_err(fulltext_napi_error)?;
+		let queue = runtime.search_queue(mode.is_expensive());
+		queue
 			.check_capacity(packed_request.len())
 			.map_err(fulltext_napi_error)?;
 		let completion = completion(callback, runtime.environment.callbacks.clone())?;
 		let request = packed_request.to_vec();
-		runtime
-			.search_queue
-			.try_push(SearchCommand { request, completion }, packed_request.len())
+		queue
+			.try_push(
+				SearchCommand {
+					operation: SearchOperation::Search(request),
+					completion,
+				},
+				packed_request.len(),
+			)
+			.map_err(fulltext_napi_error)
+	})?
+}
+
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeTraceMatches")]
+pub fn native_trace_matches(handle: u32, packed_request: Buffer, callback: JsFunction) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		let runtime = runtime(handle)?;
+		runtime.require_open().map_err(fulltext_napi_error)?;
+		let mode = trace_mode(&packed_request).map_err(fulltext_napi_error)?;
+		let queue = runtime.search_queue(mode.is_expensive());
+		queue
+			.check_capacity(packed_request.len())
+			.map_err(fulltext_napi_error)?;
+		let completion = completion(callback, runtime.environment.callbacks.clone())?;
+		let request = packed_request.to_vec();
+		queue
+			.try_push(
+				SearchCommand {
+					operation: SearchOperation::Trace(request),
+					completion,
+				},
+				packed_request.len(),
+			)
 			.map_err(fulltext_napi_error)
 	})?
 }
@@ -442,17 +487,32 @@ impl Runtime {
 			parts.config.limits.max_queued_commands,
 			parts.config.limits.max_queued_bytes,
 		));
-		let search_queue = Arc::new(BoundedQueue::new(
+		let search_budget = (search_thread_count >= 2).then(|| {
+			Arc::new(QueueBudget::new(
+				parts.config.limits.max_queued_commands,
+				parts.config.limits.max_queued_bytes,
+			))
+		});
+		let ordinary_search_queue = Arc::new(BoundedQueue::new_with_budget(
 			parts.config.limits.max_queued_commands,
 			parts.config.limits.max_queued_bytes,
+			search_budget.clone(),
 		));
+		let expensive_search_queue = (search_thread_count >= 2).then(|| {
+			Arc::new(BoundedQueue::new_with_budget(
+				parts.config.limits.max_queued_commands,
+				parts.config.limits.max_queued_bytes,
+				search_budget,
+			))
+		});
 		let runtime = Arc::new(Self {
 			handle,
 			path: parts.path,
 			path_identity: parts.path_identity,
 			config: parts.config,
 			writer_queue,
-			search_queue,
+			ordinary_search_queue,
+			expensive_search_queue,
 			state: AtomicU8::new(STATE_OPEN),
 			environment,
 			uncommitted_mutations: AtomicU64::new(0),
@@ -481,9 +541,15 @@ impl Runtime {
 			let search_runtime = runtime.clone();
 			let search_engine = engine.clone();
 			let search_reader = reader.clone();
+			let ordinary_workers = search_thread_count.div_ceil(2);
+			let queue = if worker < ordinary_workers {
+				runtime.ordinary_search_queue.clone()
+			} else {
+				runtime.expensive_search_queue.as_ref().unwrap().clone()
+			};
 			let join = match thread::Builder::new()
 				.name(format!("fulltext-search-{handle}-{worker}"))
-				.spawn(move || search_loop(search_runtime, search_engine, search_reader))
+				.spawn(move || search_loop(search_runtime, search_engine, search_reader, queue))
 			{
 				Ok(join) => join,
 				Err(error) => {
@@ -504,6 +570,16 @@ impl Runtime {
 			STATE_OPEN => Ok(()),
 			STATE_POISONED => Err(FulltextError::new("E_POISONED", "index is poisoned")),
 			_ => Err(FulltextError::new("E_CLOSED", "index is closing or closed")),
+		}
+	}
+
+	fn search_queue(&self, expensive: bool) -> &Arc<BoundedQueue<SearchCommand>> {
+		if expensive {
+			self.expensive_search_queue
+				.as_ref()
+				.unwrap_or(&self.ordinary_search_queue)
+		} else {
+			&self.ordinary_search_queue
 		}
 	}
 
@@ -553,8 +629,13 @@ impl Runtime {
 		if let Some(close) = close {
 			let _ = self.writer_queue.push_force(close.force_rollback(), 0);
 		}
-		for command in self.search_queue.close() {
+		for command in self.ordinary_search_queue.close() {
 			command.value.completion.failure(error.clone());
+		}
+		if let Some(queue) = &self.expensive_search_queue {
+			for command in queue.close() {
+				command.value.completion.failure(error.clone());
+			}
 		}
 	}
 
@@ -564,8 +645,18 @@ impl Runtime {
 		push_u64(&mut bytes, self.uncommitted_mutations.load(Ordering::Acquire));
 		push_u64(&mut bytes, self.writer_queue.queued_commands.load(Ordering::Relaxed));
 		push_u64(&mut bytes, self.writer_queue.queued_bytes.load(Ordering::Relaxed));
-		push_u64(&mut bytes, self.search_queue.queued_commands.load(Ordering::Relaxed));
-		push_u64(&mut bytes, self.search_queue.queued_bytes.load(Ordering::Relaxed));
+		let search_queued_commands = self.ordinary_search_queue.queued_commands.load(Ordering::Relaxed)
+			+ self
+				.expensive_search_queue
+				.as_ref()
+				.map_or(0, |queue| queue.queued_commands.load(Ordering::Relaxed));
+		let search_queued_bytes = self.ordinary_search_queue.queued_bytes.load(Ordering::Relaxed)
+			+ self
+				.expensive_search_queue
+				.as_ref()
+				.map_or(0, |queue| queue.queued_bytes.load(Ordering::Relaxed));
+		push_u64(&mut bytes, search_queued_commands);
+		push_u64(&mut bytes, search_queued_bytes);
 		push_u64(&mut bytes, self.commit_opstamp.load(Ordering::Acquire));
 		push_u64(&mut bytes, self.writer_queue_nanoseconds.load(Ordering::Relaxed));
 		push_u64(&mut bytes, self.writer_execution_nanoseconds.load(Ordering::Relaxed));
@@ -611,6 +702,10 @@ impl CompletionSignal {
 
 impl<T> BoundedQueue<T> {
 	fn new(max_commands: usize, max_bytes: usize) -> Self {
+		Self::new_with_budget(max_commands, max_bytes, None)
+	}
+
+	fn new_with_budget(max_commands: usize, max_bytes: usize, shared_budget: Option<Arc<QueueBudget>>) -> Self {
 		Self {
 			state: Mutex::new(QueueState {
 				items: VecDeque::new(),
@@ -622,6 +717,7 @@ impl<T> BoundedQueue<T> {
 			max_bytes,
 			queued_commands: AtomicU64::new(0),
 			queued_bytes: AtomicU64::new(0),
+			shared_budget,
 		}
 	}
 
@@ -633,6 +729,7 @@ impl<T> BoundedQueue<T> {
 		let mut state = lock(&self.state);
 		admit()?;
 		self.validate_capacity(&state, bytes)?;
+		self.reserve_shared(bytes)?;
 		state.bytes += bytes;
 		state.items.push_back(Queued {
 			value,
@@ -646,7 +743,9 @@ impl<T> BoundedQueue<T> {
 	}
 
 	fn check_capacity(&self, bytes: usize) -> Result<()> {
-		self.validate_capacity(&lock(&self.state), bytes)
+		let state = lock(&self.state);
+		self.validate_capacity(&state, bytes)?;
+		self.validate_shared_capacity(bytes)
 	}
 
 	fn validate_capacity(&self, state: &QueueState<T>, bytes: usize) -> Result<()> {
@@ -686,6 +785,7 @@ impl<T> BoundedQueue<T> {
 				state.bytes -= item.bytes;
 				self.queued_commands.fetch_sub(1, Ordering::Relaxed);
 				self.queued_bytes.fetch_sub(item.bytes as u64, Ordering::Relaxed);
+				self.release_shared(1, item.bytes);
 				return Some(item);
 			}
 			if state.closed {
@@ -699,19 +799,68 @@ impl<T> BoundedQueue<T> {
 		let mut state = lock(&self.state);
 		state.closed = true;
 		let items = drain_queue(&mut state, &self.queued_commands, &self.queued_bytes);
+		self.release_shared(items.len(), items.iter().map(|item| item.bytes).sum());
 		self.ready.notify_all();
 		items
 	}
 
 	fn drain(&self) -> Vec<Queued<T>> {
 		let mut state = lock(&self.state);
-		drain_queue(&mut state, &self.queued_commands, &self.queued_bytes)
+		let items = drain_queue(&mut state, &self.queued_commands, &self.queued_bytes);
+		self.release_shared(items.len(), items.iter().map(|item| item.bytes).sum());
+		items
 	}
 
 	fn shutdown_after_drain(&self) {
 		let mut state = lock(&self.state);
 		state.closed = true;
 		self.ready.notify_all();
+	}
+
+	fn validate_shared_capacity(&self, bytes: usize) -> Result<()> {
+		let Some(budget) = &self.shared_budget else {
+			return Ok(());
+		};
+		budget.validate(&lock(&budget.state), bytes)
+	}
+
+	fn reserve_shared(&self, bytes: usize) -> Result<()> {
+		let Some(budget) = &self.shared_budget else {
+			return Ok(());
+		};
+		let mut state = lock(&budget.state);
+		budget.validate(&state, bytes)?;
+		state.0 += 1;
+		state.1 += bytes;
+		Ok(())
+	}
+
+	fn release_shared(&self, commands: usize, bytes: usize) {
+		if let Some(budget) = &self.shared_budget {
+			let mut state = lock(&budget.state);
+			state.0 -= commands;
+			state.1 -= bytes;
+		}
+	}
+}
+
+impl QueueBudget {
+	fn new(max_commands: usize, max_bytes: usize) -> Self {
+		Self {
+			state: Mutex::new((0, 0)),
+			max_commands,
+			max_bytes,
+		}
+	}
+
+	fn validate(&self, state: &(usize, usize), bytes: usize) -> Result<()> {
+		if state.0 >= self.max_commands || state.1.saturating_add(bytes) > self.max_bytes {
+			return Err(FulltextError::new(
+				"E_QUEUE_FULL",
+				"operation queue limits are exhausted",
+			));
+		}
+		Ok(())
 	}
 }
 
@@ -990,7 +1139,10 @@ fn finish_runtime(
 	reader: Arc<IndexReader>,
 	mut outcome: WriterCloseOutcome,
 ) -> WriterCloseOutcome {
-	runtime.search_queue.shutdown_after_drain();
+	runtime.ordinary_search_queue.shutdown_after_drain();
+	if let Some(queue) = &runtime.expensive_search_queue {
+		queue.shutdown_after_drain();
+	}
 	for join in std::mem::take(&mut *lock(&runtime.search_threads)) {
 		if join.join().is_err() && outcome.error.is_none() {
 			outcome.error = Some(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
@@ -1027,7 +1179,10 @@ fn finish_runtime(
 }
 
 fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
-	runtime.search_queue.shutdown_after_drain();
+	runtime.ordinary_search_queue.shutdown_after_drain();
+	if let Some(queue) = &runtime.expensive_search_queue {
+		queue.shutdown_after_drain();
+	}
 	for join in std::mem::take(&mut *lock(&runtime.search_threads)) {
 		let _ = join.join();
 	}
@@ -1095,31 +1250,68 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 		.ok_or_else(|| FulltextError::new("E_POISONED", "writer is unavailable"))
 }
 
-fn search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
-	while let Some(queued) = runtime.search_queue.pop() {
+fn search_loop(
+	runtime: Arc<Runtime>,
+	engine: Arc<Engine>,
+	reader: Arc<IndexReader>,
+	queue: Arc<BoundedQueue<SearchCommand>>,
+) {
+	while let Some(queued) = queue.pop() {
+		let queued_for = queued.enqueued.elapsed();
 		runtime
 			.search_queue_nanoseconds
-			.fetch_add(duration_ns(queued.enqueued.elapsed()), Ordering::Relaxed);
+			.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
 		let started = Instant::now();
-		let result = catch_unwind(AssertUnwindSafe(|| {
-			decode_search(&queued.value.request).and_then(|request| engine.search(&reader.searcher(), &request))
+		let SearchCommand { operation, completion } = queued.value;
+		let result = catch_unwind(AssertUnwindSafe(|| match operation {
+			SearchOperation::Search(bytes) => decode_search(&bytes).and_then(|request| {
+				let deadline = operation_deadline(request.budget_milliseconds, queued_for)?;
+				engine
+					.search_with_deadline(&reader.searcher(), &request, deadline)
+					.map(SearchOutcome::Search)
+			}),
+			SearchOperation::Trace(bytes) => decode_trace(&bytes).and_then(|request| {
+				let deadline = operation_deadline(request.search.budget_milliseconds, queued_for)?;
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				engine.validate_query(&reader.searcher(), &request.search)?;
+				let result = engine.trace_matches(&request.search, &request.records)?;
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				Ok(SearchOutcome::Trace(result))
+			}),
 		}));
 		runtime
 			.search_execution_nanoseconds
 			.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
 		match result {
-			Ok(Ok(result)) => queued.value.completion.success(search_body(result)),
-			Ok(Err(error)) => queued.value.completion.failure(error),
+			Ok(Ok(SearchOutcome::Search(result))) => completion.success(search_body(result)),
+			Ok(Ok(SearchOutcome::Trace(result))) => completion.success(trace_body(result)),
+			Ok(Err(error)) => completion.failure(error),
 			Err(_) => {
-				queued
-					.value
-					.completion
-					.failure(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
+				completion.failure(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
 				runtime.poison(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
 				return;
 			}
 		}
 	}
+}
+
+enum SearchOutcome {
+	Search(SearchResult),
+	Trace(TraceResult),
+}
+
+fn operation_deadline(budget_milliseconds: u32, queued_for: Duration) -> Result<Instant> {
+	let budget = Duration::from_millis(u64::from(budget_milliseconds));
+	let remaining = budget.checked_sub(queued_for).ok_or_else(search_timeout)?;
+	Ok(Instant::now() + remaining)
+}
+
+fn search_timeout() -> FulltextError {
+	FulltextError::new("E_TIMEOUT", "full-text search exceeded its execution budget")
 }
 
 fn open_on_thread(
@@ -1763,13 +1955,17 @@ fn next_handle() -> Result<u32> {
 }
 
 fn success_envelope(body: Vec<u8>) -> Vec<u8> {
-	let mut bytes = b"FTRP\x01\x00\x00".to_vec();
+	let mut bytes = b"FTRP".to_vec();
+	bytes.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+	bytes.push(0);
 	bytes.extend_from_slice(&body);
 	bytes
 }
 
 fn error_envelope(error: FulltextError) -> Vec<u8> {
-	let mut bytes = b"FTRP\x01\x00\x01".to_vec();
+	let mut bytes = b"FTRP".to_vec();
+	bytes.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+	bytes.push(1);
 	push_string(&mut bytes, error.code);
 	push_string(&mut bytes, &error.message);
 	bytes
@@ -1826,6 +2022,26 @@ fn search_body(result: SearchResult) -> Vec<u8> {
 	for hit in result.hits {
 		bytes.extend_from_slice(&hit.score.to_le_bytes());
 		push_string(&mut bytes, &hit.id);
+	}
+	bytes
+}
+
+fn trace_body(result: TraceResult) -> Vec<u8> {
+	let mut bytes = Vec::new();
+	bytes.push(result.complete as u8);
+	bytes.extend_from_slice(&(result.records.len() as u16).to_le_bytes());
+	for record in result.records {
+		push_string(&mut bytes, &record.id);
+		bytes.extend_from_slice(&(record.values.len() as u16).to_le_bytes());
+		for value in record.values {
+			push_string(&mut bytes, &value.field);
+			bytes.extend_from_slice(&value.value_index.to_le_bytes());
+			bytes.extend_from_slice(&(value.spans.len() as u16).to_le_bytes());
+			for span in value.spans {
+				bytes.extend_from_slice(&span.start.to_le_bytes());
+				bytes.extend_from_slice(&span.end.to_le_bytes());
+			}
+		}
 	}
 	bytes
 }
@@ -1893,6 +2109,20 @@ mod tests {
 		assert_eq!(queue.try_push_if(2, 1, || Ok(())).unwrap_err().code, "E_QUEUE_FULL");
 		assert_eq!(queue.pop().unwrap().value, 1);
 		assert_eq!(queue.queued_bytes.load(Ordering::Relaxed), 0);
+	}
+
+	#[test]
+	fn isolated_search_lanes_share_one_admission_budget() {
+		let budget = Arc::new(QueueBudget::new(2, 8));
+		let ordinary = BoundedQueue::new_with_budget(2, 8, Some(budget.clone()));
+		let expensive = BoundedQueue::new_with_budget(2, 8, Some(budget));
+		ordinary.try_push(1, 4).unwrap();
+		expensive.try_push(2, 4).unwrap();
+		assert_eq!(ordinary.try_push(3, 1).unwrap_err().code, "E_QUEUE_FULL");
+		assert_eq!(ordinary.pop().unwrap().value, 1);
+		ordinary.try_push(3, 4).unwrap();
+		assert_eq!(expensive.pop().unwrap().value, 2);
+		assert_eq!(ordinary.pop().unwrap().value, 3);
 	}
 
 	#[test]

@@ -8,8 +8,27 @@ interface NativeRuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
+	queryApiVersion: number;
+	queryClassIsolationMinimumSearchThreads: number;
 	storageBackends: Array<string>;
-	limits: { maxCommitPayloadBytes: number };
+	limits: {
+		maxCommitPayloadBytes: number;
+		maxQueryTextBytes: number;
+		maxQueryTerms: number;
+		maxQueryClauses: number;
+		maxCandidateIds: number;
+		maxCandidateBytes: number;
+		maxPrefixExpansions: number;
+		maxFuzzyTerms: number;
+		maxSearchWindow: number;
+		maxAutocompleteResults: number;
+		maxSearchRequestBytes: number;
+		maxSearchResponseBytes: number;
+		maxSearchBudgetMilliseconds: number;
+		maxTraceRecords: number;
+		maxTraceSourceBytes: number;
+		maxTraceSpans: number;
+	};
 }
 
 interface NativeAddonApi {
@@ -23,6 +42,7 @@ interface NativeAddonApi {
 	__nativePublish(handle: number, payload: string, callback: NativeCallback): void;
 	__nativeReload(handle: number, callback: NativeCallback): void;
 	__nativeSearch(handle: number, request: Buffer, callback: NativeCallback): void;
+	__nativeTraceMatches(handle: number, request: Buffer, callback: NativeCallback): void;
 	__nativeClose(handle: number, rollback: boolean, callback: NativeCallback): void;
 	__nativeStatus(handle: number): Buffer;
 	__testCreateHandle?(): number;
@@ -37,7 +57,7 @@ interface NativeAddonApi {
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 5;
+const expectedNativeAbiVersion = 6;
 let loadedAddon: NativeAddonApi | undefined;
 
 export function loadAddon(): NativeAddonApi {
@@ -83,6 +103,18 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 		throw new FulltextError(
 			'E_NATIVE_ABI_MISMATCH',
 			`Fulltext native ABI ${info.nativeAbiVersion} from ${artifactPath} does not match ${expectedNativeAbiVersion}`,
+		);
+	}
+	if (info.queryApiVersion !== 1) {
+		throw new FulltextError(
+			'E_NATIVE_CAPABILITY_MISMATCH',
+			`Fulltext query API ${info.queryApiVersion} from ${artifactPath} is not supported`,
+		);
+	}
+	if (info.queryClassIsolationMinimumSearchThreads !== 2) {
+		throw new FulltextError(
+			'E_NATIVE_CAPABILITY_MISMATCH',
+			`Fulltext query-class isolation from ${artifactPath} has an unsupported worker requirement`,
 		);
 	}
 	if (typeof addon.__nativeInspect !== 'function') {

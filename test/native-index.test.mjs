@@ -103,6 +103,118 @@ test('runs the public create, mutate, BM25 search, close, and reopen route', asy
 	await index.close();
 });
 
+test('runs every structured query mode and score-neutral candidate filtering', async (context) => {
+	const index = await openNativeFullTextIndex(
+		options(temporaryIndex(context), { positions: true, surfaceTerms: true }),
+	);
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'one', fields: { title: 'Waterproof Trail Running Shoes' } },
+			{ id: 'two', fields: { title: 'Waterproof Road Shoes' } },
+			{ id: 'three', fields: { title: 'Wireless Headphones' } },
+		],
+	});
+	await index.commit();
+	await index.reload();
+
+	assert.deepStrictEqual(
+		(await index.search({ text: 'trail running', mode: 'phrase' })).hits.map((hit) => hit.id),
+		['one'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'waterproof trai', mode: 'prefix' })).hits.map((hit) => hit.id),
+		['one'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'waterprof', mode: 'fuzzy' })).hits.map((hit) => hit.id),
+		['one', 'two'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'waterproof tral', mode: 'fuzzy-prefix' })).hits.map((hit) => hit.id),
+		['one'],
+	);
+	const unfilteredScore = (await index.search({ text: 'waterproof' })).hits.find((hit) => hit.id === 'two').score;
+	const filtered = await index.search({ text: 'waterproof', candidateIds: ['two'] });
+	assert.deepStrictEqual(
+		filtered.hits.map((hit) => hit.id),
+		['two'],
+	);
+	assert.strictEqual(filtered.hits[0].score, unfilteredScore);
+	assert.deepStrictEqual(await index.search({ text: 'waterproof', candidateIds: [] }), {
+		total: 0,
+		totalRelation: 'exact',
+		hits: [],
+	});
+	const traced = await index.traceMatches(
+		{ text: 'trail running', mode: 'phrase' },
+		[
+			{ id: 'one', fields: { title: 'The Trail Running Shoes' } },
+			{ id: 'two', fields: { title: 'Waterproof Road Shoes' } },
+		],
+		{ snippets: true, fragmentLength: 32 },
+	);
+	assert.deepStrictEqual(traced, {
+		complete: true,
+		records: [
+			{
+				id: 'one',
+				values: [
+					{
+						field: 'title',
+						valueIndex: 0,
+						spans: [{ start: 4, end: 17 }],
+						fragments: [
+							{
+								text: 'The Trail Running Shoes',
+								start: 0,
+								spans: [{ start: 4, end: 17 }],
+							},
+						],
+					},
+				],
+			},
+		],
+	});
+	const unicodeTrace = await index.traceMatches({ text: 'waterproof', mode: 'any' }, [
+		{ id: 'one', fields: { title: '🥾 Waterproof Trail Shoes' } },
+	]);
+	assert.deepStrictEqual(unicodeTrace.records[0].values[0].spans, [{ start: 3, end: 13 }]);
+	await assert.rejects(
+		index.search({ text: 'waterproof', mode: 'any', operator: 'all' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(index.search({ text: '\ud800' }), (error) => error.code === 'E_INVALID_ARGUMENT');
+	await assert.rejects(
+		index.search({ text: 'waterproof', limit: 10_001 }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({ text: 'waterproof', candidateIds: Array.from({ length: 1_025 }, (_, id) => `${id}`) }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({ text: 'waterproof' }, { remainingBudgetMilliseconds: 0 }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await index.close();
+});
+
+test('rejects query modes when their schema capability is disabled', async (context) => {
+	const index = await openNativeFullTextIndex(
+		options(temporaryIndex(context), { positions: false, surfaceTerms: false }),
+	);
+	await assert.rejects(
+		index.search({ text: 'trail running', mode: 'phrase' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(index.search({ text: 'trai', mode: 'prefix' }), (error) => error.code === 'E_INVALID_ARGUMENT');
+	await assert.rejects(
+		index.traceMatches({ text: 'trail' }, [{ id: 'one', fields: { title: 'trail' } }]),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await index.close();
+});
+
 test('inspects missing storage without creating it', (context) => {
 	const parent = temporaryIndex(context);
 	const indexPath = path.join(parent, 'missing');

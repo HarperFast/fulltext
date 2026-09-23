@@ -25,11 +25,30 @@ test('loads the artifact for the executing platform', async () => {
 	assert.deepStrictEqual(info, {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
-		nativeAbiVersion: 5,
+		nativeAbiVersion: 6,
+		queryApiVersion: 1,
+		queryClassIsolationMinimumSearchThreads: 2,
 		lifecycleApiVersion: 1,
 		mutationBatchApiVersion: 3,
 		storageBackends: ['native'],
-		limits: { maxCommitPayloadBytes: 64 * 1024 },
+		limits: {
+			maxCommitPayloadBytes: 64 * 1024,
+			maxQueryTextBytes: 64 * 1024,
+			maxQueryTerms: 64,
+			maxQueryClauses: 256,
+			maxCandidateIds: 1_024,
+			maxCandidateBytes: 1 << 20,
+			maxPrefixExpansions: 50,
+			maxFuzzyTerms: 16,
+			maxSearchWindow: 10_000,
+			maxAutocompleteResults: 100,
+			maxSearchRequestBytes: 8 << 20,
+			maxSearchResponseBytes: 8 << 20,
+			maxSearchBudgetMilliseconds: 30_000,
+			maxTraceRecords: 100,
+			maxTraceSourceBytes: 1 << 20,
+			maxTraceSpans: 1_024,
+		},
 	});
 	assert.strictEqual(cargoPackageVersion, packageManifest.version);
 	assert.match(platformTriple(), /^(darwin|linux|win32)-(arm64|x64)(-(gnu|musl|msvc))?$/);

@@ -21,8 +21,10 @@ const errorCodes = [
 	'E_LOCK_BUSY',
 	'E_QUEUE_FULL',
 	'E_QUIESCENCE_FAILED',
+	'E_RESULT_TOO_LARGE',
 	'E_SCHEMA_MISMATCH',
 	'E_STORAGE',
+	'E_TIMEOUT',
 ] as const;
 
 export type FulltextErrorCode = (typeof errorCodes)[number];

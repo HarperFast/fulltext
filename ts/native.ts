@@ -10,6 +10,7 @@ import {
 	encodeOpen,
 	encodeReset,
 	encodeSearch,
+	encodeTrace,
 	MutationBatchFrameCursor,
 } from './codec.js';
 import { invoke } from './invoke.js';
@@ -25,10 +26,29 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
+	queryApiVersion: 1;
+	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
 	mutationBatchApiVersion: 3;
 	storageBackends: ReadonlyArray<'native'>;
-	limits: { maxCommitPayloadBytes: number };
+	limits: {
+		maxCommitPayloadBytes: number;
+		maxQueryTextBytes: number;
+		maxQueryTerms: number;
+		maxQueryClauses: number;
+		maxCandidateIds: number;
+		maxCandidateBytes: number;
+		maxPrefixExpansions: number;
+		maxFuzzyTerms: number;
+		maxSearchWindow: number;
+		maxAutocompleteResults: number;
+		maxSearchRequestBytes: number;
+		maxSearchResponseBytes: number;
+		maxSearchBudgetMilliseconds: number;
+		maxTraceRecords: number;
+		maxTraceSourceBytes: number;
+		maxTraceSpans: number;
+	};
 }
 
 export interface NativeFullTextIndexOptions {
@@ -122,8 +142,10 @@ export interface AppliedFullTextMutationBatch {
 
 export interface SearchRequest {
 	text: string;
+	mode?: 'any' | 'all' | 'phrase' | 'prefix' | 'fuzzy' | 'fuzzy-prefix';
 	operator?: 'any' | 'all';
 	fields?: string[];
+	candidateIds?: string[];
 	offset?: number;
 	limit?: number;
 	exactTotal?: boolean;
@@ -133,6 +155,46 @@ export interface SearchResult {
 	total: number;
 	totalRelation: 'exact' | 'lower-bound';
 	hits: Array<{ id: string; score: number }>;
+}
+
+export interface SearchExecutionOptions {
+	/** Queue wait and native execution share this budget. The native ceiling is 30 seconds. */
+	remainingBudgetMilliseconds?: number;
+}
+
+export interface TraceRecord {
+	id: string;
+	fields: Record<string, string | string[]>;
+}
+
+export interface TraceSpan {
+	start: number;
+	end: number;
+}
+
+export interface TraceFragment {
+	text: string;
+	start: number;
+	spans: TraceSpan[];
+}
+
+export interface TraceValueMatch {
+	field: string;
+	valueIndex: number;
+	spans: TraceSpan[];
+	fragments?: TraceFragment[];
+}
+
+export interface TraceMatchesResult {
+	complete: boolean;
+	records: Array<{ id: string; values: TraceValueMatch[] }>;
+}
+
+export interface TraceMatchesOptions extends SearchExecutionOptions {
+	/** Snippet generation is opt-in; match offsets are always returned. */
+	snippets?: boolean;
+	fragmentLength?: number;
+	maxFragmentsPerValue?: number;
 }
 
 export interface FullTextStatus {
@@ -401,17 +463,22 @@ export class NativeFullTextIndex {
 		cursor.finish();
 	}
 
-	async search(request: SearchRequest): Promise<SearchResult> {
+	async search(request: SearchRequest, options: SearchExecutionOptions = {}): Promise<SearchResult> {
+		if (request.mode !== undefined && request.operator !== undefined) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
+		}
 		const cursor = await invoke((callback) =>
 			loadAddon().__nativeSearch(
 				this.#handle,
 				encodeSearch({
 					text: request.text,
-					operator: request.operator ?? 'any',
+					mode: request.mode ?? request.operator ?? 'any',
 					fields: request.fields ?? [],
+					candidateIds: request.candidateIds,
 					offset: request.offset ?? 0,
 					limit: request.limit ?? 20,
 					exactTotal: request.exactTotal ?? false,
+					budgetMilliseconds: options.remainingBudgetMilliseconds ?? 30_000,
 				}),
 				callback,
 			),
@@ -429,6 +496,91 @@ export class NativeFullTextIndex {
 			totalRelation: relation === 0 ? 'exact' : 'lower-bound',
 			hits,
 		};
+	}
+
+	async traceMatches(
+		request: SearchRequest,
+		records: TraceRecord[],
+		options: TraceMatchesOptions = {},
+	): Promise<TraceMatchesResult> {
+		if (request.mode !== undefined && request.operator !== undefined) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
+		}
+		if (!Array.isArray(records) || records.length > 100) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'trace records must be an array with at most 100 entries');
+		}
+		const seenIds = new Set<string>();
+		const sourceById = new Map<string, Record<string, string[]>>();
+		const packedRecords = records.map((record) => {
+			if (!record || typeof record !== 'object' || typeof record.id !== 'string' || record.id.length === 0) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'trace records require a non-empty string id');
+			}
+			if (seenIds.has(record.id)) {
+				throw new FulltextError('E_INVALID_ARGUMENT', `duplicate trace record ${record.id}`);
+			}
+			seenIds.add(record.id);
+			if (!record.fields || typeof record.fields !== 'object' || Array.isArray(record.fields)) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'trace record fields must be an object');
+			}
+			const normalized: Record<string, string[]> = {};
+			const fields = Object.entries(record.fields).map(([name, input]) => {
+				const values = typeof input === 'string' ? [input] : input;
+				if (!Array.isArray(values) || values.some((value) => typeof value !== 'string')) {
+					throw new FulltextError('E_INVALID_ARGUMENT', `trace field ${name} must contain strings`);
+				}
+				normalized[name] = values;
+				return { name, values };
+			});
+			sourceById.set(record.id, normalized);
+			return { id: record.id, fields };
+		});
+		const snippets = options.snippets ?? false;
+		const fragmentLength = options.fragmentLength ?? 160;
+		const maxFragments = options.maxFragmentsPerValue ?? 3;
+		if (!Number.isInteger(fragmentLength) || fragmentLength < 32 || fragmentLength > 512) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'fragmentLength must be an integer between 32 and 512');
+		}
+		if (!Number.isInteger(maxFragments) || maxFragments < 1 || maxFragments > 5) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'maxFragmentsPerValue must be an integer between 1 and 5');
+		}
+		const cursor = await invoke((callback) =>
+			loadAddon().__nativeTraceMatches(
+				this.#handle,
+				encodeTrace({
+					text: request.text,
+					mode: request.mode ?? request.operator ?? 'any',
+					fields: request.fields ?? [],
+					candidateIds: request.candidateIds,
+					records: packedRecords,
+					budgetMilliseconds: options.remainingBudgetMilliseconds ?? 30_000,
+				}),
+				callback,
+			),
+		);
+		const complete = cursor.u8() === 1;
+		const recordCount = cursor.u16();
+		const matched = Array.from({ length: recordCount }, () => {
+			const id = cursor.string();
+			const valueCount = cursor.u16();
+			const values = Array.from({ length: valueCount }, () => {
+				const field = cursor.string();
+				const valueIndex = cursor.u32();
+				const spanCount = cursor.u16();
+				const spans = Array.from({ length: spanCount }, () => ({ start: cursor.u32(), end: cursor.u32() }));
+				const value = sourceById.get(id)?.[field]?.[valueIndex];
+				return {
+					field,
+					valueIndex,
+					spans,
+					...(snippets && value !== undefined
+						? { fragments: traceFragments(value, spans, fragmentLength, maxFragments) }
+						: {}),
+				};
+			});
+			return { id, values };
+		});
+		cursor.finish();
+		return { complete, records: matched };
 	}
 
 	status(): FullTextStatus {
@@ -750,10 +902,12 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
+			queryApiVersion: info.queryApiVersion as 1,
+			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
 			mutationBatchApiVersion: 3,
 			storageBackends: ['native'],
-			limits: { maxCommitPayloadBytes: info.limits.maxCommitPayloadBytes },
+			limits: { ...info.limits },
 		};
 	} catch (error) {
 		throw normalizeNativeError(error);
@@ -788,6 +942,42 @@ function safeNumber(value: bigint, name: string): number {
 		throw new FulltextError('E_NATIVE_FAILURE', `${name} exceeds JavaScript's safe integer range`);
 	}
 	return Number(value);
+}
+
+function traceFragments(
+	value: string,
+	spans: TraceSpan[],
+	fragmentLength: number,
+	maxFragments: number,
+): TraceFragment[] {
+	const fragments: TraceFragment[] = [];
+	for (const span of spans) {
+		if (fragments.length >= maxFragments) break;
+		let start = Math.max(0, span.start - Math.floor((fragmentLength - (span.end - span.start)) / 2));
+		let end = Math.min(value.length, start + fragmentLength);
+		start = Math.max(0, end - fragmentLength);
+		if (start > 0 && isLowSurrogate(value.charCodeAt(start))) start--;
+		if (end < value.length && isHighSurrogate(value.charCodeAt(end - 1))) end++;
+		if (fragments.some((fragment) => start >= fragment.start && end <= fragment.start + fragment.text.length)) {
+			continue;
+		}
+		const included = spans
+			.filter((candidate) => candidate.start < end && candidate.end > start)
+			.map((candidate) => ({
+				start: Math.max(candidate.start, start) - start,
+				end: Math.min(candidate.end, end) - start,
+			}));
+		fragments.push({ text: value.slice(start, end), start, spans: included });
+	}
+	return fragments;
+}
+
+function isHighSurrogate(value: number): boolean {
+	return value >= 0xd800 && value <= 0xdbff;
+}
+
+function isLowSurrogate(value: number): boolean {
+	return value >= 0xdc00 && value <= 0xdfff;
 }
 
 function escapeRegExp(value: string): string {

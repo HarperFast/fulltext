@@ -1,23 +1,32 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 
+use tantivy::collector::sort_key::{SortBySimilarityScore, SortByString};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
-use tantivy::query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery};
+use tantivy::query::{
+	BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery,
+	Query, TermQuery, TermSetQuery,
+};
 use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{
 	Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer,
 };
-use tantivy::{Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, Searcher, Term};
+use tantivy::{DocAddress, Index, IndexReader, IndexSettings, IndexWriter, Order, ReloadPolicy, Searcher, Term};
 
 use crate::error::{FulltextError, Result};
-use crate::protocol::{EngineConfig, EngineIdentityConfig, MutationBatch, SearchOperator, SearchRequest};
+use crate::protocol::{
+	EngineConfig, EngineIdentityConfig, MutationBatch, SearchMode, SearchRequest, TraceRecord, MAX_FUZZY_TERMS,
+	MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES, MAX_TRACE_SPANS,
+};
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
 pub(crate) const IDENTITY_PATH: &str = ".harper-fulltext-identity";
 const META_PATH: &str = "meta.json";
 const ANALYZER_NAME: &str = "english@1";
+const SURFACE_ANALYZER_NAME: &str = "english_surface@1";
 pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
@@ -27,6 +36,8 @@ pub struct Engine {
 	fields: Vec<EngineField>,
 	field_lookup: HashMap<String, usize>,
 	analyzer: TextAnalyzer,
+	surface_analyzer: TextAnalyzer,
+	positions: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +51,7 @@ pub enum InspectionResult {
 struct EngineField {
 	name: String,
 	field: Field,
+	surface_field: Option<Field>,
 	weight: f32,
 }
 
@@ -74,6 +86,65 @@ pub struct SearchResult {
 	pub total: u64,
 	pub total_relation: TotalRelation,
 	pub hits: Vec<SearchHit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceSpan {
+	pub start: u32,
+	pub end: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceValueMatch {
+	pub field: String,
+	pub value_index: u32,
+	pub spans: Vec<TraceSpan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceRecordMatch {
+	pub id: String,
+	pub values: Vec<TraceValueMatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceResult {
+	pub complete: bool,
+	pub records: Vec<TraceRecordMatch>,
+}
+
+#[derive(Clone)]
+struct SourceToken {
+	text: String,
+	start: usize,
+	end: usize,
+}
+
+enum TracePlan {
+	Any(Vec<String>),
+	All(Vec<String>),
+	Phrase(Vec<String>),
+	Prefix {
+		completed: Vec<String>,
+		prefix: String,
+		fuzzy: bool,
+	},
+	Fuzzy(Vec<(String, String)>),
+}
+
+impl TracePlan {
+	fn record_matches(&self, found: &HashSet<String>) -> bool {
+		match self {
+			Self::Any(terms) if terms.is_empty() => false,
+			Self::Any(terms) => terms.iter().any(|term| found.contains(term)),
+			Self::All(terms) => !terms.is_empty() && terms.iter().all(|term| found.contains(term)),
+			Self::Phrase(terms) => !terms.is_empty() && found.contains("__phrase"),
+			Self::Prefix { completed, prefix, .. } => {
+				!prefix.is_empty() && found.contains("__prefix") && completed.iter().all(|term| found.contains(term))
+			}
+			Self::Fuzzy(terms) => !terms.is_empty() && terms.iter().any(|(term, _)| found.contains(term)),
+		}
+	}
 }
 
 impl Engine {
@@ -153,7 +224,11 @@ impl Engine {
 			));
 		}
 		let analyzer = build_analyzer(config.identity.stop_words)?;
+		let surface_analyzer = build_surface_analyzer();
 		index.tokenizers().register(ANALYZER_NAME, analyzer.clone());
+		index
+			.tokenizers()
+			.register(SURFACE_ANALYZER_NAME, surface_analyzer.clone());
 		let field_lookup = fields
 			.iter()
 			.enumerate()
@@ -165,6 +240,8 @@ impl Engine {
 			fields,
 			field_lookup,
 			analyzer,
+			surface_analyzer,
+			positions: config.identity.positions,
 		})
 	}
 
@@ -221,82 +298,307 @@ impl Engine {
 	}
 
 	pub fn search(&self, searcher: &Searcher, request: &SearchRequest) -> Result<SearchResult> {
+		self.search_inner(searcher, request, None)
+	}
+
+	pub fn search_with_deadline(
+		&self,
+		searcher: &Searcher,
+		request: &SearchRequest,
+		deadline: Instant,
+	) -> Result<SearchResult> {
+		self.search_inner(searcher, request, Some(deadline))
+	}
+
+	fn search_inner(
+		&self,
+		searcher: &Searcher,
+		request: &SearchRequest,
+		deadline: Option<Instant>,
+	) -> Result<SearchResult> {
+		check_deadline(deadline)?;
 		let selected = self.selected_fields(&request.fields)?;
-		let query = self.query(&request.text, request.operator, &selected)?;
-		let top_docs = searcher
+		let query = self.query(searcher, request, &selected)?;
+		check_deadline(deadline)?;
+		let window_end = request.offset + request.limit;
+		let scored_docs = searcher
 			.search(
 				query.as_ref(),
-				&TopDocs::with_limit(request.limit)
-					.and_offset(request.offset)
-					.order_by_score(),
+				&TopDocs::with_limit(window_end.saturating_add(1)).order_by_score(),
 			)
 			.map_err(index_error)?;
-		let mut hits_by_segment = HashMap::new();
-		for (index, (_, address)) in top_docs.iter().enumerate() {
-			hits_by_segment
-				.entry(address.segment_ord)
-				.or_insert_with(Vec::new)
-				.push((index, address.doc_id));
-		}
-		let mut ids = vec![String::new(); top_docs.len()];
-		for (segment_ord, segment_hits) in hits_by_segment {
-			let segment = &searcher.segment_readers()[segment_ord as usize];
-			let column = segment
-				.fast_fields()
-				.str(ID_FIELD_NAME)
+		check_deadline(deadline)?;
+		let boundary_tie = scored_docs.len() > window_end && scored_docs[window_end - 1].0 == scored_docs[window_end].0;
+		let hits = if boundary_tie {
+			let collector = TopDocs::for_doc_range(request.offset..window_end).order_by((
+				(SortBySimilarityScore, Order::Desc),
+				(SortByString::for_field(ID_FIELD_NAME), Order::Asc),
+			));
+			searcher
+				.search(query.as_ref(), &collector)
 				.map_err(index_error)?
-				.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no ID fast field"))?;
-			let mut id = Vec::new();
-			for (index, doc_id) in segment_hits {
-				let ordinal = column
-					.term_ords(doc_id)
-					.next()
-					.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"))?;
-				id.clear();
-				if !column
-					.dictionary()
-					.ord_to_term(ordinal, &mut id)
-					.map_err(storage_error)?
-				{
-					return Err(FulltextError::new(
-						"E_NATIVE_FAILURE",
-						"search hit ID ordinal is missing",
-					));
-				}
-				ids[index] = std::str::from_utf8(&id)
-					.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?
-					.to_owned();
-			}
-		}
-		let hits = top_docs
-			.into_iter()
-			.zip(ids)
-			.map(|((score, _), id)| SearchHit { id, score })
-			.collect::<Vec<_>>();
+				.into_iter()
+				.map(|((score, id), _)| {
+					id.map(|id| SearchHit { id, score })
+						.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID fast field value"))
+				})
+				.collect::<Result<Vec<_>>>()?
+		} else {
+			let ids = search_hit_ids(searcher, &scored_docs)?;
+			let mut ranked = scored_docs
+				.iter()
+				.zip(ids)
+				.map(|((score, _), id)| SearchHit { id, score: *score })
+				.collect::<Vec<_>>();
+			ranked.sort_by(|left, right| {
+				right
+					.score
+					.total_cmp(&left.score)
+					.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+			});
+			ranked.into_iter().skip(request.offset).take(request.limit).collect()
+		};
 		let (total, total_relation) = if request.exact_total {
+			check_deadline(deadline)?;
 			(
 				searcher.search(query.as_ref(), &Count).map_err(index_error)? as u64,
 				TotalRelation::Exact,
 			)
-		} else if request.offset == 0 && hits.len() < request.limit {
-			(hits.len() as u64, TotalRelation::Exact)
-		} else if !hits.is_empty() && hits.len() < request.limit {
-			((request.offset + hits.len()) as u64, TotalRelation::Exact)
+		} else if scored_docs.len() <= window_end {
+			(scored_docs.len() as u64, TotalRelation::Exact)
 		} else {
-			(
-				if hits.is_empty() {
-					0
-				} else {
-					(request.offset + hits.len()) as u64
-				},
-				TotalRelation::LowerBound,
-			)
+			(window_end as u64, TotalRelation::LowerBound)
 		};
+		check_deadline(deadline)?;
+		let response_bytes = hits
+			.iter()
+			.try_fold(13usize, |bytes, hit| bytes.checked_add(8 + hit.id.len()))
+			.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))?;
+		if response_bytes > MAX_SEARCH_RESPONSE_BYTES {
+			return Err(FulltextError::new(
+				"E_RESULT_TOO_LARGE",
+				format!("search response exceeds {MAX_SEARCH_RESPONSE_BYTES} bytes"),
+			));
+		}
 		Ok(SearchResult {
 			total,
 			total_relation,
 			hits,
 		})
+	}
+
+	pub fn trace_matches(&self, request: &SearchRequest, records: &[TraceRecord]) -> Result<TraceResult> {
+		let selected = self.selected_fields(&request.fields)?;
+		self.require_surface_fields(&selected)?;
+		let selected_names = selected.iter().map(|field| field.name.as_str()).collect::<HashSet<_>>();
+		let candidates = request
+			.candidate_ids
+			.as_ref()
+			.map(|ids| ids.iter().map(String::as_str).collect::<HashSet<_>>());
+		if candidates.as_ref().is_some_and(HashSet::is_empty) {
+			return Ok(TraceResult {
+				complete: true,
+				records: Vec::new(),
+			});
+		}
+		let plan = self.trace_plan(request)?;
+		let mut complete = true;
+		let mut remaining_spans = MAX_TRACE_SPANS;
+		let mut matched_records = Vec::new();
+		for record in records {
+			if candidates
+				.as_ref()
+				.is_some_and(|candidates| !candidates.contains(record.id.as_str()))
+			{
+				continue;
+			}
+			let mut seen_fields = HashSet::new();
+			let mut values = Vec::new();
+			let mut found = HashSet::new();
+			for (field, source_values) in &record.fields {
+				if !seen_fields.insert(field.as_str()) {
+					return Err(FulltextError::invalid(format!("duplicate trace field {field}")));
+				}
+				if !self.field_lookup.contains_key(field) {
+					return Err(FulltextError::invalid(format!("unknown trace field {field}")));
+				}
+				if !selected_names.contains(field.as_str()) {
+					continue;
+				}
+				for (value_index, value) in source_values.iter().enumerate() {
+					let (spans, terms) = self.trace_value(&plan, value)?;
+					found.extend(terms);
+					if spans.is_empty() {
+						continue;
+					}
+					let keep = spans.len().min(remaining_spans);
+					if keep < spans.len() {
+						complete = false;
+					}
+					if keep > 0 {
+						values.push(TraceValueMatch {
+							field: field.clone(),
+							value_index: value_index as u32,
+							spans: spans.into_iter().take(keep).collect(),
+						});
+						remaining_spans -= keep;
+					}
+				}
+			}
+			if plan.record_matches(&found) && !values.is_empty() {
+				matched_records.push(TraceRecordMatch {
+					id: record.id.clone(),
+					values,
+				});
+			}
+		}
+		Ok(TraceResult {
+			complete,
+			records: matched_records,
+		})
+	}
+
+	pub fn validate_query(&self, searcher: &Searcher, request: &SearchRequest) -> Result<()> {
+		let selected = self.selected_fields(&request.fields)?;
+		self.query(searcher, request, &selected).map(drop)
+	}
+
+	fn trace_plan(&self, request: &SearchRequest) -> Result<TracePlan> {
+		match request.mode {
+			SearchMode::Any => Ok(TracePlan::Any(self.analyze(&request.text, false, true)?)),
+			SearchMode::All => Ok(TracePlan::All(self.analyze(&request.text, false, true)?)),
+			SearchMode::Phrase => {
+				if !self.positions {
+					return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
+				}
+				Ok(TracePlan::Phrase(self.analyze(&request.text, false, false)?))
+			}
+			SearchMode::Prefix | SearchMode::FuzzyPrefix => {
+				if request.text.chars().last().is_some_and(char::is_whitespace) {
+					return Ok(TracePlan::All(self.analyze(&request.text, false, true)?));
+				}
+				let (completed, prefix) = self.final_surface_term(&request.text)?;
+				let mut prefix = prefix.unwrap_or_default();
+				if self.analyze(&prefix, false, false)?.is_empty() {
+					prefix.clear();
+				}
+				let minimum = if request.mode == SearchMode::FuzzyPrefix { 4 } else { 3 };
+				if !prefix.is_empty() && prefix.chars().count() < minimum {
+					return Err(FulltextError::invalid(format!(
+						"{} prefix must contain at least {minimum} Unicode characters",
+						if request.mode == SearchMode::FuzzyPrefix {
+							"fuzzy"
+						} else {
+							"exact"
+						}
+					)));
+				}
+				Ok(TracePlan::Prefix {
+					completed: self.analyze(completed, false, true)?,
+					prefix,
+					fuzzy: request.mode == SearchMode::FuzzyPrefix,
+				})
+			}
+			SearchMode::Fuzzy => {
+				let mut terms = Vec::new();
+				for surface in self.analyze(&request.text, true, true)? {
+					if let [analyzed] = self.analyze(&surface, false, false)?.as_slice() {
+						terms.push((analyzed.clone(), surface));
+					}
+				}
+				if terms.iter().filter(|(_, surface)| fuzzy_eligible(surface)).count() > MAX_FUZZY_TERMS {
+					return Err(FulltextError::invalid(format!(
+						"fuzzy search contains more than {MAX_FUZZY_TERMS} eligible terms"
+					)));
+				}
+				Ok(TracePlan::Fuzzy(terms))
+			}
+		}
+	}
+
+	fn trace_value(&self, plan: &TracePlan, value: &str) -> Result<(Vec<TraceSpan>, HashSet<String>)> {
+		let analyzed = self.source_tokens(value, false);
+		let surface = self.source_tokens(value, true);
+		let mut spans = Vec::new();
+		let mut found = HashSet::new();
+		match plan {
+			TracePlan::Any(terms) | TracePlan::All(terms) => {
+				for token in &analyzed {
+					if terms.contains(&token.text) {
+						found.insert(token.text.clone());
+						spans.push(source_span(value, token.start, token.end));
+					}
+				}
+			}
+			TracePlan::Phrase(terms) => {
+				if !terms.is_empty() {
+					for window in analyzed.windows(terms.len()) {
+						if window
+							.iter()
+							.map(|token| token.text.as_str())
+							.eq(terms.iter().map(String::as_str))
+						{
+							found.insert("__phrase".to_owned());
+							spans.push(source_span(value, window[0].start, window[window.len() - 1].end));
+						}
+					}
+				}
+			}
+			TracePlan::Prefix {
+				completed,
+				prefix,
+				fuzzy,
+			} => {
+				for token in &analyzed {
+					if completed.contains(&token.text) {
+						found.insert(token.text.clone());
+						spans.push(source_span(value, token.start, token.end));
+					}
+				}
+				for token in &surface {
+					if token.text.starts_with(prefix)
+						|| (*fuzzy && fuzzy_eligible(prefix) && fuzzy_prefix_matches(prefix, &token.text))
+					{
+						found.insert("__prefix".to_owned());
+						spans.push(source_span(value, token.start, token.end));
+					}
+				}
+			}
+			TracePlan::Fuzzy(terms) => {
+				for token in &surface {
+					let analyzed_token = self.analyze(&token.text, false, false)?;
+					for (analyzed_term, surface_term) in terms {
+						if analyzed_token.first() == Some(analyzed_term)
+							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
+						{
+							found.insert(analyzed_term.clone());
+							spans.push(source_span(value, token.start, token.end));
+							break;
+						}
+					}
+				}
+			}
+		}
+		spans.sort_by_key(|span| (span.start, span.end));
+		spans.dedup();
+		Ok((spans, found))
+	}
+
+	fn source_tokens(&self, text: &str, surface: bool) -> Vec<SourceToken> {
+		let mut analyzer = if surface {
+			self.surface_analyzer.clone()
+		} else {
+			self.analyzer.clone()
+		};
+		let mut tokens = Vec::new();
+		analyzer.token_stream(text).process(&mut |token| {
+			tokens.push(SourceToken {
+				text: token.text.clone(),
+				start: token.offset_from,
+				end: token.offset_to,
+			});
+		});
+		tokens
 	}
 
 	fn selected_fields(&self, requested: &[String]) -> Result<Vec<&EngineField>> {
@@ -318,37 +620,451 @@ impl Engine {
 		Ok(fields)
 	}
 
-	fn query(&self, text: &str, operator: SearchOperator, fields: &[&EngineField]) -> Result<Box<dyn Query>> {
-		let mut analyzer = self.analyzer.clone();
-		let mut stream = analyzer.token_stream(text);
-		let mut tokens = Vec::new();
-		stream.process(&mut |token| tokens.push(token.text.clone()));
-		if tokens.is_empty() {
-			return Err(FulltextError::invalid("search text produced no searchable terms"));
-		}
-		let outer_occur = match operator {
-			SearchOperator::Any => Occur::Should,
-			SearchOperator::All => Occur::Must,
+	fn query(&self, searcher: &Searcher, request: &SearchRequest, fields: &[&EngineField]) -> Result<Box<dyn Query>> {
+		let query = match request.mode {
+			SearchMode::Any => self.term_query(&request.text, fields, Occur::Should)?,
+			SearchMode::All => self.term_query(&request.text, fields, Occur::Must)?,
+			SearchMode::Phrase => self.phrase_query(&request.text, fields)?,
+			SearchMode::Prefix => self.prefix_query(searcher, &request.text, fields, false)?,
+			SearchMode::Fuzzy => self.fuzzy_query(&request.text, fields)?,
+			SearchMode::FuzzyPrefix => self.prefix_query(searcher, &request.text, fields, true)?,
 		};
-		let mut terms = Vec::with_capacity(tokens.len());
-		for token in tokens {
-			let mut alternatives: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(fields.len());
-			for field in fields {
+		self.with_candidates(query, request.candidate_ids.as_deref())
+	}
+
+	fn analyze(&self, text: &str, surface: bool, deduplicate: bool) -> Result<Vec<String>> {
+		let mut analyzer = if surface {
+			self.surface_analyzer.clone()
+		} else {
+			self.analyzer.clone()
+		};
+		let mut stream = analyzer.token_stream(text);
+		let mut terms = Vec::new();
+		let mut seen = HashSet::new();
+		stream.process(&mut |token| {
+			if !deduplicate || seen.insert(token.text.clone()) {
+				terms.push(token.text.clone());
+			}
+		});
+		if terms.len() > MAX_QUERY_TERMS {
+			return Err(FulltextError::invalid(format!(
+				"search text produces more than {MAX_QUERY_TERMS} terms"
+			)));
+		}
+		Ok(terms)
+	}
+
+	fn term_query(&self, text: &str, fields: &[&EngineField], occur: Occur) -> Result<Box<dyn Query>> {
+		let terms = self.analyze(text, false, true)?;
+		if terms.is_empty() {
+			return Ok(Box::new(EmptyQuery));
+		}
+		self.check_clause_count(terms.len(), fields.len())?;
+		Ok(Box::new(BooleanQuery::new(
+			terms
+				.into_iter()
+				.map(|term| (occur, self.term_group(&term, fields)))
+				.collect(),
+		)))
+	}
+
+	fn phrase_query(&self, text: &str, fields: &[&EngineField]) -> Result<Box<dyn Query>> {
+		if !self.positions {
+			return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
+		}
+		let terms = self.analyze(text, false, false)?;
+		if terms.is_empty() {
+			return Ok(Box::new(EmptyQuery));
+		}
+		if terms.len() == 1 {
+			return Ok(self.term_group(&terms[0], fields));
+		}
+		self.check_clause_count(1, fields.len())?;
+		let alternatives = fields
+			.iter()
+			.map(|field| {
+				let query: Box<dyn Query> = Box::new(PhraseQuery::new(
+					terms
+						.iter()
+						.map(|term| Term::from_field_text(field.field, term))
+						.collect(),
+				));
+				(Occur::Should, boosted(query, field.weight))
+			})
+			.collect();
+		Ok(Box::new(BooleanQuery::new(alternatives)))
+	}
+
+	fn fuzzy_query(&self, text: &str, fields: &[&EngineField]) -> Result<Box<dyn Query>> {
+		let surface = self.analyze(text, true, true)?;
+		let mut pairs = Vec::new();
+		for surface_term in surface {
+			let analyzed = self.analyze(&surface_term, false, false)?;
+			if let [analyzed_term] = analyzed.as_slice() {
+				pairs.push((analyzed_term.clone(), surface_term));
+			}
+		}
+		if pairs.is_empty() {
+			return Ok(Box::new(EmptyQuery));
+		}
+		self.require_surface_fields(fields)?;
+		let fuzzy_terms = pairs.iter().filter(|(_, term)| fuzzy_eligible(term)).count();
+		if fuzzy_terms > MAX_FUZZY_TERMS {
+			return Err(FulltextError::invalid(format!(
+				"fuzzy search contains more than {MAX_FUZZY_TERMS} eligible terms"
+			)));
+		}
+		self.check_clause_count(pairs.len(), fields.len().saturating_mul(3))?;
+		let clauses = pairs
+			.into_iter()
+			.map(|(analyzed, surface)| {
+				let exact = self.term_group(&analyzed, fields);
+				if !fuzzy_eligible(&surface) {
+					return Ok((Occur::Should, exact));
+				}
+				let exact_branch: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
+					(Occur::Must, exact.box_clone()),
+					(Occur::Must, Box::new(ConstScoreQuery::new(exact, 1.0))),
+				]));
+				let fuzzy = self.fuzzy_group(&surface, fields, false)?;
+				Ok((
+					Occur::Should,
+					Box::new(DisjunctionMaxQuery::new(vec![exact_branch, fuzzy])) as Box<dyn Query>,
+				))
+			})
+			.collect::<Result<Vec<_>>>()?;
+		Ok(Box::new(BooleanQuery::new(clauses)))
+	}
+
+	fn prefix_query(
+		&self,
+		searcher: &Searcher,
+		text: &str,
+		fields: &[&EngineField],
+		fuzzy: bool,
+	) -> Result<Box<dyn Query>> {
+		self.require_surface_fields(fields)?;
+		if text.chars().last().is_some_and(char::is_whitespace) {
+			return self.term_query(text, fields, Occur::Must);
+		}
+		let (completed_text, surface_prefix) = self.final_surface_term(text)?;
+		let Some(surface_prefix) = surface_prefix else {
+			return Ok(Box::new(EmptyQuery));
+		};
+		if self.analyze(&surface_prefix, false, false)?.is_empty() {
+			return Ok(Box::new(EmptyQuery));
+		}
+		let minimum = if fuzzy { 4 } else { 3 };
+		if surface_prefix.chars().count() < minimum {
+			return Err(FulltextError::invalid(format!(
+				"{} prefix must contain at least {minimum} Unicode characters",
+				if fuzzy { "fuzzy" } else { "exact" }
+			)));
+		}
+		let completed = self.analyze(completed_text, false, true)?;
+		let completed_clause_count = completed.len().saturating_mul(fields.len());
+		let mut clauses = Vec::with_capacity(completed.len() + 1);
+		for term in completed {
+			clauses.push((Occur::Must, self.term_group(&term, fields)));
+		}
+		let (exact_prefix, prefix_clause_count) = self.expanded_prefix_group(searcher, &surface_prefix, fields)?;
+		let fuzzy_clause_count = usize::from(fuzzy && fuzzy_eligible(&surface_prefix)) * fields.len();
+		if completed_clause_count
+			.saturating_add(prefix_clause_count)
+			.saturating_add(fuzzy_clause_count)
+			> MAX_QUERY_CLAUSES
+		{
+			return Err(FulltextError::invalid(format!(
+				"search query exceeds {MAX_QUERY_CLAUSES} clauses"
+			)));
+		}
+		let final_group = if fuzzy && fuzzy_eligible(&surface_prefix) {
+			Box::new(DisjunctionMaxQuery::new(vec![
+				Box::new(ConstScoreQuery::new(exact_prefix, 2.0)),
+				self.fuzzy_group(&surface_prefix, fields, true)?,
+			])) as Box<dyn Query>
+		} else {
+			exact_prefix
+		};
+		clauses.push((Occur::Must, final_group));
+		Ok(Box::new(BooleanQuery::new(clauses)))
+	}
+
+	fn final_surface_term<'a>(&self, text: &'a str) -> Result<(&'a str, Option<String>)> {
+		let mut analyzer = self.surface_analyzer.clone();
+		let mut stream = analyzer.token_stream(text);
+		let mut final_term = None;
+		let mut final_offset = 0;
+		stream.process(&mut |token| {
+			final_term = Some(token.text.clone());
+			final_offset = token.offset_from;
+		});
+		Ok((&text[..final_offset], final_term))
+	}
+
+	fn term_group(&self, term: &str, fields: &[&EngineField]) -> Box<dyn Query> {
+		Box::new(BooleanQuery::new(
+			fields
+				.iter()
+				.map(|field| {
+					let query: Box<dyn Query> = Box::new(TermQuery::new(
+						Term::from_field_text(field.field, term),
+						IndexRecordOption::WithFreqs,
+					));
+					(Occur::Should, boosted(query, field.weight))
+				})
+				.collect(),
+		))
+	}
+
+	fn fuzzy_group(&self, term: &str, fields: &[&EngineField], prefix: bool) -> Result<Box<dyn Query>> {
+		let alternatives = fields
+			.iter()
+			.map(|field| {
+				let surface_field = field.surface_field.ok_or_else(|| {
+					FulltextError::invalid("prefix and fuzzy search require surfaceTerms to be enabled")
+				})?;
+				let term = Term::from_field_text(surface_field, term);
+				let query: Box<dyn Query> = if prefix {
+					Box::new(FuzzyTermQuery::new_prefix(term, 1, true))
+				} else {
+					Box::new(FuzzyTermQuery::new(term, 1, true))
+				};
+				Ok(Box::new(BoostQuery::new(
+					Box::new(ConstScoreQuery::new(query, 0.25)),
+					field.weight,
+				)) as Box<dyn Query>)
+			})
+			.collect::<Result<Vec<_>>>()?;
+		Ok(Box::new(DisjunctionMaxQuery::new(alternatives)))
+	}
+
+	fn expanded_prefix_group(
+		&self,
+		searcher: &Searcher,
+		prefix: &str,
+		fields: &[&EngineField],
+	) -> Result<(Box<dyn Query>, usize)> {
+		let mut alternatives = Vec::new();
+		for field in fields {
+			let surface_field = field
+				.surface_field
+				.ok_or_else(|| FulltextError::invalid("prefix and fuzzy search require surfaceTerms to be enabled"))?;
+			let mut terms = BTreeSet::new();
+			for segment in searcher.segment_readers() {
+				let inverted = segment.inverted_index(surface_field).map_err(index_error)?;
+				let dictionary = inverted.terms();
+				let mut range = dictionary.range().ge(prefix.as_bytes());
+				let end = prefix_end(prefix.as_bytes());
+				if let Some(end) = end.as_deref() {
+					range = range.lt(end);
+				}
+				let mut stream = range.into_stream().map_err(storage_error)?;
+				while stream.advance() {
+					terms.insert(stream.key().to_vec());
+					if terms.len() > MAX_PREFIX_EXPANSIONS {
+						return Err(FulltextError::invalid(format!(
+							"prefix expands to more than {MAX_PREFIX_EXPANSIONS} terms"
+						)));
+					}
+				}
+			}
+			for term in terms {
 				let query: Box<dyn Query> = Box::new(TermQuery::new(
-					Term::from_field_text(field.field, &token),
+					Term::from_field_bytes(surface_field, &term),
 					IndexRecordOption::WithFreqs,
 				));
-				let query = if field.weight == 1.0 {
-					query
-				} else {
-					Box::new(BoostQuery::new(query, field.weight))
-				};
-				alternatives.push((Occur::Should, query));
+				alternatives.push(boosted(query, field.weight));
+				if alternatives.len() > MAX_QUERY_CLAUSES {
+					return Err(FulltextError::invalid(format!(
+						"search query exceeds {MAX_QUERY_CLAUSES} clauses"
+					)));
+				}
 			}
-			terms.push((outer_occur, Box::new(BooleanQuery::new(alternatives)) as Box<dyn Query>));
 		}
-		Ok(Box::new(BooleanQuery::new(terms)))
+		let clause_count = alternatives.len();
+		if alternatives.is_empty() {
+			Ok((Box::new(EmptyQuery), 0))
+		} else {
+			Ok((Box::new(DisjunctionMaxQuery::new(alternatives)), clause_count))
+		}
 	}
+
+	fn with_candidates(&self, query: Box<dyn Query>, candidate_ids: Option<&[String]>) -> Result<Box<dyn Query>> {
+		let Some(candidate_ids) = candidate_ids else {
+			return Ok(query);
+		};
+		if candidate_ids.is_empty() {
+			return Ok(Box::new(EmptyQuery));
+		}
+		let terms = candidate_ids
+			.iter()
+			.collect::<HashSet<_>>()
+			.into_iter()
+			.map(|id| Term::from_field_text(self.id_field, id));
+		let filter: Box<dyn Query> = Box::new(ConstScoreQuery::new(Box::new(TermSetQuery::new(terms)), 0.0));
+		Ok(Box::new(BooleanQuery::new(vec![
+			(Occur::Must, query),
+			(Occur::Must, filter),
+		])))
+	}
+
+	fn require_surface_fields(&self, fields: &[&EngineField]) -> Result<()> {
+		if fields.iter().any(|field| field.surface_field.is_none()) {
+			return Err(FulltextError::invalid(
+				"prefix and fuzzy search require surfaceTerms to be enabled",
+			));
+		}
+		Ok(())
+	}
+
+	fn check_clause_count(&self, groups: usize, alternatives: usize) -> Result<()> {
+		if groups.saturating_mul(alternatives) > MAX_QUERY_CLAUSES {
+			return Err(FulltextError::invalid(format!(
+				"search query exceeds {MAX_QUERY_CLAUSES} clauses"
+			)));
+		}
+		Ok(())
+	}
+}
+
+fn check_deadline(deadline: Option<Instant>) -> Result<()> {
+	if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+		Err(FulltextError::new(
+			"E_TIMEOUT",
+			"full-text search exceeded its execution budget",
+		))
+	} else {
+		Ok(())
+	}
+}
+
+fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Result<Vec<String>> {
+	let mut hits_by_segment = HashMap::new();
+	for (index, (_, address)) in scored_docs.iter().enumerate() {
+		hits_by_segment
+			.entry(address.segment_ord)
+			.or_insert_with(Vec::new)
+			.push((index, address.doc_id));
+	}
+	let mut ids = vec![String::new(); scored_docs.len()];
+	for (segment_ord, segment_hits) in hits_by_segment {
+		let segment = &searcher.segment_readers()[segment_ord as usize];
+		let column = segment
+			.fast_fields()
+			.str(ID_FIELD_NAME)
+			.map_err(index_error)?
+			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no ID fast field"))?;
+		let mut id = Vec::new();
+		for (index, doc_id) in segment_hits {
+			let ordinal = column
+				.term_ords(doc_id)
+				.next()
+				.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"))?;
+			id.clear();
+			if !column
+				.dictionary()
+				.ord_to_term(ordinal, &mut id)
+				.map_err(storage_error)?
+			{
+				return Err(FulltextError::new(
+					"E_NATIVE_FAILURE",
+					"search hit ID ordinal is missing",
+				));
+			}
+			ids[index] = std::str::from_utf8(&id)
+				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?
+				.to_owned();
+		}
+	}
+	Ok(ids)
+}
+
+fn boosted(query: Box<dyn Query>, weight: f32) -> Box<dyn Query> {
+	if weight == 1.0 {
+		query
+	} else {
+		Box::new(BoostQuery::new(query, weight))
+	}
+}
+
+fn fuzzy_eligible(term: &str) -> bool {
+	term.chars().count() >= 4
+		&& term.chars().any(char::is_alphabetic)
+		&& !term
+			.chars()
+			.any(|character| character.is_numeric() || matches!(character, '-' | '_' | '/'))
+}
+
+fn source_span(source: &str, start: usize, end: usize) -> TraceSpan {
+	TraceSpan {
+		start: source[..start].encode_utf16().count() as u32,
+		end: source[..end].encode_utf16().count() as u32,
+	}
+}
+
+fn within_one_edit(left: &str, right: &str) -> bool {
+	let left = left.chars().collect::<Vec<_>>();
+	let right = right.chars().collect::<Vec<_>>();
+	if left.len().abs_diff(right.len()) > 1 {
+		return false;
+	}
+	if left == right {
+		return true;
+	}
+	if left.len() == right.len() {
+		let differences = left
+			.iter()
+			.zip(&right)
+			.enumerate()
+			.filter_map(|(index, (left, right))| (left != right).then_some(index))
+			.collect::<Vec<_>>();
+		return differences.len() == 1
+			|| (differences.len() == 2
+				&& differences[1] == differences[0] + 1
+				&& left[differences[0]] == right[differences[1]]
+				&& left[differences[1]] == right[differences[0]]);
+	}
+	let (shorter, longer) = if left.len() < right.len() {
+		(&left, &right)
+	} else {
+		(&right, &left)
+	};
+	let mut short = 0;
+	let mut long = 0;
+	let mut edits = 0;
+	while short < shorter.len() && long < longer.len() {
+		if shorter[short] == longer[long] {
+			short += 1;
+		} else {
+			edits += 1;
+			if edits > 1 {
+				return false;
+			}
+		}
+		long += 1;
+	}
+	true
+}
+
+fn fuzzy_prefix_matches(prefix: &str, candidate: &str) -> bool {
+	let prefix_length = prefix.chars().count();
+	(prefix_length.saturating_sub(1)..=prefix_length.saturating_add(1)).any(|length| {
+		let candidate_prefix = candidate.chars().take(length).collect::<String>();
+		within_one_edit(prefix, &candidate_prefix)
+	})
+}
+
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+	let mut end = prefix.to_vec();
+	while let Some(last) = end.last_mut() {
+		if *last != u8::MAX {
+			*last += 1;
+			return Some(end);
+		}
+		end.pop();
+	}
+	None
 }
 
 impl Writer {
@@ -381,7 +1097,11 @@ impl Writer {
 					.get(&name)
 					.ok_or_else(|| FulltextError::invalid(format!("unknown mutation field {name}")))?;
 				for value in values {
-					document.add_text(self.fields[*index].field, &value);
+					let field = &self.fields[*index];
+					document.add_text(field.field, &value);
+					if let Some(surface_field) = field.surface_field {
+						document.add_text(surface_field, &value);
+					}
 				}
 			}
 			documents.push((upsert.id, document));
@@ -456,14 +1176,24 @@ fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Vec<Eng
 		let indexing = TextFieldIndexing::default()
 			.set_tokenizer(ANALYZER_NAME)
 			.set_index_option(record);
-		let mut options = TextOptions::default().set_indexing_options(indexing);
-		if config.surface_terms {
-			options = options.set_stored();
-		}
+		let options = TextOptions::default().set_indexing_options(indexing);
 		let schema_field = builder.add_text_field(&field.name, options);
+		let surface_field = if config.surface_terms {
+			let surface_name = format!("__fulltext_surface_{}", fields.len());
+			let surface_indexing = TextFieldIndexing::default()
+				.set_tokenizer(SURFACE_ANALYZER_NAME)
+				.set_index_option(record);
+			Some(builder.add_text_field(
+				&surface_name,
+				TextOptions::default().set_indexing_options(surface_indexing),
+			))
+		} else {
+			None
+		};
 		fields.push(EngineField {
 			name: field.name.clone(),
 			field: schema_field,
+			surface_field,
 			weight: field.weight,
 		});
 	}
@@ -482,8 +1212,15 @@ fn build_analyzer(stop_words: bool) -> Result<TextAnalyzer> {
 	Ok(builder.filter_dynamic(Stemmer::new(Language::English)).build())
 }
 
+fn build_surface_analyzer() -> TextAnalyzer {
+	TextAnalyzer::builder(SimpleTokenizer::default())
+		.filter_dynamic(RemoveLongFilter::limit(40))
+		.filter_dynamic(LowerCaser)
+		.build()
+}
+
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
-	let mut bytes = b"HTFI\x01\x00".to_vec();
+	let mut bytes = b"HTFI\x02\x00".to_vec();
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
 	push_string(&mut bytes, &config.analyzer);
@@ -495,12 +1232,14 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 	bytes.extend_from_slice(&(config.fields.len() as u16).to_le_bytes());
 	for field in &config.fields {
 		push_string(&mut bytes, &field.name);
+		bytes.extend_from_slice(&field.weight.to_le_bytes());
 	}
 	bytes
 }
 
 pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
-	if bytes.get(..6)? != b"HTFI\x01\x00" {
+	let version = bytes.get(4..6)?;
+	if bytes.get(..4)? != b"HTFI" || !matches!(version, b"\x01\x00" | b"\x02\x00") {
 		return None;
 	}
 	let mut offset = 6;
@@ -519,6 +1258,10 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	offset += 2;
 	for _ in 0..field_count {
 		take_string(bytes, &mut offset)?;
+		if version == b"\x02\x00" {
+			offset = offset.checked_add(4)?;
+			bytes.get(offset.saturating_sub(4)..offset)?;
+		}
 	}
 	(offset == bytes.len()).then_some(index_id)
 }
@@ -730,11 +1473,13 @@ mod tests {
 		reader.reload().unwrap();
 		let request = SearchRequest {
 			text: "shoes".to_owned(),
-			operator: SearchOperator::Any,
+			mode: SearchMode::Any,
 			fields: Vec::new(),
+			candidate_ids: None,
 			offset: 0,
 			limit: 10,
 			exact_total: true,
+			budget_milliseconds: 30_000,
 		};
 		let result = engine.search(&reader.searcher(), &request).unwrap();
 		assert_eq!(result.total, 2);
@@ -752,6 +1497,175 @@ mod tests {
 		let reopened = Engine::open(directory, &config).unwrap();
 		let reopened_reader = reopened.reader().unwrap();
 		assert_eq!(reopened.search(&reopened_reader.searcher(), &request).unwrap().total, 1);
+	}
+
+	#[test]
+	fn supports_structured_query_modes_and_candidate_filters() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![
+					crate::protocol::Upsert {
+						id: "one".to_owned(),
+						fields: vec![("title".to_owned(), vec!["Waterproof Trail Running Shoes".to_owned()])],
+					},
+					crate::protocol::Upsert {
+						id: "two".to_owned(),
+						fields: vec![("title".to_owned(), vec!["Waterproof Road Shoes".to_owned()])],
+					},
+					crate::protocol::Upsert {
+						id: "three".to_owned(),
+						fields: vec![("title".to_owned(), vec!["Wireless Headphones".to_owned()])],
+					},
+				],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let reader = engine.reader().unwrap();
+
+		let search = |text: &str, mode: SearchMode, candidates: Option<Vec<&str>>| {
+			engine
+				.search(
+					&reader.searcher(),
+					&SearchRequest {
+						text: text.to_owned(),
+						mode,
+						fields: Vec::new(),
+						candidate_ids: candidates.map(|ids| ids.into_iter().map(str::to_owned).collect()),
+						offset: 0,
+						limit: 10,
+						exact_total: true,
+						budget_milliseconds: 30_000,
+					},
+				)
+				.unwrap()
+		};
+
+		assert_eq!(search("trail running", SearchMode::Phrase, None).hits[0].id, "one");
+		assert_eq!(search("waterproof trai", SearchMode::Prefix, None).hits[0].id, "one");
+		assert_eq!(search("waterprof", SearchMode::Fuzzy, None).total, 2);
+		assert_eq!(
+			search("waterproof tral", SearchMode::FuzzyPrefix, None).hits[0].id,
+			"one"
+		);
+		assert_eq!(
+			search("waterproof", SearchMode::Any, Some(vec!["two"])).hits[0].id,
+			"two"
+		);
+		assert!(search("waterproof", SearchMode::Any, Some(Vec::new())).hits.is_empty());
+		assert!(search("the", SearchMode::Any, None).hits.is_empty());
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn orders_equal_scores_by_id_across_segments_and_pages() {
+		let directory = RamDirectory::create();
+		let config = config();
+		let engine = Engine::open(directory.clone(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for id in ["z", "a"] {
+			writer
+				.apply(MutationBatch {
+					upserts: vec![crate::protocol::Upsert {
+						id: id.to_owned(),
+						fields: vec![("title".to_owned(), vec!["identical catalog text".to_owned()])],
+					}],
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let reader = engine.reader().unwrap();
+		let page = |offset| {
+			engine
+				.search(
+					&reader.searcher(),
+					&SearchRequest {
+						text: "identical".to_owned(),
+						mode: SearchMode::Any,
+						fields: Vec::new(),
+						candidate_ids: None,
+						offset,
+						limit: 1,
+						exact_total: false,
+						budget_milliseconds: 30_000,
+					},
+				)
+				.unwrap()
+				.hits[0]
+				.id
+				.clone()
+		};
+		assert_eq!(page(0), "a");
+		assert_eq!(page(1), "z");
+		writer.close().unwrap();
+		let reopened = Engine::open(directory, &config).unwrap();
+		let result = reopened
+			.search(
+				&reopened.reader().unwrap().searcher(),
+				&SearchRequest {
+					text: "identical".to_owned(),
+					mode: SearchMode::Any,
+					fields: Vec::new(),
+					candidate_ids: None,
+					offset: 0,
+					limit: 2,
+					exact_total: false,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert_eq!(
+			result.hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+			["a", "z"]
+		);
+	}
+
+	#[test]
+	fn rejects_prefix_expansion_past_the_release_ceiling() {
+		let directory = RamDirectory::create();
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(directory, &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: (0..=MAX_PREFIX_EXPANSIONS)
+					.map(|id| crate::protocol::Upsert {
+						id: id.to_string(),
+						fields: vec![("title".to_owned(), vec![format!("catalog{id:03}")])],
+					})
+					.collect(),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let reader = engine.reader().unwrap();
+		let error = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					text: "cat".to_owned(),
+					mode: SearchMode::Prefix,
+					fields: Vec::new(),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: false,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap_err();
+		assert_eq!(error.code, "E_INVALID_ARGUMENT");
+		assert!(error.message.contains("more than 50 terms"));
+		writer.close().unwrap();
 	}
 
 	#[test]

@@ -10,10 +10,11 @@ Implement `@harperfast/fulltext/native` as a usable standalone full-text index b
 Tantivy's `MmapDirectory`. This backend provides the engine and persistence path that Harper will
 also consume through its derived-index lifecycle.
 
-This change covers the smallest end-to-end slice needed to measure real behavior: native index
-creation and reopen, batched document upsert/delete, explicit commit and reload, BM25 search,
-status, and deterministic close. Phrase, fuzzy, prefix, autocomplete,
-suggestions, highlighting, and derived-index watermarks were outside this initial slice.
+The backend covers native index creation and reopen, batched document upsert/delete, explicit
+commit and checkpoint publication, weighted BM25, phrase, bounded prefix/autocomplete, fuzzy and
+fuzzy-prefix queries, score-neutral candidate filtering, current-record match tracing, status, and
+deterministic close. Harper's derived-index watermark and readiness policy remain outside the
+wrapper.
 
 It deliberately implements narrow prerequisites from issues #14 and #17 without closing either
 issue. From #14 it uses one versioned packed mutation request, one packed search result, stable error
@@ -93,8 +94,10 @@ interface EncodeFullTextMutationBatchesOptions {
 
 interface SearchRequest {
 	text: string;
+	mode?: 'any' | 'all' | 'phrase' | 'prefix' | 'fuzzy' | 'fuzzy-prefix';
 	operator?: 'any' | 'all';
 	fields?: string[];
+	candidateIds?: string[];
 	offset?: number;
 	limit?: number;
 	exactTotal?: boolean;
@@ -169,9 +172,10 @@ without positions. Changing that default in a future release is an index-format 
 silent reinterpretation. `generation` is an opaque caller-owned identity for this physical index
 generation; it is persisted in the engine fingerprint and must match on reopen. It is not a Tantivy
 opstamp or a Harper transaction-log position.
-`surfaceTerms` stores original field values in the same Tantivy field for later highlighting and
-suggestion work; it defaults off because of its storage cost. Field weights are applied as query
-boosts and therefore may change without rebuilding the physical schema.
+`surfaceTerms` creates a separately indexed, unstemmed companion term field for prefix,
+fuzzy-prefix, and current-record match tracing; it never stores source values. It defaults off
+because of its storage cost. Field weights are applied as query boosts and are persisted as part of
+the logical index identity.
 
 The public search method accepts a small typed request and decodes a versioned native result buffer
 into bounded result objects. The N-API boundary receives one operation per batch or search;
@@ -205,8 +209,9 @@ N-API handle registry ── canonical path reservation
   ├─ write/commit/reload barrier ─► bounded writer queue ─► dedicated writer actor
   │                                                       └─ Tantivy IndexWriter
   │                                                          └─ indexing/merge workers
-  └─ search/reload ─► bounded search queue ─► small search worker pool
-                                             └─ shared IndexReader/Searcher
+  └─ search/reload ─┬► bounded ordinary queue ─► reserved ordinary worker
+                    └► bounded expensive queue ─► phrase/prefix/fuzzy workers
+                                                  └─ shared IndexReader/Searcher
 
 writer actor ─► shared engine ─► MmapDirectory
 ```
@@ -348,8 +353,8 @@ metadata and:
 - durable documents and packed MiB indexed per second by batch size and commit cadence;
 - separately reported packing, apply, writer queue, and writer execution time;
 - commit latency distribution and reload time;
-- warm BM25 search p50/p95/p99 and throughput at configurable concurrency, using approximate totals
-  by default and same-concurrency single-worker approximate/exact profiles;
+- warm p50/p95/p99 and throughput for any/all, phrase, prefix, fuzzy, fuzzy-prefix, and candidate
+  filtering at configurable concurrency, plus approximate/exact-total profiles;
 - cold-after-reopen search p50/p95/p99;
 - index bytes, periodically sampled peak RSS, and post-close RSS; and
 - document count, field count, average packed bytes, thread/memory budgets, Tantivy version, and
@@ -367,7 +372,9 @@ with the integrated Harper path and a no-index Harper control.
 CI runs correctness tests and an explicit small benchmark-smoke command that performs ranking,
 commit, close, and reopen assertions before validating nonzero measurements. Shared runners enforce
 no timing threshold. Performance thresholds require controlled hardware and release-over-release
-history.
+history. Smoke JSON is retained as a GitHub Actions artifact. A published release also attaches its
+JSON benchmark record to the GitHub release so results remain comparable after Actions artifacts
+expire.
 
 The inspection benchmark creates one committed native seed, clones it to configurable index counts,
 and compares synchronous inspection with full writer-backed reopen. It reports first-pass and warm
@@ -449,11 +456,11 @@ yields the reference implementation used by Harper's derived index.
 ## Explicit deferrals
 
 - Derived-index delivery, replay, readiness, and Harper lifecycle hooks.
-- Phrase, fuzzy, prefix, autocomplete, suggestions, highlighting, snippets, and filters.
+- Corpus-level query suggestions; bounded prefix search supplies text autocomplete.
 - Shared handles across multiple Node worker environments.
 - A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe
   callback; this is part of the shared multi-environment runtime in issue #17.
-- Durable benchmark publication and fixed-host regression thresholds comparing standalone native,
-  Harper without full text, and Harper using the native derived index.
+- Fixed-host regression thresholds comparing standalone native, Harper without full text, and
+  Harper using the native derived index.
 - Process-wide runtime budgets, cancellation, and cursor-based
   deep pagination.

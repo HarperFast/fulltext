@@ -1,0 +1,55 @@
+name: Release benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      documents:
+        description: Product documents to index
+        required: true
+        default: '100000'
+      queries:
+        description: Queries per mixed workload
+        required: true
+        default: '500'
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Run native query matrix
+        env:
+          DOCUMENTS: ${{ inputs.documents || '100000' }}
+          QUERIES: ${{ inputs.queries || '500' }}
+        run: >-
+          node benchmarks/native.mjs
+          --documents "$DOCUMENTS"
+          --queries "$QUERIES"
+          --revision "${{ github.event.release.tag_name || github.sha }}"
+          --output benchmark-native.json
+      - name: Store workflow result
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-native-${{ github.event.release.tag_name || github.sha }}
+          path: benchmark-native.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Attach result to the GitHub release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" benchmark-native.json --clobber
