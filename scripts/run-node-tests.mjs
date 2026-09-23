@@ -32,6 +32,7 @@ for (const batch of [concurrentFiles, isolatedFiles]) {
 	}
 	arguments_.push(...batch);
 	const result = spawnSync(process.execPath, arguments_, {
+		env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1' },
 		stdio: 'inherit',
 		timeout: batch === isolatedFiles ? isolatedTestTimeout : undefined,
 	});

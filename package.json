@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/fulltext",
-	"version": "0.0.0",
+	"version": "0.1.0",
 	"description": "Tantivy full-text indexing for Node.js and Harper",
 	"type": "module",
 	"exports": {
@@ -11,7 +11,6 @@
 	},
 	"files": [
 		"dist/",
-		"fulltext.*.node",
 		"README.md",
 		"LICENSE",
 		"dependencies.md"
@@ -34,18 +33,18 @@
 		"build:test-native": "napi build --platform --js false --dts ts/addon.d.ts --features test-panic",
 		"build:typescript": "npm run clean:typescript && tsc -p tsconfig.json",
 		"clean:typescript": "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
-		"benchmark:native": "npm run build && node benchmarks/native.mjs",
-		"benchmark:inspect": "npm run build && node benchmarks/inspect.mjs",
-		"benchmark:inspect:smoke": "node benchmarks/inspect.mjs --smoke",
-		"benchmark:smoke": "node benchmarks/native.mjs --smoke --mutation-driver logical && node benchmarks/native.mjs --smoke --mutation-driver low-level",
+		"benchmark:native": "npm run build && node scripts/run-local.mjs benchmarks/native.mjs",
+		"benchmark:inspect": "npm run build && node scripts/run-local.mjs benchmarks/inspect.mjs",
+		"benchmark:inspect:smoke": "node scripts/run-local.mjs benchmarks/inspect.mjs --smoke",
+		"benchmark:smoke": "node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver logical && node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver low-level",
 		"check": "npm run format:check && npm run lint && npm run test",
 		"format": "prettier --write . && cargo fmt",
 		"format:check": "prettier --check . && cargo fmt --check",
 		"lint": "tsc -p tsconfig.json --noEmit && cargo clippy --locked --all-targets --all-features -- -D warnings",
-		"prepack": "npm run build:native && npm run build:typescript && npm run verify:package-artifacts",
+		"prepack": "npm run build:typescript && npm run verify:package-artifacts",
 		"test": "cargo test --locked --all-features && npm run test:node",
 		"test:rust": "cargo test --locked --all-features",
-		"test:node": "npm run build:test-native && npm run build:typescript && node scripts/run-node-tests.mjs test && node scripts/run-node-tests.mjs release",
+		"test:node": "npm run build:test-native && npm run build:typescript && node scripts/run-node-tests.mjs test && npm run build:native && node scripts/run-node-tests.mjs release",
 		"verify:package-artifacts": "node scripts/verify-package-artifacts.mjs"
 	},
 	"engines": {
@@ -61,6 +60,11 @@
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/HarperFast/fulltext.git"
+	},
+	"optionalDependencies": {
+		"@harperfast/fulltext-darwin-arm64": "0.1.0",
+		"@harperfast/fulltext-linux-x64-gnu": "0.1.0",
+		"@harperfast/fulltext-win32-x64-msvc": "0.1.0"
 	},
 	"devDependencies": {
 		"@napi-rs/cli": "2.18.4",

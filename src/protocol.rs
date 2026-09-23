@@ -1,7 +1,8 @@
 use crate::error::{FulltextError, Result};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_STRING_BYTES: usize = 1 << 20;
+pub const MAX_RECORD_ID_BYTES: usize = 4 << 10;
 const MAX_FIELDS: usize = 1_024;
 const MUTATION_BATCH_HEADER_BYTES: usize = 14;
 const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 7;
@@ -69,20 +70,72 @@ pub struct MutationBatch {
 	pub deletes: Vec<String>,
 }
 
+pub const MAX_QUERY_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_QUERY_TERMS: usize = 64;
+pub const MAX_QUERY_CLAUSES: usize = 256;
+pub const MAX_CANDIDATE_IDS: usize = 1_024;
+pub const MAX_CANDIDATE_BYTES: usize = 1 << 20;
+pub const MAX_PREFIX_EXPANSIONS: usize = 50;
+pub const MAX_FUZZY_TERMS: usize = 16;
+pub const MAX_SEARCH_WINDOW: usize = 10_000;
+pub const MAX_AUTOCOMPLETE_RESULTS: usize = 100;
+pub const MAX_SEARCH_REQUEST_BYTES: usize = 8 << 20;
+pub const MAX_SEARCH_RESPONSE_BYTES: usize = 8 << 20;
+pub const MAX_SEARCH_BUDGET_MILLISECONDS: u32 = 30_000;
+
+pub(crate) fn validate_record_id(id: &str) -> Result<()> {
+	if id.is_empty() {
+		return Err(FulltextError::invalid("record IDs must not be empty"));
+	}
+	if id.len() > MAX_RECORD_ID_BYTES {
+		return Err(FulltextError::invalid(format!(
+			"record IDs must not exceed {MAX_RECORD_ID_BYTES} UTF-8 bytes"
+		)));
+	}
+	Ok(())
+}
+pub const MAX_TRACE_RECORDS: usize = 100;
+pub const MAX_TRACE_SOURCE_BYTES: usize = 1 << 20;
+pub const MAX_TRACE_SPANS: usize = 1_024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchOperator {
+pub enum SearchMode {
 	Any,
 	All,
+	Phrase,
+	Prefix,
+	Fuzzy,
+	FuzzyPrefix,
+}
+
+impl SearchMode {
+	pub fn is_expensive(self) -> bool {
+		matches!(self, Self::Phrase | Self::Prefix | Self::Fuzzy | Self::FuzzyPrefix)
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchRequest {
 	pub text: String,
-	pub operator: SearchOperator,
+	pub mode: SearchMode,
 	pub fields: Vec<String>,
+	pub candidate_ids: Option<Vec<String>>,
 	pub offset: usize,
 	pub limit: usize,
 	pub exact_total: bool,
+	pub budget_milliseconds: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceRecord {
+	pub id: String,
+	pub fields: Vec<(String, Vec<String>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceRequest {
+	pub search: SearchRequest,
+	pub records: Vec<TraceRecord>,
 }
 
 pub fn decode_open(bytes: &[u8]) -> Result<NativeOpenConfig> {
@@ -180,8 +233,53 @@ pub fn validate_batch_header(bytes: &[u8], max_batch_bytes: usize) -> Result<()>
 }
 
 pub fn validate_search_header(bytes: &[u8]) -> Result<()> {
+	if bytes.len() > MAX_SEARCH_REQUEST_BYTES {
+		return Err(FulltextError::invalid("packed search request exceeds 8388608 bytes"));
+	}
 	let _ = Cursor::new(bytes, *b"FTSQ")?;
 	Ok(())
+}
+
+pub fn validate_trace_header(bytes: &[u8]) -> Result<()> {
+	if bytes.len() > MAX_SEARCH_REQUEST_BYTES {
+		return Err(FulltextError::invalid("packed trace request exceeds 8388608 bytes"));
+	}
+	let _ = Cursor::new(bytes, *b"FTTM")?;
+	Ok(())
+}
+
+pub fn search_budget(bytes: &[u8]) -> Result<u32> {
+	packed_budget(bytes, *b"FTSQ", "search")
+}
+
+pub fn trace_budget(bytes: &[u8]) -> Result<u32> {
+	packed_budget(bytes, *b"FTTM", "trace")
+}
+
+fn packed_budget(bytes: &[u8], magic: [u8; 4], operation: &str) -> Result<u32> {
+	let _ = Cursor::new(bytes, magic)?;
+	let budget_bytes = bytes
+		.get(bytes.len().saturating_sub(4)..)
+		.filter(|bytes| bytes.len() == 4)
+		.ok_or_else(|| FulltextError::invalid("packed request is truncated"))?;
+	let budget = u32::from_le_bytes(budget_bytes.try_into().unwrap());
+	if budget == 0 || budget > MAX_SEARCH_BUDGET_MILLISECONDS {
+		return Err(FulltextError::invalid(format!(
+			"{operation} budget must be between 1 and {MAX_SEARCH_BUDGET_MILLISECONDS} milliseconds"
+		)));
+	}
+	Ok(budget)
+}
+
+pub fn search_mode(bytes: &[u8]) -> Result<SearchMode> {
+	validate_search_header(bytes)?;
+	let mut cursor = Cursor::new(bytes, *b"FTSQ")?;
+	let query_length = cursor.u32()? as usize;
+	if query_length > MAX_QUERY_TEXT_BYTES {
+		return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
+	}
+	cursor.take(query_length)?;
+	decode_search_mode(cursor.u8()?)
 }
 
 pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
@@ -201,7 +299,7 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 	}
 	let mut upserts = Vec::with_capacity(upsert_count);
 	for _ in 0..upsert_count {
-		let id = cursor.string()?;
+		let id = cursor.record_id()?;
 		let field_count = cursor.u16()? as usize;
 		if field_count > MAX_FIELDS {
 			return Err(FulltextError::invalid("upsert field count exceeds 1024"));
@@ -231,7 +329,7 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 	}
 	let mut deletes = Vec::with_capacity(delete_count);
 	for _ in 0..delete_count {
-		deletes.push(cursor.string()?);
+		deletes.push(cursor.record_id()?);
 	}
 	cursor.finish()?;
 	Ok(MutationBatch { upserts, deletes })
@@ -240,11 +338,10 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	let mut cursor = Cursor::new(bytes, *b"FTSQ")?;
 	let text = cursor.string()?;
-	let operator = match cursor.u8()? {
-		0 => SearchOperator::Any,
-		1 => SearchOperator::All,
-		_ => return Err(FulltextError::invalid("unknown search operator")),
-	};
+	if text.len() > MAX_QUERY_TEXT_BYTES {
+		return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
+	}
+	let mode = decode_search_mode(cursor.u8()?)?;
 	let field_count = cursor.u16()? as usize;
 	if field_count > MAX_FIELDS {
 		return Err(FulltextError::invalid("search field count exceeds 1024"));
@@ -253,24 +350,160 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	for _ in 0..field_count {
 		fields.push(cursor.string()?);
 	}
+	let has_candidates = cursor.boolean()?;
+	let candidate_count = if has_candidates { cursor.u16()? as usize } else { 0 };
+	if candidate_count > MAX_CANDIDATE_IDS {
+		return Err(FulltextError::invalid("candidate ID count exceeds 1024"));
+	}
+	if candidate_count > cursor.remaining() / 4 {
+		return Err(FulltextError::invalid(
+			"candidate ID count exceeds the packed request length",
+		));
+	}
+	let mut candidate_bytes = 0usize;
+	let mut candidate_ids = Vec::with_capacity(candidate_count);
+	for _ in 0..candidate_count {
+		let id = cursor.record_id()?;
+		candidate_bytes = candidate_bytes
+			.checked_add(id.len())
+			.ok_or_else(|| FulltextError::invalid("candidate ID byte count overflow"))?;
+		if candidate_bytes > MAX_CANDIDATE_BYTES {
+			return Err(FulltextError::invalid("candidate IDs exceed 1048576 UTF-8 bytes"));
+		}
+		candidate_ids.push(id);
+	}
 	let offset = cursor.u32()? as usize;
 	let limit = cursor.u32()? as usize;
 	let exact_total = cursor.boolean()?;
+	let budget_milliseconds = cursor.u32()?;
 	cursor.finish()?;
-	if text.trim().is_empty() {
-		return Err(FulltextError::invalid("search text must not be empty"));
+	if budget_milliseconds == 0 || budget_milliseconds > MAX_SEARCH_BUDGET_MILLISECONDS {
+		return Err(FulltextError::invalid(format!(
+			"search budget must be between 1 and {MAX_SEARCH_BUDGET_MILLISECONDS} milliseconds"
+		)));
 	}
-	if limit == 0 || offset.saturating_add(limit) > 10_000 {
+	if limit == 0 || offset.saturating_add(limit) > MAX_SEARCH_WINDOW {
 		return Err(FulltextError::invalid("search window must be between 1 and 10000"));
+	}
+	if matches!(mode, SearchMode::Prefix | SearchMode::FuzzyPrefix) && (offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS)
+	{
+		return Err(FulltextError::invalid(
+			"prefix search requires offset zero and a limit no greater than 100",
+		));
 	}
 	Ok(SearchRequest {
 		text,
-		operator,
+		mode,
 		fields,
+		candidate_ids: has_candidates.then_some(candidate_ids),
 		offset,
 		limit,
 		exact_total,
+		budget_milliseconds,
 	})
+}
+
+pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
+	let mut cursor = Cursor::new(bytes, *b"FTTM")?;
+	let text = cursor.string()?;
+	if text.len() > MAX_QUERY_TEXT_BYTES {
+		return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
+	}
+	let mode = decode_search_mode(cursor.u8()?)?;
+	let field_count = cursor.u16()? as usize;
+	if field_count > MAX_FIELDS || field_count > cursor.remaining() / 4 {
+		return Err(FulltextError::invalid("trace field count exceeds its packed request"));
+	}
+	let mut fields = Vec::with_capacity(field_count);
+	for _ in 0..field_count {
+		fields.push(cursor.string()?);
+	}
+	let has_candidates = cursor.boolean()?;
+	let candidate_count = if has_candidates { cursor.u16()? as usize } else { 0 };
+	if candidate_count > MAX_CANDIDATE_IDS || candidate_count > cursor.remaining() / 4 {
+		return Err(FulltextError::invalid(
+			"trace candidate count exceeds its packed request",
+		));
+	}
+	let mut candidate_bytes = 0usize;
+	let mut candidate_ids = Vec::with_capacity(candidate_count);
+	for _ in 0..candidate_count {
+		let id = cursor.record_id()?;
+		candidate_bytes = candidate_bytes.saturating_add(id.len());
+		if candidate_bytes > MAX_CANDIDATE_BYTES {
+			return Err(FulltextError::invalid("candidate IDs exceed 1048576 UTF-8 bytes"));
+		}
+		candidate_ids.push(id);
+	}
+	let record_count = cursor.u16()? as usize;
+	if record_count > MAX_TRACE_RECORDS || record_count > cursor.remaining() / 6 {
+		return Err(FulltextError::invalid("trace record count exceeds its packed request"));
+	}
+	let mut source_bytes = 0usize;
+	let mut records = Vec::with_capacity(record_count);
+	for _ in 0..record_count {
+		let id = cursor.record_id()?;
+		let field_count = cursor.u16()? as usize;
+		if field_count > MAX_FIELDS || field_count > cursor.remaining() / 6 {
+			return Err(FulltextError::invalid(
+				"trace record field count exceeds its packed request",
+			));
+		}
+		let mut record_fields = Vec::with_capacity(field_count);
+		for _ in 0..field_count {
+			let name = cursor.string()?;
+			let value_count = cursor.u16()? as usize;
+			if value_count > cursor.remaining() / 4 {
+				return Err(FulltextError::invalid("trace value count exceeds its packed request"));
+			}
+			let mut values = Vec::with_capacity(value_count);
+			for _ in 0..value_count {
+				let value = cursor.string()?;
+				source_bytes = source_bytes.saturating_add(value.len());
+				if source_bytes > MAX_TRACE_SOURCE_BYTES {
+					return Err(FulltextError::invalid("trace source text exceeds 1048576 UTF-8 bytes"));
+				}
+				values.push(value);
+			}
+			record_fields.push((name, values));
+		}
+		records.push(TraceRecord {
+			id,
+			fields: record_fields,
+		});
+	}
+	let budget_milliseconds = cursor.u32()?;
+	cursor.finish()?;
+	if budget_milliseconds == 0 || budget_milliseconds > MAX_SEARCH_BUDGET_MILLISECONDS {
+		return Err(FulltextError::invalid(format!(
+			"trace budget must be between 1 and {MAX_SEARCH_BUDGET_MILLISECONDS} milliseconds"
+		)));
+	}
+	Ok(TraceRequest {
+		search: SearchRequest {
+			text,
+			mode,
+			fields,
+			candidate_ids: has_candidates.then_some(candidate_ids),
+			offset: 0,
+			limit: record_count,
+			exact_total: false,
+			budget_milliseconds,
+		},
+		records,
+	})
+}
+
+fn decode_search_mode(value: u8) -> Result<SearchMode> {
+	match value {
+		0 => Ok(SearchMode::Any),
+		1 => Ok(SearchMode::All),
+		2 => Ok(SearchMode::Phrase),
+		3 => Ok(SearchMode::Prefix),
+		4 => Ok(SearchMode::Fuzzy),
+		5 => Ok(SearchMode::FuzzyPrefix),
+		_ => Err(FulltextError::invalid("unknown search mode")),
+	}
 }
 
 fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
@@ -313,9 +546,9 @@ fn validate_identity_config(config: &EngineIdentityConfig) -> Result<()> {
 	}
 	let mut names = std::collections::HashSet::with_capacity(config.fields.len());
 	for field in &config.fields {
-		if field.name.is_empty() || field.name == "__fulltext_id" || !names.insert(field.name.as_str()) {
+		if field.name.is_empty() || field.name.starts_with("__fulltext_") || !names.insert(field.name.as_str()) {
 			return Err(FulltextError::invalid(
-				"field names must be non-empty, unique, and not reserved",
+				"field names must be non-empty, unique, and outside the reserved __fulltext_ namespace",
 			));
 		}
 	}
@@ -406,6 +639,12 @@ impl<'a> Cursor<'a> {
 		String::from_utf8(bytes.to_vec()).map_err(|_| FulltextError::invalid("packed string is not valid UTF-8"))
 	}
 
+	fn record_id(&mut self) -> Result<String> {
+		let id = self.string()?;
+		validate_record_id(&id)?;
+		Ok(id)
+	}
+
 	fn finish(&self) -> Result<()> {
 		if self.offset == self.bytes.len() {
 			Ok(())
@@ -425,7 +664,7 @@ mod tests {
 
 	#[test]
 	fn reset_frame_contains_only_path_and_logical_index_id() {
-		let mut bytes = b"FTRX\x01\x00".to_vec();
+		let mut bytes = b"FTRX\x02\x00".to_vec();
 		for value in ["/tmp/index", "products"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -446,7 +685,7 @@ mod tests {
 
 	#[test]
 	fn inspection_frame_is_distinct_and_rejects_trailing_limits() {
-		let mut bytes = b"FTIP\x01\x00".to_vec();
+		let mut bytes = b"FTIP\x02\x00".to_vec();
 		for value in ["/tmp/index", "products", "one", "english@1"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -468,7 +707,7 @@ mod tests {
 
 	#[test]
 	fn rejects_counts_before_allocating() {
-		let mut bytes = b"FTMB\x01\x00".to_vec();
+		let mut bytes = b"FTMB\x02\x00".to_vec();
 		bytes.extend_from_slice(&u32::MAX.to_le_bytes());
 		bytes.extend_from_slice(&0u32.to_le_bytes());
 		assert_eq!(decode_batch(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
@@ -476,7 +715,7 @@ mod tests {
 
 	#[test]
 	fn distinguishes_batch_size_from_invalid_encoding() {
-		let bytes = b"FTMB\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+		let bytes = b"FTMB\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 		assert_eq!(
 			validate_batch_header(bytes, bytes.len() - 1).unwrap_err().code,
 			"E_BATCH_TOO_LARGE"
@@ -538,14 +777,14 @@ mod tests {
 
 	#[test]
 	fn rejects_nested_counts_before_allocating() {
-		let mut fields = b"FTMB\x01\x00".to_vec();
+		let mut fields = b"FTMB\x02\x00".to_vec();
 		fields.extend_from_slice(&1u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&u16::MAX.to_le_bytes());
 		assert_eq!(decode_batch(&fields).unwrap_err().code, "E_INVALID_ARGUMENT");
 
-		let mut values = b"FTMB\x01\x00".to_vec();
+		let mut values = b"FTMB\x02\x00".to_vec();
 		values.extend_from_slice(&1u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());

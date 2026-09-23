@@ -1,9 +1,11 @@
 const errorCodes = [
 	'E_NATIVE_ADDON_NOT_FOUND',
+	'E_NATIVE_LOAD_FAILED',
 	'E_NATIVE_ABI_MISMATCH',
 	'E_NATIVE_CAPABILITY_MISMATCH',
 	'E_NATIVE_PANIC',
 	'E_POISONED',
+	'E_PREFIX_TOO_BROAD',
 	'E_NATIVE_FAILURE',
 	'E_CLOSED',
 	'E_CLOSE_FAILED',
@@ -21,8 +23,10 @@ const errorCodes = [
 	'E_LOCK_BUSY',
 	'E_QUEUE_FULL',
 	'E_QUIESCENCE_FAILED',
+	'E_RESULT_TOO_LARGE',
 	'E_SCHEMA_MISMATCH',
 	'E_STORAGE',
+	'E_TIMEOUT',
 ] as const;
 
 export type FulltextErrorCode = (typeof errorCodes)[number];

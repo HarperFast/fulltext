@@ -11,11 +11,13 @@ Harper remains the source of truth; each node maintains its own rebuildable Tant
 - Node.js 22.18 or newer, or Node.js 24 or newer
 - Rust 1.90 when building from source
 
-The package never compiles or downloads native code during installation. A supported prebuilt
-artifact must be present for the executing platform.
+The package never compiles or downloads native code during installation. It installs a matching
+exact-version native package through npm optional dependencies.
 
-The initial CI-qualified targets are Linux x64 glibc, macOS arm64, and Windows x64. Additional
-targets are added only after their artifacts are loaded and tested on the target runtime.
+The initial CI-qualified targets are Linux x64 with glibc 2.35 or newer, macOS arm64, and Windows
+x64. Additional targets are added only after their packed artifacts are loaded and tested on the
+target runtime. Unsupported targets fail with `E_NATIVE_ADDON_NOT_FOUND` when the native entry point
+is first used; importing the JavaScript facade does not eagerly load an addon.
 
 ## Native usage
 
@@ -54,6 +56,7 @@ if (applied.rejected.length) console.warn(`${applied.rejected.length} products w
 await index.commit();
 await index.reload();
 console.log(await index.search({ text: 'waterproof running shoes', limit: 10 }));
+console.log(await index.search({ text: 'waterproof runn', mode: 'prefix', limit: 10 }));
 await index.publish('source-checkpoint-42');
 await index.close();
 
@@ -125,11 +128,51 @@ blocks low-level writer interleaving while its logical batch is active. The low-
 not infer logical batch boundaries, so callers using it remain responsible for excluding another
 publisher between frames. Searches may still run concurrently with either writer sequence.
 
-Search uses BM25. `total` is a bounded result by default so Tantivy can retain block-max WAND
-pruning. Set `exactTotal: true` only when an exact match count is worth a second full-match
-traversal. `positions` defaults on for future phrase queries; `surfaceTerms` defaults off because it
-stores source text for future highlighting and suggestions. Both settings are persisted and must
-match when the index is reopened.
+Search uses weighted BM25 and a typed request; raw Tantivy query syntax is not exposed. `mode` is
+`any`, `all`, `phrase`, `prefix`, `fuzzy`, or `fuzzy-prefix`. The older `operator: 'any' | 'all'`
+spelling remains a compatibility alias and cannot be combined with `mode`. Candidate IDs compile to
+a score-neutral required filter. Prefix modes are autocomplete-oriented, require offset zero, and
+return at most 100 hits. Fuzzy and prefix work has fixed term, clause, expansion, request, result,
+and execution ceilings. Prefix expansion fails with `E_PREFIX_TOO_BROAD` instead of silently
+truncating the term set and returning incomplete rankings. `fuzzy-prefix` is a preview capability
+until catalog-scale benchmark qualification is complete.
+
+Record IDs are limited to 4,096 UTF-8 bytes. This is above Harper's maximum encoded record key and
+keeps deterministic tie-page sorting memory bounded for standalone callers.
+
+`total` is bounded by default so Tantivy can retain block-max WAND pruning. Set `exactTotal: true`
+only when an exact match count is worth a second full-match traversal. Ranking is score descending,
+then UTF-8 ID ascending, including ties that cross segment or page boundaries.
+
+`positions` defaults on and is required for phrase search. `surfaceTerms` defaults off and creates
+an internal unstemmed companion term field used by prefix, fuzzy-prefix, and match tracing. It does
+not store source values. Both settings are persisted and must match when the index is reopened.
+Enable `surfaceTerms` only on indexes that need those operations. Field weights are query-time
+boosts and may change on reopen without rebuilding the index.
+
+Highlighting is opt-in and operates on caller-supplied current source values, so the wrapper never
+returns stale stored text. It returns UTF-16 half-open offsets and no HTML. Snippets are also off by
+default:
+
+```js
+const traced = await index.traceMatches(
+	{ text: 'trail running', mode: 'phrase' },
+	[{ id: 'shoe-1', fields: { title: 'Waterproof trail running shoe' } }],
+	{ snippets: true, fragmentLength: 160, maxFragmentsPerValue: 3 },
+);
+```
+
+Tracing evaluates only the supplied current values; it does not expand the live index dictionary.
+When its span or response ceiling is reached, `complete` is false and both later spans and later
+matching records may be omitted.
+
+Search and tracing share a maximum 30-second queue-plus-execution budget. Harper passes its shorter
+remaining request budget through the second method argument; larger values are clamped to 30
+seconds. Tantivy search itself is not interruptible, so a search that expires in flight is discarded
+after Tantivy returns. Match tracing checks its deadline while tokenizing and matching. With at
+least two search threads, one worker is reserved for ordinary `any`/`all` BM25. The remaining
+workers prioritize phrase, prefix, fuzzy, and trace work, then steal ordinary work when that queue
+is idle. A one-thread configuration remains valid but cannot isolate query classes.
 
 `close()` rejects uncommitted data by default. Use `close({ mode: 'rollback' })` to discard it
 explicitly. `commit()` publishes mutations, and `reload()` makes the latest commit visible to this
@@ -214,8 +257,8 @@ the handoff lock while renaming the native directory on Windows. The wrapper doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 5. The loader rejects older addon binaries; persisted index identity and
-Tantivy file formats are unchanged by the ABI update.
+This API uses native ABI 6. The loader rejects older addon binaries. Query protocol and native index
+identity changes require rebuilding prototype indexes created by earlier unreleased builds.
 
 ## Storage boundary
 
@@ -237,14 +280,16 @@ npm test
 npm run lint
 npm run format:check
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000
+npm run benchmark:native -- --documents 100000 --revision v0.1.0 --output benchmark-native.json
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000 --mutation-driver low-level
 npm run benchmark:inspect -- --indexes 1,10,100,1000 --commits 64 --warm-rounds 10
 ```
 
 The benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
 JSON record. It reports packing, apply, durable end-to-end ingestion, actor queue and execution
-time, logical-batch p50/p95/p99, frame count, commit distributions, reload cost, warm and cold BM25
-p50/p95/p99, exact-total overhead, index bytes, and periodically sampled process RSS. The default
+time, logical-batch p50/p95/p99, frame count, commit distributions, reload cost, warm and cold query
+p50/p95/p99, per-mode term/phrase/prefix/fuzzy/candidate performance, exact-total overhead, index
+bytes, and periodically sampled process RSS. The default
 `--mutation-driver logical` exercises `applyMutationBatch()`; rerun the identical command with
 `--mutation-driver low-level` for the prior encode-plus-apply path. Compare
 `mutationDriverMilliseconds`, durable end-to-end throughput, logical-batch percentiles, and peak
@@ -254,6 +299,12 @@ between durability points; it materially affects throughput and peak memory beca
 replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
 comparisons require controlled hardware.
 
+`--revision` labels a result and `--output` writes the same JSON record printed to stdout. Pull
+requests keep smoke records as GitHub Actions artifacts for 30 days. The release benchmark keeps a
+90-day Actions artifact and attaches `benchmark-native.json` to the GitHub release, providing a
+permanent release-over-release history. Shared-runner numbers are evidence that the workload still
+runs, not a latency gate; compare performance only on equivalent controlled hardware.
+
 The inspection benchmark compares synchronous read-only inspection with full writer reopen across
 multiple index counts. It reports equivalent first-pass and warm p50/p95/p99/max latency,
 synchronous wall time per inspection sweep, metadata size, and the actual segment count produced by
@@ -262,6 +313,15 @@ that create at most 10,000 temporary index directories across both benchmark pat
 
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.
+
+## Releases
+
+The root `@harperfast/fulltext` package contains only the JavaScript and TypeScript facade. Native
+artifacts are published as exact-version platform packages and selected at runtime. Release tags
+must match both npm and Cargo versions. The release workflow builds and tests each supported native
+artifact, installs the packed root and platform tarballs in a clean consumer with lifecycle scripts
+disabled, and publishes with npm provenance. Platform packages are published before the root, so a
+root version is never available until every supported artifact has passed its consumer test.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
 [the native backend design](docs/native-backend-implementation.md) for implementation details.

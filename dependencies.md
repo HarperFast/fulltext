@@ -29,4 +29,14 @@ error codes and per-handle poison state for package-owned operations.
 | `prettier` 3.6.2      | development | Repository formatting checks.                                         |
 | `typescript` 5.9.3    | development | Compiles the public façade and declarations.                          |
 
-The public entry point has no production npm dependencies and does not depend on rocksdb-js.
+The public entry point has no JavaScript runtime dependencies and does not depend on rocksdb-js.
+Its optional native packages are exact-version platform artifacts for Linux x64 glibc, macOS arm64,
+and Windows x64. They contain only the compiled addon and package metadata; keeping them separate
+prevents consumers from downloading binaries for other platforms and preserves installation without
+lifecycle scripts or a Rust toolchain.
+
+| Dependency                            | Scope            | Purpose                                        |
+| ------------------------------------- | ---------------- | ---------------------------------------------- |
+| `@harperfast/fulltext-darwin-arm64`   | optional runtime | macOS arm64 native addon for this version.     |
+| `@harperfast/fulltext-linux-x64-gnu`  | optional runtime | Linux x64 glibc native addon for this version. |
+| `@harperfast/fulltext-win32-x64-msvc` | optional runtime | Windows x64 native addon for this version.     |

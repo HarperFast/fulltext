@@ -5,11 +5,29 @@
 
 export interface RuntimeLimits {
   maxCommitPayloadBytes: number
+  maxQueryTextBytes: number
+  maxQueryTerms: number
+  maxQueryClauses: number
+  maxCandidateIds: number
+  maxCandidateBytes: number
+  maxRecordIdBytes: number
+  maxPrefixExpansions: number
+  maxFuzzyTerms: number
+  maxSearchWindow: number
+  maxAutocompleteResults: number
+  maxSearchRequestBytes: number
+  maxSearchResponseBytes: number
+  maxSearchBudgetMilliseconds: number
+  maxTraceRecords: number
+  maxTraceSourceBytes: number
+  maxTraceSpans: number
 }
 export interface RuntimeInfo {
   packageVersion: string
   tantivyVersion: string
   nativeAbiVersion: number
+  queryApiVersion: number
+  queryClassIsolationMinimumSearchThreads: number
   storageBackends: Array<string>
   limits: RuntimeLimits
 }

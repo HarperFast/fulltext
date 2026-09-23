@@ -103,6 +103,288 @@ test('runs the public create, mutate, BM25 search, close, and reopen route', asy
 	await index.close();
 });
 
+test('runs every structured query mode and score-neutral candidate filtering', async (context) => {
+	const index = await openNativeFullTextIndex(
+		options(temporaryIndex(context), { positions: true, surfaceTerms: true }),
+	);
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'one', fields: { title: 'Waterproof Trail Running Shoes' } },
+			{ id: 'two', fields: { title: 'Waterproof Road Shoes' } },
+			{ id: 'three', fields: { title: 'Wireless Headphones' } },
+		],
+	});
+	await index.commit();
+	await index.reload();
+
+	assert.deepStrictEqual(
+		(await index.search({ text: 'trail running', mode: 'phrase' })).hits.map((hit) => hit.id),
+		['one'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'waterproof trai', mode: 'prefix' })).hits.map((hit) => hit.id),
+		['one'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'waterprof', mode: 'fuzzy' })).hits.map((hit) => hit.id),
+		['one', 'two'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'waterproof tral', mode: 'fuzzy-prefix' })).hits.map((hit) => hit.id),
+		['one'],
+	);
+	const unfilteredScore = (await index.search({ text: 'waterproof' })).hits.find((hit) => hit.id === 'two').score;
+	const filtered = await index.search({ text: 'waterproof', candidateIds: ['two'] });
+	assert.deepStrictEqual(
+		filtered.hits.map((hit) => hit.id),
+		['two'],
+	);
+	assert.strictEqual(filtered.hits[0].score, unfilteredScore);
+	assert.deepStrictEqual(await index.search({ text: 'waterproof', candidateIds: [] }), {
+		total: 0,
+		totalRelation: 'exact',
+		hits: [],
+	});
+	const traced = await index.traceMatches(
+		{ text: 'trail running', mode: 'phrase' },
+		[
+			{ id: 'one', fields: { title: 'The Trail Running Shoes' } },
+			{ id: 'two', fields: { title: 'Waterproof Road Shoes' } },
+		],
+		{ snippets: true, fragmentLength: 32 },
+	);
+	assert.deepStrictEqual(traced, {
+		complete: true,
+		records: [
+			{
+				id: 'one',
+				values: [
+					{
+						field: 'title',
+						valueIndex: 0,
+						spans: [{ start: 4, end: 17 }],
+						fragments: [
+							{
+								text: 'The Trail Running Shoes',
+								start: 0,
+								spans: [{ start: 4, end: 17 }],
+							},
+						],
+					},
+				],
+			},
+		],
+	});
+	const unicodeTrace = await index.traceMatches({ text: 'waterproof', mode: 'any' }, [
+		{ id: 'one', fields: { title: '🥾 Waterproof Trail Shoes' } },
+	]);
+	assert.deepStrictEqual(unicodeTrace.records[0].values[0].spans, [{ start: 3, end: 13 }]);
+	const boundedTrace = await index.traceMatches({ text: 'shoe' }, [
+		{ id: 'one', fields: { title: 'shoe '.repeat(1_100) } },
+	]);
+	assert.strictEqual(boundedTrace.complete, false);
+	assert.strictEqual(boundedTrace.records[0].values[0].spans.length, 1_024);
+	const overlappingPrefixTrace = await index.traceMatches({ text: 'shoe sho', mode: 'prefix' }, [
+		{ id: 'one', fields: { title: 'shoe '.repeat(513) } },
+	]);
+	assert.strictEqual(overlappingPrefixTrace.complete, true);
+	assert.strictEqual(overlappingPrefixTrace.records[0].values[0].spans.length, 513);
+	const exactEmptyTrace = await index.traceMatches({ text: 'shoe missing', mode: 'all' }, [
+		{ id: 'one', fields: { title: 'shoe '.repeat(1_100) } },
+	]);
+	assert.deepStrictEqual(exactEmptyTrace, { complete: true, records: [] });
+	await assert.rejects(
+		index.search({ text: 'waterproof', mode: 'any', operator: 'all' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({ text: 'x'.repeat(40), mode: 'prefix' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: `${'x'.repeat(40)} waterproof`, mode: 'prefix' })).hits.map((hit) => hit.id).sort(),
+		['one', 'two'],
+	);
+	await assert.rejects(index.search({ text: '\ud800' }), (error) => error.code === 'E_INVALID_ARGUMENT');
+	await assert.rejects(
+		index.search({ text: 'waterproof', limit: 10_001 }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({ text: 'waterproof', candidateIds: Array.from({ length: 1_025 }, (_, id) => `${id}`) }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({ text: 'waterproof', candidateIds: 'one' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({ text: 'waterproof', candidateIds: ['x'.repeat(4_097)] }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.traceMatches({ text: 'waterproof' }, [{ id: 'x'.repeat(4_097), fields: { title: 'waterproof' } }]),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.apply(encodeMutationBatch({ deletes: ['x'.repeat(4_097)] })),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({ text: 'waterproof' }, { remainingBudgetMilliseconds: 0 }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.strictEqual((await index.search({ text: 'waterproof' }, { remainingBudgetMilliseconds: 60_000 })).total, 2);
+	await index.applyMutationBatch({ upserts: [{ id: 'plural', fields: { title: 'Waterproofs' } }] });
+	await index.commit();
+	await index.reload();
+	assert((await index.search({ text: 'waterprof', mode: 'fuzzy' })).hits.some((hit) => hit.id === 'plural'));
+	assert.deepStrictEqual(
+		(
+			await index.traceMatches({ text: 'waterprof', mode: 'fuzzy' }, [
+				{ id: 'plural', fields: { title: 'Waterproofs' } },
+			])
+		).records[0].values[0].spans,
+		[{ start: 0, end: 11 }],
+	);
+	assert.strictEqual(
+		await index.apply(
+			encodeMutationBatch({ upserts: [{ id: 'surrogate', fields: { title: '\ud800' } }], deletes: [] }),
+		),
+		1,
+	);
+	await index.close({ mode: 'rollback' });
+});
+
+test('uses the surface field for stop-word prefixes and preserves weighted fuzzy-prefix ranking', async (context) => {
+	const index = await openNativeFullTextIndex(
+		options(temporaryIndex(context), { positions: true, surfaceTerms: true }),
+	);
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'title', fields: { title: 'Waterproof Therefore Catalogapple' } },
+			{ id: 'description', fields: { description: 'Waterproof Thermal Catalogapple' } },
+		],
+	});
+	await index.commit();
+	await index.reload();
+	assert.deepStrictEqual(
+		(await index.search({ text: 'there', mode: 'prefix' })).hits.map((hit) => hit.id),
+		['title'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'waterproof the', mode: 'prefix' })).hits.map((hit) => hit.id),
+		['title', 'description'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'catalogapp', mode: 'fuzzy-prefix' })).hits.map((hit) => hit.id),
+		['title', 'description'],
+	);
+	await index.close();
+});
+
+test('preserves phrase positions through stop words in search and tracing', async (context) => {
+	const index = await openNativeFullTextIndex(
+		options(temporaryIndex(context), { positions: true, surfaceTerms: true }),
+	);
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'adjacent', fields: { title: 'trail running' } },
+			{ id: 'gap', fields: { title: 'trail the running' } },
+			{ id: 'substitute', fields: { title: 'trail blazing running' } },
+		],
+	});
+	await index.commit();
+	await index.reload();
+	assert.deepStrictEqual(
+		(await index.search({ text: 'trail running', mode: 'phrase' })).hits.map((hit) => hit.id),
+		['adjacent'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'trail the running', mode: 'phrase' })).hits.map((hit) => hit.id),
+		['gap', 'substitute'],
+	);
+	const trace = await index.traceMatches({ text: 'trail the running', mode: 'phrase' }, [
+		{ id: 'adjacent', fields: { title: 'trail running' } },
+		{ id: 'gap', fields: { title: 'trail the running' } },
+		{ id: 'substitute', fields: { title: 'trail blazing running' } },
+	]);
+	assert.deepStrictEqual(
+		trace.records.map((record) => record.id),
+		['gap', 'substitute'],
+	);
+	await index.close();
+});
+
+test('field weights can change without rebuilding native storage', async (context) => {
+	const indexPath = temporaryIndex(context);
+	let index = await openNativeFullTextIndex(options(indexPath));
+	await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'shoe', description: 'shoe' } }] });
+	await index.publish('checkpoint-1');
+	await index.close();
+
+	const weighted = options(indexPath, {
+		fields: [
+			{ name: 'title', weight: 8 },
+			{ name: 'description', weight: 0.5 },
+		],
+	});
+	assert.deepStrictEqual(inspectNativeFullTextIndex(weighted), {
+		state: 'checkpointed',
+		committedPayload: 'checkpoint-1',
+	});
+	index = await openNativeFullTextIndex(weighted);
+	assert.strictEqual((await index.search({ text: 'shoe' })).hits[0].id, 'one');
+	await index.close();
+});
+
+test('times out bounded trace work inside the native execution lane', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context), { surfaceTerms: true }));
+	await assert.rejects(
+		index.traceMatches(
+			{ text: 'waterprof', mode: 'fuzzy' },
+			[{ id: 'one', fields: { title: 'waterproof '.repeat(80_000) } }],
+			{ remainingBudgetMilliseconds: 1 },
+		),
+		(error) => error.code === 'E_TIMEOUT',
+	);
+	await index.close();
+});
+
+test('snapshots trace source arrays before asynchronous native execution', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context), { surfaceTerms: true }));
+	const values = ['waterproof shoe'];
+	const trace = index.traceMatches({ text: 'waterproof' }, [{ id: 'one', fields: { title: values } }], {
+		snippets: true,
+	});
+	values[0] = 'changed';
+	assert.strictEqual((await trace).records[0].values[0].fragments[0].text, 'waterproof shoe');
+	await index.close();
+});
+
+test('rejects query modes when their schema capability is disabled', async (context) => {
+	const index = await openNativeFullTextIndex(
+		options(temporaryIndex(context), { positions: false, surfaceTerms: false }),
+	);
+	await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'Waterproof shoe' } }] });
+	await index.commit();
+	await index.reload();
+	assert.deepStrictEqual(
+		(await index.search({ text: 'waterprof', mode: 'fuzzy' })).hits.map((hit) => hit.id),
+		['one'],
+	);
+	await assert.rejects(
+		index.search({ text: 'trail running', mode: 'phrase' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(index.search({ text: 'trai', mode: 'prefix' }), (error) => error.code === 'E_INVALID_ARGUMENT');
+	await assert.rejects(
+		index.traceMatches({ text: 'trail' }, [{ id: 'one', fields: { title: 'trail' } }]),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await index.close();
+});
+
 test('inspects missing storage without creating it', (context) => {
 	const parent = temporaryIndex(context);
 	const indexPath = path.join(parent, 'missing');

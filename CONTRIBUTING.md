@@ -36,3 +36,12 @@ of `npm pack` into a temporary consumer project.
 
 Open an issue before changing a public package entry point, native ABI, persistence contract, or
 supported-platform matrix.
+
+## Release packaging
+
+The root package is binary-free. Each supported native runner stages one exact-version platform
+package, and CI installs the packed root and matching native tarball before a release can publish.
+Keep `package.json`, `Cargo.toml`, the root optional dependencies, and platform-package versions in
+lockstep. Repository tests and benchmarks set `FULLTEXT_PREFER_LOCAL_BUILD=1` so a previously
+published optional package cannot shadow the addon just built from the checkout. Do not add install
+scripts or build-from-source installation fallback to the published package contract.

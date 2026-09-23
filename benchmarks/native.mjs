@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -13,6 +13,8 @@ const queryCount = integerArgument('--queries', smoke ? 20 : 500);
 const concurrency = integerArgument('--concurrency', 4);
 const commitEvery = integerArgument('--commit-every', documents);
 const mutationDriver = enumArgument('--mutation-driver', ['logical', 'low-level'], 'logical');
+const revision = stringArgument('--revision', process.env.GITHUB_SHA ?? 'working-tree');
+const outputPath = stringArgument('--output');
 const indexPath = await mkdtemp(path.join(tmpdir(), 'harper-fulltext-benchmark-'));
 const config = {
 	path: indexPath,
@@ -21,7 +23,7 @@ const config = {
 	fields: [{ name: 'title', weight: 3 }, { name: 'description' }, { name: 'category', weight: 1.5 }],
 	analyzer: 'english@1',
 	positions: true,
-	surfaceTerms: false,
+	surfaceTerms: true,
 	limits: {
 		indexingThreads: Math.min(4, Math.max(1, concurrency)),
 		searchThreads: Math.min(8, Math.max(1, concurrency)),
@@ -93,11 +95,29 @@ try {
 	const correctness = await index.search({ text: 'waterproof trail shoes', exactTotal: true, limit: 10 });
 	assert(correctness.total > 0);
 	assert(correctness.hits.some((hit) => hit.id.startsWith('product-')));
-	const queryMix = ['waterproof trail shoes', 'wireless headphones', 'cotton blue shirt', 'outdoor product'];
+	const queryMix = [
+		{ name: 'any', text: 'waterproof trail shoes', mode: 'any' },
+		{ name: 'all', text: 'waterproof trail shoes', mode: 'all' },
+		{ name: 'phrase', text: 'trail running', mode: 'phrase' },
+		{ name: 'prefix', text: 'waterproof trai', mode: 'prefix' },
+		{ name: 'fuzzy', text: 'waterprof', mode: 'fuzzy' },
+		{ name: 'fuzzy-prefix', text: 'waterproof tral', mode: 'fuzzy-prefix' },
+		{ name: 'candidate-filter', text: 'waterproof', mode: 'any', candidateIds: ['product-0'] },
+	];
 	for (const query of queryMix) {
-		await index.search({ text: query, limit: 10 });
+		await index.search({ ...query, limit: 10 });
 	}
 	const warm = await measureSearch(index, queryMix, queryCount, concurrency, false);
+	const byMode = {};
+	for (const query of queryMix) {
+		byMode[query.name] = await measureSearch(
+			index,
+			[query],
+			Math.max(4, Math.floor(queryCount / queryMix.length)),
+			concurrency,
+			false,
+		);
+	}
 	const exactComparisonCount = Math.max(4, Math.floor(queryCount / 10));
 	const approximateSingle = await measureSearch(index, queryMix, exactComparisonCount, 1, false);
 	const exact = await measureSearch(index, queryMix, exactComparisonCount, 1, true);
@@ -114,7 +134,8 @@ try {
 	const sortedCommitLatencies = [...commitLatencies].sort((left, right) => left - right);
 	logicalBatchLatencies.sort((left, right) => left - right);
 	const output = {
-		formatVersion: 1,
+		formatVersion: 2,
+		revision,
 		backend: 'tantivy-mmap',
 		runtime: info,
 		host: {
@@ -159,6 +180,7 @@ try {
 		},
 		search: {
 			warmApproximate: warm,
+			byMode,
 			warmApproximateSingle: approximateSingle,
 			warmExactTotal: exact,
 			coldAfterReopen: cold,
@@ -179,7 +201,9 @@ try {
 	assert(output.indexing.durableDocumentsPerSecond > 0);
 	assert(output.search.warmApproximate.p99Milliseconds > 0);
 	assert(output.resources.indexBytes > 0);
-	console.log(JSON.stringify(output, null, 2));
+	const serialized = `${JSON.stringify(output, null, 2)}\n`;
+	if (outputPath) await writeFile(outputPath, serialized);
+	console.log(serialized.trimEnd());
 } finally {
 	await rm(indexPath, { recursive: true, force: true });
 }
@@ -203,7 +227,7 @@ async function measureSearch(index, queries, count, parallelism, exactTotal) {
 			Array.from({ length: Math.min(parallelism, count - offset) }, async (_, lane) => {
 				const queryStarted = performance.now();
 				const result = await index.search({
-					text: queries[(offset + lane) % queries.length],
+					...queries[(offset + lane) % queries.length],
 					limit: 10,
 					exactTotal,
 				});
@@ -237,6 +261,14 @@ function integerArgument(name, fallback) {
 	if (!Number.isSafeInteger(value) || value <= 0) {
 		throw new Error(`${name} must be a positive integer`);
 	}
+	return value;
+}
+
+function stringArgument(name, fallback) {
+	const index = process.argv.indexOf(name);
+	if (index === -1) return fallback;
+	const value = process.argv[index + 1];
+	if (!value || value.startsWith('--')) throw new Error(`${name} requires a value`);
 	return value;
 }
 

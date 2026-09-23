@@ -1,0 +1,192 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  platform-package:
+    name: Package ${{ matrix.target }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x64-gnu
+          - os: macos-14
+            target: darwin-arm64
+          - os: windows-latest
+            target: win32-x64-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - name: Reject RocksDB dependencies and symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact="fulltext.${{ matrix.target }}.node"
+          test -f "$artifact"
+          cargo tree --locked --all-features > cargo-tree.txt
+          if grep -qi rocksdb cargo-tree.txt; then exit 1; fi
+          if grep -a -qi rocksdb "$artifact"; then exit 1; fi
+          case "${{ runner.os }}" in
+            Linux)
+              ldd "$artifact" | tee native-linkage.txt
+              ;;
+            macOS)
+              otool -L "$artifact" | tee native-linkage.txt
+              ;;
+            Windows)
+              if command -v llvm-objdump >/dev/null; then
+                llvm-objdump -p "$artifact" | grep 'DLL Name' | tee native-linkage.txt
+              elif command -v objdump >/dev/null; then
+                objdump -p "$artifact" | grep 'DLL Name' | tee native-linkage.txt
+              else
+                echo 'No PE linkage inspector is available' >&2
+                exit 1
+              fi
+              ;;
+          esac
+          if grep -qi rocksdb native-linkage.txt; then exit 1; fi
+      - name: Stage platform package
+        shell: bash
+        run: >-
+          node scripts/stage-platform-package.mjs
+          --target "${{ matrix.target }}"
+          --artifact "fulltext.${{ matrix.target }}.node"
+          --output "release/${{ matrix.target }}"
+      - name: Pack platform package
+        shell: bash
+        run: |
+          mkdir -p release-tarball
+          npm pack "release/${{ matrix.target }}" --json --pack-destination "release-tarball"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package-${{ matrix.target }}
+          path: release-tarball/*.tgz
+          if-no-files-found: error
+
+  root-package:
+    name: Package JavaScript facade
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Pack root package
+        shell: bash
+        run: |
+          mkdir -p release-tarball
+          npm pack --json --pack-destination release-tarball
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package-root
+          path: release-tarball/*.tgz
+          if-no-files-found: error
+
+  packed-consumer:
+    name: Install ${{ matrix.target }} package
+    needs: [platform-package, root-package]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x64-gnu
+          - os: macos-14
+            target: darwin-arm64
+          - os: windows-latest
+            target: win32-x64-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package-root
+          path: packages/root
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package-${{ matrix.target }}
+          path: packages/native
+      - name: Install packed artifacts without lifecycle scripts
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir consumer
+          cd consumer
+          npm init --yes >/dev/null
+          npm install ../packages/root/*.tgz ../packages/native/*.tgz --ignore-scripts --no-audit --no-fund
+          expected_version="$RELEASE_TAG"
+          EXPECTED_VERSION="${expected_version#v}" node --input-type=module --eval "const info = await import('@harperfast/fulltext/native').then(module => module.runtimeInfo()); if (info.packageVersion !== process.env.EXPECTED_VERSION || info.storageBackends.join(',') !== 'native') process.exit(1); console.log(info)"
+
+  publish:
+    name: Publish npm packages
+    needs: packed-consumer
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-package-*
+          path: release-tarballs
+          merge-multiple: true
+      - name: Verify release version and select dist-tag
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="$RELEASE_TAG"
+          version="${version#v}"
+          npm_version=$(node -p "require('./package.json').version")
+          cargo_version=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          test "$version" = "$npm_version"
+          test "$version" = "$cargo_version"
+          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            echo 'tag=next' >> "$GITHUB_OUTPUT"
+          else
+            echo 'tag=latest' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish exact release artifacts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: >-
+          node scripts/publish-release-packages.mjs
+          --directory release-tarballs
+          --tag "${{ steps.release.outputs.tag }}"
