@@ -62,7 +62,8 @@ jobs:
           set -euo pipefail
           artifact=fulltext.linux-x64-gnu.node
           test -f "$artifact"
-          if cargo tree --locked --all-features | grep -qi rocksdb; then exit 1; fi
+          cargo tree --locked --all-features > "$RUNNER_TEMP/fulltext-cargo-tree.txt"
+          if grep -qi rocksdb "$RUNNER_TEMP/fulltext-cargo-tree.txt"; then exit 1; fi
           nm -D --defined-only "$artifact" > "$RUNNER_TEMP/fulltext-symbols.txt"
           test -s "$RUNNER_TEMP/fulltext-symbols.txt"
           grep -q napi_register_module_v1 "$RUNNER_TEMP/fulltext-symbols.txt"
@@ -89,9 +90,9 @@ jobs:
       - run: npm run build:native
       - run: npm run build:typescript
       - name: Run logical mutation benchmark smoke
-        run: node benchmarks/native.mjs --smoke --mutation-driver logical --output benchmark-logical.json
+        run: node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver logical --output benchmark-logical.json
       - name: Run low-level mutation benchmark smoke
-        run: node benchmarks/native.mjs --smoke --mutation-driver low-level --output benchmark-low-level.json
+        run: node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver low-level --output benchmark-low-level.json
       - run: npm run benchmark:inspect:smoke
       - name: Store benchmark smoke results
         if: always()

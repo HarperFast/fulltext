@@ -50,6 +50,26 @@ export function readTarballManifest(tarballPath) {
 	return JSON.parse(execFileSync('tar', ['-xOf', tarballPath, 'package/package.json'], { encoding: 'utf8' }));
 }
 
+export function parsePublishedIntegrity(output) {
+	const trimmed = output.trim();
+	if (!trimmed) {
+		return undefined;
+	}
+	const integrity = JSON.parse(trimmed);
+	if (integrity === null) {
+		return undefined;
+	}
+	if (typeof integrity !== 'string') {
+		throw new Error(`npm returned an invalid dist.integrity value: ${trimmed}`);
+	}
+	return integrity;
+}
+
+export function isUnpublishedVersionError(error) {
+	const detail = `${error.stderr ?? ''}\n${error.stdout ?? ''}`;
+	return /E404|ETARGET|404 Not Found|No matching version found/i.test(detail);
+}
+
 function tarballsIn(directory) {
 	const tarballs = [];
 	for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -69,10 +89,9 @@ function publishedIntegrity(name, version) {
 			encoding: 'utf8',
 			stdio: ['ignore', 'pipe', 'pipe'],
 		});
-		return JSON.parse(output);
+		return parsePublishedIntegrity(output);
 	} catch (error) {
-		const detail = `${error.stderr ?? ''}\n${error.stdout ?? ''}`;
-		if (/E404|404 Not Found/.test(detail)) {
+		if (isUnpublishedVersionError(error)) {
 			return undefined;
 		}
 		throw error;

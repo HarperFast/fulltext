@@ -570,7 +570,6 @@ impl Engine {
 		deadline: Option<Instant>,
 	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool)> {
 		let analyzed = self.source_tokens(value, false, deadline)?;
-		let surface = self.source_tokens(value, true, deadline)?;
 		let utf16_offsets = utf16_offsets(value);
 		let mut spans = Vec::new();
 		let mut found = HashSet::new();
@@ -635,6 +634,7 @@ impl Engine {
 				prefix,
 				fuzzy,
 			} => {
+				let surface = self.source_tokens(value, true, deadline)?;
 				for (index, token) in analyzed.iter().enumerate() {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
@@ -665,6 +665,7 @@ impl Engine {
 				}
 			}
 			TracePlan::Fuzzy(terms) => {
+				let surface = self.source_tokens(value, true, deadline)?;
 				let analyzed_by_position = analyzed
 					.iter()
 					.map(|token| (token.position, token.text.as_str()))

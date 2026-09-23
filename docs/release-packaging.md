@@ -1,9 +1,5 @@
 # Release packaging
 
-Status: **draft** — implemented and locally tested; Gemini CLI second-reader pass completed;
-cross-platform CI and npm publication are untested · Owner: Kyle Bernhardy · Last verified:
-2026-09-23
-
 ## TL;DR
 
 - Publish a binary-free `@harperfast/fulltext` facade at `0.1.0`.
@@ -88,6 +84,9 @@ installation.
   until every supported native artifact has been built, packed, and validated. A failed root
   publish leaves unreachable platform packages but no installable root version that references an
   incomplete set.
+- Retry a failed publish job with the original workflow artifacts. Do not restart the complete
+  workflow after any package has published: a rebuilt native artifact may not be byte-identical,
+  and the publisher intentionally rejects different bytes for an existing version.
 
 ## Verification
 

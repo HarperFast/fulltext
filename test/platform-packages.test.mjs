@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { integrityForTarball, validateReleaseManifests } from '../scripts/publish-release-packages.mjs';
+import {
+	integrityForTarball,
+	isUnpublishedVersionError,
+	parsePublishedIntegrity,
+	validateReleaseManifests,
+} from '../scripts/publish-release-packages.mjs';
 import { platformPackageName, stagePlatformPackage, supportedPlatformPackages } from '../scripts/platform-packages.mjs';
 
 const rootManifest = {
@@ -82,4 +87,15 @@ test('tarball integrity is stable and content-sensitive', (context) => {
 	assert.strictEqual(integrityForTarball(tarball), first);
 	writeFileSync(tarball, 'second');
 	assert.notStrictEqual(integrityForTarball(tarball), first);
+});
+
+test('npm registry responses distinguish unpublished versions from malformed metadata', () => {
+	assert.strictEqual(parsePublishedIntegrity(''), undefined);
+	assert.strictEqual(parsePublishedIntegrity('null\n'), undefined);
+	assert.strictEqual(parsePublishedIntegrity('"sha512-example"\n'), 'sha512-example');
+	assert.throws(() => parsePublishedIntegrity('{}'), /invalid dist\.integrity/);
+	assert.strictEqual(isUnpublishedVersionError({ stderr: 'npm error code E404' }), true);
+	assert.strictEqual(isUnpublishedVersionError({ stderr: 'npm error code ETARGET' }), true);
+	assert.strictEqual(isUnpublishedVersionError({ stderr: 'No matching version found for example@2.0.0' }), true);
+	assert.strictEqual(isUnpublishedVersionError({ stderr: 'npm error code E401' }), false);
 });

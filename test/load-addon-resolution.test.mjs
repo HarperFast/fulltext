@@ -44,6 +44,25 @@ test('missing packages and unsupported musl targets have actionable names', (con
 	assert.strictEqual(platformPackageName(muslTriple), '@harperfast/fulltext-linux-x64-musl');
 });
 
+test('runtime libc detection is cached', () => {
+	const output = execFileSync(
+		process.execPath,
+		[
+			'--input-type=module',
+			'--eval',
+			`let calls = 0;
+			const getReport = process.report.getReport;
+			process.report.getReport = () => { calls++; return getReport.call(process.report); };
+			const { platformTriple } = await import('./dist/load-addon.js');
+			platformTriple({ platform: 'linux', architecture: 'x64' });
+			platformTriple({ platform: 'linux', architecture: 'x64' });
+			console.log(calls);`,
+		],
+		{ cwd: new URL('..', import.meta.url), encoding: 'utf8' },
+	).trim();
+	assert.strictEqual(output, '1');
+});
+
 function createFixture(context, options) {
 	const root = mkdtempSync(path.join(tmpdir(), 'fulltext-loader-'));
 	context.after(() => rmSync(root, { recursive: true, force: true }));

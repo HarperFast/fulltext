@@ -61,6 +61,7 @@ const require = createRequire(import.meta.url);
 const expectedNativeAbiVersion = 6;
 const packageManifest = require('../package.json') as { name: string; version: string };
 let loadedAddon: NativeAddonApi | undefined;
+let runtimeUsesGlibc: boolean | undefined;
 
 export function loadAddon(): NativeAddonApi {
 	if (loadedAddon) {
@@ -114,8 +115,12 @@ export function platformPackageName(triple: string): string {
 }
 
 function usesGlibc(): boolean {
+	if (runtimeUsesGlibc !== undefined) {
+		return runtimeUsesGlibc;
+	}
 	const report = process.report?.getReport() as { header?: { glibcVersionRuntime?: string } } | undefined;
-	return Boolean(report?.header?.glibcVersionRuntime);
+	runtimeUsesGlibc = Boolean(report?.header?.glibcVersionRuntime);
+	return runtimeUsesGlibc;
 }
 
 function loadLocalAddon(triple: string, required: true): NativeAddonApi;

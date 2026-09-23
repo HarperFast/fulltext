@@ -37,7 +37,7 @@ jobs:
           QUERIES: ${{ inputs.queries || '500' }}
           REVISION: ${{ github.event.release.tag_name || github.sha }}
         run: >-
-          node benchmarks/native.mjs
+          node scripts/run-local.mjs benchmarks/native.mjs
           --documents "$DOCUMENTS"
           --queries "$QUERIES"
           --revision "$REVISION"
