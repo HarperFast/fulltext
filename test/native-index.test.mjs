@@ -179,6 +179,11 @@ test('runs every structured query mode and score-neutral candidate filtering', a
 		{ id: 'one', fields: { title: '🥾 Waterproof Trail Shoes' } },
 	]);
 	assert.deepStrictEqual(unicodeTrace.records[0].values[0].spans, [{ start: 3, end: 13 }]);
+	const boundedTrace = await index.traceMatches({ text: 'shoe' }, [
+		{ id: 'one', fields: { title: 'shoe '.repeat(1_100) } },
+	]);
+	assert.strictEqual(boundedTrace.complete, false);
+	assert.strictEqual(boundedTrace.records[0].values[0].spans.length, 1_024);
 	await assert.rejects(
 		index.search({ text: 'waterproof', mode: 'any', operator: 'all' }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
@@ -193,15 +198,131 @@ test('runs every structured query mode and score-neutral candidate filtering', a
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	await assert.rejects(
+		index.search({ text: 'waterproof', candidateIds: 'one' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
 		index.search({ text: 'waterproof' }, { remainingBudgetMilliseconds: 0 }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
+	assert.strictEqual((await index.search({ text: 'waterproof' }, { remainingBudgetMilliseconds: 60_000 })).total, 2);
+	await index.close();
+});
+
+test('uses the surface field for stop-word prefixes and preserves weighted fuzzy-prefix ranking', async (context) => {
+	const index = await openNativeFullTextIndex(
+		options(temporaryIndex(context), { positions: true, surfaceTerms: true }),
+	);
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'title', fields: { title: 'Waterproof Therefore Catalogapple' } },
+			{ id: 'description', fields: { description: 'Waterproof Thermal Catalogapple' } },
+		],
+	});
+	await index.commit();
+	await index.reload();
+	assert.deepStrictEqual(
+		(await index.search({ text: 'there', mode: 'prefix' })).hits.map((hit) => hit.id),
+		['title'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'waterproof the', mode: 'prefix' })).hits.map((hit) => hit.id),
+		['title', 'description'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'catalogapp', mode: 'fuzzy-prefix' })).hits.map((hit) => hit.id),
+		['title', 'description'],
+	);
+	await index.close();
+});
+
+test('preserves phrase positions through stop words in search and tracing', async (context) => {
+	const index = await openNativeFullTextIndex(
+		options(temporaryIndex(context), { positions: true, surfaceTerms: true }),
+	);
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'adjacent', fields: { title: 'trail running' } },
+			{ id: 'gap', fields: { title: 'trail the running' } },
+		],
+	});
+	await index.commit();
+	await index.reload();
+	assert.deepStrictEqual(
+		(await index.search({ text: 'trail running', mode: 'phrase' })).hits.map((hit) => hit.id),
+		['adjacent'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'trail the running', mode: 'phrase' })).hits.map((hit) => hit.id),
+		['gap'],
+	);
+	const trace = await index.traceMatches({ text: 'trail the running', mode: 'phrase' }, [
+		{ id: 'adjacent', fields: { title: 'trail running' } },
+		{ id: 'gap', fields: { title: 'trail the running' } },
+	]);
+	assert.deepStrictEqual(
+		trace.records.map((record) => record.id),
+		['gap'],
+	);
+	await index.close();
+});
+
+test('field weights can change without rebuilding native storage', async (context) => {
+	const indexPath = temporaryIndex(context);
+	let index = await openNativeFullTextIndex(options(indexPath));
+	await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'shoe', description: 'shoe' } }] });
+	await index.publish('checkpoint-1');
+	await index.close();
+
+	const weighted = options(indexPath, {
+		fields: [
+			{ name: 'title', weight: 8 },
+			{ name: 'description', weight: 0.5 },
+		],
+	});
+	assert.deepStrictEqual(inspectNativeFullTextIndex(weighted), {
+		state: 'checkpointed',
+		committedPayload: 'checkpoint-1',
+	});
+	index = await openNativeFullTextIndex(weighted);
+	assert.strictEqual((await index.search({ text: 'shoe' })).hits[0].id, 'one');
+	await index.close();
+});
+
+test('times out bounded trace work inside the native execution lane', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context), { surfaceTerms: true }));
+	await assert.rejects(
+		index.traceMatches(
+			{ text: 'waterprof', mode: 'fuzzy' },
+			[{ id: 'one', fields: { title: 'waterproof '.repeat(80_000) } }],
+			{ remainingBudgetMilliseconds: 1 },
+		),
+		(error) => error.code === 'E_TIMEOUT',
+	);
+	await index.close();
+});
+
+test('snapshots trace source arrays before asynchronous native execution', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context), { surfaceTerms: true }));
+	const values = ['waterproof shoe'];
+	const trace = index.traceMatches({ text: 'waterproof' }, [{ id: 'one', fields: { title: values } }], {
+		snippets: true,
+	});
+	values[0] = 'changed';
+	assert.strictEqual((await trace).records[0].values[0].fragments[0].text, 'waterproof shoe');
 	await index.close();
 });
 
 test('rejects query modes when their schema capability is disabled', async (context) => {
 	const index = await openNativeFullTextIndex(
 		options(temporaryIndex(context), { positions: false, surfaceTerms: false }),
+	);
+	await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'Waterproof shoe' } }] });
+	await index.commit();
+	await index.reload();
+	assert.deepStrictEqual(
+		(await index.search({ text: 'waterprof', mode: 'fuzzy' })).hits.map((hit) => hit.id),
+		['one'],
 	);
 	await assert.rejects(
 		index.search({ text: 'trail running', mode: 'phrase' }),

@@ -478,7 +478,7 @@ export class NativeFullTextIndex {
 					offset: request.offset ?? 0,
 					limit: request.limit ?? 20,
 					exactTotal: request.exactTotal ?? false,
-					budgetMilliseconds: options.remainingBudgetMilliseconds ?? 30_000,
+					budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
 				}),
 				callback,
 			),
@@ -528,8 +528,9 @@ export class NativeFullTextIndex {
 				if (!Array.isArray(values) || values.some((value) => typeof value !== 'string')) {
 					throw new FulltextError('E_INVALID_ARGUMENT', `trace field ${name} must contain strings`);
 				}
-				normalized[name] = values;
-				return { name, values };
+				const snapshot = values.slice();
+				normalized[name] = snapshot;
+				return { name, values: snapshot };
 			});
 			sourceById.set(record.id, normalized);
 			return { id: record.id, fields };
@@ -552,7 +553,7 @@ export class NativeFullTextIndex {
 					fields: request.fields ?? [],
 					candidateIds: request.candidateIds,
 					records: packedRecords,
-					budgetMilliseconds: options.remainingBudgetMilliseconds ?? 30_000,
+					budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
 				}),
 				callback,
 			),
@@ -942,6 +943,14 @@ function safeNumber(value: bigint, name: string): number {
 		throw new FulltextError('E_NATIVE_FAILURE', `${name} exceeds JavaScript's safe integer range`);
 	}
 	return Number(value);
+}
+
+function searchBudget(value: number | undefined): number {
+	if (value === undefined) return 30_000;
+	if (!Number.isFinite(value) || value <= 0) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'remainingBudgetMilliseconds must be greater than zero');
+	}
+	return Math.min(30_000, Math.floor(value));
 }
 
 function traceFragments(

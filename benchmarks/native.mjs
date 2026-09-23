@@ -108,14 +108,16 @@ try {
 		await index.search({ ...query, limit: 10 });
 	}
 	const warm = await measureSearch(index, queryMix, queryCount, concurrency, false);
-	const byMode = Object.fromEntries(
-		await Promise.all(
-			queryMix.map(async (query) => [
-				query.name,
-				await measureSearch(index, [query], Math.max(4, Math.floor(queryCount / queryMix.length)), concurrency, false),
-			]),
-		),
-	);
+	const byMode = {};
+	for (const query of queryMix) {
+		byMode[query.name] = await measureSearch(
+			index,
+			[query],
+			Math.max(4, Math.floor(queryCount / queryMix.length)),
+			concurrency,
+			false,
+		);
+	}
 	const exactComparisonCount = Math.max(4, Math.floor(queryCount / 10));
 	const approximateSingle = await measureSearch(index, queryMix, exactComparisonCount, 1, false);
 	const exact = await measureSearch(index, queryMix, exactComparisonCount, 1, true);

@@ -21,8 +21,8 @@ use crate::engine::{
 };
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	decode_batch, decode_inspect, decode_open, decode_reset, decode_search, decode_trace, search_mode, trace_mode,
-	validate_batch_header, validate_search_header, EngineConfig, PROTOCOL_VERSION,
+	decode_batch, decode_inspect, decode_open, decode_reset, decode_search, decode_trace, search_mode,
+	validate_batch_header, validate_search_header, validate_trace_header, EngineConfig, PROTOCOL_VERSION,
 };
 
 const STATE_OPEN: u8 = 0;
@@ -131,6 +131,12 @@ struct Queued<T> {
 	value: T,
 	bytes: usize,
 	enqueued: Instant,
+}
+
+enum QueuePop<T> {
+	Item(Queued<T>),
+	TimedOut,
+	Closed,
 }
 
 struct BoundedQueue<T> {
@@ -365,8 +371,8 @@ pub fn native_trace_matches(handle: u32, packed_request: Buffer, callback: JsFun
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
 		runtime.require_open().map_err(fulltext_napi_error)?;
-		let mode = trace_mode(&packed_request).map_err(fulltext_napi_error)?;
-		let queue = runtime.search_queue(mode.is_expensive());
+		validate_trace_header(&packed_request).map_err(fulltext_napi_error)?;
+		let queue = runtime.search_queue(true);
 		queue
 			.check_capacity(packed_request.len())
 			.map_err(fulltext_napi_error)?;
@@ -541,16 +547,15 @@ impl Runtime {
 			let search_runtime = runtime.clone();
 			let search_engine = engine.clone();
 			let search_reader = reader.clone();
-			let ordinary_workers = search_thread_count.div_ceil(2);
-			let queue = if worker < ordinary_workers {
-				runtime.ordinary_search_queue.clone()
-			} else {
-				runtime.expensive_search_queue.as_ref().unwrap().clone()
-			};
 			let join = match thread::Builder::new()
 				.name(format!("fulltext-search-{handle}-{worker}"))
-				.spawn(move || search_loop(search_runtime, search_engine, search_reader, queue))
-			{
+				.spawn(move || {
+					if worker == 0 || search_runtime.expensive_search_queue.is_none() {
+						ordinary_search_loop(search_runtime, search_engine, search_reader);
+					} else {
+						flexible_search_loop(search_runtime, search_engine, search_reader);
+					}
+				}) {
 				Ok(join) => join,
 				Err(error) => {
 					drop(engine);
@@ -781,11 +786,7 @@ impl<T> BoundedQueue<T> {
 	fn pop(&self) -> Option<Queued<T>> {
 		let mut state = lock(&self.state);
 		loop {
-			if let Some(item) = state.items.pop_front() {
-				state.bytes -= item.bytes;
-				self.queued_commands.fetch_sub(1, Ordering::Relaxed);
-				self.queued_bytes.fetch_sub(item.bytes as u64, Ordering::Relaxed);
-				self.release_shared(1, item.bytes);
+			if let Some(item) = self.take_front(&mut state) {
 				return Some(item);
 			}
 			if state.closed {
@@ -793,6 +794,39 @@ impl<T> BoundedQueue<T> {
 			}
 			state = self.ready.wait(state).unwrap_or_else(|error| error.into_inner());
 		}
+	}
+
+	fn try_pop(&self) -> Option<Queued<T>> {
+		self.take_front(&mut lock(&self.state))
+	}
+
+	fn pop_timeout(&self, timeout: Duration) -> QueuePop<T> {
+		let mut state = lock(&self.state);
+		loop {
+			if let Some(item) = self.take_front(&mut state) {
+				return QueuePop::Item(item);
+			}
+			if state.closed {
+				return QueuePop::Closed;
+			}
+			let (next, result) = self
+				.ready
+				.wait_timeout(state, timeout)
+				.unwrap_or_else(|error| error.into_inner());
+			state = next;
+			if result.timed_out() {
+				return QueuePop::TimedOut;
+			}
+		}
+	}
+
+	fn take_front(&self, state: &mut QueueState<T>) -> Option<Queued<T>> {
+		let item = state.items.pop_front()?;
+		state.bytes -= item.bytes;
+		self.queued_commands.fetch_sub(1, Ordering::Relaxed);
+		self.queued_bytes.fetch_sub(item.bytes as u64, Ordering::Relaxed);
+		self.release_shared(1, item.bytes);
+		Some(item)
 	}
 
 	fn close(&self) -> Vec<Queued<T>> {
@@ -1250,53 +1284,88 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 		.ok_or_else(|| FulltextError::new("E_POISONED", "writer is unavailable"))
 }
 
-fn search_loop(
-	runtime: Arc<Runtime>,
-	engine: Arc<Engine>,
-	reader: Arc<IndexReader>,
-	queue: Arc<BoundedQueue<SearchCommand>>,
-) {
-	while let Some(queued) = queue.pop() {
-		let queued_for = queued.enqueued.elapsed();
-		runtime
-			.search_queue_nanoseconds
-			.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
-		let started = Instant::now();
-		let SearchCommand { operation, completion } = queued.value;
-		let result = catch_unwind(AssertUnwindSafe(|| match operation {
-			SearchOperation::Search(bytes) => decode_search(&bytes).and_then(|request| {
-				let deadline = operation_deadline(request.budget_milliseconds, queued_for)?;
-				engine
-					.search_with_deadline(&reader.searcher(), &request, deadline)
-					.map(SearchOutcome::Search)
-			}),
-			SearchOperation::Trace(bytes) => decode_trace(&bytes).and_then(|request| {
-				let deadline = operation_deadline(request.search.budget_milliseconds, queued_for)?;
-				if Instant::now() >= deadline {
-					return Err(search_timeout());
+fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
+	while let Some(queued) = runtime.ordinary_search_queue.pop() {
+		if !execute_search_command(&runtime, &engine, &reader, queued) {
+			return;
+		}
+	}
+}
+
+fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
+	let expensive = runtime.expensive_search_queue.as_ref().unwrap();
+	loop {
+		let queued = expensive.try_pop().or_else(|| runtime.ordinary_search_queue.try_pop());
+		if let Some(queued) = queued {
+			if !execute_search_command(&runtime, &engine, &reader, queued) {
+				return;
+			}
+			continue;
+		}
+		match expensive.pop_timeout(Duration::from_millis(1)) {
+			QueuePop::Item(queued) => {
+				if !execute_search_command(&runtime, &engine, &reader, queued) {
+					return;
 				}
-				engine.validate_query(&reader.searcher(), &request.search)?;
-				let result = engine.trace_matches(&request.search, &request.records)?;
-				if Instant::now() >= deadline {
-					return Err(search_timeout());
+			}
+			QueuePop::TimedOut => {}
+			QueuePop::Closed => {
+				while let Some(queued) = runtime.ordinary_search_queue.pop() {
+					if !execute_search_command(&runtime, &engine, &reader, queued) {
+						return;
+					}
 				}
-				Ok(SearchOutcome::Trace(result))
-			}),
-		}));
-		runtime
-			.search_execution_nanoseconds
-			.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
-		match result {
-			Ok(Ok(SearchOutcome::Search(result))) => completion.success(search_body(result)),
-			Ok(Ok(SearchOutcome::Trace(result))) => completion.success(trace_body(result)),
-			Ok(Err(error)) => completion.failure(error),
-			Err(_) => {
-				completion.failure(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
-				runtime.poison(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
 				return;
 			}
 		}
 	}
+}
+
+fn execute_search_command(
+	runtime: &Runtime,
+	engine: &Engine,
+	reader: &IndexReader,
+	queued: Queued<SearchCommand>,
+) -> bool {
+	let queued_for = queued.enqueued.elapsed();
+	runtime
+		.search_queue_nanoseconds
+		.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
+	let started = Instant::now();
+	let SearchCommand { operation, completion } = queued.value;
+	let result = catch_unwind(AssertUnwindSafe(|| match operation {
+		SearchOperation::Search(bytes) => decode_search(&bytes).and_then(|request| {
+			let deadline = operation_deadline(request.budget_milliseconds, queued.enqueued.elapsed())?;
+			engine
+				.search_with_deadline(&reader.searcher(), &request, deadline)
+				.map(SearchOutcome::Search)
+		}),
+		SearchOperation::Trace(bytes) => decode_trace(&bytes).and_then(|request| {
+			let deadline = operation_deadline(request.search.budget_milliseconds, queued.enqueued.elapsed())?;
+			if Instant::now() >= deadline {
+				return Err(search_timeout());
+			}
+			let result = engine.trace_matches(&request.search, &request.records, Some(deadline))?;
+			if Instant::now() >= deadline {
+				return Err(search_timeout());
+			}
+			Ok(SearchOutcome::Trace(result))
+		}),
+	}));
+	runtime
+		.search_execution_nanoseconds
+		.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+	match result {
+		Ok(Ok(SearchOutcome::Search(result))) => completion.success(search_body(result)),
+		Ok(Ok(SearchOutcome::Trace(result))) => completion.success(trace_body(result)),
+		Ok(Err(error)) => completion.failure(error),
+		Err(_) => {
+			completion.failure(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
+			runtime.poison(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
+			return false;
+		}
+	}
+	true
 }
 
 enum SearchOutcome {
@@ -2123,6 +2192,27 @@ mod tests {
 		ordinary.try_push(3, 4).unwrap();
 		assert_eq!(expensive.pop().unwrap().value, 2);
 		assert_eq!(ordinary.pop().unwrap().value, 3);
+	}
+
+	#[test]
+	fn queue_timeout_distinguishes_idle_from_closed() {
+		let queue = BoundedQueue::<u8>::new(1, 8);
+		assert!(matches!(
+			queue.pop_timeout(Duration::from_millis(1)),
+			QueuePop::TimedOut
+		));
+		queue.try_push(1, 1).unwrap();
+		assert!(matches!(queue.pop_timeout(Duration::from_secs(1)), QueuePop::Item(item) if item.value == 1));
+		queue.shutdown_after_drain();
+		assert!(matches!(queue.pop_timeout(Duration::from_secs(1)), QueuePop::Closed));
+	}
+
+	#[test]
+	fn queued_time_consumes_the_search_budget() {
+		assert_eq!(
+			operation_deadline(1, Duration::from_millis(2)).unwrap_err().code,
+			"E_TIMEOUT"
+		);
 	}
 
 	#[test]

@@ -227,6 +227,14 @@ pub fn validate_search_header(bytes: &[u8]) -> Result<()> {
 	Ok(())
 }
 
+pub fn validate_trace_header(bytes: &[u8]) -> Result<()> {
+	if bytes.len() > MAX_SEARCH_REQUEST_BYTES {
+		return Err(FulltextError::invalid("packed trace request exceeds 8388608 bytes"));
+	}
+	let _ = Cursor::new(bytes, *b"FTTM")?;
+	Ok(())
+}
+
 pub fn search_mode(bytes: &[u8]) -> Result<SearchMode> {
 	validate_search_header(bytes)?;
 	let mut cursor = Cursor::new(bytes, *b"FTSQ")?;
@@ -457,19 +465,6 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 		},
 		records,
 	})
-}
-
-pub fn trace_mode(bytes: &[u8]) -> Result<SearchMode> {
-	if bytes.len() > MAX_SEARCH_REQUEST_BYTES {
-		return Err(FulltextError::invalid("packed trace request exceeds 8388608 bytes"));
-	}
-	let mut cursor = Cursor::new(bytes, *b"FTTM")?;
-	let query_length = cursor.u32()? as usize;
-	if query_length > MAX_QUERY_TEXT_BYTES {
-		return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
-	}
-	cursor.take(query_length)?;
-	decode_search_mode(cursor.u8()?)
 }
 
 fn decode_search_mode(value: u8) -> Result<SearchMode> {

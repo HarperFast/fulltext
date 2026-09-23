@@ -131,7 +131,9 @@ Search uses weighted BM25 and a typed request; raw Tantivy query syntax is not e
 spelling remains a compatibility alias and cannot be combined with `mode`. Candidate IDs compile to
 a score-neutral required filter. Prefix modes are autocomplete-oriented, require offset zero, and
 return at most 100 hits. Fuzzy and prefix work has fixed term, clause, expansion, request, result,
-and execution ceilings.
+and execution ceilings. Prefix expansion fails with `E_PREFIX_TOO_BROAD` instead of silently
+truncating the term set and returning incomplete rankings. `fuzzy-prefix` is a preview capability
+until catalog-scale benchmark qualification is complete.
 
 `total` is bounded by default so Tantivy can retain block-max WAND pruning. Set `exactTotal: true`
 only when an exact match count is worth a second full-match traversal. Ranking is score descending,
@@ -140,7 +142,8 @@ then UTF-8 ID ascending, including ties that cross segment or page boundaries.
 `positions` defaults on and is required for phrase search. `surfaceTerms` defaults off and creates
 an internal unstemmed companion term field used by prefix, fuzzy-prefix, and match tracing. It does
 not store source values. Both settings are persisted and must match when the index is reopened.
-Enable `surfaceTerms` only on indexes that need those operations.
+Enable `surfaceTerms` only on indexes that need those operations. Field weights are query-time
+boosts and may change on reopen without rebuilding the index.
 
 Highlighting is opt-in and operates on caller-supplied current source values, so the wrapper never
 returns stale stored text. It returns UTF-16 half-open offsets and no HTML. Snippets are also off by
@@ -154,11 +157,17 @@ const traced = await index.traceMatches(
 );
 ```
 
+Tracing evaluates only the supplied current values; it does not expand the live index dictionary.
+When its span or response ceiling is reached, `complete` is false and both later spans and later
+matching records may be omitted.
+
 Search and tracing share a maximum 30-second queue-plus-execution budget. Harper passes its shorter
-remaining request budget through the second method argument. Tantivy search is not interruptible;
-an operation that expires in flight is discarded after Tantivy returns. With at least two search
-threads, one worker is reserved for ordinary `any`/`all` BM25 and expensive modes use a separate
-queue. A one-thread configuration remains valid but cannot isolate query classes.
+remaining request budget through the second method argument; larger values are clamped to 30
+seconds. Tantivy search itself is not interruptible, so a search that expires in flight is discarded
+after Tantivy returns. Match tracing checks its deadline while tokenizing and matching. With at
+least two search threads, one worker is reserved for ordinary `any`/`all` BM25. The remaining
+workers prioritize phrase, prefix, fuzzy, and trace work, then steal ordinary work when that queue
+is idle. A one-thread configuration remains valid but cannot isolate query classes.
 
 `close()` rejects uncommitted data by default. Use `close({ mode: 'rollback' })` to discard it
 explicitly. `commit()` publishes mutations, and `reload()` makes the latest commit visible to this

@@ -516,6 +516,7 @@ function encodeBatchHeader(upserts: number, deletes: number): Buffer {
 }
 
 export function encodeSearch(request: PackedSearchRequest): Buffer {
+	validateCandidateIds(request.candidateIds);
 	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
 	writer.header('FTSQ');
 	writer.string(request.text);
@@ -539,6 +540,7 @@ export function encodeSearch(request: PackedSearchRequest): Buffer {
 }
 
 export function encodeTrace(request: PackedTraceRequest): Buffer {
+	validateCandidateIds(request.candidateIds);
 	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
 	writer.header('FTTM');
 	writer.string(request.text);
@@ -562,6 +564,15 @@ export function encodeTrace(request: PackedTraceRequest): Buffer {
 	}
 	writer.u32(request.budgetMilliseconds, 'budgetMilliseconds');
 	return writer.finish();
+}
+
+function validateCandidateIds(candidateIds: string[] | undefined): void {
+	if (
+		candidateIds !== undefined &&
+		(!Array.isArray(candidateIds) || candidateIds.some((id) => typeof id !== 'string'))
+	) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'candidateIds must be an array of strings');
+	}
 }
 
 export function decodeResponse(value: Buffer): Cursor {

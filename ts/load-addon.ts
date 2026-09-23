@@ -111,12 +111,6 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 			`Fulltext query API ${info.queryApiVersion} from ${artifactPath} is not supported`,
 		);
 	}
-	if (info.queryClassIsolationMinimumSearchThreads !== 2) {
-		throw new FulltextError(
-			'E_NATIVE_CAPABILITY_MISMATCH',
-			`Fulltext query-class isolation from ${artifactPath} has an unsupported worker requirement`,
-		);
-	}
 	if (typeof addon.__nativeInspect !== 'function') {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',

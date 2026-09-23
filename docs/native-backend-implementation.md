@@ -174,8 +174,8 @@ generation; it is persisted in the engine fingerprint and must match on reopen. 
 opstamp or a Harper transaction-log position.
 `surfaceTerms` creates a separately indexed, unstemmed companion term field for prefix,
 fuzzy-prefix, and current-record match tracing; it never stores source values. It defaults off
-because of its storage cost. Field weights are applied as query boosts and are persisted as part of
-the logical index identity.
+because of its storage cost. Field weights are query-time boosts and may change when reopening the
+same physical index without rebuilding it.
 
 The public search method accepts a small typed request and decodes a versioned native result buffer
 into bounded result objects. The N-API boundary receives one operation per batch or search;
@@ -210,7 +210,8 @@ N-API handle registry ── canonical path reservation
   │                                                       └─ Tantivy IndexWriter
   │                                                          └─ indexing/merge workers
   └─ search/reload ─┬► bounded ordinary queue ─► reserved ordinary worker
-                    └► bounded expensive queue ─► phrase/prefix/fuzzy workers
+                    │                         └► idle flexible workers
+                    └► bounded expensive queue ─► flexible workers
                                                   └─ shared IndexReader/Searcher
 
 writer actor ─► shared engine ─► MmapDirectory
@@ -226,6 +227,12 @@ requests. Tantivy remains free to use its
 configured indexing and merge workers behind the writer actor. Independent indexes and their
 searches may run concurrently. #17 later replaces the per-index search pools with the bounded
 process pool without changing engine behavior.
+
+With two or more search threads, one worker consumes only the ordinary BM25 lane. Every other
+worker prioritizes phrase, prefix, fuzzy, and trace requests, then steals ordinary work when the
+expensive lane is idle. This preserves ordinary-query capacity during expensive traffic without
+stranding half the pool during ordinary-only workloads. A one-thread configuration uses one shared
+lane and provides no query-class isolation.
 
 Both queues are bounded by command count and retained bytes. A JS-owned buffer is copied once into a
 Rust-owned `Vec<u8>` before admission; no native thread borrows memory owned by a Node environment.
@@ -257,9 +264,9 @@ change durable semantics, and Tantivy performs its own index-format compatibilit
 compares both the generated Tantivy schema and this fingerprint before creating a writer. The
 immutable sidecar is separate from Tantivy's per-commit payload, which remains available for
 standalone checkpoints and derived watermarks.
-Unknown mutation fields, missing IDs, duplicate schema
-field names, empty queries, unknown search fields, oversized batches, and excessive result windows
-fail before search/index work.
+Unknown mutation fields, missing IDs, duplicate schema field names, unknown search fields, oversized
+batches, and excessive result windows fail before search/index work. Blank and stop-word-only
+queries return an exact empty result.
 
 Create treats `{sidecar, meta.json}` as a pair. If neither exists, it writes and syncs the sidecar
 first and then creates the Tantivy index. If both exist, it reopens and verifies them. A sidecar-only
@@ -289,6 +296,15 @@ total is explicit per query, runs a separate `Count`, and is benchmarked separat
 concurrency because it must visit all matches. The initial schema resolves hit IDs through that fast
 field once per result segment, avoiding stored-document decompression on every result. The ID is not
 duplicated in Tantivy's document store.
+
+Phrase queries preserve analyzer positions, including gaps left by removed stop words, and match
+tracing uses the same positional rule. Prefix expansion is capped; exceeding the cap returns
+`E_PREFIX_TOO_BROAD` rather than truncating the term set and silently biasing recall or rank. A
+caller such as Harper may catch that distinct code and choose a documented fallback. Fuzzy-prefix
+remains a preview capability until the catalog-scale benchmark qualifies it. Request budgets cover
+queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing;
+Tantivy's collector itself cannot be interrupted, so an expired search result is discarded after
+the collector returns.
 
 ## Failure and lifecycle behavior
 

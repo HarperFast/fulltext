@@ -12,7 +12,7 @@ use tantivy::query::{
 };
 use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{
-	Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer,
+	Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TokenStream,
 };
 use tantivy::{DocAddress, Index, IndexReader, IndexSettings, IndexWriter, Order, ReloadPolicy, Searcher, Term};
 
@@ -118,12 +118,13 @@ struct SourceToken {
 	text: String,
 	start: usize,
 	end: usize,
+	position: usize,
 }
 
 enum TracePlan {
 	Any(Vec<String>),
 	All(Vec<String>),
-	Phrase(Vec<String>),
+	Phrase(Vec<(usize, String)>),
 	Prefix {
 		completed: Vec<String>,
 		prefix: String,
@@ -344,7 +345,7 @@ impl Engine {
 				})
 				.collect::<Result<Vec<_>>>()?
 		} else {
-			let ids = search_hit_ids(searcher, &scored_docs)?;
+			let ids = search_hit_ids(searcher, &scored_docs, MAX_SEARCH_RESPONSE_BYTES - 13)?;
 			let mut ranked = scored_docs
 				.iter()
 				.zip(ids)
@@ -387,7 +388,13 @@ impl Engine {
 		})
 	}
 
-	pub fn trace_matches(&self, request: &SearchRequest, records: &[TraceRecord]) -> Result<TraceResult> {
+	pub fn trace_matches(
+		&self,
+		request: &SearchRequest,
+		records: &[TraceRecord],
+		deadline: Option<Instant>,
+	) -> Result<TraceResult> {
+		check_deadline(deadline)?;
 		let selected = self.selected_fields(&request.fields)?;
 		self.require_surface_fields(&selected)?;
 		let selected_names = selected.iter().map(|field| field.name.as_str()).collect::<HashSet<_>>();
@@ -404,8 +411,10 @@ impl Engine {
 		let plan = self.trace_plan(request)?;
 		let mut complete = true;
 		let mut remaining_spans = MAX_TRACE_SPANS;
+		let mut response_bytes = 3usize;
 		let mut matched_records = Vec::new();
 		for record in records {
+			check_deadline(deadline)?;
 			if candidates
 				.as_ref()
 				.is_some_and(|candidates| !candidates.contains(record.id.as_str()))
@@ -413,8 +422,9 @@ impl Engine {
 				continue;
 			}
 			let mut seen_fields = HashSet::new();
-			let mut values = Vec::new();
+			let mut pending_values = Vec::new();
 			let mut found = HashSet::new();
+			let mut record_span_budget = remaining_spans;
 			for (field, source_values) in &record.fields {
 				if !seen_fields.insert(field.as_str()) {
 					return Err(FulltextError::invalid(format!("duplicate trace field {field}")));
@@ -426,26 +436,49 @@ impl Engine {
 					continue;
 				}
 				for (value_index, value) in source_values.iter().enumerate() {
-					let (spans, terms) = self.trace_value(&plan, value)?;
+					check_deadline(deadline)?;
+					let (spans, terms, truncated) = self.trace_value(&plan, value, record_span_budget, deadline)?;
+					if truncated {
+						complete = false;
+					}
 					found.extend(terms);
 					if spans.is_empty() {
 						continue;
 					}
-					let keep = spans.len().min(remaining_spans);
+					record_span_budget = record_span_budget.saturating_sub(spans.len());
+					pending_values.push((field.as_str(), value_index as u32, spans));
+				}
+			}
+			if plan.record_matches(&found) && !pending_values.is_empty() {
+				let record_header_bytes = 6usize.saturating_add(record.id.len());
+				let mut record_bytes = 0usize;
+				let mut values = Vec::new();
+				for (field, value_index, spans) in pending_values {
+					let value_header_bytes = 10usize.saturating_add(field.len());
+					let available = MAX_SEARCH_RESPONSE_BYTES
+						.saturating_sub(response_bytes)
+						.saturating_sub(record_header_bytes)
+						.saturating_sub(record_bytes);
+					let byte_limited_spans = available.saturating_sub(value_header_bytes) / 8;
+					let keep = spans.len().min(remaining_spans).min(byte_limited_spans);
 					if keep < spans.len() {
 						complete = false;
 					}
-					if keep > 0 {
-						values.push(TraceValueMatch {
-							field: field.clone(),
-							value_index: value_index as u32,
-							spans: spans.into_iter().take(keep).collect(),
-						});
-						remaining_spans -= keep;
+					if keep == 0 {
+						continue;
 					}
+					values.push(TraceValueMatch {
+						field: field.to_owned(),
+						value_index,
+						spans: spans.into_iter().take(keep).collect(),
+					});
+					remaining_spans -= keep;
+					record_bytes = record_bytes.saturating_add(value_header_bytes + keep * 8);
 				}
-			}
-			if plan.record_matches(&found) && !values.is_empty() {
+				if values.is_empty() {
+					continue;
+				}
+				response_bytes = response_bytes.saturating_add(record_header_bytes + record_bytes);
 				matched_records.push(TraceRecordMatch {
 					id: record.id.clone(),
 					values,
@@ -458,11 +491,6 @@ impl Engine {
 		})
 	}
 
-	pub fn validate_query(&self, searcher: &Searcher, request: &SearchRequest) -> Result<()> {
-		let selected = self.selected_fields(&request.fields)?;
-		self.query(searcher, request, &selected).map(drop)
-	}
-
 	fn trace_plan(&self, request: &SearchRequest) -> Result<TracePlan> {
 		match request.mode {
 			SearchMode::Any => Ok(TracePlan::Any(self.analyze(&request.text, false, true)?)),
@@ -471,17 +499,14 @@ impl Engine {
 				if !self.positions {
 					return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
 				}
-				Ok(TracePlan::Phrase(self.analyze(&request.text, false, false)?))
+				Ok(TracePlan::Phrase(self.analyze_positioned(&request.text)?))
 			}
 			SearchMode::Prefix | SearchMode::FuzzyPrefix => {
 				if request.text.chars().last().is_some_and(char::is_whitespace) {
 					return Ok(TracePlan::All(self.analyze(&request.text, false, true)?));
 				}
 				let (completed, prefix) = self.final_surface_term(&request.text)?;
-				let mut prefix = prefix.unwrap_or_default();
-				if self.analyze(&prefix, false, false)?.is_empty() {
-					prefix.clear();
-				}
+				let prefix = prefix.unwrap_or_default();
 				let minimum = if request.mode == SearchMode::FuzzyPrefix { 4 } else { 3 };
 				if !prefix.is_empty() && prefix.chars().count() < minimum {
 					return Err(FulltextError::invalid(format!(
@@ -516,30 +541,51 @@ impl Engine {
 		}
 	}
 
-	fn trace_value(&self, plan: &TracePlan, value: &str) -> Result<(Vec<TraceSpan>, HashSet<String>)> {
-		let analyzed = self.source_tokens(value, false);
-		let surface = self.source_tokens(value, true);
+	fn trace_value(
+		&self,
+		plan: &TracePlan,
+		value: &str,
+		max_spans: usize,
+		deadline: Option<Instant>,
+	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool)> {
+		let analyzed = self.source_tokens(value, false, deadline)?;
+		let surface = self.source_tokens(value, true, deadline)?;
+		let utf16_offsets = utf16_offsets(value);
 		let mut spans = Vec::new();
 		let mut found = HashSet::new();
+		let mut truncated = false;
 		match plan {
 			TracePlan::Any(terms) | TracePlan::All(terms) => {
-				for token in &analyzed {
+				for (index, token) in analyzed.iter().enumerate() {
+					if index % 256 == 0 {
+						check_deadline(deadline)?;
+					}
 					if terms.contains(&token.text) {
 						found.insert(token.text.clone());
-						spans.push(source_span(value, token.start, token.end));
+						truncated |= push_trace_span(
+							&mut spans,
+							source_span(&utf16_offsets, token.start, token.end),
+							max_spans,
+						);
 					}
 				}
 			}
 			TracePlan::Phrase(terms) => {
 				if !terms.is_empty() {
 					for window in analyzed.windows(terms.len()) {
-						if window
-							.iter()
-							.map(|token| token.text.as_str())
-							.eq(terms.iter().map(String::as_str))
-						{
+						check_deadline(deadline)?;
+						let first_source_position = window[0].position;
+						let first_query_position = terms[0].0;
+						if window.iter().zip(terms).all(|(token, (position, term))| {
+							token.text == *term
+								&& token.position - first_source_position == position - first_query_position
+						}) {
 							found.insert("__phrase".to_owned());
-							spans.push(source_span(value, window[0].start, window[window.len() - 1].end));
+							truncated |= push_trace_span(
+								&mut spans,
+								source_span(&utf16_offsets, window[0].start, window[window.len() - 1].end),
+								max_spans,
+							);
 						}
 					}
 				}
@@ -549,30 +595,51 @@ impl Engine {
 				prefix,
 				fuzzy,
 			} => {
-				for token in &analyzed {
+				for (index, token) in analyzed.iter().enumerate() {
+					if index % 256 == 0 {
+						check_deadline(deadline)?;
+					}
 					if completed.contains(&token.text) {
 						found.insert(token.text.clone());
-						spans.push(source_span(value, token.start, token.end));
+						truncated |= push_trace_span(
+							&mut spans,
+							source_span(&utf16_offsets, token.start, token.end),
+							max_spans,
+						);
 					}
 				}
-				for token in &surface {
+				for (index, token) in surface.iter().enumerate() {
+					if index % 256 == 0 {
+						check_deadline(deadline)?;
+					}
 					if token.text.starts_with(prefix)
 						|| (*fuzzy && fuzzy_eligible(prefix) && fuzzy_prefix_matches(prefix, &token.text))
 					{
 						found.insert("__prefix".to_owned());
-						spans.push(source_span(value, token.start, token.end));
+						truncated |= push_trace_span(
+							&mut spans,
+							source_span(&utf16_offsets, token.start, token.end),
+							max_spans,
+						);
 					}
 				}
 			}
 			TracePlan::Fuzzy(terms) => {
-				for token in &surface {
+				for (index, token) in surface.iter().enumerate() {
+					if index % 256 == 0 {
+						check_deadline(deadline)?;
+					}
 					let analyzed_token = self.analyze(&token.text, false, false)?;
 					for (analyzed_term, surface_term) in terms {
 						if analyzed_token.first() == Some(analyzed_term)
 							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
 						{
 							found.insert(analyzed_term.clone());
-							spans.push(source_span(value, token.start, token.end));
+							truncated |= push_trace_span(
+								&mut spans,
+								source_span(&utf16_offsets, token.start, token.end),
+								max_spans,
+							);
 							break;
 						}
 					}
@@ -581,24 +648,30 @@ impl Engine {
 		}
 		spans.sort_by_key(|span| (span.start, span.end));
 		spans.dedup();
-		Ok((spans, found))
+		Ok((spans, found, truncated))
 	}
 
-	fn source_tokens(&self, text: &str, surface: bool) -> Vec<SourceToken> {
+	fn source_tokens(&self, text: &str, surface: bool, deadline: Option<Instant>) -> Result<Vec<SourceToken>> {
 		let mut analyzer = if surface {
 			self.surface_analyzer.clone()
 		} else {
 			self.analyzer.clone()
 		};
 		let mut tokens = Vec::new();
-		analyzer.token_stream(text).process(&mut |token| {
+		let mut stream = analyzer.token_stream(text);
+		while stream.advance() {
+			if tokens.len() % 256 == 0 {
+				check_deadline(deadline)?;
+			}
+			let token = stream.token();
 			tokens.push(SourceToken {
 				text: token.text.clone(),
 				start: token.offset_from,
 				end: token.offset_to,
+				position: token.position,
 			});
-		});
-		tokens
+		}
+		Ok(tokens)
 	}
 
 	fn selected_fields(&self, requested: &[String]) -> Result<Vec<&EngineField>> {
@@ -654,6 +727,22 @@ impl Engine {
 		Ok(terms)
 	}
 
+	fn analyze_positioned(&self, text: &str) -> Result<Vec<(usize, String)>> {
+		let mut analyzer = self.analyzer.clone();
+		let mut stream = analyzer.token_stream(text);
+		let mut terms = Vec::new();
+		while stream.advance() {
+			let token = stream.token();
+			terms.push((token.position, token.text.clone()));
+			if terms.len() > MAX_QUERY_TERMS {
+				return Err(FulltextError::invalid(format!(
+					"search text produces more than {MAX_QUERY_TERMS} terms"
+				)));
+			}
+		}
+		Ok(terms)
+	}
+
 	fn term_query(&self, text: &str, fields: &[&EngineField], occur: Occur) -> Result<Box<dyn Query>> {
 		let terms = self.analyze(text, false, true)?;
 		if terms.is_empty() {
@@ -672,21 +761,22 @@ impl Engine {
 		if !self.positions {
 			return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
 		}
-		let terms = self.analyze(text, false, false)?;
+		let terms = self.analyze_positioned(text)?;
 		if terms.is_empty() {
 			return Ok(Box::new(EmptyQuery));
 		}
 		if terms.len() == 1 {
-			return Ok(self.term_group(&terms[0], fields));
+			return Ok(self.term_group(&terms[0].1, fields));
 		}
 		self.check_clause_count(1, fields.len())?;
 		let alternatives = fields
 			.iter()
 			.map(|field| {
-				let query: Box<dyn Query> = Box::new(PhraseQuery::new(
+				let first_position = terms[0].0;
+				let query: Box<dyn Query> = Box::new(PhraseQuery::new_with_offset(
 					terms
 						.iter()
-						.map(|term| Term::from_field_text(field.field, term))
+						.map(|(position, term)| (position - first_position, Term::from_field_text(field.field, term)))
 						.collect(),
 				));
 				(Occur::Should, boosted(query, field.weight))
@@ -707,7 +797,6 @@ impl Engine {
 		if pairs.is_empty() {
 			return Ok(Box::new(EmptyQuery));
 		}
-		self.require_surface_fields(fields)?;
 		let fuzzy_terms = pairs.iter().filter(|(_, term)| fuzzy_eligible(term)).count();
 		if fuzzy_terms > MAX_FUZZY_TERMS {
 			return Err(FulltextError::invalid(format!(
@@ -715,6 +804,7 @@ impl Engine {
 			)));
 		}
 		self.check_clause_count(pairs.len(), fields.len().saturating_mul(3))?;
+		let exact_bonus = fields.iter().map(|field| field.weight).fold(0.0f32, f32::max) * 0.25 + 1.0;
 		let clauses = pairs
 			.into_iter()
 			.map(|(analyzed, surface)| {
@@ -724,9 +814,9 @@ impl Engine {
 				}
 				let exact_branch: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
 					(Occur::Must, exact.box_clone()),
-					(Occur::Must, Box::new(ConstScoreQuery::new(exact, 1.0))),
+					(Occur::Must, Box::new(ConstScoreQuery::new(exact, exact_bonus))),
 				]));
-				let fuzzy = self.fuzzy_group(&surface, fields, false)?;
+				let fuzzy = self.fuzzy_group(&analyzed, fields, false)?;
 				Ok((
 					Occur::Should,
 					Box::new(DisjunctionMaxQuery::new(vec![exact_branch, fuzzy])) as Box<dyn Query>,
@@ -751,9 +841,6 @@ impl Engine {
 		let Some(surface_prefix) = surface_prefix else {
 			return Ok(Box::new(EmptyQuery));
 		};
-		if self.analyze(&surface_prefix, false, false)?.is_empty() {
-			return Ok(Box::new(EmptyQuery));
-		}
 		let minimum = if fuzzy { 4 } else { 3 };
 		if surface_prefix.chars().count() < minimum {
 			return Err(FulltextError::invalid(format!(
@@ -779,8 +866,17 @@ impl Engine {
 			)));
 		}
 		let final_group = if fuzzy && fuzzy_eligible(&surface_prefix) {
+			let exact_bonus = fields.iter().map(|field| field.weight).fold(0.0f32, f32::max) * 0.25 + 1.0;
+			let exact_for_bonus = exact_prefix.box_clone();
+			let exact_branch: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
+				(Occur::Must, exact_prefix),
+				(
+					Occur::Must,
+					Box::new(ConstScoreQuery::new(exact_for_bonus, exact_bonus)),
+				),
+			]));
 			Box::new(DisjunctionMaxQuery::new(vec![
-				Box::new(ConstScoreQuery::new(exact_prefix, 2.0)),
+				exact_branch,
 				self.fuzzy_group(&surface_prefix, fields, true)?,
 			])) as Box<dyn Query>
 		} else {
@@ -821,10 +917,14 @@ impl Engine {
 		let alternatives = fields
 			.iter()
 			.map(|field| {
-				let surface_field = field.surface_field.ok_or_else(|| {
-					FulltextError::invalid("prefix and fuzzy search require surfaceTerms to be enabled")
-				})?;
-				let term = Term::from_field_text(surface_field, term);
+				let query_field = if prefix {
+					field
+						.surface_field
+						.ok_or_else(|| FulltextError::invalid("prefix search requires surfaceTerms to be enabled"))?
+				} else {
+					field.field
+				};
+				let term = Term::from_field_text(query_field, term);
 				let query: Box<dyn Query> = if prefix {
 					Box::new(FuzzyTermQuery::new_prefix(term, 1, true))
 				} else {
@@ -849,7 +949,7 @@ impl Engine {
 		for field in fields {
 			let surface_field = field
 				.surface_field
-				.ok_or_else(|| FulltextError::invalid("prefix and fuzzy search require surfaceTerms to be enabled"))?;
+				.ok_or_else(|| FulltextError::invalid("prefix search requires surfaceTerms to be enabled"))?;
 			let mut terms = BTreeSet::new();
 			for segment in searcher.segment_readers() {
 				let inverted = segment.inverted_index(surface_field).map_err(index_error)?;
@@ -863,9 +963,10 @@ impl Engine {
 				while stream.advance() {
 					terms.insert(stream.key().to_vec());
 					if terms.len() > MAX_PREFIX_EXPANSIONS {
-						return Err(FulltextError::invalid(format!(
-							"prefix expands to more than {MAX_PREFIX_EXPANSIONS} terms"
-						)));
+						return Err(FulltextError::new(
+							"E_PREFIX_TOO_BROAD",
+							format!("prefix expands to more than {MAX_PREFIX_EXPANSIONS} terms"),
+						));
 					}
 				}
 			}
@@ -912,7 +1013,7 @@ impl Engine {
 	fn require_surface_fields(&self, fields: &[&EngineField]) -> Result<()> {
 		if fields.iter().any(|field| field.surface_field.is_none()) {
 			return Err(FulltextError::invalid(
-				"prefix and fuzzy search require surfaceTerms to be enabled",
+				"prefix search and match tracing require surfaceTerms to be enabled",
 			));
 		}
 		Ok(())
@@ -939,7 +1040,7 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
 	}
 }
 
-fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Result<Vec<String>> {
+fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)], max_bytes: usize) -> Result<Vec<String>> {
 	let mut hits_by_segment = HashMap::new();
 	for (index, (_, address)) in scored_docs.iter().enumerate() {
 		hits_by_segment
@@ -948,6 +1049,7 @@ fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Res
 			.push((index, address.doc_id));
 	}
 	let mut ids = vec![String::new(); scored_docs.len()];
+	let mut response_bytes = 0usize;
 	for (segment_ord, segment_hits) in hits_by_segment {
 		let segment = &searcher.segment_readers()[segment_ord as usize];
 		let column = segment
@@ -972,9 +1074,19 @@ fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Res
 					"search hit ID ordinal is missing",
 				));
 			}
-			ids[index] = std::str::from_utf8(&id)
+			let id = std::str::from_utf8(&id)
 				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?
 				.to_owned();
+			response_bytes = response_bytes
+				.checked_add(8 + id.len())
+				.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))?;
+			if response_bytes > max_bytes {
+				return Err(FulltextError::new(
+					"E_RESULT_TOO_LARGE",
+					format!("search response exceeds {} bytes", max_bytes + 13),
+				));
+			}
+			ids[index] = id;
 		}
 	}
 	Ok(ids)
@@ -996,10 +1108,33 @@ fn fuzzy_eligible(term: &str) -> bool {
 			.any(|character| character.is_numeric() || matches!(character, '-' | '_' | '/'))
 }
 
-fn source_span(source: &str, start: usize, end: usize) -> TraceSpan {
+fn utf16_offsets(source: &str) -> Option<Vec<u32>> {
+	if source.is_ascii() {
+		return None;
+	}
+	let mut offsets = vec![0; source.len() + 1];
+	let mut utf16_offset = 0u32;
+	for (byte_offset, character) in source.char_indices() {
+		offsets[byte_offset] = utf16_offset;
+		utf16_offset += character.len_utf16() as u32;
+		offsets[byte_offset + character.len_utf8()] = utf16_offset;
+	}
+	Some(offsets)
+}
+
+fn source_span(utf16_offsets: &Option<Vec<u32>>, start: usize, end: usize) -> TraceSpan {
 	TraceSpan {
-		start: source[..start].encode_utf16().count() as u32,
-		end: source[..end].encode_utf16().count() as u32,
+		start: utf16_offsets.as_ref().map_or(start as u32, |offsets| offsets[start]),
+		end: utf16_offsets.as_ref().map_or(end as u32, |offsets| offsets[end]),
+	}
+}
+
+fn push_trace_span(spans: &mut Vec<TraceSpan>, span: TraceSpan, max_spans: usize) -> bool {
+	if spans.len() < max_spans {
+		spans.push(span);
+		false
+	} else {
+		true
 	}
 }
 
@@ -1232,7 +1367,6 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 	bytes.extend_from_slice(&(config.fields.len() as u16).to_le_bytes());
 	for field in &config.fields {
 		push_string(&mut bytes, &field.name);
-		bytes.extend_from_slice(&field.weight.to_le_bytes());
 	}
 	bytes
 }
@@ -1258,10 +1392,6 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	offset += 2;
 	for _ in 0..field_count {
 		take_string(bytes, &mut offset)?;
-		if version == b"\x02\x00" {
-			offset = offset.checked_add(4)?;
-			bytes.get(offset.saturating_sub(4)..offset)?;
-		}
 	}
 	(offset == bytes.len()).then_some(index_id)
 }
@@ -1663,7 +1793,7 @@ mod tests {
 				},
 			)
 			.unwrap_err();
-		assert_eq!(error.code, "E_INVALID_ARGUMENT");
+		assert_eq!(error.code, "E_PREFIX_TOO_BROAD");
 		assert!(error.message.contains("more than 50 terms"));
 		writer.close().unwrap();
 	}
