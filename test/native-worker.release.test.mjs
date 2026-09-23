@@ -9,6 +9,7 @@ for (const [scenario, name] of [
 	['apply', 'abrupt worker termination detaches completions and releases its writer'],
 	['opening', 'worker termination during open releases its native cleanup hook'],
 	['multiple', 'worker termination releases every index in one Node environment'],
+	['sequence', 'repeated worker termination remains safe in one Node process'],
 ]) {
 	test(name, async () => {
 		const result = await runScenario(scenario);

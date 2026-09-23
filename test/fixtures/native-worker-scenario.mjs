@@ -15,6 +15,10 @@ if (scenario === 'apply') {
 	await runOpening();
 } else if (scenario === 'multiple') {
 	await runMultiple();
+} else if (scenario === 'sequence') {
+	await runApply();
+	await runOpening();
+	await runMultiple();
 } else {
 	throw new Error(`unknown native worker scenario: ${scenario}`);
 }
