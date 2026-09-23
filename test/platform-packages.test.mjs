@@ -98,6 +98,12 @@ test('release tarballs use unambiguous absolute paths for npm publish', (context
 	assert.deepStrictEqual(tarballsIn(path.relative(process.cwd(), temporaryDirectory)), [path.resolve(tarball)]);
 });
 
+test('release workflow marks staged platform packages as local npm inputs', () => {
+	const workflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
+	assert.match(workflow, /npm pack "\.\/release\/\$\{\{ matrix\.target \}\}"/);
+	assert.doesNotMatch(workflow, /npm pack "release\/\$\{\{ matrix\.target \}\}"/);
+});
+
 test('npm registry responses distinguish unpublished versions from malformed metadata', () => {
 	assert.strictEqual(parsePublishedIntegrity(''), undefined);
 	assert.strictEqual(parsePublishedIntegrity('null\n'), undefined);

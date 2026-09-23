@@ -7,7 +7,7 @@ import { Worker } from 'node:worker_threads';
 
 import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
 
-test('worker termination detaches completions and releases its writer', async (context) => {
+test('abrupt worker termination detaches completions and releases its writer', async (context) => {
 	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-'));
 	context.after(() => rmSync(indexPath, { recursive: true, force: true }));
 	const worker = new Worker(new URL('./fixtures/native-worker-child.mjs', import.meta.url), {

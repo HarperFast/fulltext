@@ -11,18 +11,14 @@ if (phase !== 'test' && phase !== 'release') {
 const testDirectory = fileURLToPath(new URL('../test/', import.meta.url));
 const files = readdirSync(testDirectory, { recursive: true })
 	.filter((entry) => typeof entry === 'string' && entry.endsWith('.test.mjs'))
-	.filter(
-		(entry) =>
-			(phase === 'release') ===
-			(entry.endsWith('.release.test.mjs') || path.basename(entry) === 'native-worker.test.mjs'),
-	)
+	.filter((entry) => (phase === 'release') === entry.endsWith('.release.test.mjs'))
 	.map((entry) => path.join(testDirectory, entry));
 
 if (files.length === 0) {
 	throw new Error(`No ${phase} test files were discovered`);
 }
 
-const isolatedFiles = files.filter((file) => path.basename(file) === 'native-worker.test.mjs');
+const isolatedFiles = files.filter((file) => path.basename(file).startsWith('native-worker.'));
 const concurrentFiles = files.filter((file) => !isolatedFiles.includes(file));
 const nodeMajorVersion = Number.parseInt(process.versions.node, 10);
 const isolatedTestTimeout = 120_000;
