@@ -21,8 +21,8 @@ use crate::engine::{
 };
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	decode_batch, decode_inspect, decode_open, decode_reset, decode_search, decode_trace, search_mode,
-	validate_batch_header, validate_search_header, validate_trace_header, EngineConfig, PROTOCOL_VERSION,
+	decode_batch, decode_inspect, decode_open, decode_reset, decode_search, decode_trace, search_budget, search_mode,
+	trace_budget, validate_batch_header, validate_search_header, validate_trace_header, EngineConfig, PROTOCOL_VERSION,
 };
 
 const STATE_OPEN: u8 = 0;
@@ -69,6 +69,7 @@ struct Runtime {
 	writer_queue: Arc<BoundedQueue<WriterCommand>>,
 	ordinary_search_queue: Arc<BoundedQueue<SearchCommand>>,
 	expensive_search_queue: Option<Arc<BoundedQueue<SearchCommand>>>,
+	search_wake: Option<Arc<QueueWake>>,
 	state: AtomicU8,
 	environment: Arc<EnvironmentState>,
 	uncommitted_mutations: AtomicU64,
@@ -133,12 +134,6 @@ struct Queued<T> {
 	enqueued: Instant,
 }
 
-enum QueuePop<T> {
-	Item(Queued<T>),
-	TimedOut,
-	Closed,
-}
-
 struct BoundedQueue<T> {
 	state: Mutex<QueueState<T>>,
 	ready: Condvar,
@@ -147,12 +142,18 @@ struct BoundedQueue<T> {
 	queued_commands: AtomicU64,
 	queued_bytes: AtomicU64,
 	shared_budget: Option<Arc<QueueBudget>>,
+	shared_wake: Option<Arc<QueueWake>>,
 }
 
 struct QueueBudget {
 	state: Mutex<(usize, usize)>,
 	max_commands: usize,
 	max_bytes: usize,
+}
+
+struct QueueWake {
+	generation: Mutex<u64>,
+	ready: Condvar,
 }
 
 type Callback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
@@ -499,16 +500,19 @@ impl Runtime {
 				parts.config.limits.max_queued_bytes,
 			))
 		});
-		let ordinary_search_queue = Arc::new(BoundedQueue::new_with_budget(
+		let search_wake = (search_thread_count >= 2).then(|| Arc::new(QueueWake::new()));
+		let ordinary_search_queue = Arc::new(BoundedQueue::new_with_budget_and_wake(
 			parts.config.limits.max_queued_commands,
 			parts.config.limits.max_queued_bytes,
 			search_budget.clone(),
+			search_wake.clone(),
 		));
 		let expensive_search_queue = (search_thread_count >= 2).then(|| {
-			Arc::new(BoundedQueue::new_with_budget(
+			Arc::new(BoundedQueue::new_with_budget_and_wake(
 				parts.config.limits.max_queued_commands,
 				parts.config.limits.max_queued_bytes,
 				search_budget,
+				search_wake.clone(),
 			))
 		});
 		let runtime = Arc::new(Self {
@@ -519,6 +523,7 @@ impl Runtime {
 			writer_queue,
 			ordinary_search_queue,
 			expensive_search_queue,
+			search_wake,
 			state: AtomicU8::new(STATE_OPEN),
 			environment,
 			uncommitted_mutations: AtomicU64::new(0),
@@ -707,10 +712,15 @@ impl CompletionSignal {
 
 impl<T> BoundedQueue<T> {
 	fn new(max_commands: usize, max_bytes: usize) -> Self {
-		Self::new_with_budget(max_commands, max_bytes, None)
+		Self::new_with_budget_and_wake(max_commands, max_bytes, None, None)
 	}
 
-	fn new_with_budget(max_commands: usize, max_bytes: usize, shared_budget: Option<Arc<QueueBudget>>) -> Self {
+	fn new_with_budget_and_wake(
+		max_commands: usize,
+		max_bytes: usize,
+		shared_budget: Option<Arc<QueueBudget>>,
+		shared_wake: Option<Arc<QueueWake>>,
+	) -> Self {
 		Self {
 			state: Mutex::new(QueueState {
 				items: VecDeque::new(),
@@ -723,6 +733,7 @@ impl<T> BoundedQueue<T> {
 			queued_commands: AtomicU64::new(0),
 			queued_bytes: AtomicU64::new(0),
 			shared_budget,
+			shared_wake,
 		}
 	}
 
@@ -744,6 +755,7 @@ impl<T> BoundedQueue<T> {
 		self.queued_commands.fetch_add(1, Ordering::Relaxed);
 		self.queued_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
 		self.ready.notify_one();
+		self.notify_shared(false);
 		Ok(())
 	}
 
@@ -780,6 +792,7 @@ impl<T> BoundedQueue<T> {
 		self.queued_commands.fetch_add(1, Ordering::Relaxed);
 		self.queued_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
 		self.ready.notify_one();
+		self.notify_shared(false);
 		Ok(())
 	}
 
@@ -800,24 +813,8 @@ impl<T> BoundedQueue<T> {
 		self.take_front(&mut lock(&self.state))
 	}
 
-	fn pop_timeout(&self, timeout: Duration) -> QueuePop<T> {
-		let mut state = lock(&self.state);
-		loop {
-			if let Some(item) = self.take_front(&mut state) {
-				return QueuePop::Item(item);
-			}
-			if state.closed {
-				return QueuePop::Closed;
-			}
-			let (next, result) = self
-				.ready
-				.wait_timeout(state, timeout)
-				.unwrap_or_else(|error| error.into_inner());
-			state = next;
-			if result.timed_out() {
-				return QueuePop::TimedOut;
-			}
-		}
+	fn is_closed(&self) -> bool {
+		lock(&self.state).closed
 	}
 
 	fn take_front(&self, state: &mut QueueState<T>) -> Option<Queued<T>> {
@@ -835,6 +832,7 @@ impl<T> BoundedQueue<T> {
 		let items = drain_queue(&mut state, &self.queued_commands, &self.queued_bytes);
 		self.release_shared(items.len(), items.iter().map(|item| item.bytes).sum());
 		self.ready.notify_all();
+		self.notify_shared(true);
 		items
 	}
 
@@ -842,6 +840,7 @@ impl<T> BoundedQueue<T> {
 		let mut state = lock(&self.state);
 		let items = drain_queue(&mut state, &self.queued_commands, &self.queued_bytes);
 		self.release_shared(items.len(), items.iter().map(|item| item.bytes).sum());
+		self.notify_shared(false);
 		items
 	}
 
@@ -849,6 +848,7 @@ impl<T> BoundedQueue<T> {
 		let mut state = lock(&self.state);
 		state.closed = true;
 		self.ready.notify_all();
+		self.notify_shared(true);
 	}
 
 	fn validate_shared_capacity(&self, bytes: usize) -> Result<()> {
@@ -876,6 +876,12 @@ impl<T> BoundedQueue<T> {
 			state.1 -= bytes;
 		}
 	}
+
+	fn notify_shared(&self, all: bool) {
+		if let Some(wake) = &self.shared_wake {
+			wake.notify(all);
+		}
+	}
 }
 
 impl QueueBudget {
@@ -895,6 +901,37 @@ impl QueueBudget {
 			));
 		}
 		Ok(())
+	}
+}
+
+impl QueueWake {
+	fn new() -> Self {
+		Self {
+			generation: Mutex::new(0),
+			ready: Condvar::new(),
+		}
+	}
+
+	fn snapshot(&self) -> u64 {
+		*lock(&self.generation)
+	}
+
+	fn notify(&self, all: bool) {
+		let mut generation = lock(&self.generation);
+		*generation = generation.wrapping_add(1);
+		if all {
+			self.ready.notify_all();
+		} else {
+			self.ready.notify_one();
+		}
+	}
+
+	fn wait_for_change(&self, observed: u64) {
+		let generation = lock(&self.generation);
+		let _guard = self
+			.ready
+			.wait_while(generation, |generation| *generation == observed)
+			.unwrap_or_else(|error| error.into_inner());
 	}
 }
 
@@ -1294,7 +1331,9 @@ fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 
 fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
 	let expensive = runtime.expensive_search_queue.as_ref().unwrap();
+	let wake = runtime.search_wake.as_ref().unwrap();
 	loop {
+		let observed = wake.snapshot();
 		let queued = expensive.try_pop().or_else(|| runtime.ordinary_search_queue.try_pop());
 		if let Some(queued) = queued {
 			if !execute_search_command(&runtime, &engine, &reader, queued) {
@@ -1302,22 +1341,15 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 			}
 			continue;
 		}
-		match expensive.pop_timeout(Duration::from_millis(1)) {
-			QueuePop::Item(queued) => {
+		if expensive.is_closed() {
+			while let Some(queued) = runtime.ordinary_search_queue.pop() {
 				if !execute_search_command(&runtime, &engine, &reader, queued) {
 					return;
 				}
 			}
-			QueuePop::TimedOut => {}
-			QueuePop::Closed => {
-				while let Some(queued) = runtime.ordinary_search_queue.pop() {
-					if !execute_search_command(&runtime, &engine, &reader, queued) {
-						return;
-					}
-				}
-				return;
-			}
+			return;
 		}
+		wake.wait_for_change(observed);
 	}
 }
 
@@ -1334,23 +1366,27 @@ fn execute_search_command(
 	let started = Instant::now();
 	let SearchCommand { operation, completion } = queued.value;
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
-		SearchOperation::Search(bytes) => decode_search(&bytes).and_then(|request| {
-			let deadline = operation_deadline(request.budget_milliseconds, queued.enqueued.elapsed())?;
-			engine
-				.search_with_deadline(&reader.searcher(), &request, deadline)
-				.map(SearchOutcome::Search)
-		}),
-		SearchOperation::Trace(bytes) => decode_trace(&bytes).and_then(|request| {
-			let deadline = operation_deadline(request.search.budget_milliseconds, queued.enqueued.elapsed())?;
-			if Instant::now() >= deadline {
-				return Err(search_timeout());
-			}
-			let result = engine.trace_matches(&request.search, &request.records, Some(deadline))?;
-			if Instant::now() >= deadline {
-				return Err(search_timeout());
-			}
-			Ok(SearchOutcome::Trace(result))
-		}),
+		SearchOperation::Search(bytes) => {
+			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
+			decode_search(&bytes).and_then(|request| {
+				engine
+					.search_with_deadline(&reader.searcher(), &request, deadline)
+					.map(SearchOutcome::Search)
+			})
+		}
+		SearchOperation::Trace(bytes) => {
+			let deadline = operation_deadline(trace_budget(&bytes)?, queued.enqueued.elapsed())?;
+			decode_trace(&bytes).and_then(|request| {
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				let result = engine.trace_matches(&request.search, &request.records, Some(deadline))?;
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				Ok(SearchOutcome::Trace(result))
+			})
+		}
 	}));
 	runtime
 		.search_execution_nanoseconds
@@ -2183,8 +2219,8 @@ mod tests {
 	#[test]
 	fn isolated_search_lanes_share_one_admission_budget() {
 		let budget = Arc::new(QueueBudget::new(2, 8));
-		let ordinary = BoundedQueue::new_with_budget(2, 8, Some(budget.clone()));
-		let expensive = BoundedQueue::new_with_budget(2, 8, Some(budget));
+		let ordinary = BoundedQueue::new_with_budget_and_wake(2, 8, Some(budget.clone()), None);
+		let expensive = BoundedQueue::new_with_budget_and_wake(2, 8, Some(budget), None);
 		ordinary.try_push(1, 4).unwrap();
 		expensive.try_push(2, 4).unwrap();
 		assert_eq!(ordinary.try_push(3, 1).unwrap_err().code, "E_QUEUE_FULL");
@@ -2195,16 +2231,20 @@ mod tests {
 	}
 
 	#[test]
-	fn queue_timeout_distinguishes_idle_from_closed() {
-		let queue = BoundedQueue::<u8>::new(1, 8);
-		assert!(matches!(
-			queue.pop_timeout(Duration::from_millis(1)),
-			QueuePop::TimedOut
-		));
-		queue.try_push(1, 1).unwrap();
-		assert!(matches!(queue.pop_timeout(Duration::from_secs(1)), QueuePop::Item(item) if item.value == 1));
-		queue.shutdown_after_drain();
-		assert!(matches!(queue.pop_timeout(Duration::from_secs(1)), QueuePop::Closed));
+	fn shared_search_wake_observes_both_lanes() {
+		let wake = Arc::new(QueueWake::new());
+		let ordinary = BoundedQueue::new_with_budget_and_wake(1, 8, None, Some(wake.clone()));
+		let expensive = BoundedQueue::new_with_budget_and_wake(1, 8, None, Some(wake.clone()));
+
+		let observed = wake.snapshot();
+		ordinary.try_push(1, 1).unwrap();
+		wake.wait_for_change(observed);
+		assert_eq!(ordinary.pop().unwrap().value, 1);
+
+		let observed = wake.snapshot();
+		expensive.try_push(2, 1).unwrap();
+		wake.wait_for_change(observed);
+		assert_eq!(expensive.pop().unwrap().value, 2);
 	}
 
 	#[test]

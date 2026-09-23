@@ -140,9 +140,18 @@ export interface AppliedFullTextMutationBatch {
 	frames: number;
 }
 
+export type SearchMode =
+	| 'any'
+	| 'all'
+	| 'phrase'
+	| 'prefix'
+	| 'fuzzy'
+	/** Preview until catalog-scale performance qualification is complete. */
+	| 'fuzzy-prefix';
+
 export interface SearchRequest {
 	text: string;
-	mode?: 'any' | 'all' | 'phrase' | 'prefix' | 'fuzzy' | 'fuzzy-prefix';
+	mode?: SearchMode;
 	operator?: 'any' | 'all';
 	fields?: string[];
 	candidateIds?: string[];

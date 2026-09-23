@@ -13,6 +13,7 @@ use tantivy::query::{
 use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{
 	Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TokenStream,
+	Tokenizer,
 };
 use tantivy::{DocAddress, Index, IndexReader, IndexSettings, IndexWriter, Order, ReloadPolicy, Searcher, Term};
 
@@ -317,6 +318,9 @@ impl Engine {
 		request: &SearchRequest,
 		deadline: Option<Instant>,
 	) -> Result<SearchResult> {
+		if request.limit == 0 {
+			return Err(FulltextError::invalid("search limit must be greater than zero"));
+		}
 		check_deadline(deadline)?;
 		let selected = self.selected_fields(&request.fields)?;
 		let query = self.query(searcher, request, &selected)?;
@@ -425,6 +429,7 @@ impl Engine {
 			let mut pending_values = Vec::new();
 			let mut found = HashSet::new();
 			let mut record_span_budget = remaining_spans;
+			let mut record_truncated = false;
 			for (field, source_values) in &record.fields {
 				if !seen_fields.insert(field.as_str()) {
 					return Err(FulltextError::invalid(format!("duplicate trace field {field}")));
@@ -438,9 +443,7 @@ impl Engine {
 				for (value_index, value) in source_values.iter().enumerate() {
 					check_deadline(deadline)?;
 					let (spans, terms, truncated) = self.trace_value(&plan, value, record_span_budget, deadline)?;
-					if truncated {
-						complete = false;
-					}
+					record_truncated |= truncated;
 					found.extend(terms);
 					if spans.is_empty() {
 						continue;
@@ -449,7 +452,11 @@ impl Engine {
 					pending_values.push((field.as_str(), value_index as u32, spans));
 				}
 			}
-			if plan.record_matches(&found) && !pending_values.is_empty() {
+			if plan.record_matches(&found) {
+				complete &= !record_truncated;
+				if pending_values.is_empty() {
+					continue;
+				}
 				let record_header_bytes = 6usize.saturating_add(record.id.len());
 				let mut record_bytes = 0usize;
 				let mut values = Vec::new();
@@ -572,18 +579,37 @@ impl Engine {
 			}
 			TracePlan::Phrase(terms) => {
 				if !terms.is_empty() {
-					for window in analyzed.windows(terms.len()) {
+					for (anchor_index, anchor) in analyzed.iter().enumerate() {
 						check_deadline(deadline)?;
-						let first_source_position = window[0].position;
+						if anchor.text != terms[0].1 {
+							continue;
+						}
+						let first_source_position = anchor.position;
 						let first_query_position = terms[0].0;
-						if window.iter().zip(terms).all(|(token, (position, term))| {
-							token.text == *term
-								&& token.position - first_source_position == position - first_query_position
-						}) {
+						let mut source_index = anchor_index + 1;
+						let mut final_token = anchor;
+						let mut matches = true;
+						for (position, term) in terms.iter().skip(1) {
+							let expected_position = first_source_position + (position - first_query_position);
+							while source_index < analyzed.len() && analyzed[source_index].position < expected_position {
+								source_index += 1;
+							}
+							let Some(token) = analyzed.get(source_index) else {
+								matches = false;
+								break;
+							};
+							if token.position != expected_position || token.text != *term {
+								matches = false;
+								break;
+							}
+							final_token = token;
+							source_index += 1;
+						}
+						if matches {
 							found.insert("__phrase".to_owned());
 							truncated |= push_trace_span(
 								&mut spans,
-								source_span(&utf16_offsets, window[0].start, window[window.len() - 1].end),
+								source_span(&utf16_offsets, anchor.start, final_token.end),
 								max_spans,
 							);
 						}
@@ -625,13 +651,16 @@ impl Engine {
 				}
 			}
 			TracePlan::Fuzzy(terms) => {
+				let analyzed_by_position = analyzed
+					.iter()
+					.map(|token| (token.position, token.text.as_str()))
+					.collect::<HashMap<_, _>>();
 				for (index, token) in surface.iter().enumerate() {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
-					let analyzed_token = self.analyze(&token.text, false, false)?;
 					for (analyzed_term, surface_term) in terms {
-						if analyzed_token.first() == Some(analyzed_term)
+						if analyzed_by_position.get(&token.position) == Some(&analyzed_term.as_str())
 							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
 						{
 							found.insert(analyzed_term.clone());
@@ -861,9 +890,10 @@ impl Engine {
 			.saturating_add(fuzzy_clause_count)
 			> MAX_QUERY_CLAUSES
 		{
-			return Err(FulltextError::invalid(format!(
-				"search query exceeds {MAX_QUERY_CLAUSES} clauses"
-			)));
+			return Err(FulltextError::new(
+				"E_PREFIX_TOO_BROAD",
+				format!("prefix query exceeds {MAX_QUERY_CLAUSES} clauses"),
+			));
 		}
 		let final_group = if fuzzy && fuzzy_eligible(&surface_prefix) {
 			let exact_bonus = fields.iter().map(|field| field.weight).fold(0.0f32, f32::max) * 0.25 + 1.0;
@@ -887,14 +917,20 @@ impl Engine {
 	}
 
 	fn final_surface_term<'a>(&self, text: &'a str) -> Result<(&'a str, Option<String>)> {
-		let mut analyzer = self.surface_analyzer.clone();
-		let mut stream = analyzer.token_stream(text);
+		let mut tokenizer = SimpleTokenizer::default();
+		let mut stream = tokenizer.token_stream(text);
 		let mut final_term = None;
 		let mut final_offset = 0;
-		stream.process(&mut |token| {
-			final_term = Some(token.text.clone());
+		while stream.advance() {
+			let token = stream.token();
+			if token.text.len() >= 40 {
+				return Err(FulltextError::invalid(
+					"prefix tokens must be shorter than 40 UTF-8 bytes",
+				));
+			}
+			final_term = Some(token.text.to_lowercase());
 			final_offset = token.offset_from;
-		});
+		}
 		Ok((&text[..final_offset], final_term))
 	}
 
@@ -977,9 +1013,10 @@ impl Engine {
 				));
 				alternatives.push(boosted(query, field.weight));
 				if alternatives.len() > MAX_QUERY_CLAUSES {
-					return Err(FulltextError::invalid(format!(
-						"search query exceeds {MAX_QUERY_CLAUSES} clauses"
-					)));
+					return Err(FulltextError::new(
+						"E_PREFIX_TOO_BROAD",
+						format!("prefix query exceeds {MAX_QUERY_CLAUSES} clauses"),
+					));
 				}
 			}
 		}
@@ -1601,7 +1638,7 @@ mod tests {
 		writer.commit().unwrap();
 		let reader = engine.reader().unwrap();
 		reader.reload().unwrap();
-		let request = SearchRequest {
+		let mut request = SearchRequest {
 			text: "shoes".to_owned(),
 			mode: SearchMode::Any,
 			fields: Vec::new(),
@@ -1627,6 +1664,11 @@ mod tests {
 		let reopened = Engine::open(directory, &config).unwrap();
 		let reopened_reader = reopened.reader().unwrap();
 		assert_eq!(reopened.search(&reopened_reader.searcher(), &request).unwrap().total, 1);
+		request.limit = 0;
+		assert_eq!(
+			reopened.search(&reopened_reader.searcher(), &request).unwrap_err().code,
+			"E_INVALID_ARGUMENT"
+		);
 	}
 
 	#[test]

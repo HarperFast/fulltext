@@ -184,8 +184,16 @@ test('runs every structured query mode and score-neutral candidate filtering', a
 	]);
 	assert.strictEqual(boundedTrace.complete, false);
 	assert.strictEqual(boundedTrace.records[0].values[0].spans.length, 1_024);
+	const exactEmptyTrace = await index.traceMatches({ text: 'shoe missing', mode: 'all' }, [
+		{ id: 'one', fields: { title: 'shoe '.repeat(1_100) } },
+	]);
+	assert.deepStrictEqual(exactEmptyTrace, { complete: true, records: [] });
 	await assert.rejects(
 		index.search({ text: 'waterproof', mode: 'any', operator: 'all' }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({ text: 'x'.repeat(40), mode: 'prefix' }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	await assert.rejects(index.search({ text: '\ud800' }), (error) => error.code === 'E_INVALID_ARGUMENT');
@@ -244,6 +252,7 @@ test('preserves phrase positions through stop words in search and tracing', asyn
 		upserts: [
 			{ id: 'adjacent', fields: { title: 'trail running' } },
 			{ id: 'gap', fields: { title: 'trail the running' } },
+			{ id: 'substitute', fields: { title: 'trail blazing running' } },
 		],
 	});
 	await index.commit();
@@ -254,15 +263,16 @@ test('preserves phrase positions through stop words in search and tracing', asyn
 	);
 	assert.deepStrictEqual(
 		(await index.search({ text: 'trail the running', mode: 'phrase' })).hits.map((hit) => hit.id),
-		['gap'],
+		['gap', 'substitute'],
 	);
 	const trace = await index.traceMatches({ text: 'trail the running', mode: 'phrase' }, [
 		{ id: 'adjacent', fields: { title: 'trail running' } },
 		{ id: 'gap', fields: { title: 'trail the running' } },
+		{ id: 'substitute', fields: { title: 'trail blazing running' } },
 	]);
 	assert.deepStrictEqual(
 		trace.records.map((record) => record.id),
-		['gap'],
+		['gap', 'substitute'],
 	);
 	await index.close();
 });

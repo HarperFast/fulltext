@@ -235,6 +235,29 @@ pub fn validate_trace_header(bytes: &[u8]) -> Result<()> {
 	Ok(())
 }
 
+pub fn search_budget(bytes: &[u8]) -> Result<u32> {
+	packed_budget(bytes, *b"FTSQ", "search")
+}
+
+pub fn trace_budget(bytes: &[u8]) -> Result<u32> {
+	packed_budget(bytes, *b"FTTM", "trace")
+}
+
+fn packed_budget(bytes: &[u8], magic: [u8; 4], operation: &str) -> Result<u32> {
+	let _ = Cursor::new(bytes, magic)?;
+	let budget_bytes = bytes
+		.get(bytes.len().saturating_sub(4)..)
+		.filter(|bytes| bytes.len() == 4)
+		.ok_or_else(|| FulltextError::invalid("packed request is truncated"))?;
+	let budget = u32::from_le_bytes(budget_bytes.try_into().unwrap());
+	if budget == 0 || budget > MAX_SEARCH_BUDGET_MILLISECONDS {
+		return Err(FulltextError::invalid(format!(
+			"{operation} budget must be between 1 and {MAX_SEARCH_BUDGET_MILLISECONDS} milliseconds"
+		)));
+	}
+	Ok(budget)
+}
+
 pub fn search_mode(bytes: &[u8]) -> Result<SearchMode> {
 	validate_search_header(bytes)?;
 	let mut cursor = Cursor::new(bytes, *b"FTSQ")?;
