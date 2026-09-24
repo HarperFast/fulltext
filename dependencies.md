@@ -22,6 +22,11 @@ error codes and per-handle poison state for package-owned operations. The runtim
 addon image before native actors can outlive a Node environment, preventing worker teardown from
 unmapping code that those actors can still execute.
 
+Completion callbacks retain the one-buffer, non-callee-handled contract used by the JavaScript
+facade. If JavaScript buffer allocation fails, napi-rs escalates through `napi_fatal_exception`;
+refusal of external buffers falls back to a copy. Changing this behavior requires an error-first
+private addon callback and a matching facade change.
+
 ## JavaScript development graph
 
 | Dependency            | Scope       | Purpose                                                               |

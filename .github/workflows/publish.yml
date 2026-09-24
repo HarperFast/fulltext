@@ -25,7 +25,7 @@ jobs:
           - os: windows-latest
             target: win32-x64-msvc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

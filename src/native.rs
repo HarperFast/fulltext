@@ -202,7 +202,7 @@ pub fn native_open(env: Env, packed_config: Buffer, callback: CompletionCallback
 	boundary::run_stateless(|| {
 		let environment = environment_state(&env)?;
 		let opening_done = Arc::new(CompletionSignal::new());
-		let completion = completion(&env, callback, &environment)?;
+		let completion = completion(callback, &environment)?;
 		let handle = next_handle().map_err(fulltext_napi_error)?;
 		registry().opening.insert(handle);
 		environment.track(handle, opening_done.clone());
@@ -249,7 +249,7 @@ pub fn native_reset(env: Env, packed_config: Buffer, callback: CompletionCallbac
 	boundary::run_stateless(|| {
 		let environment = environment_state(&env)?;
 		let reset_done = Arc::new(CompletionSignal::new());
-		let completion = completion(&env, callback, &environment)?;
+		let completion = completion(callback, &environment)?;
 		let operation = next_handle().map_err(fulltext_napi_error)?;
 		registry().opening.insert(operation);
 		environment.track(operation, reset_done.clone());
@@ -283,7 +283,7 @@ pub fn native_apply(
 			.writer_queue
 			.check_capacity(packed_batch.len())
 			.map_err(fulltext_napi_error)?;
-		let completion = completion(&env, callback, &runtime.environment)?;
+		let completion = completion(callback, &runtime.environment)?;
 		let bytes = packed_batch.to_vec();
 		runtime.enqueue_writer(
 			WriterCommand {
@@ -299,7 +299,7 @@ pub fn native_apply(
 pub fn native_commit(env: Env, handle: u32, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		let completion = completion(&env, callback, &runtime.environment)?;
+		let completion = completion(callback, &runtime.environment)?;
 		runtime.enqueue_writer(
 			WriterCommand {
 				operation: WriterOperation::Commit,
@@ -325,7 +325,7 @@ pub fn native_publish(
 			))));
 		}
 		let runtime = runtime(&env, handle)?;
-		let completion = completion(&env, callback, &runtime.environment)?;
+		let completion = completion(callback, &runtime.environment)?;
 		let bytes = payload.len();
 		runtime.enqueue_writer(
 			WriterCommand {
@@ -341,7 +341,7 @@ pub fn native_publish(
 pub fn native_reload(env: Env, handle: u32, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		let completion = completion(&env, callback, &runtime.environment)?;
+		let completion = completion(callback, &runtime.environment)?;
 		runtime.enqueue_writer(
 			WriterCommand {
 				operation: WriterOperation::Reload,
@@ -368,7 +368,7 @@ pub fn native_search(
 		queue
 			.check_capacity(packed_request.len())
 			.map_err(fulltext_napi_error)?;
-		let completion = completion(&env, callback, &runtime.environment)?;
+		let completion = completion(callback, &runtime.environment)?;
 		let request = packed_request.to_vec();
 		queue
 			.try_push(
@@ -397,7 +397,7 @@ pub fn native_trace_matches(
 		queue
 			.check_capacity(packed_request.len())
 			.map_err(fulltext_napi_error)?;
-		let completion = completion(&env, callback, &runtime.environment)?;
+		let completion = completion(callback, &runtime.environment)?;
 		let request = packed_request.to_vec();
 		queue
 			.try_push(
@@ -415,7 +415,7 @@ pub fn native_trace_matches(
 pub fn native_close(env: Env, handle: u32, rollback: bool, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		let completion = completion(&env, callback, &runtime.environment)?;
+		let completion = completion(callback, &runtime.environment)?;
 		match runtime
 			.state
 			.compare_exchange(STATE_OPEN, STATE_CLOSING, Ordering::AcqRel, Ordering::Acquire)
@@ -1873,11 +1873,7 @@ fn open_runtime_with_directory(
 	result
 }
 
-fn completion(
-	_env: &Env,
-	callback: CompletionCallback<'_>,
-	environment: &Arc<EnvironmentState>,
-) -> boundary::Result<Completion> {
+fn completion(callback: CompletionCallback<'_>, environment: &Arc<EnvironmentState>) -> boundary::Result<Completion> {
 	let callback = callback
 		.build_threadsafe_function::<Buffer>()
 		.build()
