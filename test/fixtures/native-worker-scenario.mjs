@@ -82,11 +82,12 @@ async function runMultiple() {
 
 async function runForeignEnvironment() {
 	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-owner-'));
+	const callerIndexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-caller-'));
 	try {
 		const owner = startWorker({ indexPath, mode: 'owner' });
 		const ownerExit = waitForExit(owner);
 		const opened = await waitForMessage(owner, (message) => message?.type === 'owner-open');
-		const caller = startWorker({ handle: opened.handle, mode: 'foreign' });
+		const caller = startWorker({ handle: opened.handle, indexPath: callerIndexPath, mode: 'foreign' });
 		const callerExit = waitForExit(caller);
 		const result = await waitForMessage(caller, (message) => message?.type === 'foreign-result');
 		assert.strictEqual(result.code, 'E_NATIVE_FAILURE');
@@ -99,6 +100,7 @@ async function runForeignEnvironment() {
 		mark('foreign:closed');
 	} finally {
 		rmSync(indexPath, { recursive: true, force: true });
+		rmSync(callerIndexPath, { recursive: true, force: true });
 	}
 }
 

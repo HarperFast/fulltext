@@ -83,11 +83,14 @@ async function runOwner() {
 async function runForeignCall() {
 	const { invoke } = await import(new URL('./invoke.js', workerData.moduleUrl));
 	const { loadAddon } = await import(new URL('./load-addon.js', workerData.moduleUrl));
+	const ownIndex = await openIndex(workerData.indexPath);
 	try {
 		await invoke((callback) => loadAddon().__nativeCommit(workerData.handle, callback));
 		parentPort.postMessage({ type: 'foreign-result' });
 	} catch (error) {
 		parentPort.postMessage({ type: 'foreign-result', code: error.code, message: error.message });
+	} finally {
+		await ownIndex.close();
 	}
 }
 

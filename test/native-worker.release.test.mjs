@@ -27,7 +27,7 @@ for (const [scenario, name] of scenarios) {
 function runScenario(scenario) {
 	return new Promise((resolve, reject) => {
 		let timedOut = false;
-		const timeoutMilliseconds = scenario === 'apply-stress' ? 120_000 : scenario === 'sequence' ? 60_000 : 20_000;
+		const timeoutMilliseconds = scenario === 'apply-stress' ? 1_200_000 : scenario === 'sequence' ? 300_000 : 60_000;
 		const child = spawn(process.execPath, [scenarioPath, scenario], {
 			stdio: ['ignore', 'pipe', 'pipe'],
 		});

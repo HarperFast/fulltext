@@ -1991,7 +1991,7 @@ impl EnvironmentState {
 		// Node runs cleanup hooks last-in-first-out. Keep this marker newer than every
 		// operation callback so teardown closes the gate before destroying any callback.
 		let mut hook = lock(&self.callback_cleanup);
-		if let Some(previous) = hook.take() {
+		let data = if let Some(previous) = hook.take() {
 			let status = unsafe {
 				sys::napi_remove_env_cleanup_hook(env.raw(), Some(close_callback_gate), previous.data as *mut c_void)
 			};
@@ -1999,17 +1999,16 @@ impl EnvironmentState {
 				*hook = Some(previous);
 				return Err(napi_error("E_NATIVE_FAILURE", Status::from(status)));
 			}
-			unsafe {
-				drop(Box::from_raw(previous.data as *mut CallbackCleanupData));
-			}
-		}
-
-		let data = Box::into_raw(Box::new(CallbackCleanupData {
-			environment: Arc::downgrade(self),
-			callbacks: self.callbacks.clone(),
-		}));
+			previous.data as *mut CallbackCleanupData
+		} else {
+			Box::into_raw(Box::new(CallbackCleanupData {
+				environment: Arc::downgrade(self),
+				callbacks: self.callbacks.clone(),
+			}))
+		};
 		let status = unsafe { sys::napi_add_env_cleanup_hook(env.raw(), Some(close_callback_gate), data.cast()) };
 		if status != sys::Status::napi_ok {
+			self.callbacks.close();
 			unsafe {
 				drop(Box::from_raw(data));
 			}
