@@ -132,6 +132,8 @@ struct CallbackCleanupData {
 struct CallbackGate {
 	alive: AtomicBool,
 	transition: RwLock<()>,
+	callbacks: Mutex<HashMap<u64, Callback>>,
+	next_callback: AtomicU64,
 }
 
 struct QueueState<T> {
@@ -171,7 +173,7 @@ struct QueueWake {
 type Callback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
 
 struct Completion {
-	callback: Option<Callback>,
+	callback: Option<u64>,
 	callbacks: Arc<CallbackGate>,
 }
 
@@ -989,6 +991,8 @@ impl CallbackGate {
 		Self {
 			alive: AtomicBool::new(true),
 			transition: RwLock::new(()),
+			callbacks: Mutex::new(HashMap::new()),
+			next_callback: AtomicU64::new(1),
 		}
 	}
 
@@ -998,12 +1002,30 @@ impl CallbackGate {
 
 	fn close(&self) {
 		let _transition = self.transition.write().unwrap_or_else(|error| error.into_inner());
-		self.alive.store(false, Ordering::Release);
+		if !self.alive.swap(false, Ordering::AcqRel) {
+			return;
+		}
+		for callback in mem::take(&mut *lock(&self.callbacks)).into_values() {
+			if let Err(error) = callback.abort() {
+				eprintln!("failed to abort fulltext callback during environment cleanup: {error}");
+			}
+		}
 	}
 
-	fn send(&self, callback: Callback, bytes: Vec<u8>) {
+	fn register(&self, callback: Callback) -> std::result::Result<u64, Callback> {
 		let _transition = self.transition.read().unwrap_or_else(|error| error.into_inner());
-		if self.is_alive() {
+		if !self.is_alive() {
+			return Err(callback);
+		}
+		let id = self.next_callback.fetch_add(1, Ordering::Relaxed);
+		let replaced = lock(&self.callbacks).insert(id, callback);
+		debug_assert!(replaced.is_none(), "fulltext callback identifier wrapped");
+		Ok(id)
+	}
+
+	fn send(&self, callback: u64, bytes: Vec<u8>) {
+		let _transition = self.transition.read().unwrap_or_else(|error| error.into_inner());
+		if let Some(callback) = lock(&self.callbacks).remove(&callback) {
 			let status = callback.call(bytes, ThreadsafeFunctionCallMode::NonBlocking);
 			if status == Status::Closing {
 				// napi_closing already decremented the thread count; releasing again is an error.
@@ -1011,8 +1033,6 @@ impl CallbackGate {
 			} else {
 				drop(callback);
 			}
-		} else {
-			mem::forget(callback);
 		}
 	}
 }
@@ -1881,6 +1901,10 @@ fn completion(env: &Env, callback: JsFunction, environment: &Arc<EnvironmentStat
 		)
 		.map_err(|error| napi_error("E_NATIVE_FAILURE", error))?;
 	environment.rearm_callback_cleanup(env)?;
+	let callback = environment.callbacks.register(callback).map_err(|callback| {
+		let _ = callback.abort();
+		napi_error("E_CLOSED", "Node environment is closing")
+	})?;
 	Ok(Completion {
 		callback: Some(callback),
 		callbacks: environment.callbacks.clone(),
