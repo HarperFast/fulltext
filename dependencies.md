@@ -20,11 +20,15 @@ its rebuildable derived index rather than linking a second RocksDB runtime into 
 A Dependabot pull request announces a new Tantivy release; it is not a merge-ready upgrade. Before
 merging it:
 
-- Update the exact manifest and lockfile versions, `TANTIVY_VERSION`, and release-package assertion.
+- Update `TANTIVY_VERSION` and the release-package assertion to match the bot-managed exact pin.
 - Review Tantivy's release notes for index-format, analyzer, schema, scoring, and query changes.
-- Check the Rust version floor and the exact-version exceptions in `deny.toml` against the new graph.
+- Check the manifest and CI Rust version floors and the exact-version exceptions in `deny.toml`.
 - Refresh the dependency table and every version-specific Tantivy citation in the design documents.
-- Run the full test suite and compare the indexing and search benchmarks with the prior release.
+- Run the full test suite. Manually dispatch the `Release benchmark` workflow on the update branch,
+  then compare its `benchmark-native.json` with the asset attached to the previous release.
+
+Scheduled Cargo version updates are limited to Tantivy. Dependabot security updates remain enabled
+for the full Cargo graph; they share the `dependencies` label used for Slack notifications.
 
 napi-rs generates an outer unwind boundary only for exports marked `catch_unwind`. Every
 fulltext function, method, and constructor uses that option to contain argument and result

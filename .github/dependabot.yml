@@ -9,10 +9,22 @@ updates:
       day: monday
       time: '09:00'
       timezone: America/Denver
-    allow:
-      - dependency-name: tantivy
-        dependency-type: direct
+    ignore:
+      - dependency-name: napi
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+      - dependency-name: napi-derive
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+      - dependency-name: napi-build
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
     open-pull-requests-limit: 1
     labels:
       - dependencies
-      - tantivy
