@@ -115,6 +115,22 @@ test('release workflow marks staged platform packages as local npm inputs', () =
 	assert.match(workflow, /index\.close/);
 });
 
+test('release workflow reports publication success and failure to Slack', () => {
+	const workflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
+	assert.strictEqual(
+		workflow.match(/slackapi\/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c/g)?.length,
+		2,
+	);
+	assert.strictEqual(workflow.match(/method: chat\.postMessage/g)?.length, 2);
+	assert.strictEqual(workflow.match(/secrets\.SLACK_BOT_TOKEN/g)?.length, 2);
+	assert.strictEqual(workflow.match(/secrets\.SLACK_CHANNEL_ID/g)?.length, 2);
+	assert.match(workflow, /on-publish-success:[\s\S]*if: success\(\) && !cancelled\(\)[\s\S]*needs: publish/);
+	assert.match(
+		workflow,
+		/on-publish-failure:[\s\S]*if: failure\(\) && !cancelled\(\)[\s\S]*needs: \[platform-package, root-package, packed-consumer, publish\]/,
+	);
+});
+
 test('Linux arm64 is built, installed, and benchmarked on a native runner', () => {
 	const publishWorkflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
 	const ciWorkflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');

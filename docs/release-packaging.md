@@ -50,6 +50,9 @@ Use the established HNSW packaging model:
    publication because its platform-package path was parsed as a GitHub shorthand instead of a
    local directory. Version `0.1.1` successfully published the facade and three original platform
    packages on 2026-09-24. Version `0.1.2` adds the Linux arm64 artifact.
+7. The publish workflow reports success or failure to Slack after the release pipeline settles.
+   Success links the npm package and GitHub release; failure links the workflow run and observes
+   failures from packaging, packed-consumer verification, or publication.
 
 The support matrix is Linux x64 glibc, Linux arm64 glibc, macOS arm64, and Windows x64. Adding a
 target requires its own native runner, packed-artifact load test, and platform package.
@@ -127,6 +130,9 @@ standalone wrapper, avoids install-time compilation, and does not download irrel
 - **untested:** run the release workflow and full benchmark on the Linux arm64 runner.
 - **untested:** publish the new Linux arm64 package with npm provenance and verify an identical-
   tarball retry.
+- **configuration:** grant `HarperFast/fulltext` access to the organization `SLACK_BOT_TOKEN`
+  secret and set the repository `SLACK_CHANNEL_ID` secret before the next release.
+- **untested:** confirm both Slack notification paths against the configured channel.
 - After `0.1.2` is published, refresh `package-lock.json` so every platform package carries its
   registry URL and integrity hash.
 - Publish `0.1.2` before updating Harper's exact optional dependency; the Harper integration test
