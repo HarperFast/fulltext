@@ -39,11 +39,47 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Enable Windows crash dumps
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dumpDirectory = "$env:RUNNER_TEMP\fulltext-dumps"
+          New-Item -ItemType Directory -Force -Path $dumpDirectory | Out-Null
+          $registryPath = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\node.exe'
+          New-Item -Force -Path $registryPath | Out-Null
+          New-ItemProperty -Force -Path $registryPath -Name DumpFolder -PropertyType ExpandString -Value $dumpDirectory | Out-Null
+          New-ItemProperty -Force -Path $registryPath -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $registryPath -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
       - run: npm ci --ignore-scripts
       - run: npm run format:check
       - run: npm run lint
       - name: Run tests
         run: npm test
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: ${{ runner.os == 'Windows' && '1' || '0' }}
+      - name: Analyze Windows crash dumps
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $debugger = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+          $dumps = @(Get-ChildItem "$env:RUNNER_TEMP\fulltext-dumps\*.dmp" -ErrorAction SilentlyContinue)
+          if (-not (Test-Path $debugger) -or $dumps.Count -eq 0) {
+            Write-Output 'No Windows crash dump or debugger is available'
+            exit 0
+          }
+          $symbols = "$(Resolve-Path target\debug);$(Resolve-Path target\release);srv*"
+          foreach ($dump in $dumps) {
+            & $debugger -z $dump.FullName -y $symbols -c '!analyze -v;~* kb;q'
+          }
+          exit 0
+      - name: Upload Windows crash dumps
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-crash-dumps-node-${{ matrix.node }}
+          path: ${{ runner.temp }}/fulltext-dumps/*.dmp
+          if-no-files-found: warn
+          retention-days: 3
       - run: git diff --exit-code -- ts/addon.d.ts
 
   supply-chain:
