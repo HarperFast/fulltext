@@ -39,51 +39,10 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Enable Windows crash dumps
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $dumpDirectory = "$env:RUNNER_TEMP\fulltext-dumps"
-          New-Item -ItemType Directory -Force -Path $dumpDirectory | Out-Null
-          $archive = "$env:RUNNER_TEMP\procdump.zip"
-          $tools = "$env:RUNNER_TEMP\procdump"
-          Invoke-WebRequest https://download.sysinternals.com/files/Procdump.zip -OutFile $archive
-          Expand-Archive -Path $archive -DestinationPath $tools
-          & "$tools\procdump64.exe" -accepteula -ma -i $dumpDirectory
       - run: npm ci --ignore-scripts
       - run: npm run format:check
       - run: npm run lint
-      - name: Run tests
-        run: npm test
-        env:
-          CARGO_PROFILE_RELEASE_DEBUG: ${{ runner.os == 'Windows' && '1' || '0' }}
-      - name: Analyze Windows crash dumps
-        if: failure() && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $debugger = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
-          $dumps = @(Get-ChildItem "$env:RUNNER_TEMP\fulltext-dumps\*.dmp" -ErrorAction SilentlyContinue)
-          if (-not (Test-Path $debugger) -or $dumps.Count -eq 0) {
-            Write-Output 'No Windows crash dump or debugger is available'
-            exit 0
-          }
-          $symbols = "$(Resolve-Path target\debug);$(Resolve-Path target\release);srv*"
-          foreach ($dump in $dumps) {
-            & $debugger -z $dump.FullName -y $symbols -c '!analyze -v;~* kb;q'
-          }
-          exit 0
-      - name: Upload Windows crash dumps
-        if: failure() && runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-crash-dumps-node-${{ matrix.node }}
-          path: ${{ runner.temp }}/fulltext-dumps/*.dmp
-          if-no-files-found: warn
-          retention-days: 3
-      - name: Disable Windows crash dumps
-        if: always() && runner.os == 'Windows'
-        shell: pwsh
-        run: '& "$env:RUNNER_TEMP\procdump\procdump64.exe" -accepteula -u'
+      - run: npm test
       - run: git diff --exit-code -- ts/addon.d.ts
 
   supply-chain:
