@@ -15,6 +15,23 @@ reviewed deliberately.
 The Rust dependency graph must not include RocksDB. Harper uses the native filesystem backend for
 its rebuildable derived index rather than linking a second RocksDB runtime into this addon.
 
+### Updating Tantivy
+
+A Dependabot pull request announces a new Tantivy release; it is not a merge-ready upgrade. Before
+merging it:
+
+- Update `TANTIVY_VERSION` and the release-package assertion to match the bot-managed exact pin.
+- Review Tantivy's release notes for index-format, analyzer, schema, scoring, and query changes.
+- Check the manifest and CI Rust version floors and the exact-version exceptions in `deny.toml`.
+- Refresh the dependency table and every version-specific Tantivy citation in the design documents.
+- Run the full test suite. Manually dispatch the `Release benchmark` workflow on the update branch,
+  then compare its `benchmark-native.json` with the asset attached to the previous release.
+
+Scheduled Cargo version updates are limited to Tantivy. Dependabot security updates remain enabled
+for the full Cargo graph; they share the `dependencies` label used for Slack notifications. The
+per-dependency `version-update:` filters preserve that distinction and must not be replaced with a
+bare dependency-name ignore rule.
+
 napi-rs generates an outer unwind boundary only for exports marked `catch_unwind`. Every
 fulltext function, method, and constructor uses that option to contain argument and result
 conversion panics. That outer boundary uses napi-rs error mapping; the inner boundary adds stable
