@@ -21,7 +21,7 @@ if (files.length === 0) {
 const isolatedFiles = files.filter((file) => path.basename(file).startsWith('native-worker.'));
 const concurrentFiles = files.filter((file) => !isolatedFiles.includes(file));
 const nodeMajorVersion = Number.parseInt(process.versions.node, 10);
-const isolatedTestTimeout = 1_500_000;
+const isolatedTestTimeout = phase === 'test' ? 960_000 : 480_000;
 for (const batch of [concurrentFiles, isolatedFiles]) {
 	if (batch.length === 0) {
 		continue;
@@ -32,7 +32,7 @@ for (const batch of [concurrentFiles, isolatedFiles]) {
 	}
 	arguments_.push(...batch);
 	const result = spawnSync(process.execPath, arguments_, {
-		env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1' },
+		env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1', FULLTEXT_TEST_PHASE: phase },
 		stdio: 'inherit',
 		timeout: batch === isolatedFiles ? isolatedTestTimeout : undefined,
 	});

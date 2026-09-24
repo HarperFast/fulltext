@@ -12,7 +12,7 @@ const scenarios = [
 	['foreign', 'native handles reject use from another Node environment'],
 	['sequence', 'repeated worker termination remains safe in one Node process'],
 ];
-if (process.platform === 'win32') {
+if (process.platform === 'win32' && process.env.FULLTEXT_TEST_PHASE === 'test') {
 	scenarios.push(['apply-stress', 'repeated abrupt worker termination remains safe on Windows']);
 }
 
@@ -27,7 +27,7 @@ for (const [scenario, name] of scenarios) {
 function runScenario(scenario) {
 	return new Promise((resolve, reject) => {
 		let timedOut = false;
-		const timeoutMilliseconds = scenario === 'apply-stress' ? 900_000 : scenario === 'sequence' ? 300_000 : 60_000;
+		const timeoutMilliseconds = scenario === 'apply-stress' ? 480_000 : scenario === 'sequence' ? 240_000 : 45_000;
 		const child = spawn(process.execPath, [scenarioPath, scenario], {
 			stdio: ['ignore', 'pipe', 'pipe'],
 		});

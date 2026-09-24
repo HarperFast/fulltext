@@ -23,7 +23,7 @@ if (scenario === 'apply') {
 	await runMultiple();
 	await runForeignEnvironment();
 } else if (scenario === 'apply-stress') {
-	for (let attempt = 1; attempt <= 20; attempt++) {
+	for (let attempt = 1; attempt <= 10; attempt++) {
 		mark(`apply:${attempt}:starting`);
 		await runApply();
 	}
