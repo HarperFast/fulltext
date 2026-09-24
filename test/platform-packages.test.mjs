@@ -29,23 +29,23 @@ test('stages a constrained native package for a supported target', (context) => 
 	const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'fulltext-platform-package-'));
 	context.after(() => rmSync(temporaryDirectory, { recursive: true, force: true }));
 	const manifestPath = path.join(temporaryDirectory, 'package.json');
-	const artifactPath = path.join(temporaryDirectory, 'fulltext.linux-x64-gnu.node');
+	const artifactPath = path.join(temporaryDirectory, 'fulltext.linux-arm64-gnu.node');
 	const outputDirectory = path.join(temporaryDirectory, 'output');
 	writeFileSync(manifestPath, JSON.stringify(rootManifest));
 	writeFileSync(artifactPath, 'native artifact');
 
 	const manifest = stagePlatformPackage({
 		rootManifestPath: manifestPath,
-		triple: 'linux-x64-gnu',
+		triple: 'linux-arm64-gnu',
 		artifactPath,
 		outputDirectory,
 	});
-	assert.strictEqual(manifest.name, '@harperfast/fulltext-linux-x64-gnu');
+	assert.strictEqual(manifest.name, '@harperfast/fulltext-linux-arm64-gnu');
 	assert.deepStrictEqual(manifest.os, ['linux']);
-	assert.deepStrictEqual(manifest.cpu, ['x64']);
+	assert.deepStrictEqual(manifest.cpu, ['arm64']);
 	assert.deepStrictEqual(manifest.libc, ['glibc']);
 	assert.strictEqual(
-		readFileSync(path.join(outputDirectory, 'fulltext.linux-x64-gnu.node'), 'utf8'),
+		readFileSync(path.join(outputDirectory, 'fulltext.linux-arm64-gnu.node'), 'utf8'),
 		'native artifact',
 	);
 });
@@ -106,6 +106,18 @@ test('release workflow marks staged platform packages as local npm inputs', () =
 	assert.match(workflow, /applyMutationBatch/);
 	assert.match(workflow, /index\.search/);
 	assert.match(workflow, /index\.close/);
+});
+
+test('Linux arm64 is built, installed, and benchmarked on a native runner', () => {
+	const publishWorkflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
+	const ciWorkflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+	const benchmarkWorkflow = readFileSync(new URL('../.github/workflows/benchmark.yml', import.meta.url), 'utf8');
+	assert.strictEqual(publishWorkflow.match(/target: linux-arm64-gnu/g)?.length, 2);
+	assert.match(ciWorkflow, /target: linux-arm64-gnu/);
+	assert.match(benchmarkWorkflow, /benchmark-native-linux-arm64-gnu\.json/);
+	for (const workflow of [publishWorkflow, ciWorkflow, benchmarkWorkflow]) {
+		assert.match(workflow, /ubuntu-22\.04-arm/);
+	}
 });
 
 test('npm registry responses distinguish unpublished versions from malformed metadata', () => {

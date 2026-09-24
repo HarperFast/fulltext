@@ -14,10 +14,10 @@ Harper remains the source of truth; each node maintains its own rebuildable Tant
 The package never compiles or downloads native code during installation. It installs a matching
 exact-version native package through npm optional dependencies.
 
-The initial CI-qualified targets are Linux x64 with glibc 2.35 or newer, macOS arm64, and Windows
-x64. Additional targets are added only after their packed artifacts are loaded and tested on the
-target runtime. Unsupported targets fail with `E_NATIVE_ADDON_NOT_FOUND` when the native entry point
-is first used; importing the JavaScript facade does not eagerly load an addon.
+The CI-qualified targets are Linux x64 and Linux arm64 with glibc 2.35 or newer, macOS arm64, and
+Windows x64. Additional targets are added only after their packed artifacts are loaded and tested
+on the target runtime. Unsupported targets fail with `E_NATIVE_ADDON_NOT_FOUND` when the native
+entry point is first used; importing the JavaScript facade does not eagerly load an addon.
 
 ## Native usage
 
@@ -300,10 +300,12 @@ replacement-safe upserts include delete terms. CI runs only the correctness smok
 comparisons require controlled hardware.
 
 `--revision` labels a result and `--output` writes the same JSON record printed to stdout. Pull
-requests keep smoke records as GitHub Actions artifacts for 30 days. The release benchmark keeps a
-90-day Actions artifact and attaches `benchmark-native.json` to the GitHub release, providing a
-permanent release-over-release history. Shared-runner numbers are evidence that the workload still
-runs, not a latency gate; compare performance only on equivalent controlled hardware.
+requests keep smoke records as GitHub Actions artifacts for 30 days. The release benchmark keeps
+90-day Actions artifacts and attaches `benchmark-native.json` for Linux x64 and
+`benchmark-native-linux-arm64-gnu.json` for Linux arm64 to the GitHub release, providing a permanent
+per-architecture release-over-release history. Shared-runner numbers are evidence that the workload
+still runs, not a latency gate; compare performance only on equivalent controlled hardware and the
+same architecture.
 
 The inspection benchmark compares synchronous read-only inspection with full writer reopen across
 multiple index counts. It reports equivalent first-pass and warm p50/p95/p99/max latency,

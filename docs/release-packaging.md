@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-- Publish a binary-free `@harperfast/fulltext` facade at `0.1.1`.
+- Publish a binary-free `@harperfast/fulltext` facade at `0.1.2`.
 - Publish one exact-version optional package for each supported platform.
 - Load the platform package by default; repository tests explicitly prefer the local build.
 - Reject missing, unloadable, ABI-incompatible, capability-incompatible, or version-skewed addons
@@ -29,8 +29,8 @@ Use the established HNSW packaging model:
 
 1. `@harperfast/fulltext` contains the JavaScript and TypeScript facade.
 2. It declares exact-version optional dependencies for the supported native packages:
-   `@harperfast/fulltext-linux-x64-gnu`, `@harperfast/fulltext-darwin-arm64`, and
-   `@harperfast/fulltext-win32-x64-msvc`.
+   `@harperfast/fulltext-linux-x64-gnu`, `@harperfast/fulltext-linux-arm64-gnu`,
+   `@harperfast/fulltext-darwin-arm64`, and `@harperfast/fulltext-win32-x64-msvc`.
 3. The loader selects the platform package first in an installed consumer and falls back to an
    adjacent local artifact when no package is installed. Repository tests and benchmarks set
    `FULLTEXT_PREFER_LOCAL_BUILD=1` so a previously published package cannot shadow current source.
@@ -48,12 +48,11 @@ Use the established HNSW packaging model:
    `@harperfast/fulltext/native` export.
 6. The first published version is `0.1.1`. The `0.1.0` GitHub release failed before npm
    publication because its platform-package path was parsed as a GitHub shorthand instead of a
-   local directory. npm returned `404` for the facade and all three platform packages on
-   2026-09-23. After publication, Harper will consume `0.1.1` as an optional dependency and record
-   it in its lockfile and dependency ledger.
+   local directory. Version `0.1.1` successfully published the facade and three original platform
+   packages on 2026-09-24. Version `0.1.2` adds the Linux arm64 artifact.
 
-The initial support matrix remains Linux x64 glibc, macOS arm64, and Windows x64. Adding a target
-requires its own native runner, packed-artifact load test, and platform package.
+The support matrix is Linux x64 glibc, Linux arm64 glibc, macOS arm64, and Windows x64. Adding a
+target requires its own native runner, packed-artifact load test, and platform package.
 Linux artifacts are built on Ubuntu 22.04 and require glibc 2.35 or newer.
 
 The root package's explicit `files` allowlist excludes native artifacts. Its `prepack` compiles only
@@ -94,7 +93,7 @@ installation.
   release artifact for RocksDB dependencies and linkage.
 - Re-run the no-RocksDB dependency and native-linkage checks on release artifacts before publish;
   publish with npm provenance.
-- **untested:** after publishing, install `@harperfast/fulltext@0.1.1` into Harper and run the
+- **untested:** after publishing, install `@harperfast/fulltext@0.1.2` into Harper and run the
   derived-index lifecycle suite against the real package rather than an injected binding.
 
 ## Approaches considered
@@ -125,13 +124,10 @@ standalone wrapper, avoids install-time compilation, and does not download irrel
 
 ## Open items
 
-- **untested:** run the release workflow on Linux x64 glibc, macOS arm64, and Windows x64.
-- **untested:** exercise npm publication, provenance generation, and identical-tarball retry against
-  the HarperFast npm organization.
-- **untested:** confirm the repository `NPM_TOKEN` can publish all four scoped packages.
-- After `0.1.1` is published, refresh `package-lock.json` so the new platform package entries carry
-  registry URLs and integrity hashes.
-- Publish `0.1.1` before adding the exact optional dependency to Harper; the Harper integration test
+- **untested:** run the release workflow and full benchmark on the Linux arm64 runner.
+- **untested:** publish the new Linux arm64 package with npm provenance and verify an identical-
+  tarball retry.
+- Publish `0.1.2` before updating Harper's exact optional dependency; the Harper integration test
   must use the registry artifact rather than an injected binding.
 
 ## Sources

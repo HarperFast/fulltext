@@ -19,7 +19,17 @@ permissions:
 
 jobs:
   native:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64-gnu
+            output: benchmark-native.json
+          - os: ubuntu-22.04-arm
+            target: linux-arm64-gnu
+            output: benchmark-native-linux-arm64-gnu.json
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -41,12 +51,12 @@ jobs:
           --documents "$DOCUMENTS"
           --queries "$QUERIES"
           --revision "$REVISION"
-          --output benchmark-native.json
+          --output "${{ matrix.output }}"
       - name: Store workflow result
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-native-${{ github.sha }}
-          path: benchmark-native.json
+          name: benchmark-native-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ matrix.output }}
           if-no-files-found: error
           retention-days: 90
 
@@ -60,10 +70,11 @@ jobs:
       - name: Download benchmark result
         uses: actions/download-artifact@v4
         with:
-          name: benchmark-native-${{ github.sha }}
+          pattern: benchmark-native-*-${{ github.sha }}
+          merge-multiple: true
       - name: Attach result to the GitHub release
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" benchmark-native.json --clobber
+        run: gh release upload "$RELEASE_TAG" benchmark-native*.json --clobber

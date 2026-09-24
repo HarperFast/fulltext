@@ -20,6 +20,8 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: linux-x64-gnu
+          - os: ubuntu-22.04-arm
+            target: linux-arm64-gnu
           - os: macos-14
             target: darwin-arm64
           - os: windows-latest
@@ -115,6 +117,8 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: linux-x64-gnu
+          - os: ubuntu-22.04-arm
+            target: linux-arm64-gnu
           - os: macos-14
             target: darwin-arm64
           - os: windows-latest
