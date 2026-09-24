@@ -20,6 +20,8 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: linux-x64-gnu
+          - os: ubuntu-22.04-arm
+            target: linux-arm64-gnu
           - os: macos-14
             target: darwin-arm64
           - os: windows-latest
@@ -115,6 +117,8 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: linux-x64-gnu
+          - os: ubuntu-22.04-arm
+            target: linux-arm64-gnu
           - os: macos-14
             target: darwin-arm64
           - os: windows-latest
@@ -197,6 +201,8 @@ jobs:
     needs: packed-consumer
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    outputs:
+      version: ${{ steps.release.outputs.version }}
     permissions:
       contents: read
       id-token: write
@@ -224,6 +230,7 @@ jobs:
           cargo_version=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
           test "$version" = "$npm_version"
           test "$version" = "$cargo_version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           if [ "${{ github.event.release.prerelease }}" = "true" ]; then
             echo 'tag=next' >> "$GITHUB_OUTPUT"
           else
@@ -236,3 +243,91 @@ jobs:
           node scripts/publish-release-packages.mjs
           --directory release-tarballs
           --tag "${{ steps.release.outputs.tag }}"
+
+  on-publish-success:
+    if: success() && !cancelled()
+    name: Publish success
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            {
+              "channel": "${{ secrets.SLACK_CHANNEL_ID }}",
+              "text": "@harperfast/fulltext v${{ needs.publish.outputs.version }} has been published to npm",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "@harperfast/fulltext v${{ needs.publish.outputs.version }} has been published to npm"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status* :white_check_mark:"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "Published to :npm: <https://www.npmjs.com/package/@harperfast/fulltext/v/${{ needs.publish.outputs.version }}|@harperfast/fulltext@${{ needs.publish.outputs.version }}>"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":github: <${{ github.event.release.html_url }}|GitHub Release>"
+                    }
+                  ]
+                }
+              ]
+            }
+
+  on-publish-failure:
+    if: failure() && !cancelled()
+    name: Publish failure
+    needs: [platform-package, root-package, packed-consumer, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            {
+              "channel": "${{ secrets.SLACK_CHANNEL_ID }}",
+              "text": "@harperfast/fulltext release pipeline failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "@harperfast/fulltext release pipeline failed"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status* :x:"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "Failed during packaging, verification, or publication"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow run ${{ github.run_id }}>"
+                    }
+                  ]
+                }
+              ]
+            }

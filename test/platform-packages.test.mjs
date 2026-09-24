@@ -25,29 +25,36 @@ const rootManifest = {
 	),
 };
 
-test('stages a constrained native package for a supported target', (context) => {
+test('stages constrained native packages for every supported target', (context) => {
 	const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'fulltext-platform-package-'));
 	context.after(() => rmSync(temporaryDirectory, { recursive: true, force: true }));
 	const manifestPath = path.join(temporaryDirectory, 'package.json');
-	const artifactPath = path.join(temporaryDirectory, 'fulltext.linux-x64-gnu.node');
-	const outputDirectory = path.join(temporaryDirectory, 'output');
 	writeFileSync(manifestPath, JSON.stringify(rootManifest));
-	writeFileSync(artifactPath, 'native artifact');
+	assert.deepStrictEqual(supportedPlatformPackages, [
+		{ triple: 'darwin-arm64', os: 'darwin', cpu: 'arm64' },
+		{ triple: 'linux-arm64-gnu', os: 'linux', cpu: 'arm64', libc: 'glibc' },
+		{ triple: 'linux-x64-gnu', os: 'linux', cpu: 'x64', libc: 'glibc' },
+		{ triple: 'win32-x64-msvc', os: 'win32', cpu: 'x64' },
+	]);
 
-	const manifest = stagePlatformPackage({
-		rootManifestPath: manifestPath,
-		triple: 'linux-x64-gnu',
-		artifactPath,
-		outputDirectory,
-	});
-	assert.strictEqual(manifest.name, '@harperfast/fulltext-linux-x64-gnu');
-	assert.deepStrictEqual(manifest.os, ['linux']);
-	assert.deepStrictEqual(manifest.cpu, ['x64']);
-	assert.deepStrictEqual(manifest.libc, ['glibc']);
-	assert.strictEqual(
-		readFileSync(path.join(outputDirectory, 'fulltext.linux-x64-gnu.node'), 'utf8'),
-		'native artifact',
-	);
+	for (const platform of supportedPlatformPackages) {
+		const artifactName = `fulltext.${platform.triple}.node`;
+		const artifactPath = path.join(temporaryDirectory, artifactName);
+		const outputDirectory = path.join(temporaryDirectory, platform.triple);
+		writeFileSync(artifactPath, 'native artifact');
+
+		const manifest = stagePlatformPackage({
+			rootManifestPath: manifestPath,
+			triple: platform.triple,
+			artifactPath,
+			outputDirectory,
+		});
+		assert.strictEqual(manifest.name, `@harperfast/fulltext-${platform.triple}`);
+		assert.deepStrictEqual(manifest.os, [platform.os]);
+		assert.deepStrictEqual(manifest.cpu, [platform.cpu]);
+		assert.deepStrictEqual(manifest.libc, platform.libc ? [platform.libc] : undefined);
+		assert.strictEqual(readFileSync(path.join(outputDirectory, artifactName), 'utf8'), 'native artifact');
+	}
 });
 
 test('release validation requires every exact-version platform package', () => {
@@ -106,6 +113,38 @@ test('release workflow marks staged platform packages as local npm inputs', () =
 	assert.match(workflow, /applyMutationBatch/);
 	assert.match(workflow, /index\.search/);
 	assert.match(workflow, /index\.close/);
+});
+
+test('release workflow reports publication success and failure to Slack', () => {
+	const workflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
+	assert.strictEqual(
+		workflow.match(/slackapi\/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c/g)?.length,
+		2,
+	);
+	assert.strictEqual(workflow.match(/method: chat\.postMessage/g)?.length, 2);
+	assert.strictEqual(workflow.match(/errors: true/g)?.length, 2);
+	assert.strictEqual(workflow.match(/secrets\.SLACK_BOT_TOKEN/g)?.length, 2);
+	assert.strictEqual(workflow.match(/secrets\.SLACK_CHANNEL_ID/g)?.length, 2);
+	assert.match(workflow, /"text": "@harperfast\/fulltext release pipeline failed"/);
+	assert.match(workflow, /on-publish-success:[\s\S]*if: success\(\) && !cancelled\(\)[\s\S]*needs: publish/);
+	assert.match(
+		workflow,
+		/on-publish-failure:[\s\S]*if: failure\(\) && !cancelled\(\)[\s\S]*needs: \[platform-package, root-package, packed-consumer, publish\]/,
+	);
+});
+
+test('Linux arm64 is built, installed, and benchmarked on a native runner', () => {
+	const publishWorkflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
+	const ciWorkflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+	const benchmarkWorkflow = readFileSync(new URL('../.github/workflows/benchmark.yml', import.meta.url), 'utf8');
+	assert.strictEqual(publishWorkflow.match(/target: linux-arm64-gnu/g)?.length, 2);
+	assert.match(ciWorkflow, /target: linux-arm64-gnu/);
+	assert.match(ciWorkflow, /os: ubuntu-22\.04-arm\s+node: '22\.18\.0'/);
+	assert.match(ciWorkflow, /os: ubuntu-22\.04-arm\s+node: '24'/);
+	assert.match(benchmarkWorkflow, /benchmark-native-linux-arm64-gnu\.json/);
+	for (const workflow of [publishWorkflow, ciWorkflow, benchmarkWorkflow]) {
+		assert.match(workflow, /ubuntu-22\.04-arm/);
+	}
 });
 
 test('npm registry responses distinguish unpublished versions from malformed metadata', () => {

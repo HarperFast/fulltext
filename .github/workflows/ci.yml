@@ -21,6 +21,10 @@ jobs:
             node: '22.18.0'
           - os: ubuntu-latest
             node: '24'
+          - os: ubuntu-22.04-arm
+            node: '22.18.0'
+          - os: ubuntu-22.04-arm
+            node: '24'
           - os: macos-15
             node: '22.18.0'
           - os: macos-15
@@ -80,7 +84,15 @@ jobs:
 
   benchmark-smoke:
     name: Native benchmark smoke
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64-gnu
+          - os: ubuntu-22.04-arm
+            target: linux-arm64-gnu
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -102,7 +114,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-smoke-${{ github.sha }}
+          name: benchmark-smoke-${{ matrix.target }}-${{ github.sha }}
           path: benchmark-*.json
           if-no-files-found: warn
           retention-days: 30

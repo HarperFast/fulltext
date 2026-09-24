@@ -25,7 +25,8 @@ merging it:
 - Check the manifest and CI Rust version floors and the exact-version exceptions in `deny.toml`.
 - Refresh the dependency table and every version-specific Tantivy citation in the design documents.
 - Run the full test suite. Manually dispatch the `Release benchmark` workflow on the update branch,
-  then compare its `benchmark-native.json` with the asset attached to the previous release.
+  then compare its Linux x64 and Linux arm64 results with the matching assets attached to the
+  previous release.
 
 Scheduled Cargo version updates are limited to Tantivy. Dependabot security updates remain enabled
 for the full Cargo graph; they share the `dependencies` label used for Slack notifications. The
@@ -54,13 +55,14 @@ private addon callback and a matching facade change.
 | `typescript` 5.9.3    | development | Compiles the public façade and declarations.                          |
 
 The public entry point has no JavaScript runtime dependencies and does not depend on rocksdb-js.
-Its optional native packages are exact-version platform artifacts for Linux x64 glibc, macOS arm64,
-and Windows x64. They contain only the compiled addon and package metadata; keeping them separate
-prevents consumers from downloading binaries for other platforms and preserves installation without
-lifecycle scripts or a Rust toolchain.
+Its optional native packages are exact-version platform artifacts for Linux x64 glibc, Linux arm64
+glibc, macOS arm64, and Windows x64. They contain only the compiled addon and package metadata;
+keeping them separate prevents consumers from downloading binaries for other platforms and
+preserves installation without lifecycle scripts or a Rust toolchain.
 
-| Dependency                            | Scope            | Purpose                                        |
-| ------------------------------------- | ---------------- | ---------------------------------------------- |
-| `@harperfast/fulltext-darwin-arm64`   | optional runtime | macOS arm64 native addon for this version.     |
-| `@harperfast/fulltext-linux-x64-gnu`  | optional runtime | Linux x64 glibc native addon for this version. |
-| `@harperfast/fulltext-win32-x64-msvc` | optional runtime | Windows x64 native addon for this version.     |
+| Dependency                             | Scope            | Purpose                                        |
+| -------------------------------------- | ---------------- | ---------------------------------------------- |
+| `@harperfast/fulltext-darwin-arm64`    | optional runtime | macOS arm64 native addon for this version.     |
+| `@harperfast/fulltext-linux-arm64-gnu` | optional runtime | Linux arm64 glibc addon for this version.      |
+| `@harperfast/fulltext-linux-x64-gnu`   | optional runtime | Linux x64 glibc native addon for this version. |
+| `@harperfast/fulltext-win32-x64-msvc`  | optional runtime | Windows x64 native addon for this version.     |
