@@ -114,6 +114,7 @@ struct CompletionSignal {
 }
 
 struct EnvironmentState {
+	key: usize,
 	callbacks: Arc<CallbackGate>,
 	handles: Mutex<HashMap<u32, Arc<CompletionSignal>>>,
 	callback_cleanup: Mutex<Option<CallbackCleanupHook>>,
@@ -121,8 +122,12 @@ struct EnvironmentState {
 
 #[derive(Clone, Copy)]
 struct CallbackCleanupHook {
-	environment: usize,
 	data: usize,
+}
+
+struct CallbackCleanupData {
+	environment: Weak<EnvironmentState>,
+	callbacks: Arc<CallbackGate>,
 }
 
 struct CallbackGate {
@@ -491,9 +496,10 @@ pub fn test_fail_next_close(handle: u32, quiesced: bool) -> boundary::Result<()>
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeStatus")]
-pub fn native_status(handle: u32) -> boundary::Result<Buffer> {
+pub fn native_status(env: Env, handle: u32) -> boundary::Result<Buffer> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
+		runtime.environment.require_owner(&env)?;
 		Ok(Buffer::from(success_envelope(runtime.status_bytes())))
 	})?
 }
@@ -1868,6 +1874,7 @@ fn open_runtime_with_directory(
 }
 
 fn completion(env: &Env, callback: JsFunction, environment: &Arc<EnvironmentState>) -> boundary::Result<Completion> {
+	environment.require_owner(env)?;
 	let callback = callback
 		.create_threadsafe_function::<Vec<u8>, Buffer, _, ErrorStrategy::Fatal>(
 			0,
@@ -1925,6 +1932,7 @@ fn environment_state(env: &Env) -> boundary::Result<Arc<EnvironmentState>> {
 		return Ok(environment);
 	}
 	let environment = Arc::new(EnvironmentState {
+		key,
 		callbacks: Arc::new(CallbackGate::new()),
 		handles: Mutex::new(HashMap::new()),
 		callback_cleanup: Mutex::new(None),
@@ -1972,13 +1980,21 @@ fn finish_environment_cleanup(data: EnvironmentHookData) {
 }
 
 impl EnvironmentState {
-	fn rearm_callback_cleanup(&self, env: &Env) -> boundary::Result<()> {
+	fn require_owner(&self, env: &Env) -> boundary::Result<()> {
+		if self.key != env.raw() as usize {
+			return Err(napi_error(
+				"E_NATIVE_FAILURE",
+				"native index handles cannot be used from another Node environment",
+			));
+		}
+		Ok(())
+	}
+
+	fn rearm_callback_cleanup(self: &Arc<Self>, env: &Env) -> boundary::Result<()> {
 		// Node runs cleanup hooks last-in-first-out. Keep this marker newer than every
 		// operation callback so teardown closes the gate before destroying any callback.
-		let environment = env.raw() as usize;
 		let mut hook = lock(&self.callback_cleanup);
 		if let Some(previous) = hook.take() {
-			debug_assert_eq!(previous.environment, environment);
 			let status = unsafe {
 				sys::napi_remove_env_cleanup_hook(env.raw(), Some(close_callback_gate), previous.data as *mut c_void)
 			};
@@ -1987,11 +2003,14 @@ impl EnvironmentState {
 				return Err(napi_error("E_NATIVE_FAILURE", Status::from(status)));
 			}
 			unsafe {
-				drop(Box::from_raw(previous.data as *mut Arc<CallbackGate>));
+				drop(Box::from_raw(previous.data as *mut CallbackCleanupData));
 			}
 		}
 
-		let data = Box::into_raw(Box::new(self.callbacks.clone()));
+		let data = Box::into_raw(Box::new(CallbackCleanupData {
+			environment: Arc::downgrade(self),
+			callbacks: self.callbacks.clone(),
+		}));
 		let status = unsafe { sys::napi_add_env_cleanup_hook(env.raw(), Some(close_callback_gate), data.cast()) };
 		if status != sys::Status::napi_ok {
 			unsafe {
@@ -1999,10 +2018,7 @@ impl EnvironmentState {
 			}
 			return Err(napi_error("E_NATIVE_FAILURE", Status::from(status)));
 		}
-		*hook = Some(CallbackCleanupHook {
-			environment,
-			data: data as usize,
-		});
+		*hook = Some(CallbackCleanupHook { data: data as usize });
 		Ok(())
 	}
 
@@ -2020,8 +2036,15 @@ impl EnvironmentState {
 }
 
 unsafe extern "C" fn close_callback_gate(data: *mut c_void) {
-	let callbacks = unsafe { Box::from_raw(data.cast::<Arc<CallbackGate>>()) };
-	callbacks.close();
+	let data_address = data as usize;
+	let cleanup = unsafe { Box::from_raw(data.cast::<CallbackCleanupData>()) };
+	if let Some(environment) = cleanup.environment.upgrade() {
+		let mut hook = lock(&environment.callback_cleanup);
+		if hook.is_some_and(|hook| hook.data == data_address) {
+			*hook = None;
+		}
+	}
+	cleanup.callbacks.close();
 }
 
 impl CleanupWait {

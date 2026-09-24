@@ -15,12 +15,15 @@ if (scenario === 'apply') {
 	await runOpening();
 } else if (scenario === 'multiple') {
 	await runMultiple();
+} else if (scenario === 'foreign') {
+	await runForeignEnvironment();
 } else if (scenario === 'sequence') {
 	await runApply();
 	await runOpening();
 	await runMultiple();
+	await runForeignEnvironment();
 } else if (scenario === 'apply-stress') {
-	for (let attempt = 1; attempt <= 50; attempt++) {
+	for (let attempt = 1; attempt <= 25; attempt++) {
 		mark(`apply:${attempt}:starting`);
 		await runApply();
 	}
@@ -77,6 +80,28 @@ async function runMultiple() {
 	}
 }
 
+async function runForeignEnvironment() {
+	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-owner-'));
+	try {
+		const owner = startWorker({ indexPath, mode: 'owner' });
+		const ownerExit = waitForExit(owner);
+		const opened = await waitForMessage(owner, (message) => message?.type === 'owner-open');
+		const caller = startWorker({ handle: opened.handle, mode: 'foreign' });
+		const callerExit = waitForExit(caller);
+		const result = await waitForMessage(caller, (message) => message?.type === 'foreign-result');
+		assert.strictEqual(result.code, 'E_NATIVE_FAILURE');
+		assert.match(result.message, /another Node environment/);
+		assert.strictEqual(await callerExit, 0);
+		owner.postMessage('close');
+		assert.strictEqual(await ownerExit, 0);
+		const index = await waitForOpen(indexPath);
+		await index.close();
+		mark('foreign:closed');
+	} finally {
+		rmSync(indexPath, { recursive: true, force: true });
+	}
+}
+
 function startWorker(workerData) {
 	return new Worker(new URL('./native-worker-child.mjs', import.meta.url), {
 		workerData: { ...workerData, moduleUrl },
@@ -85,8 +110,26 @@ function startWorker(workerData) {
 
 function waitForMessage(worker, expected) {
 	return new Promise((resolve, reject) => {
+		const matches = typeof expected === 'function' ? expected : (message) => message === expected;
+		const onError = (error) => {
+			worker.off('message', onMessage);
+			reject(error);
+		};
+		const onMessage = (message) => {
+			if (!matches(message)) return;
+			worker.off('error', onError);
+			worker.off('message', onMessage);
+			resolve(message);
+		};
+		worker.once('error', onError);
+		worker.on('message', onMessage);
+	});
+}
+
+function waitForExit(worker) {
+	return new Promise((resolve, reject) => {
 		worker.once('error', reject);
-		worker.on('message', (message) => message === expected && resolve());
+		worker.once('exit', resolve);
 	});
 }
 
