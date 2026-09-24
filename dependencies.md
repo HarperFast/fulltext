@@ -28,7 +28,9 @@ merging it:
   then compare its `benchmark-native.json` with the asset attached to the previous release.
 
 Scheduled Cargo version updates are limited to Tantivy. Dependabot security updates remain enabled
-for the full Cargo graph; they share the `dependencies` label used for Slack notifications.
+for the full Cargo graph; they share the `dependencies` label used for Slack notifications. The
+per-dependency `version-update:` filters preserve that distinction and must not be replaced with a
+bare dependency-name ignore rule.
 
 napi-rs generates an outer unwind boundary only for exports marked `catch_unwind`. Every
 fulltext function, method, and constructor uses that option to contain argument and result
