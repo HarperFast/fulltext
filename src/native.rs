@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::c_void;
 use std::fs;
 use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use napi::bindgen_prelude::Buffer;
 use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{Env, JsFunction, Status};
+use napi::{sys, Env, JsFunction, Status};
 use napi_derive::napi;
 use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory, INDEX_WRITER_LOCK, META_LOCK};
 use tantivy::IndexReader;
@@ -115,6 +116,13 @@ struct CompletionSignal {
 struct EnvironmentState {
 	callbacks: Arc<CallbackGate>,
 	handles: Mutex<HashMap<u32, Arc<CompletionSignal>>>,
+	callback_cleanup: Mutex<Option<CallbackCleanupHook>>,
+}
+
+#[derive(Clone, Copy)]
+struct CallbackCleanupHook {
+	environment: usize,
+	data: usize,
 }
 
 struct CallbackGate {
@@ -202,7 +210,7 @@ pub fn native_open(env: Env, packed_config: Buffer, callback: JsFunction) -> bou
 	boundary::run_stateless(|| {
 		let environment = environment_state(&env)?;
 		let opening_done = Arc::new(CompletionSignal::new());
-		let completion = completion(callback, environment.callbacks.clone())?;
+		let completion = completion(&env, callback, &environment)?;
 		let handle = next_handle().map_err(fulltext_napi_error)?;
 		registry().opening.insert(handle);
 		environment.track(handle, opening_done.clone());
@@ -249,7 +257,7 @@ pub fn native_reset(env: Env, packed_config: Buffer, callback: JsFunction) -> bo
 	boundary::run_stateless(|| {
 		let environment = environment_state(&env)?;
 		let reset_done = Arc::new(CompletionSignal::new());
-		let completion = completion(callback, environment.callbacks.clone())?;
+		let completion = completion(&env, callback, &environment)?;
 		let operation = next_handle().map_err(fulltext_napi_error)?;
 		registry().opening.insert(operation);
 		environment.track(operation, reset_done.clone());
@@ -270,7 +278,7 @@ pub fn native_reset(env: Env, packed_config: Buffer, callback: JsFunction) -> bo
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeApply")]
-pub fn native_apply(handle: u32, packed_batch: Buffer, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_apply(env: Env, handle: u32, packed_batch: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
 		validate_batch_header(&packed_batch, runtime.config.limits.max_batch_bytes).map_err(fulltext_napi_error)?;
@@ -278,7 +286,7 @@ pub fn native_apply(handle: u32, packed_batch: Buffer, callback: JsFunction) -> 
 			.writer_queue
 			.check_capacity(packed_batch.len())
 			.map_err(fulltext_napi_error)?;
-		let completion = completion(callback, runtime.environment.callbacks.clone())?;
+		let completion = completion(&env, callback, &runtime.environment)?;
 		let bytes = packed_batch.to_vec();
 		runtime.enqueue_writer(
 			WriterCommand {
@@ -291,10 +299,10 @@ pub fn native_apply(handle: u32, packed_batch: Buffer, callback: JsFunction) -> 
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeCommit")]
-pub fn native_commit(handle: u32, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_commit(env: Env, handle: u32, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.environment.callbacks.clone())?;
+		let completion = completion(&env, callback, &runtime.environment)?;
 		runtime.enqueue_writer(
 			WriterCommand {
 				operation: WriterOperation::Commit,
@@ -306,7 +314,7 @@ pub fn native_commit(handle: u32, callback: JsFunction) -> boundary::Result<()> 
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativePublish")]
-pub fn native_publish(handle: u32, payload: String, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_publish(env: Env, handle: u32, payload: String, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		if payload.len() > crate::engine::MAX_COMMIT_PAYLOAD_BYTES {
 			return Err(fulltext_napi_error(FulltextError::invalid(format!(
@@ -315,7 +323,7 @@ pub fn native_publish(handle: u32, payload: String, callback: JsFunction) -> bou
 			))));
 		}
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.environment.callbacks.clone())?;
+		let completion = completion(&env, callback, &runtime.environment)?;
 		let bytes = payload.len();
 		runtime.enqueue_writer(
 			WriterCommand {
@@ -328,10 +336,10 @@ pub fn native_publish(handle: u32, payload: String, callback: JsFunction) -> bou
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeReload")]
-pub fn native_reload(handle: u32, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_reload(env: Env, handle: u32, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.environment.callbacks.clone())?;
+		let completion = completion(&env, callback, &runtime.environment)?;
 		runtime.enqueue_writer(
 			WriterCommand {
 				operation: WriterOperation::Reload,
@@ -343,7 +351,7 @@ pub fn native_reload(handle: u32, callback: JsFunction) -> boundary::Result<()> 
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeSearch")]
-pub fn native_search(handle: u32, packed_request: Buffer, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_search(env: Env, handle: u32, packed_request: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
 		runtime.require_open().map_err(fulltext_napi_error)?;
@@ -353,7 +361,7 @@ pub fn native_search(handle: u32, packed_request: Buffer, callback: JsFunction) 
 		queue
 			.check_capacity(packed_request.len())
 			.map_err(fulltext_napi_error)?;
-		let completion = completion(callback, runtime.environment.callbacks.clone())?;
+		let completion = completion(&env, callback, &runtime.environment)?;
 		let request = packed_request.to_vec();
 		queue
 			.try_push(
@@ -368,7 +376,12 @@ pub fn native_search(handle: u32, packed_request: Buffer, callback: JsFunction) 
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeTraceMatches")]
-pub fn native_trace_matches(handle: u32, packed_request: Buffer, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_trace_matches(
+	env: Env,
+	handle: u32,
+	packed_request: Buffer,
+	callback: JsFunction,
+) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
 		runtime.require_open().map_err(fulltext_napi_error)?;
@@ -377,7 +390,7 @@ pub fn native_trace_matches(handle: u32, packed_request: Buffer, callback: JsFun
 		queue
 			.check_capacity(packed_request.len())
 			.map_err(fulltext_napi_error)?;
-		let completion = completion(callback, runtime.environment.callbacks.clone())?;
+		let completion = completion(&env, callback, &runtime.environment)?;
 		let request = packed_request.to_vec();
 		queue
 			.try_push(
@@ -392,10 +405,10 @@ pub fn native_trace_matches(handle: u32, packed_request: Buffer, callback: JsFun
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeClose")]
-pub fn native_close(handle: u32, rollback: bool, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_close(env: Env, handle: u32, rollback: bool, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(handle)?;
-		let completion = completion(callback, runtime.environment.callbacks.clone())?;
+		let completion = completion(&env, callback, &runtime.environment)?;
 		match runtime
 			.state
 			.compare_exchange(STATE_OPEN, STATE_CLOSING, Ordering::AcqRel, Ordering::Acquire)
@@ -1854,16 +1867,17 @@ fn open_runtime_with_directory(
 	result
 }
 
-fn completion(callback: JsFunction, callbacks: Arc<CallbackGate>) -> boundary::Result<Completion> {
+fn completion(env: &Env, callback: JsFunction, environment: &Arc<EnvironmentState>) -> boundary::Result<Completion> {
 	let callback = callback
 		.create_threadsafe_function::<Vec<u8>, Buffer, _, ErrorStrategy::Fatal>(
 			0,
 			|context: ThreadSafeCallContext<Vec<u8>>| Ok(vec![Buffer::from(context.value)]),
 		)
 		.map_err(|error| napi_error("E_NATIVE_FAILURE", error))?;
+	environment.rearm_callback_cleanup(env)?;
 	Ok(Completion {
 		callback: Some(callback),
-		callbacks,
+		callbacks: environment.callbacks.clone(),
 	})
 }
 
@@ -1913,6 +1927,7 @@ fn environment_state(env: &Env) -> boundary::Result<Arc<EnvironmentState>> {
 	let environment = Arc::new(EnvironmentState {
 		callbacks: Arc::new(CallbackGate::new()),
 		handles: Mutex::new(HashMap::new()),
+		callback_cleanup: Mutex::new(None),
 	});
 	env.add_async_cleanup_hook(
 		EnvironmentHookData {
@@ -1957,6 +1972,40 @@ fn finish_environment_cleanup(data: EnvironmentHookData) {
 }
 
 impl EnvironmentState {
+	fn rearm_callback_cleanup(&self, env: &Env) -> boundary::Result<()> {
+		// Node runs cleanup hooks last-in-first-out. Keep this marker newer than every
+		// operation callback so teardown closes the gate before destroying any callback.
+		let environment = env.raw() as usize;
+		let mut hook = lock(&self.callback_cleanup);
+		if let Some(previous) = hook.take() {
+			debug_assert_eq!(previous.environment, environment);
+			let status = unsafe {
+				sys::napi_remove_env_cleanup_hook(env.raw(), Some(close_callback_gate), previous.data as *mut c_void)
+			};
+			if status != sys::Status::napi_ok {
+				*hook = Some(previous);
+				return Err(napi_error("E_NATIVE_FAILURE", Status::from(status)));
+			}
+			unsafe {
+				drop(Box::from_raw(previous.data as *mut Arc<CallbackGate>));
+			}
+		}
+
+		let data = Box::into_raw(Box::new(self.callbacks.clone()));
+		let status = unsafe { sys::napi_add_env_cleanup_hook(env.raw(), Some(close_callback_gate), data.cast()) };
+		if status != sys::Status::napi_ok {
+			unsafe {
+				drop(Box::from_raw(data));
+			}
+			return Err(napi_error("E_NATIVE_FAILURE", Status::from(status)));
+		}
+		*hook = Some(CallbackCleanupHook {
+			environment,
+			data: data as usize,
+		});
+		Ok(())
+	}
+
 	fn track(&self, handle: u32, opening_done: Arc<CompletionSignal>) {
 		lock(&self.handles).insert(handle, opening_done);
 	}
@@ -1968,6 +2017,11 @@ impl EnvironmentState {
 	fn take_handles(&self) -> HashMap<u32, Arc<CompletionSignal>> {
 		mem::take(&mut *lock(&self.handles))
 	}
+}
+
+unsafe extern "C" fn close_callback_gate(data: *mut c_void) {
+	let callbacks = unsafe { Box::from_raw(data.cast::<Arc<CallbackGate>>()) };
+	callbacks.close();
 }
 
 impl CleanupWait {
