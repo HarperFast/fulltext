@@ -102,6 +102,10 @@ test('release workflow marks staged platform packages as local npm inputs', () =
 	const workflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
 	assert.match(workflow, /npm pack "\.\/release\/\$\{\{ matrix\.target \}\}"/);
 	assert.doesNotMatch(workflow, /npm pack "release\/\$\{\{ matrix\.target \}\}"/);
+	assert.match(workflow, /openNativeFullTextIndex/);
+	assert.match(workflow, /applyMutationBatch/);
+	assert.match(workflow, /index\.search/);
+	assert.match(workflow, /index\.close/);
 });
 
 test('npm registry responses distinguish unpublished versions from malformed metadata', () => {
