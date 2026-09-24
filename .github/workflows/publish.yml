@@ -255,6 +255,7 @@ jobs:
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
           payload: |
             {
               "channel": "${{ secrets.SLACK_CHANNEL_ID }}",
@@ -298,16 +299,17 @@ jobs:
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
           payload: |
             {
               "channel": "${{ secrets.SLACK_CHANNEL_ID }}",
-              "text": "@harperfast/fulltext ${{ github.event.release.tag_name }} npm publish failed",
+              "text": "@harperfast/fulltext release pipeline failed",
               "blocks": [
                 {
                   "type": "header",
                   "text": {
                     "type": "plain_text",
-                    "text": "@harperfast/fulltext ${{ github.event.release.tag_name }} npm publish failed"
+                    "text": "@harperfast/fulltext release pipeline failed"
                   }
                 },
                 {
@@ -319,7 +321,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "Failed before or during publication to :npm:"
+                      "text": "Failed during packaging, verification, or publication"
                     },
                     {
                       "type": "mrkdwn",

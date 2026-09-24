@@ -52,7 +52,8 @@ Use the established HNSW packaging model:
    packages on 2026-09-24. Version `0.1.2` adds the Linux arm64 artifact.
 7. The publish workflow reports success or failure to Slack after the release pipeline settles.
    Success links the npm package and GitHub release; failure links the workflow run and observes
-   failures from packaging, packed-consumer verification, or publication.
+   failures from packaging, packed-consumer verification, or publication. Slack API rejection
+   fails the notification job rather than producing a false green result.
 
 The support matrix is Linux x64 glibc, Linux arm64 glibc, macOS arm64, and Windows x64. Adding a
 target requires its own native runner, packed-artifact load test, and platform package.

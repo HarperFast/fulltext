@@ -122,8 +122,10 @@ test('release workflow reports publication success and failure to Slack', () => 
 		2,
 	);
 	assert.strictEqual(workflow.match(/method: chat\.postMessage/g)?.length, 2);
+	assert.strictEqual(workflow.match(/errors: true/g)?.length, 2);
 	assert.strictEqual(workflow.match(/secrets\.SLACK_BOT_TOKEN/g)?.length, 2);
 	assert.strictEqual(workflow.match(/secrets\.SLACK_CHANNEL_ID/g)?.length, 2);
+	assert.match(workflow, /"text": "@harperfast\/fulltext release pipeline failed"/);
 	assert.match(workflow, /on-publish-success:[\s\S]*if: success\(\) && !cancelled\(\)[\s\S]*needs: publish/);
 	assert.match(
 		workflow,
