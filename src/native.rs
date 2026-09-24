@@ -699,10 +699,6 @@ impl Runtime {
 		bytes
 	}
 
-	fn signal_closed(&self) {
-		self.closed.signal();
-	}
-
 	fn wait_closed(&self, timeout: Duration) -> bool {
 		self.closed.wait(timeout)
 	}
@@ -1181,6 +1177,12 @@ impl WriterCommand {
 }
 
 fn writer_loop(runtime: Arc<Runtime>, writer: Writer, engine: Arc<Engine>, reader: Arc<IndexReader>) {
+	let closed = runtime.closed.clone();
+	writer_loop_inner(runtime, writer, engine, reader);
+	closed.signal();
+}
+
+fn writer_loop_inner(runtime: Arc<Runtime>, writer: Writer, engine: Arc<Engine>, reader: Arc<IndexReader>) {
 	let mut writer = Some(writer);
 	while let Some(queued) = runtime.writer_queue.pop() {
 		runtime
@@ -1410,7 +1412,6 @@ fn finish_runtime(
 			&runtime.environment,
 		);
 	}
-	runtime.signal_closed();
 	outcome
 }
 
@@ -1430,7 +1431,6 @@ fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
 		&runtime.path_identity,
 		&runtime.environment,
 	);
-	runtime.signal_closed();
 }
 
 fn close_result(outcome: WriterCloseOutcome) -> Result<Vec<u8>> {
@@ -1591,6 +1591,11 @@ fn open_on_thread(
 	opening_done: Arc<CompletionSignal>,
 	environment: Arc<EnvironmentState>,
 ) {
+	open_on_thread_inner(handle, bytes, completion, environment);
+	opening_done.signal();
+}
+
+fn open_on_thread_inner(handle: u32, bytes: Vec<u8>, completion: Completion, environment: Arc<EnvironmentState>) {
 	let result = catch_unwind(AssertUnwindSafe(|| open_runtime(handle, bytes, environment.clone())));
 	let opened = matches!(result, Ok(Ok(_)));
 	match result {
@@ -1602,7 +1607,6 @@ fn open_on_thread(
 	if !opened {
 		environment.release(handle);
 	}
-	opening_done.signal();
 }
 
 fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>) -> Result<Option<String>> {
@@ -1633,6 +1637,11 @@ fn reset_on_thread(
 	reset_done: Arc<CompletionSignal>,
 	environment: Arc<EnvironmentState>,
 ) {
+	reset_on_thread_inner(operation, bytes, completion, environment);
+	reset_done.signal();
+}
+
+fn reset_on_thread_inner(operation: u32, bytes: Vec<u8>, completion: Completion, environment: Arc<EnvironmentState>) {
 	let result = catch_unwind(AssertUnwindSafe(|| reset_runtime(operation, &bytes, &environment)));
 	let response = match result {
 		Ok(Ok(result)) => Ok(reset_body(result)),
@@ -1646,7 +1655,6 @@ fn reset_on_thread(
 		registry.cancelled.remove(&operation);
 	}
 	environment.release(operation);
-	reset_done.signal();
 }
 
 fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -> Result<ResetResult> {
