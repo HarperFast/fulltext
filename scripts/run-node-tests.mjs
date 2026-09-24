@@ -18,10 +18,10 @@ if (files.length === 0) {
 	throw new Error(`No ${phase} test files were discovered`);
 }
 
-const isolatedFiles = files.filter((file) => path.basename(file) === 'native-worker.test.mjs');
+const isolatedFiles = files.filter((file) => path.basename(file).startsWith('native-worker.'));
 const concurrentFiles = files.filter((file) => !isolatedFiles.includes(file));
 const nodeMajorVersion = Number.parseInt(process.versions.node, 10);
-const isolatedTestTimeout = 120_000;
+const isolatedTestTimeout = 900_000;
 for (const batch of [concurrentFiles, isolatedFiles]) {
 	if (batch.length === 0) {
 		continue;

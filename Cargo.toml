@@ -1,6 +1,6 @@
 [package]
 name = "harper-fulltext"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.90"
 description = "Tantivy full-text indexing for Node.js and Harper"
@@ -16,12 +16,12 @@ node-api = ["dep:napi", "dep:napi-derive"]
 test-panic = ["node-api"]
 
 [dependencies]
-napi = { version = "=2.16.17", default-features = false, features = ["napi8"], optional = true }
-napi-derive = { version = "=2.16.13", optional = true }
+napi = { version = "=3.13.0", default-features = false, features = ["dyn-symbols", "napi8"], optional = true }
+napi-derive = { version = "=3.6.9", optional = true }
 tantivy = "=0.26.1"
 
 [build-dependencies]
-napi-build = "=2.4.1"
+napi-build = "=2.5.0"
 
 [profile.release]
 lto = "thin"

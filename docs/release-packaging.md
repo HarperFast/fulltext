@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-- Publish a binary-free `@harperfast/fulltext` facade at `0.1.0`.
+- Publish a binary-free `@harperfast/fulltext` facade at `0.1.1`.
 - Publish one exact-version optional package for each supported platform.
 - Load the platform package by default; repository tests explicitly prefer the local build.
 - Reject missing, unloadable, ABI-incompatible, capability-incompatible, or version-skewed addons
@@ -42,10 +42,15 @@ Use the established HNSW packaging model:
    package. The root tarball contains no native artifact. Release tags must match both the npm and
    Cargo manifest versions, prereleases use the `next` dist-tag, and a retry skips an already
    published package only after its registry integrity matches the local tarball byte-for-byte.
-5. CI installs the packed root and matching packed platform package into a clean consumer with
-   lifecycle scripts disabled, then loads the public `@harperfast/fulltext/native` export.
-6. The first published version is `0.1.0`. After publication, Harper will consume that exact
-   version as an optional dependency and record it in its lockfile and dependency ledger.
+5. The release workflow installs the packed root and matching packed platform package into a clean
+   consumer with lifecycle scripts disabled, validates `runtimeInfo()`, then runs an
+   open/apply/commit/reload/search/close round trip through the public
+   `@harperfast/fulltext/native` export.
+6. The first published version is `0.1.1`. The `0.1.0` GitHub release failed before npm
+   publication because its platform-package path was parsed as a GitHub shorthand instead of a
+   local directory. npm returned `404` for the facade and all three platform packages on
+   2026-09-23. After publication, Harper will consume `0.1.1` as an optional dependency and record
+   it in its lockfile and dependency ledger.
 
 The initial support matrix remains Linux x64 glibc, macOS arm64, and Windows x64. Adding a target
 requires its own native runner, packed-artifact load test, and platform package.
@@ -82,13 +87,14 @@ installation.
   target maps to its expected package name.
 - Test package assembly rejects a missing target, an unexpected target, or version skew.
 - On each platform, install the packed root and packed platform tarballs in a clean temporary
-  consumer with `--ignore-scripts`, import the public entry point, and inspect `runtimeInfo()`.
+  consumer with `--ignore-scripts`, validate `runtimeInfo()`, then open an index, apply and commit a
+  document, reload and search it, and close the index.
 - Before merge, the existing PR CI runs formatting, lint, Rust, Node, supply-chain, and
   benchmark-smoke gates. The release workflow reruns Rust and Node tests and inspects each exact
   release artifact for RocksDB dependencies and linkage.
 - Re-run the no-RocksDB dependency and native-linkage checks on release artifacts before publish;
   publish with npm provenance.
-- **untested:** after publishing, install `@harperfast/fulltext@0.1.0` into Harper and run the
+- **untested:** after publishing, install `@harperfast/fulltext@0.1.1` into Harper and run the
   derived-index lifecycle suite against the real package rather than an injected binding.
 
 ## Approaches considered
@@ -123,9 +129,9 @@ standalone wrapper, avoids install-time compilation, and does not download irrel
 - **untested:** exercise npm publication, provenance generation, and identical-tarball retry against
   the HarperFast npm organization.
 - **untested:** confirm the repository `NPM_TOKEN` can publish all four scoped packages.
-- After `0.1.0` is published, refresh `package-lock.json` so the new platform package entries carry
+- After `0.1.1` is published, refresh `package-lock.json` so the new platform package entries carry
   registry URLs and integrity hashes.
-- Publish `0.1.0` before adding the exact optional dependency to Harper; the Harper integration test
+- Publish `0.1.1` before adding the exact optional dependency to Harper; the Harper integration test
   must use the registry artifact rather than an injected binding.
 
 ## Sources

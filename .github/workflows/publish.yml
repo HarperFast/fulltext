@@ -25,12 +25,12 @@ jobs:
           - os: windows-latest
             target: win32-x64-msvc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '22.18.0'
           cache: npm
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p release-tarball
-          npm pack "release/${{ matrix.target }}" --json --pack-destination "release-tarball"
+          npm pack "./release/${{ matrix.target }}" --json --pack-destination "release-tarball"
       - uses: actions/upload-artifact@v4
         with:
           name: release-package-${{ matrix.target }}
@@ -144,7 +144,53 @@ jobs:
           npm init --yes >/dev/null
           npm install ../packages/root/*.tgz ../packages/native/*.tgz --ignore-scripts --no-audit --no-fund
           expected_version="$RELEASE_TAG"
-          EXPECTED_VERSION="${expected_version#v}" node --input-type=module --eval "const info = await import('@harperfast/fulltext/native').then(module => module.runtimeInfo()); if (info.packageVersion !== process.env.EXPECTED_VERSION || info.storageBackends.join(',') !== 'native') process.exit(1); console.log(info)"
+          EXPECTED_VERSION="${expected_version#v}" node --input-type=module <<'NODE'
+          import assert from 'node:assert';
+          import { mkdtemp, rm } from 'node:fs/promises';
+          import { tmpdir } from 'node:os';
+          import path from 'node:path';
+          import { openNativeFullTextIndex, runtimeInfo } from '@harperfast/fulltext/native';
+
+          const info = await runtimeInfo();
+          assert.strictEqual(info.packageVersion, process.env.EXPECTED_VERSION);
+          assert.deepStrictEqual(info.storageBackends, ['native']);
+
+          const indexPath = await mkdtemp(path.join(tmpdir(), 'fulltext-packed-'));
+          let index;
+          try {
+            index = await openNativeFullTextIndex({
+              path: indexPath,
+              indexId: 'packed-smoke',
+              generation: 'release',
+              fields: [{ name: 'title', weight: 1 }],
+              analyzer: 'english@1',
+              limits: {
+                indexingThreads: 1,
+                searchThreads: 2,
+                writerMemoryBytes: 15_000_000,
+                maxQueuedCommands: 8,
+                maxQueuedBytes: 1024 * 1024,
+                maxBatchBytes: 1024 * 1024,
+              },
+            });
+            const applied = await index.applyMutationBatch({
+              upserts: [{ id: 'packed-smoke', fields: { title: 'Packed artifact smoke test' } }],
+            });
+            assert.strictEqual(applied.processed, 1);
+            await index.commit();
+            await index.reload();
+            const result = await index.search({ text: 'artifact', exactTotal: true });
+            assert.strictEqual(result.total, 1);
+            assert.strictEqual(result.hits[0]?.id, 'packed-smoke');
+            await index.close();
+            index = undefined;
+          } finally {
+            await index?.close({ mode: 'rollback' }).catch(() => {});
+            await rm(indexPath, { recursive: true, force: true });
+          }
+
+          console.log(info);
+          NODE
 
   publish:
     name: Publish npm packages

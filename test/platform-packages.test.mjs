@@ -8,6 +8,7 @@ import {
 	integrityForTarball,
 	isUnpublishedVersionError,
 	parsePublishedIntegrity,
+	tarballsIn,
 	validateReleaseManifests,
 } from '../scripts/publish-release-packages.mjs';
 import { platformPackageName, stagePlatformPackage, supportedPlatformPackages } from '../scripts/platform-packages.mjs';
@@ -87,6 +88,24 @@ test('tarball integrity is stable and content-sensitive', (context) => {
 	assert.strictEqual(integrityForTarball(tarball), first);
 	writeFileSync(tarball, 'second');
 	assert.notStrictEqual(integrityForTarball(tarball), first);
+});
+
+test('release tarballs use unambiguous absolute paths for npm publish', (context) => {
+	const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'fulltext-release-tarballs-'));
+	context.after(() => rmSync(temporaryDirectory, { recursive: true, force: true }));
+	const tarball = path.join(temporaryDirectory, 'package.tgz');
+	writeFileSync(tarball, 'package');
+	assert.deepStrictEqual(tarballsIn(path.relative(process.cwd(), temporaryDirectory)), [path.resolve(tarball)]);
+});
+
+test('release workflow marks staged platform packages as local npm inputs', () => {
+	const workflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
+	assert.match(workflow, /npm pack "\.\/release\/\$\{\{ matrix\.target \}\}"/);
+	assert.doesNotMatch(workflow, /npm pack "release\/\$\{\{ matrix\.target \}\}"/);
+	assert.match(workflow, /openNativeFullTextIndex/);
+	assert.match(workflow, /applyMutationBatch/);
+	assert.match(workflow, /index\.search/);
+	assert.match(workflow, /index\.close/);
 });
 
 test('npm registry responses distinguish unpublished versions from malformed metadata', () => {

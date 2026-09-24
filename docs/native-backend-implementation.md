@@ -53,7 +53,7 @@ construction; Harper owns source projection, replay, and derived-index readiness
   `verify: src/engine.rs:148-154; tantivy 0.26.1 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
 - napi-rs `AsyncTask` executes on the shared libuv pool, so it is not the execution primitive for
   sustained indexing or search.
-  `verify: napi 2.16.17 src/task.rs:6-14`
+  `verify: napi 3.13.0 src/bindgen_runtime/js_values/task.rs:18-43; src/async_work.rs:181-195`
 
 ## Public slice
 
