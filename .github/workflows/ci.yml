@@ -45,11 +45,11 @@ jobs:
         run: |
           $dumpDirectory = "$env:RUNNER_TEMP\fulltext-dumps"
           New-Item -ItemType Directory -Force -Path $dumpDirectory | Out-Null
-          $registryPath = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\node.exe'
-          New-Item -Force -Path $registryPath | Out-Null
-          New-ItemProperty -Force -Path $registryPath -Name DumpFolder -PropertyType ExpandString -Value $dumpDirectory | Out-Null
-          New-ItemProperty -Force -Path $registryPath -Name DumpType -PropertyType DWord -Value 2 | Out-Null
-          New-ItemProperty -Force -Path $registryPath -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          $archive = "$env:RUNNER_TEMP\procdump.zip"
+          $tools = "$env:RUNNER_TEMP\procdump"
+          Invoke-WebRequest https://download.sysinternals.com/files/Procdump.zip -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath $tools
+          & "$tools\procdump64.exe" -accepteula -ma -i $dumpDirectory
       - run: npm ci --ignore-scripts
       - run: npm run format:check
       - run: npm run lint
@@ -80,6 +80,10 @@ jobs:
           path: ${{ runner.temp }}/fulltext-dumps/*.dmp
           if-no-files-found: warn
           retention-days: 3
+      - name: Disable Windows crash dumps
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: '& "$env:RUNNER_TEMP\procdump\procdump64.exe" -accepteula -u'
       - run: git diff --exit-code -- ts/addon.d.ts
 
   supply-chain:
