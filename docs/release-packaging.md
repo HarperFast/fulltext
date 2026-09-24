@@ -42,8 +42,10 @@ Use the established HNSW packaging model:
    package. The root tarball contains no native artifact. Release tags must match both the npm and
    Cargo manifest versions, prereleases use the `next` dist-tag, and a retry skips an already
    published package only after its registry integrity matches the local tarball byte-for-byte.
-5. CI installs the packed root and matching packed platform package into a clean consumer with
-   lifecycle scripts disabled, then loads the public `@harperfast/fulltext/native` export.
+5. The release workflow installs the packed root and matching packed platform package into a clean
+   consumer with lifecycle scripts disabled, validates `runtimeInfo()`, then runs an
+   open/apply/commit/reload/search/close round trip through the public
+   `@harperfast/fulltext/native` export.
 6. The first published version is `0.1.1`. The `0.1.0` GitHub release failed before npm
    publication because its platform-package path was parsed as a GitHub shorthand instead of a
    local directory. npm returned `404` for the facade and all three platform packages on
@@ -85,7 +87,8 @@ installation.
   target maps to its expected package name.
 - Test package assembly rejects a missing target, an unexpected target, or version skew.
 - On each platform, install the packed root and packed platform tarballs in a clean temporary
-  consumer with `--ignore-scripts`, import the public entry point, and inspect `runtimeInfo()`.
+  consumer with `--ignore-scripts`, validate `runtimeInfo()`, then open an index, apply and commit a
+  document, reload and search it, and close the index.
 - Before merge, the existing PR CI runs formatting, lint, Rust, Node, supply-chain, and
   benchmark-smoke gates. The release workflow reruns Rust and Node tests and inspects each exact
   release artifact for RocksDB dependencies and linkage.
