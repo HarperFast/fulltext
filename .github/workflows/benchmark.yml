@@ -61,7 +61,7 @@ jobs:
           retention-days: 90
 
   publish:
-    if: github.event_name == 'release'
+    if: ${{ github.event_name == 'release' && !cancelled() }}
     needs: native
     runs-on: ubuntu-latest
     permissions:

@@ -127,6 +127,8 @@ standalone wrapper, avoids install-time compilation, and does not download irrel
 - **untested:** run the release workflow and full benchmark on the Linux arm64 runner.
 - **untested:** publish the new Linux arm64 package with npm provenance and verify an identical-
   tarball retry.
+- After `0.1.2` is published, refresh `package-lock.json` so every platform package carries its
+  registry URL and integrity hash.
 - Publish `0.1.2` before updating Harper's exact optional dependency; the Harper integration test
   must use the registry artifact rather than an injected binding.
 

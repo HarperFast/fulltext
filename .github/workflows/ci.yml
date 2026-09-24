@@ -22,6 +22,8 @@ jobs:
           - os: ubuntu-latest
             node: '24'
           - os: ubuntu-22.04-arm
+            node: '22.18.0'
+          - os: ubuntu-22.04-arm
             node: '24'
           - os: macos-15
             node: '22.18.0'

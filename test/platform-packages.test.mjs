@@ -25,29 +25,36 @@ const rootManifest = {
 	),
 };
 
-test('stages a constrained native package for a supported target', (context) => {
+test('stages constrained native packages for every supported target', (context) => {
 	const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'fulltext-platform-package-'));
 	context.after(() => rmSync(temporaryDirectory, { recursive: true, force: true }));
 	const manifestPath = path.join(temporaryDirectory, 'package.json');
-	const artifactPath = path.join(temporaryDirectory, 'fulltext.linux-arm64-gnu.node');
-	const outputDirectory = path.join(temporaryDirectory, 'output');
 	writeFileSync(manifestPath, JSON.stringify(rootManifest));
-	writeFileSync(artifactPath, 'native artifact');
+	assert.deepStrictEqual(supportedPlatformPackages, [
+		{ triple: 'darwin-arm64', os: 'darwin', cpu: 'arm64' },
+		{ triple: 'linux-arm64-gnu', os: 'linux', cpu: 'arm64', libc: 'glibc' },
+		{ triple: 'linux-x64-gnu', os: 'linux', cpu: 'x64', libc: 'glibc' },
+		{ triple: 'win32-x64-msvc', os: 'win32', cpu: 'x64' },
+	]);
 
-	const manifest = stagePlatformPackage({
-		rootManifestPath: manifestPath,
-		triple: 'linux-arm64-gnu',
-		artifactPath,
-		outputDirectory,
-	});
-	assert.strictEqual(manifest.name, '@harperfast/fulltext-linux-arm64-gnu');
-	assert.deepStrictEqual(manifest.os, ['linux']);
-	assert.deepStrictEqual(manifest.cpu, ['arm64']);
-	assert.deepStrictEqual(manifest.libc, ['glibc']);
-	assert.strictEqual(
-		readFileSync(path.join(outputDirectory, 'fulltext.linux-arm64-gnu.node'), 'utf8'),
-		'native artifact',
-	);
+	for (const platform of supportedPlatformPackages) {
+		const artifactName = `fulltext.${platform.triple}.node`;
+		const artifactPath = path.join(temporaryDirectory, artifactName);
+		const outputDirectory = path.join(temporaryDirectory, platform.triple);
+		writeFileSync(artifactPath, 'native artifact');
+
+		const manifest = stagePlatformPackage({
+			rootManifestPath: manifestPath,
+			triple: platform.triple,
+			artifactPath,
+			outputDirectory,
+		});
+		assert.strictEqual(manifest.name, `@harperfast/fulltext-${platform.triple}`);
+		assert.deepStrictEqual(manifest.os, [platform.os]);
+		assert.deepStrictEqual(manifest.cpu, [platform.cpu]);
+		assert.deepStrictEqual(manifest.libc, platform.libc ? [platform.libc] : undefined);
+		assert.strictEqual(readFileSync(path.join(outputDirectory, artifactName), 'utf8'), 'native artifact');
+	}
 });
 
 test('release validation requires every exact-version platform package', () => {
@@ -114,6 +121,8 @@ test('Linux arm64 is built, installed, and benchmarked on a native runner', () =
 	const benchmarkWorkflow = readFileSync(new URL('../.github/workflows/benchmark.yml', import.meta.url), 'utf8');
 	assert.strictEqual(publishWorkflow.match(/target: linux-arm64-gnu/g)?.length, 2);
 	assert.match(ciWorkflow, /target: linux-arm64-gnu/);
+	assert.match(ciWorkflow, /os: ubuntu-22\.04-arm\s+node: '22\.18\.0'/);
+	assert.match(ciWorkflow, /os: ubuntu-22\.04-arm\s+node: '24'/);
 	assert.match(benchmarkWorkflow, /benchmark-native-linux-arm64-gnu\.json/);
 	for (const workflow of [publishWorkflow, ciWorkflow, benchmarkWorkflow]) {
 		assert.match(workflow, /ubuntu-22\.04-arm/);
