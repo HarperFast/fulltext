@@ -129,7 +129,7 @@ standalone wrapper, avoids install-time compilation, and does not download irrel
 ## Open items
 
 - **untested:** run the release workflow and full benchmark on the Linux arm64 runner.
-- **untested:** publish the new Linux arm64 package with npm provenance and verify an identical-
+- **untested:** publish the new Linux arm64 package with npm provenance and verify an identical
   tarball retry.
 - **configuration:** grant `HarperFast/fulltext` access to the organization `SLACK_BOT_TOKEN`
   secret and set the repository `SLACK_CHANNEL_ID` secret before the next release.
