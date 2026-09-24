@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::c_void;
 use std::fs;
 use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -9,8 +8,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use napi::bindgen_prelude::Buffer;
-use napi::{sys, Env, JsFunction, NapiRaw, Status};
+use napi::bindgen_prelude::{Buffer, Function};
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::{Env, Status};
 use napi_derive::napi;
 use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory, INDEX_WRITER_LOCK, META_LOCK};
 use tantivy::IndexReader;
@@ -36,6 +36,9 @@ static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 const LIFECYCLE_ROOT: &str = ".fulltext-locks";
 const LEGACY_LIFECYCLE_LOCK: &str = ".harper-fulltext-lifecycle.lock";
 const RETIRED_ROOT: &str = ".fulltext-retired";
+
+type CompletionCallback<'scope> = Function<'scope, Buffer, ()>;
+type CompletionThreadsafeFunction = ThreadsafeFunction<Buffer, (), Buffer, Status, false>;
 
 #[derive(Default)]
 struct Registry {
@@ -117,23 +120,6 @@ struct EnvironmentState {
 	handles: Mutex<HashMap<u32, Arc<CompletionSignal>>>,
 }
 
-struct Callback {
-	handle: Arc<CallbackHandle>,
-}
-
-struct CallbackHandle {
-	pending: Mutex<Option<sys::napi_threadsafe_function>>,
-}
-
-struct CallbackHookData {
-	handle: Weak<CallbackHandle>,
-	hook_registered: AtomicBool,
-}
-
-struct CallbackCall {
-	bytes: Vec<u8>,
-}
-
 struct CallbackGate {
 	alive: AtomicBool,
 }
@@ -173,12 +159,9 @@ struct QueueWake {
 }
 
 struct Completion {
-	callback: Option<Callback>,
+	callback: Option<CompletionThreadsafeFunction>,
 	callbacks: Arc<CallbackGate>,
 }
-
-unsafe impl Send for CallbackHandle {}
-unsafe impl Sync for CallbackHandle {}
 
 struct WriterCommand {
 	operation: WriterOperation,
@@ -215,7 +198,7 @@ enum SearchOperation {
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeOpen")]
-pub fn native_open(env: Env, packed_config: Buffer, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_open(env: Env, packed_config: Buffer, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let environment = environment_state(&env)?;
 		let opening_done = Arc::new(CompletionSignal::new());
@@ -262,7 +245,7 @@ pub fn native_validate_open(packed_config: Buffer) -> boundary::Result<Buffer> {
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeReset")]
-pub fn native_reset(env: Env, packed_config: Buffer, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_reset(env: Env, packed_config: Buffer, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let environment = environment_state(&env)?;
 		let reset_done = Arc::new(CompletionSignal::new());
@@ -287,7 +270,12 @@ pub fn native_reset(env: Env, packed_config: Buffer, callback: JsFunction) -> bo
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeApply")]
-pub fn native_apply(env: Env, handle: u32, packed_batch: Buffer, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_apply(
+	env: Env,
+	handle: u32,
+	packed_batch: Buffer,
+	callback: CompletionCallback<'_>,
+) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
 		validate_batch_header(&packed_batch, runtime.config.limits.max_batch_bytes).map_err(fulltext_napi_error)?;
@@ -308,7 +296,7 @@ pub fn native_apply(env: Env, handle: u32, packed_batch: Buffer, callback: JsFun
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeCommit")]
-pub fn native_commit(env: Env, handle: u32, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_commit(env: Env, handle: u32, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
 		let completion = completion(&env, callback, &runtime.environment)?;
@@ -323,7 +311,12 @@ pub fn native_commit(env: Env, handle: u32, callback: JsFunction) -> boundary::R
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativePublish")]
-pub fn native_publish(env: Env, handle: u32, payload: String, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_publish(
+	env: Env,
+	handle: u32,
+	payload: String,
+	callback: CompletionCallback<'_>,
+) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		if payload.len() > crate::engine::MAX_COMMIT_PAYLOAD_BYTES {
 			return Err(fulltext_napi_error(FulltextError::invalid(format!(
@@ -345,7 +338,7 @@ pub fn native_publish(env: Env, handle: u32, payload: String, callback: JsFuncti
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeReload")]
-pub fn native_reload(env: Env, handle: u32, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_reload(env: Env, handle: u32, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
 		let completion = completion(&env, callback, &runtime.environment)?;
@@ -360,7 +353,12 @@ pub fn native_reload(env: Env, handle: u32, callback: JsFunction) -> boundary::R
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeSearch")]
-pub fn native_search(env: Env, handle: u32, packed_request: Buffer, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_search(
+	env: Env,
+	handle: u32,
+	packed_request: Buffer,
+	callback: CompletionCallback<'_>,
+) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
 		runtime.require_open().map_err(fulltext_napi_error)?;
@@ -389,7 +387,7 @@ pub fn native_trace_matches(
 	env: Env,
 	handle: u32,
 	packed_request: Buffer,
-	callback: JsFunction,
+	callback: CompletionCallback<'_>,
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
@@ -414,7 +412,7 @@ pub fn native_trace_matches(
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeClose")]
-pub fn native_close(env: Env, handle: u32, rollback: bool, callback: JsFunction) -> boundary::Result<()> {
+pub fn native_close(env: Env, handle: u32, rollback: bool, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
 		let completion = completion(&env, callback, &runtime.environment)?;
@@ -1000,156 +998,10 @@ impl CallbackGate {
 		self.alive.store(false, Ordering::Release);
 	}
 
-	fn send(&self, callback: Callback, bytes: Vec<u8>) {
+	fn send(&self, callback: CompletionThreadsafeFunction, bytes: Vec<u8>) {
 		if self.is_alive() {
-			callback.call(bytes);
-		} else {
-			callback.abort();
+			callback.call(Buffer::from(bytes), ThreadsafeFunctionCallMode::NonBlocking);
 		}
-	}
-}
-
-impl Callback {
-	fn new(env: &Env, callback: JsFunction) -> boundary::Result<Self> {
-		let handle = Arc::new(CallbackHandle {
-			pending: Mutex::new(None),
-		});
-		let hook_data = Box::into_raw(Box::new(CallbackHookData {
-			handle: Arc::downgrade(&handle),
-			hook_registered: AtomicBool::new(false),
-		}));
-		let mut resource_name = std::ptr::null_mut();
-		let name = b"fulltext_completion";
-		let name_status =
-			unsafe { sys::napi_create_string_utf8(env.raw(), name.as_ptr().cast(), name.len(), &mut resource_name) };
-		if name_status != sys::Status::napi_ok {
-			unsafe {
-				drop(Box::from_raw(hook_data));
-			}
-			return Err(napi_error("E_NATIVE_FAILURE", Status::from(name_status)));
-		}
-		let mut threadsafe = std::ptr::null_mut();
-		let create_status = unsafe {
-			sys::napi_create_threadsafe_function(
-				env.raw(),
-				callback.raw(),
-				std::ptr::null_mut(),
-				resource_name,
-				0,
-				1,
-				hook_data.cast(),
-				Some(finalize_callback),
-				std::ptr::null_mut(),
-				Some(deliver_callback),
-				&mut threadsafe,
-			)
-		};
-		if create_status != sys::Status::napi_ok {
-			unsafe {
-				drop(Box::from_raw(hook_data));
-			}
-			return Err(napi_error("E_NATIVE_FAILURE", Status::from(create_status)));
-		}
-		*lock(&handle.pending) = Some(threadsafe);
-		let callback = Self { handle };
-		let hook_status = unsafe { sys::napi_add_env_cleanup_hook(env.raw(), Some(abort_callback), hook_data.cast()) };
-		if hook_status != sys::Status::napi_ok {
-			callback.abort();
-			return Err(napi_error("E_NATIVE_FAILURE", Status::from(hook_status)));
-		}
-		unsafe { &*hook_data }.hook_registered.store(true, Ordering::Release);
-		Ok(callback)
-	}
-
-	fn call(self, bytes: Vec<u8>) {
-		let mut pending = lock(&self.handle.pending);
-		let Some(threadsafe) = pending.take() else {
-			return;
-		};
-		let data = Box::into_raw(Box::new(CallbackCall { bytes }));
-		let status = unsafe {
-			sys::napi_call_threadsafe_function(threadsafe, data.cast(), sys::ThreadsafeFunctionCallMode::nonblocking)
-		};
-		if status != sys::Status::napi_ok {
-			unsafe {
-				drop(Box::from_raw(data));
-			}
-		}
-		if status != sys::Status::napi_closing {
-			let release_status = unsafe {
-				sys::napi_release_threadsafe_function(threadsafe, sys::ThreadsafeFunctionReleaseMode::release)
-			};
-			debug_assert_eq!(release_status, sys::Status::napi_ok);
-		}
-	}
-
-	fn abort(self) {
-		let mut pending = lock(&self.handle.pending);
-		if let Some(threadsafe) = pending.take() {
-			let status =
-				unsafe { sys::napi_release_threadsafe_function(threadsafe, sys::ThreadsafeFunctionReleaseMode::abort) };
-			debug_assert_eq!(status, sys::Status::napi_ok);
-		}
-	}
-}
-
-unsafe extern "C" fn abort_callback(data: *mut c_void) {
-	let hook = unsafe { &*data.cast::<CallbackHookData>() };
-	hook.hook_registered.store(false, Ordering::Release);
-	if let Some(handle) = hook.handle.upgrade() {
-		let mut pending = lock(&handle.pending);
-		if let Some(threadsafe) = pending.take() {
-			let status =
-				unsafe { sys::napi_release_threadsafe_function(threadsafe, sys::ThreadsafeFunctionReleaseMode::abort) };
-			debug_assert_eq!(status, sys::Status::napi_ok);
-		}
-	}
-}
-
-unsafe extern "C" fn finalize_callback(env: sys::napi_env, data: *mut c_void, _hint: *mut c_void) {
-	let hook_registered = unsafe { &*data.cast::<CallbackHookData>() }
-		.hook_registered
-		.load(Ordering::Acquire);
-	if !env.is_null() && hook_registered {
-		unsafe {
-			sys::napi_remove_env_cleanup_hook(env, Some(abort_callback), data);
-		}
-	}
-	let hook = unsafe { Box::from_raw(data.cast::<CallbackHookData>()) };
-	if let Some(handle) = hook.handle.upgrade() {
-		lock(&handle.pending).take();
-	}
-}
-
-unsafe extern "C" fn deliver_callback(
-	env: sys::napi_env,
-	callback: sys::napi_value,
-	_context: *mut c_void,
-	data: *mut c_void,
-) {
-	let call = unsafe { Box::from_raw(data.cast::<CallbackCall>()) };
-	if env.is_null() || callback.is_null() {
-		return;
-	}
-	let mut buffer = std::ptr::null_mut();
-	let status = unsafe {
-		sys::napi_create_buffer_copy(
-			env,
-			call.bytes.len(),
-			call.bytes.as_ptr().cast(),
-			std::ptr::null_mut(),
-			&mut buffer,
-		)
-	};
-	if status != sys::Status::napi_ok {
-		return;
-	}
-	let mut receiver = std::ptr::null_mut();
-	if unsafe { sys::napi_get_undefined(env, &mut receiver) } != sys::Status::napi_ok {
-		return;
-	}
-	unsafe {
-		sys::napi_call_function(env, receiver, callback, 1, [buffer].as_ptr(), std::ptr::null_mut());
 	}
 }
 
@@ -2021,8 +1873,15 @@ fn open_runtime_with_directory(
 	result
 }
 
-fn completion(env: &Env, callback: JsFunction, environment: &Arc<EnvironmentState>) -> boundary::Result<Completion> {
-	let callback = Callback::new(env, callback)?;
+fn completion(
+	_env: &Env,
+	callback: CompletionCallback<'_>,
+	environment: &Arc<EnvironmentState>,
+) -> boundary::Result<Completion> {
+	let callback = callback
+		.build_threadsafe_function::<Buffer>()
+		.build()
+		.map_err(|error| napi_error("E_NATIVE_FAILURE", error))?;
 	Ok(Completion {
 		callback: Some(callback),
 		callbacks: environment.callbacks.clone(),
