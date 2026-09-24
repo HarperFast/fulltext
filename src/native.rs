@@ -114,7 +114,6 @@ struct CompletionSignal {
 }
 
 struct EnvironmentState {
-	key: usize,
 	callbacks: Arc<CallbackGate>,
 	handles: Mutex<HashMap<u32, Arc<CompletionSignal>>>,
 	callback_cleanup: Mutex<Option<CallbackCleanupHook>>,
@@ -285,7 +284,7 @@ pub fn native_reset(env: Env, packed_config: Buffer, callback: JsFunction) -> bo
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeApply")]
 pub fn native_apply(env: Env, handle: u32, packed_batch: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		let runtime = runtime(handle)?;
+		let runtime = runtime(&env, handle)?;
 		validate_batch_header(&packed_batch, runtime.config.limits.max_batch_bytes).map_err(fulltext_napi_error)?;
 		runtime
 			.writer_queue
@@ -306,7 +305,7 @@ pub fn native_apply(env: Env, handle: u32, packed_batch: Buffer, callback: JsFun
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeCommit")]
 pub fn native_commit(env: Env, handle: u32, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		let runtime = runtime(handle)?;
+		let runtime = runtime(&env, handle)?;
 		let completion = completion(&env, callback, &runtime.environment)?;
 		runtime.enqueue_writer(
 			WriterCommand {
@@ -327,7 +326,7 @@ pub fn native_publish(env: Env, handle: u32, payload: String, callback: JsFuncti
 				crate::engine::MAX_COMMIT_PAYLOAD_BYTES
 			))));
 		}
-		let runtime = runtime(handle)?;
+		let runtime = runtime(&env, handle)?;
 		let completion = completion(&env, callback, &runtime.environment)?;
 		let bytes = payload.len();
 		runtime.enqueue_writer(
@@ -343,7 +342,7 @@ pub fn native_publish(env: Env, handle: u32, payload: String, callback: JsFuncti
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeReload")]
 pub fn native_reload(env: Env, handle: u32, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		let runtime = runtime(handle)?;
+		let runtime = runtime(&env, handle)?;
 		let completion = completion(&env, callback, &runtime.environment)?;
 		runtime.enqueue_writer(
 			WriterCommand {
@@ -358,7 +357,7 @@ pub fn native_reload(env: Env, handle: u32, callback: JsFunction) -> boundary::R
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeSearch")]
 pub fn native_search(env: Env, handle: u32, packed_request: Buffer, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		let runtime = runtime(handle)?;
+		let runtime = runtime(&env, handle)?;
 		runtime.require_open().map_err(fulltext_napi_error)?;
 		validate_search_header(&packed_request).map_err(fulltext_napi_error)?;
 		let mode = search_mode(&packed_request).map_err(fulltext_napi_error)?;
@@ -388,7 +387,7 @@ pub fn native_trace_matches(
 	callback: JsFunction,
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		let runtime = runtime(handle)?;
+		let runtime = runtime(&env, handle)?;
 		runtime.require_open().map_err(fulltext_napi_error)?;
 		validate_trace_header(&packed_request).map_err(fulltext_napi_error)?;
 		let queue = runtime.search_queue(true);
@@ -412,7 +411,7 @@ pub fn native_trace_matches(
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeClose")]
 pub fn native_close(env: Env, handle: u32, rollback: bool, callback: JsFunction) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		let runtime = runtime(handle)?;
+		let runtime = runtime(&env, handle)?;
 		let completion = completion(&env, callback, &runtime.environment)?;
 		match runtime
 			.state
@@ -456,9 +455,9 @@ pub fn native_close(env: Env, handle: u32, rollback: bool, callback: JsFunction)
 
 #[cfg(feature = "test-panic")]
 #[napi(catch_unwind, skip_typescript, js_name = "__testPoisonNativeHandle")]
-pub fn test_poison_native_handle(handle: u32) -> boundary::Result<()> {
+pub fn test_poison_native_handle(env: Env, handle: u32) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		let runtime = runtime(handle)?;
+		let runtime = runtime(&env, handle)?;
 		runtime.poison(FulltextError::new("E_POISONED", "test poison"));
 		Ok(())
 	})?
@@ -466,18 +465,20 @@ pub fn test_poison_native_handle(handle: u32) -> boundary::Result<()> {
 
 #[cfg(feature = "test-panic")]
 #[napi(catch_unwind, skip_typescript, js_name = "__testPoisonBeforeNextAdmission")]
-pub fn test_poison_before_next_admission(handle: u32) -> boundary::Result<()> {
+pub fn test_poison_before_next_admission(env: Env, handle: u32) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		runtime(handle)?.poison_before_admission.store(true, Ordering::Release);
+		runtime(&env, handle)?
+			.poison_before_admission
+			.store(true, Ordering::Release);
 		Ok(())
 	})?
 }
 
 #[cfg(feature = "test-panic")]
 #[napi(catch_unwind, skip_typescript, js_name = "__testFailNextPublish")]
-pub fn test_fail_next_publish(handle: u32, after_commit: bool) -> boundary::Result<()> {
+pub fn test_fail_next_publish(env: Env, handle: u32, after_commit: bool) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		runtime(handle)?
+		runtime(&env, handle)?
 			.publish_fault
 			.store(if after_commit { 2 } else { 1 }, Ordering::Release);
 		Ok(())
@@ -486,9 +487,9 @@ pub fn test_fail_next_publish(handle: u32, after_commit: bool) -> boundary::Resu
 
 #[cfg(feature = "test-panic")]
 #[napi(catch_unwind, skip_typescript, js_name = "__testFailNextClose")]
-pub fn test_fail_next_close(handle: u32, quiesced: bool) -> boundary::Result<()> {
+pub fn test_fail_next_close(env: Env, handle: u32, quiesced: bool) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		runtime(handle)?
+		runtime(&env, handle)?
 			.close_fault
 			.store(if quiesced { 1 } else { 2 }, Ordering::Release);
 		Ok(())
@@ -498,8 +499,7 @@ pub fn test_fail_next_close(handle: u32, quiesced: bool) -> boundary::Result<()>
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeStatus")]
 pub fn native_status(env: Env, handle: u32) -> boundary::Result<Buffer> {
 	boundary::run_stateless(|| {
-		let runtime = runtime(handle)?;
-		runtime.environment.require_owner(&env)?;
+		let runtime = runtime(&env, handle)?;
 		Ok(Buffer::from(success_envelope(runtime.status_bytes())))
 	})?
 }
@@ -1874,7 +1874,6 @@ fn open_runtime_with_directory(
 }
 
 fn completion(env: &Env, callback: JsFunction, environment: &Arc<EnvironmentState>) -> boundary::Result<Completion> {
-	environment.require_owner(env)?;
 	let callback = callback
 		.create_threadsafe_function::<Vec<u8>, Buffer, _, ErrorStrategy::Fatal>(
 			0,
@@ -1888,12 +1887,21 @@ fn completion(env: &Env, callback: JsFunction, environment: &Arc<EnvironmentStat
 	})
 }
 
-fn runtime(handle: u32) -> boundary::Result<Arc<Runtime>> {
-	registry()
+fn runtime(env: &Env, handle: u32) -> boundary::Result<Arc<Runtime>> {
+	let registry = registry();
+	let runtime = registry
 		.handles
 		.get(&handle)
 		.cloned()
-		.ok_or_else(|| napi_error("E_CLOSED", "unknown or closed fulltext index handle"))
+		.ok_or_else(|| napi_error("E_CLOSED", "unknown or closed fulltext index handle"))?;
+	let environment = registry.environments.get(&(env.raw() as usize)).and_then(Weak::upgrade);
+	if !environment.is_some_and(|environment| Arc::ptr_eq(&environment, &runtime.environment)) {
+		return Err(napi_error(
+			"E_NATIVE_FAILURE",
+			"native index handles cannot be used from another Node environment",
+		));
+	}
+	Ok(runtime)
 }
 
 fn cleanup_handle(handle: u32) -> Option<Arc<Runtime>> {
@@ -1932,7 +1940,6 @@ fn environment_state(env: &Env) -> boundary::Result<Arc<EnvironmentState>> {
 		return Ok(environment);
 	}
 	let environment = Arc::new(EnvironmentState {
-		key,
 		callbacks: Arc::new(CallbackGate::new()),
 		handles: Mutex::new(HashMap::new()),
 		callback_cleanup: Mutex::new(None),
@@ -1980,16 +1987,6 @@ fn finish_environment_cleanup(data: EnvironmentHookData) {
 }
 
 impl EnvironmentState {
-	fn require_owner(&self, env: &Env) -> boundary::Result<()> {
-		if self.key != env.raw() as usize {
-			return Err(napi_error(
-				"E_NATIVE_FAILURE",
-				"native index handles cannot be used from another Node environment",
-			));
-		}
-		Ok(())
-	}
-
 	fn rearm_callback_cleanup(self: &Arc<Self>, env: &Env) -> boundary::Result<()> {
 		// Node runs cleanup hooks last-in-first-out. Keep this marker newer than every
 		// operation callback so teardown closes the gate before destroying any callback.
