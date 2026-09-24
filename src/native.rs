@@ -5,13 +5,12 @@ use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use napi::bindgen_prelude::Buffer;
-use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{sys, Env, JsFunction, Status};
+use napi::{sys, Env, JsFunction, NapiRaw, Status};
 use napi_derive::napi;
 use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory, INDEX_WRITER_LOCK, META_LOCK};
 use tantivy::IndexReader;
@@ -116,24 +115,27 @@ struct CompletionSignal {
 struct EnvironmentState {
 	callbacks: Arc<CallbackGate>,
 	handles: Mutex<HashMap<u32, Arc<CompletionSignal>>>,
-	callback_cleanup: Mutex<Option<CallbackCleanupHook>>,
 }
 
-#[derive(Clone, Copy)]
-struct CallbackCleanupHook {
-	data: usize,
+struct Callback {
+	handle: Arc<CallbackHandle>,
 }
 
-struct CallbackCleanupData {
-	environment: Weak<EnvironmentState>,
-	callbacks: Arc<CallbackGate>,
+struct CallbackHandle {
+	pending: Mutex<Option<sys::napi_threadsafe_function>>,
+}
+
+struct CallbackHookData {
+	handle: Weak<CallbackHandle>,
+	hook_registered: AtomicBool,
+}
+
+struct CallbackCall {
+	bytes: Vec<u8>,
 }
 
 struct CallbackGate {
 	alive: AtomicBool,
-	transition: RwLock<()>,
-	callbacks: Mutex<HashMap<u64, Callback>>,
-	next_callback: AtomicU64,
 }
 
 struct QueueState<T> {
@@ -170,12 +172,13 @@ struct QueueWake {
 	ready: Condvar,
 }
 
-type Callback = ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>;
-
 struct Completion {
-	callback: Option<u64>,
+	callback: Option<Callback>,
 	callbacks: Arc<CallbackGate>,
 }
+
+unsafe impl Send for CallbackHandle {}
+unsafe impl Sync for CallbackHandle {}
 
 struct WriterCommand {
 	operation: WriterOperation,
@@ -990,9 +993,6 @@ impl CallbackGate {
 	fn new() -> Self {
 		Self {
 			alive: AtomicBool::new(true),
-			transition: RwLock::new(()),
-			callbacks: Mutex::new(HashMap::new()),
-			next_callback: AtomicU64::new(1),
 		}
 	}
 
@@ -1001,39 +1001,159 @@ impl CallbackGate {
 	}
 
 	fn close(&self) {
-		let _transition = self.transition.write().unwrap_or_else(|error| error.into_inner());
-		if !self.alive.swap(false, Ordering::AcqRel) {
+		self.alive.store(false, Ordering::Release);
+	}
+
+	fn send(&self, callback: Callback, bytes: Vec<u8>) {
+		if self.is_alive() {
+			callback.call(bytes);
+		} else {
+			callback.abort();
+		}
+	}
+}
+
+impl Callback {
+	fn new(env: &Env, callback: JsFunction) -> boundary::Result<Self> {
+		let handle = Arc::new(CallbackHandle {
+			pending: Mutex::new(None),
+		});
+		let hook_data = Box::into_raw(Box::new(CallbackHookData {
+			handle: Arc::downgrade(&handle),
+			hook_registered: AtomicBool::new(false),
+		}));
+		let mut resource_name = std::ptr::null_mut();
+		let name = b"fulltext_completion";
+		let name_status =
+			unsafe { sys::napi_create_string_utf8(env.raw(), name.as_ptr().cast(), name.len(), &mut resource_name) };
+		if name_status != sys::Status::napi_ok {
+			unsafe {
+				drop(Box::from_raw(hook_data));
+			}
+			return Err(napi_error("E_NATIVE_FAILURE", Status::from(name_status)));
+		}
+		let mut threadsafe = std::ptr::null_mut();
+		let create_status = unsafe {
+			sys::napi_create_threadsafe_function(
+				env.raw(),
+				callback.raw(),
+				std::ptr::null_mut(),
+				resource_name,
+				0,
+				1,
+				hook_data.cast(),
+				Some(finalize_callback),
+				std::ptr::null_mut(),
+				Some(deliver_callback),
+				&mut threadsafe,
+			)
+		};
+		if create_status != sys::Status::napi_ok {
+			unsafe {
+				drop(Box::from_raw(hook_data));
+			}
+			return Err(napi_error("E_NATIVE_FAILURE", Status::from(create_status)));
+		}
+		*lock(&handle.pending) = Some(threadsafe);
+		let callback = Self { handle };
+		let hook_status = unsafe { sys::napi_add_env_cleanup_hook(env.raw(), Some(abort_callback), hook_data.cast()) };
+		if hook_status != sys::Status::napi_ok {
+			callback.abort();
+			return Err(napi_error("E_NATIVE_FAILURE", Status::from(hook_status)));
+		}
+		unsafe { &*hook_data }.hook_registered.store(true, Ordering::Release);
+		Ok(callback)
+	}
+
+	fn call(self, bytes: Vec<u8>) {
+		let mut pending = lock(&self.handle.pending);
+		let Some(threadsafe) = pending.take() else {
 			return;
-		}
-		for callback in mem::take(&mut *lock(&self.callbacks)).into_values() {
-			if let Err(error) = callback.abort() {
-				eprintln!("failed to abort fulltext callback during environment cleanup: {error}");
+		};
+		let data = Box::into_raw(Box::new(CallbackCall { bytes }));
+		let status = unsafe {
+			sys::napi_call_threadsafe_function(threadsafe, data.cast(), sys::ThreadsafeFunctionCallMode::nonblocking)
+		};
+		if status != sys::Status::napi_ok {
+			unsafe {
+				drop(Box::from_raw(data));
 			}
+		}
+		if status != sys::Status::napi_closing {
+			let release_status = unsafe {
+				sys::napi_release_threadsafe_function(threadsafe, sys::ThreadsafeFunctionReleaseMode::release)
+			};
+			debug_assert_eq!(release_status, sys::Status::napi_ok);
 		}
 	}
 
-	fn register(&self, callback: Callback) -> std::result::Result<u64, Callback> {
-		let _transition = self.transition.read().unwrap_or_else(|error| error.into_inner());
-		if !self.is_alive() {
-			return Err(callback);
+	fn abort(self) {
+		let mut pending = lock(&self.handle.pending);
+		if let Some(threadsafe) = pending.take() {
+			let status =
+				unsafe { sys::napi_release_threadsafe_function(threadsafe, sys::ThreadsafeFunctionReleaseMode::abort) };
+			debug_assert_eq!(status, sys::Status::napi_ok);
 		}
-		let id = self.next_callback.fetch_add(1, Ordering::Relaxed);
-		let replaced = lock(&self.callbacks).insert(id, callback);
-		debug_assert!(replaced.is_none(), "fulltext callback identifier wrapped");
-		Ok(id)
 	}
+}
 
-	fn send(&self, callback: u64, bytes: Vec<u8>) {
-		let _transition = self.transition.read().unwrap_or_else(|error| error.into_inner());
-		if let Some(callback) = lock(&self.callbacks).remove(&callback) {
-			let status = callback.call(bytes, ThreadsafeFunctionCallMode::NonBlocking);
-			if status == Status::Closing {
-				// napi_closing already decremented the thread count; releasing again is an error.
-				mem::forget(callback);
-			} else {
-				drop(callback);
-			}
+unsafe extern "C" fn abort_callback(data: *mut c_void) {
+	let hook = unsafe { &*data.cast::<CallbackHookData>() };
+	hook.hook_registered.store(false, Ordering::Release);
+	if let Some(handle) = hook.handle.upgrade() {
+		let mut pending = lock(&handle.pending);
+		if let Some(threadsafe) = pending.take() {
+			let status =
+				unsafe { sys::napi_release_threadsafe_function(threadsafe, sys::ThreadsafeFunctionReleaseMode::abort) };
+			debug_assert_eq!(status, sys::Status::napi_ok);
 		}
+	}
+}
+
+unsafe extern "C" fn finalize_callback(env: sys::napi_env, data: *mut c_void, _hint: *mut c_void) {
+	let hook_registered = unsafe { &*data.cast::<CallbackHookData>() }
+		.hook_registered
+		.load(Ordering::Acquire);
+	if !env.is_null() && hook_registered {
+		unsafe {
+			sys::napi_remove_env_cleanup_hook(env, Some(abort_callback), data);
+		}
+	}
+	let hook = unsafe { Box::from_raw(data.cast::<CallbackHookData>()) };
+	if let Some(handle) = hook.handle.upgrade() {
+		lock(&handle.pending).take();
+	}
+}
+
+unsafe extern "C" fn deliver_callback(
+	env: sys::napi_env,
+	callback: sys::napi_value,
+	_context: *mut c_void,
+	data: *mut c_void,
+) {
+	let call = unsafe { Box::from_raw(data.cast::<CallbackCall>()) };
+	if env.is_null() || callback.is_null() {
+		return;
+	}
+	let mut buffer = std::ptr::null_mut();
+	let status = unsafe {
+		sys::napi_create_buffer_copy(
+			env,
+			call.bytes.len(),
+			call.bytes.as_ptr().cast(),
+			std::ptr::null_mut(),
+			&mut buffer,
+		)
+	};
+	if status != sys::Status::napi_ok {
+		return;
+	}
+	let mut receiver = std::ptr::null_mut();
+	if unsafe { sys::napi_get_undefined(env, &mut receiver) } != sys::Status::napi_ok {
+		return;
+	}
+	unsafe {
+		sys::napi_call_function(env, receiver, callback, 1, [buffer].as_ptr(), std::ptr::null_mut());
 	}
 }
 
@@ -1894,17 +2014,7 @@ fn open_runtime_with_directory(
 }
 
 fn completion(env: &Env, callback: JsFunction, environment: &Arc<EnvironmentState>) -> boundary::Result<Completion> {
-	let callback = callback
-		.create_threadsafe_function::<Vec<u8>, Buffer, _, ErrorStrategy::Fatal>(
-			0,
-			|context: ThreadSafeCallContext<Vec<u8>>| Ok(vec![Buffer::from(context.value)]),
-		)
-		.map_err(|error| napi_error("E_NATIVE_FAILURE", error))?;
-	environment.rearm_callback_cleanup(env)?;
-	let callback = environment.callbacks.register(callback).map_err(|callback| {
-		let _ = callback.abort();
-		napi_error("E_CLOSED", "Node environment is closing")
-	})?;
+	let callback = Callback::new(env, callback)?;
 	Ok(Completion {
 		callback: Some(callback),
 		callbacks: environment.callbacks.clone(),
@@ -1966,7 +2076,6 @@ fn environment_state(env: &Env) -> boundary::Result<Arc<EnvironmentState>> {
 	let environment = Arc::new(EnvironmentState {
 		callbacks: Arc::new(CallbackGate::new()),
 		handles: Mutex::new(HashMap::new()),
-		callback_cleanup: Mutex::new(None),
 	});
 	env.add_async_cleanup_hook(
 		EnvironmentHookData {
@@ -2011,37 +2120,6 @@ fn finish_environment_cleanup(data: EnvironmentHookData) {
 }
 
 impl EnvironmentState {
-	fn rearm_callback_cleanup(self: &Arc<Self>, env: &Env) -> boundary::Result<()> {
-		// Node runs cleanup hooks last-in-first-out. Keep this marker newer than every
-		// operation callback so teardown closes the gate before destroying any callback.
-		let mut hook = lock(&self.callback_cleanup);
-		let data = if let Some(previous) = hook.take() {
-			let status = unsafe {
-				sys::napi_remove_env_cleanup_hook(env.raw(), Some(close_callback_gate), previous.data as *mut c_void)
-			};
-			if status != sys::Status::napi_ok {
-				*hook = Some(previous);
-				return Err(napi_error("E_NATIVE_FAILURE", Status::from(status)));
-			}
-			previous.data as *mut CallbackCleanupData
-		} else {
-			Box::into_raw(Box::new(CallbackCleanupData {
-				environment: Arc::downgrade(self),
-				callbacks: self.callbacks.clone(),
-			}))
-		};
-		let status = unsafe { sys::napi_add_env_cleanup_hook(env.raw(), Some(close_callback_gate), data.cast()) };
-		if status != sys::Status::napi_ok {
-			self.callbacks.close();
-			unsafe {
-				drop(Box::from_raw(data));
-			}
-			return Err(napi_error("E_NATIVE_FAILURE", Status::from(status)));
-		}
-		*hook = Some(CallbackCleanupHook { data: data as usize });
-		Ok(())
-	}
-
 	fn track(&self, handle: u32, opening_done: Arc<CompletionSignal>) {
 		lock(&self.handles).insert(handle, opening_done);
 	}
@@ -2053,18 +2131,6 @@ impl EnvironmentState {
 	fn take_handles(&self) -> HashMap<u32, Arc<CompletionSignal>> {
 		mem::take(&mut *lock(&self.handles))
 	}
-}
-
-unsafe extern "C" fn close_callback_gate(data: *mut c_void) {
-	let data_address = data as usize;
-	let cleanup = unsafe { Box::from_raw(data.cast::<CallbackCleanupData>()) };
-	if let Some(environment) = cleanup.environment.upgrade() {
-		let mut hook = lock(&environment.callback_cleanup);
-		if hook.is_some_and(|hook| hook.data == data_address) {
-			*hook = None;
-		}
-	}
-	cleanup.callbacks.close();
 }
 
 impl CleanupWait {
