@@ -5,12 +5,12 @@ reviewed deliberately.
 
 ## Rust runtime and build graph
 
-| Dependency            | Scope                           | Purpose                                                                    |
-| --------------------- | ------------------------------- | -------------------------------------------------------------------------- |
-| `tantivy` 0.26.1      | runtime                         | Full-text indexing and search engine, including native filesystem storage. |
-| `napi` 3.13.0         | optional runtime                | Node-API values, error conversion, and addon-image retention.              |
-| `napi-derive` 3.6.9   | optional build/runtime boundary | Generates Node-API exports.                                                |
-| `napi-build` 2.5.0    | build                           | Configures platform-specific addon linking.                                |
+| Dependency          | Scope                           | Purpose                                                                    |
+| ------------------- | ------------------------------- | -------------------------------------------------------------------------- |
+| `tantivy` 0.26.1    | runtime                         | Full-text indexing and search engine, including native filesystem storage. |
+| `napi` 3.13.0       | optional runtime                | Node-API values, error conversion, and addon-image retention.              |
+| `napi-derive` 3.6.9 | optional build/runtime boundary | Generates Node-API exports.                                                |
+| `napi-build` 2.5.0  | build                           | Configures platform-specific addon linking.                                |
 
 The Rust dependency graph must not include RocksDB. Harper uses the native filesystem backend for
 its rebuildable derived index rather than linking a second RocksDB runtime into this addon.
