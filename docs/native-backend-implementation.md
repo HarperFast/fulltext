@@ -140,10 +140,10 @@ type NativeFullTextIndexInspection =
 	  };
 ```
 
-These native-only limits are required in the pre-1.0 standalone factory so measurements are
-reproducible and memory is bounded without prematurely implementing #17's final process-wide budget
-allocator. The shared engine accepts resolved limits; the future runtime governor will supply them,
-and the Harper schema will never expose them.
+These native-only per-index limits keep standalone measurements reproducible. The optional process
+governor adds aggregate caps without moving policy into the shared engine. Harper supplies resolved
+per-index limits and configures the process budget once before opening indexes; the schema does not
+expose runtime resource policy.
 
 The exported flow is:
 
@@ -177,8 +177,9 @@ fuzzy-prefix, and current-record match tracing; it never stores source values. I
 because of its storage cost. Field weights are query-time boosts and may change when reopening the
 same physical index without rebuilding it.
 
-`configureNativeFullTextRuntime()` optionally installs one immutable process budget before indexes
-open. Identical calls are idempotent. It admits aggregate resident indexes, indexing/search threads,
+`configureNativeFullTextRuntime()` optionally installs one immutable process budget before the first
+open attempt. Identical calls are idempotent; configuration after an unbudgeted open is rejected. It
+admits aggregate resident indexes, indexing/search threads,
 writer memory, configured queue capacity, and expensive searches with checked atomic counters.
 Exceeding a cap returns `E_RESOURCE_LIMIT`; it never evicts an active generation. Callers that omit
 it retain current per-index admission behavior.
@@ -294,13 +295,18 @@ Unicode NFKC normalization, `LowerCaser`, `AsciiFoldingFilter`, `RemoveLongFilte
 `StopWordFilter`, and English `Stemmer`. Filters mutate token text without replacing the tokenizer's
 original byte offsets. Golden fixtures cover combining marks, full-width text, Latin diacritics,
 possessives, expansions, and adjacent emoji. The same analyzer tokenizes indexed and search text.
+The analyzer name and identity-sidecar version form the compatibility key; changing filter semantics
+requires bumping at least one of them.
 
 Synonym rules are bounded by count, replacement count, and encoded bytes in the native decoder.
-Each source and replacement must yield exactly one analyzed term. Canonical rules are sorted and
-fingerprinted in identity sidecar v3. Documents receive replacements once at the source position;
-query text is not expanded. Match tracing uses the same document-side expansion and maps every
-replacement to the source token span. Version 2 sidecars remain parseable for safe reset but mismatch
-v3 open/inspection so Harper can retire and rebuild them.
+Each source and replacement must yield exactly one normalized and analyzed term. Canonical rules are
+sorted and fingerprinted in identity sidecar v3. A bounded token filter streams replacements once at
+the source position into both analyzed and surface fields; query text is not expanded. Tantivy counts
+the alternatives in BM25 field length, so enabling a rule can affect unrelated-term ranking for a
+document containing its source. Match tracing uses the same document-side expansion and maps every
+replacement to the source token span, with a 262,144-token-per-value ceiling after expansion. Version
+2 sidecars remain parseable for safe reset but mismatch v3 open/inspection so Harper can retire and
+rebuild them.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`
@@ -456,9 +462,9 @@ depend on Harper or fork those semantics.
 
 The bad state to prevent is a backend opening durable data whose analyzer or engine semantics it
 cannot interpret. The candidate is a backend-neutral persisted fingerprint and commit durability
-contract before either backend ships. This is adopted in the chosen approach. The complete #14/#17
-surface remains rejected for this issue because derived watermarks, multi-environment sharing, and a
-global scheduler are not needed to enforce that durable compatibility invariant.
+contract before either backend ships. This is adopted in the chosen approach. Derived watermarks and
+multi-environment sharing remain Harper responsibilities; the wrapper's optional process governor
+only enforces local aggregate resource caps.
 
 ### Do less: expose Tantivy's existing filesystem API or query parser directly
 
@@ -468,10 +474,10 @@ performance baseline required for the wrapper.
 
 ### Do less on runtime: engine benchmark plus separate per-index writer and search executors
 
-Adopted. The engine is generic over `Directory`, and the Node slice uses byte-bounded per-index
-execution rather than implementing #17's process governor and shared cross-index search pool.
-Keeping search separate from the writer is the minimum needed for a baseline that measures Tantivy
-instead of temporary writer-queue head-of-line blocking.
+Partially adopted. The engine remains generic over `Directory`, and the Node slice keeps separate,
+byte-bounded per-index writer and search executors. A small optional process governor accounts for
+aggregate index, thread, writer-memory, queue-capacity, and expensive-search budgets; it does not
+introduce a shared cross-index executor or scheduler.
 
 ### Identity sidecar versus repeating identity in every commit payload
 

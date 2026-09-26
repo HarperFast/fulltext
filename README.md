@@ -46,6 +46,7 @@ const index = await openNativeFullTextIndex({
 	generation: 'v1',
 	fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
 	analyzer: 'english@1',
+	surfaceTerms: true,
 	synonyms: [{ source: 'tv', replacements: ['television'] }],
 	limits: {
 		indexingThreads: 2,
@@ -78,6 +79,8 @@ console.log(
 		generation: 'v1',
 		fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
 		analyzer: 'english@1',
+		surfaceTerms: true,
+		synonyms: [{ source: 'tv', replacements: ['television'] }],
 	}),
 ); // { state: 'checkpointed', committedPayload: 'source-checkpoint-42' }
 ```
@@ -98,8 +101,9 @@ and retry instead of rolling it back. This prevents a later publish from exposin
 batch. A closing or closed handle rejects every logical batch with `E_CLOSED`, including an empty
 batch, without taking the latch.
 
-`configureNativeFullTextRuntime()` is optional and idempotent for an identical configuration. Call
-it before opening indexes when one process may host many indexes. It bounds aggregate resident
+`configureNativeFullTextRuntime()` is optional and idempotent for an identical configuration. It
+must be called before the first open attempt when one process may host many indexes; configuring
+after an unbudgeted open fails with `E_RESOURCE_LIMIT`. It bounds aggregate resident
 indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
 expensive searches. A conflicting second configuration or an open/search that would exceed the
 budget fails with `E_RESOURCE_LIMIT`; the wrapper never evicts a live generation. Closing an index
@@ -172,10 +176,17 @@ boosts and may change on reopen without rebuilding the index.
 `english@1` applies Unicode NFKC normalization, lowercase and Latin-to-ASCII folding, English
 possessive removal, optional English stop words, and English stemming. Token offsets continue to
 refer to the original source value. Index-time synonyms are optional and bounded. Each `source`
-and replacement must produce exactly one analyzed term. Rules are canonicalized, persisted in the
-index identity, and expanded once at the source token's position; query text is not synonym-expanded.
-Changing analyzer settings or synonyms requires a new generation/rebuild. Match tracing applies the
-same index-time expansion so synonym-derived hits map back to the original token span.
+and replacement must produce exactly one normalized and analyzed term. Rules are canonicalized,
+persisted in the index identity, and expanded once at the source token's position; query text is not
+synonym-expanded. The expansion is also written to the surface field, so prefix autocomplete can
+match replacement terms. Tantivy counts the stacked alternatives in BM25 field length, which can
+lower unrelated-term scores for documents containing a synonym source. Changing analyzer settings
+or synonyms requires a new generation/rebuild. Match tracing applies the same index-time expansion
+so synonym-derived hits map back to the original token span.
+
+The public analyzer name and identity-sidecar version jointly identify persisted analyzer semantics.
+Any future filter or ordering change must use a new analyzer name or sidecar version so existing
+indexes fail closed and rebuild instead of silently changing recall.
 
 Highlighting is opt-in and operates on caller-supplied current source values, so the wrapper never
 returns stale stored text. It returns UTF-16 half-open offsets and no HTML. Snippets are also off by
@@ -190,6 +201,8 @@ const traced = await index.traceMatches(
 ```
 
 Tracing evaluates only the supplied current values; it does not expand the live index dictionary.
+Analysis is limited to 262,144 emitted tokens per value after synonym expansion and fails with
+`E_RESOURCE_LIMIT` beyond that bound.
 When its span or response ceiling is reached, `complete` is false and both later spans and later
 matching records may be omitted.
 

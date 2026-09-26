@@ -244,10 +244,16 @@ fn decode_engine_identity_config(cursor: &mut Cursor<'_>) -> Result<EngineIdenti
 			"synonyms must not contain more than {MAX_SYNONYM_RULES} rules"
 		)));
 	}
-	let synonym_start = cursor.offset;
+	let mut synonym_bytes_remaining = MAX_SYNONYM_BYTES;
 	let mut synonyms = Vec::with_capacity(synonym_count);
 	for _ in 0..synonym_count {
-		let source = cursor.string()?;
+		let source = cursor.string_with_budget(&mut synonym_bytes_remaining, "encoded synonyms")?;
+		if synonym_bytes_remaining < 2 {
+			return Err(FulltextError::invalid(format!(
+				"encoded synonyms must not exceed {MAX_SYNONYM_BYTES} bytes"
+			)));
+		}
+		synonym_bytes_remaining -= 2;
 		let replacement_count = cursor.u16()? as usize;
 		if replacement_count == 0 || replacement_count > MAX_SYNONYM_REPLACEMENTS {
 			return Err(FulltextError::invalid(format!(
@@ -256,14 +262,9 @@ fn decode_engine_identity_config(cursor: &mut Cursor<'_>) -> Result<EngineIdenti
 		}
 		let mut replacements = Vec::with_capacity(replacement_count);
 		for _ in 0..replacement_count {
-			replacements.push(cursor.string()?);
+			replacements.push(cursor.string_with_budget(&mut synonym_bytes_remaining, "encoded synonyms")?);
 		}
 		synonyms.push(SynonymRule { source, replacements });
-	}
-	if cursor.offset.saturating_sub(synonym_start) > MAX_SYNONYM_BYTES {
-		return Err(FulltextError::invalid(format!(
-			"encoded synonyms must not exceed {MAX_SYNONYM_BYTES} bytes"
-		)));
 	}
 	let field_count = cursor.u16()? as usize;
 	if field_count == 0 || field_count > MAX_FIELDS {
@@ -738,6 +739,26 @@ impl<'a> Cursor<'a> {
 		String::from_utf8(bytes.to_vec()).map_err(|_| FulltextError::invalid("packed string is not valid UTF-8"))
 	}
 
+	fn string_with_budget(&mut self, remaining: &mut usize, label: &str) -> Result<String> {
+		if *remaining < 4 {
+			return Err(FulltextError::invalid(format!(
+				"{label} must not exceed {MAX_SYNONYM_BYTES} bytes"
+			)));
+		}
+		let length = self.u32()? as usize;
+		let encoded_length = length
+			.checked_add(4)
+			.ok_or_else(|| FulltextError::invalid("packed string length overflow"))?;
+		if encoded_length > *remaining || length > MAX_STRING_BYTES {
+			return Err(FulltextError::invalid(format!(
+				"{label} must not exceed {MAX_SYNONYM_BYTES} bytes"
+			)));
+		}
+		*remaining -= encoded_length;
+		let bytes = self.take(length)?;
+		String::from_utf8(bytes.to_vec()).map_err(|_| FulltextError::invalid("packed string is not valid UTF-8"))
+	}
+
 	fn record_id(&mut self) -> Result<String> {
 		let id = self.string()?;
 		validate_record_id(&id)?;
@@ -811,6 +832,23 @@ mod tests {
 		bytes.extend_from_slice(&u32::MAX.to_le_bytes());
 		bytes.extend_from_slice(&0u32.to_le_bytes());
 		assert_eq!(decode_batch(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+	}
+
+	#[test]
+	fn rejects_synonym_strings_before_allocating_past_the_aggregate_budget() {
+		let bytes = ((MAX_SYNONYM_BYTES + 1) as u32).to_le_bytes();
+		let mut cursor = Cursor {
+			bytes: &bytes,
+			offset: 0,
+		};
+		let mut remaining = MAX_SYNONYM_BYTES;
+		assert_eq!(
+			cursor
+				.string_with_budget(&mut remaining, "encoded synonyms")
+				.unwrap_err()
+				.code,
+			"E_INVALID_ARGUMENT"
+		);
 	}
 
 	#[test]

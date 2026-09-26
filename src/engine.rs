@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use tantivy::collector::sort_key::{SortBySimilarityScore, SortByString};
@@ -12,8 +13,8 @@ use tantivy::query::{
 };
 use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{
-	AsciiFoldingFilter, Language, LowerCaser, PreTokenizedString, RemoveLongFilter, SimpleTokenizer, Stemmer,
-	StopWordFilter, TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer,
+	AsciiFoldingFilter, Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer,
+	Token, TokenFilter, TokenStream, Tokenizer,
 };
 use tantivy::{DocAddress, Index, IndexReader, IndexSettings, IndexWriter, Order, ReloadPolicy, Searcher, Term};
 use unicode_normalization::UnicodeNormalization;
@@ -31,6 +32,15 @@ const META_PATH: &str = "meta.json";
 const ANALYZER_NAME: &str = "english@1";
 const SURFACE_ANALYZER_NAME: &str = "english_surface@1";
 pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_TRACE_TOKENS_PER_VALUE: usize = 262_144;
+type SynonymMap = Arc<HashMap<String, Vec<String>>>;
+
+struct CanonicalIdentity {
+	config: EngineIdentityConfig,
+	analyzer: TextAnalyzer,
+	analyzed_synonyms: SynonymMap,
+	surface_synonyms: SynonymMap,
+}
 
 #[derive(Clone)]
 pub struct Engine {
@@ -40,7 +50,8 @@ pub struct Engine {
 	field_lookup: HashMap<String, usize>,
 	analyzer: TextAnalyzer,
 	surface_analyzer: TextAnalyzer,
-	synonyms: HashMap<String, Vec<String>>,
+	index_analyzer: TextAnalyzer,
+	surface_index_analyzer: TextAnalyzer,
 	positions: bool,
 }
 
@@ -65,8 +76,6 @@ pub struct Writer {
 	id_field: Field,
 	fields: Vec<EngineField>,
 	field_lookup: HashMap<String, usize>,
-	analyzer: TextAnalyzer,
-	synonyms: HashMap<String, Vec<String>>,
 }
 
 pub(crate) struct PreparedBatch {
@@ -156,7 +165,7 @@ impl TracePlan {
 
 impl Engine {
 	pub fn inspect<D: Directory + Clone>(directory: D, config: &EngineIdentityConfig) -> Result<InspectionResult> {
-		let (identity, _, _) = canonical_identity(config)?;
+		let identity = canonical_identity(config)?.config;
 		let (expected_schema, _, _) = build_schema(&identity)?;
 		let expected_identity = identity_bytes(&identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
@@ -195,7 +204,9 @@ impl Engine {
 	}
 
 	pub fn open<D: Directory + Clone>(directory: D, config: &EngineConfig) -> Result<Self> {
-		let (identity, analyzer, synonyms) = canonical_identity(&config.identity)?;
+		let canonical = canonical_identity(&config.identity)?;
+		let identity = canonical.config;
+		let analyzer = canonical.analyzer;
 		let (schema, id_field, fields) = build_schema(&identity)?;
 		let expected_identity = identity_bytes(&identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
@@ -232,11 +243,13 @@ impl Engine {
 				"the persisted Tantivy schema does not match the requested configuration",
 			));
 		}
-		let surface_analyzer = build_surface_analyzer();
-		index.tokenizers().register(ANALYZER_NAME, analyzer.clone());
+		let surface_analyzer = build_surface_analyzer(None);
+		let index_analyzer = build_analyzer(identity.stop_words, Some(canonical.analyzed_synonyms))?;
+		let surface_index_analyzer = build_surface_analyzer(Some(canonical.surface_synonyms));
+		index.tokenizers().register(ANALYZER_NAME, index_analyzer.clone());
 		index
 			.tokenizers()
-			.register(SURFACE_ANALYZER_NAME, surface_analyzer.clone());
+			.register(SURFACE_ANALYZER_NAME, surface_index_analyzer.clone());
 		let field_lookup = fields
 			.iter()
 			.enumerate()
@@ -249,7 +262,8 @@ impl Engine {
 			field_lookup,
 			analyzer,
 			surface_analyzer,
-			synonyms,
+			index_analyzer,
+			surface_index_analyzer,
 			positions: identity.positions,
 		})
 	}
@@ -281,8 +295,6 @@ impl Engine {
 				id_field: self.id_field,
 				fields: self.fields.clone(),
 				field_lookup: self.field_lookup.clone(),
-				analyzer: self.analyzer.clone(),
-				synonyms: self.synonyms.clone(),
 			},
 			payload,
 		))
@@ -620,16 +632,19 @@ impl Engine {
 							while source_index < analyzed.len() && analyzed[source_index].position < expected_position {
 								source_index += 1;
 							}
-							let Some(token) = analyzed.get(source_index) else {
+							let position_start = source_index;
+							while source_index < analyzed.len() && analyzed[source_index].position == expected_position
+							{
+								source_index += 1;
+							}
+							let Some(token) = analyzed[position_start..source_index]
+								.iter()
+								.find(|token| token.text == *term)
+							else {
 								matches = false;
 								break;
 							};
-							if token.position != expected_position || token.text != *term {
-								matches = false;
-								break;
-							}
 							final_token = token;
-							source_index += 1;
 						}
 						if matches {
 							found.insert("__phrase".to_owned());
@@ -691,18 +706,23 @@ impl Engine {
 			}
 			TracePlan::Fuzzy(terms) => {
 				let surface = self.source_tokens(value, true, deadline)?;
-				let analyzed_by_position = analyzed
-					.iter()
-					.map(|token| (token.position, token.text.as_str()))
-					.collect::<HashMap<_, _>>();
+				let mut analyzed_by_position = HashMap::<usize, Vec<&str>>::new();
+				for token in &analyzed {
+					analyzed_by_position
+						.entry(token.position)
+						.or_default()
+						.push(token.text.as_str());
+				}
 				for (index, token) in surface.iter().enumerate() {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
 					for (analyzed_term, surface_term) in terms {
-						let analyzed_matches = analyzed_by_position.get(&token.position).is_some_and(|token| {
-							*token == analyzed_term
-								|| (fuzzy_eligible(surface_term) && within_one_edit(analyzed_term, token))
+						let analyzed_matches = analyzed_by_position.get(&token.position).is_some_and(|tokens| {
+							tokens.iter().any(|token| {
+								*token == analyzed_term
+									|| (fuzzy_eligible(surface_term) && within_one_edit(analyzed_term, token))
+							})
 						});
 						if analyzed_matches
 							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
@@ -730,18 +750,25 @@ impl Engine {
 
 	fn source_tokens(&self, text: &str, surface: bool, deadline: Option<Instant>) -> Result<Vec<SourceToken>> {
 		let mut analyzer = if surface {
-			self.surface_analyzer.clone()
+			self.surface_index_analyzer.clone()
 		} else {
-			self.analyzer.clone()
+			self.index_analyzer.clone()
 		};
-		let analyzed = analyzed_tokens(&mut analyzer, text, (!surface).then_some(&self.synonyms));
-		let mut tokens = Vec::with_capacity(analyzed.len());
-		for token in analyzed {
+		let mut stream = analyzer.token_stream(text);
+		let mut tokens = Vec::new();
+		while stream.advance() {
 			if tokens.len() % 256 == 0 {
 				check_deadline(deadline)?;
 			}
+			if tokens.len() == MAX_TRACE_TOKENS_PER_VALUE {
+				return Err(FulltextError::new(
+					"E_RESOURCE_LIMIT",
+					format!("trace analysis exceeds {MAX_TRACE_TOKENS_PER_VALUE} tokens for one value"),
+				));
+			}
+			let token = stream.token();
 			tokens.push(SourceToken {
-				text: token.text,
+				text: token.text.clone(),
 				start: token.offset_from,
 				end: token.offset_to,
 				position: token.position,
@@ -965,12 +992,23 @@ impl Engine {
 
 	fn final_surface_term<'a>(&self, text: &'a str) -> Result<(&'a str, Option<String>)> {
 		let mut tokenizer = SimpleTokenizer::default();
-		let mut stream = tokenizer.token_stream(text);
+		let mut raw_stream = tokenizer.token_stream(text);
+		let mut raw_final_length = 0;
+		while raw_stream.advance() {
+			raw_final_length = raw_stream.token().text.len();
+		}
+		if raw_final_length >= 40 {
+			return Err(FulltextError::invalid(
+				"the final prefix token must be shorter than 40 UTF-8 bytes",
+			));
+		}
+		let mut analyzer = self.surface_analyzer.clone();
+		let mut stream = analyzer.token_stream(text);
 		let mut final_term = None;
 		let mut final_offset = 0;
 		while stream.advance() {
 			let token = stream.token();
-			final_term = Some(token.text.to_lowercase());
+			final_term = Some(token.text.clone());
 			final_offset = token.offset_from;
 		}
 		if final_term.as_ref().is_some_and(|term| term.len() >= 40) {
@@ -1310,7 +1348,6 @@ impl Writer {
 
 	pub(crate) fn prepare(&self, batch: MutationBatch) -> Result<PreparedBatch> {
 		let mutation_count = batch.upserts.len() + batch.deletes.len();
-		let mut analyzer = self.analyzer.clone();
 		for id in &batch.deletes {
 			validate_record_id(id)?;
 		}
@@ -1330,14 +1367,7 @@ impl Writer {
 					.ok_or_else(|| FulltextError::invalid(format!("unknown mutation field {name}")))?;
 				for value in values {
 					let field = &self.fields[*index];
-					let tokens = analyzed_tokens(&mut analyzer, &value, Some(&self.synonyms));
-					document.add_pre_tokenized_text(
-						field.field,
-						PreTokenizedString {
-							text: value.clone(),
-							tokens,
-						},
-					);
+					document.add_text(field.field, &value);
 					if let Some(surface_field) = field.surface_field {
 						document.add_text(surface_field, &value);
 					}
@@ -1549,7 +1579,80 @@ fn is_possessive_suffix(source: &str, offset: usize) -> bool {
 		.is_some_and(char::is_alphanumeric)
 }
 
-fn build_analyzer(stop_words: bool) -> Result<TextAnalyzer> {
+#[derive(Clone)]
+struct SynonymFilter {
+	rules: SynonymMap,
+}
+
+impl TokenFilter for SynonymFilter {
+	type Tokenizer<T: Tokenizer> = SynonymFilterWrapper<T>;
+
+	fn transform<T: Tokenizer>(self, tokenizer: T) -> Self::Tokenizer<T> {
+		SynonymFilterWrapper {
+			tokenizer,
+			rules: self.rules,
+			pending: Vec::new(),
+		}
+	}
+}
+
+#[derive(Clone)]
+struct SynonymFilterWrapper<T> {
+	tokenizer: T,
+	rules: SynonymMap,
+	pending: Vec<Token>,
+}
+
+impl<T: Tokenizer> Tokenizer for SynonymFilterWrapper<T> {
+	type TokenStream<'a> = SynonymTokenStream<'a, T::TokenStream<'a>>;
+
+	fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+		self.pending.clear();
+		SynonymTokenStream {
+			tail: self.tokenizer.token_stream(text),
+			rules: &self.rules,
+			pending: &mut self.pending,
+		}
+	}
+}
+
+struct SynonymTokenStream<'a, T> {
+	tail: T,
+	rules: &'a HashMap<String, Vec<String>>,
+	pending: &'a mut Vec<Token>,
+}
+
+impl<T: TokenStream> TokenStream for SynonymTokenStream<'_, T> {
+	fn advance(&mut self) -> bool {
+		self.pending.pop();
+		if !self.pending.is_empty() {
+			return true;
+		}
+		if !self.tail.advance() {
+			return false;
+		}
+		let token = self.tail.token();
+		if let Some(replacements) = self.rules.get(&token.text) {
+			for replacement in replacements.iter().rev() {
+				let mut expanded = token.clone();
+				expanded.text = replacement.clone();
+				self.pending.push(expanded);
+			}
+			self.pending.push(token.clone());
+		}
+		true
+	}
+
+	fn token(&self) -> &Token {
+		self.pending.last().unwrap_or_else(|| self.tail.token())
+	}
+
+	fn token_mut(&mut self) -> &mut Token {
+		self.pending.last_mut().unwrap_or_else(|| self.tail.token_mut())
+	}
+}
+
+fn build_analyzer(stop_words: bool, synonyms: Option<SynonymMap>) -> Result<TextAnalyzer> {
 	let mut builder = TextAnalyzer::builder(SimpleTokenizer::default())
 		.filter_dynamic(EnglishPossessiveFilter)
 		.filter_dynamic(NfkcFilter)
@@ -1561,61 +1664,85 @@ fn build_analyzer(stop_words: bool) -> Result<TextAnalyzer> {
 			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "English stop words are unavailable"))?;
 		builder = builder.filter_dynamic(stop_filter);
 	}
-	Ok(builder.filter_dynamic(Stemmer::new(Language::English)).build())
+	builder = builder.filter_dynamic(Stemmer::new(Language::English));
+	if let Some(rules) = synonyms {
+		builder = builder.filter_dynamic(SynonymFilter { rules });
+	}
+	Ok(builder.build())
 }
 
-fn build_surface_analyzer() -> TextAnalyzer {
-	TextAnalyzer::builder(SimpleTokenizer::default())
+fn build_surface_analyzer(synonyms: Option<SynonymMap>) -> TextAnalyzer {
+	let mut builder = TextAnalyzer::builder(SimpleTokenizer::default())
 		.filter_dynamic(EnglishPossessiveFilter)
 		.filter_dynamic(NfkcFilter)
 		.filter_dynamic(LowerCaser)
 		.filter_dynamic(AsciiFoldingFilter)
-		.filter_dynamic(RemoveLongFilter::limit(40))
-		.build()
+		.filter_dynamic(RemoveLongFilter::limit(40));
+	if let Some(rules) = synonyms {
+		builder = builder.filter_dynamic(SynonymFilter { rules });
+	}
+	builder.build()
 }
 
-fn canonical_identity(
-	config: &EngineIdentityConfig,
-) -> Result<(EngineIdentityConfig, TextAnalyzer, HashMap<String, Vec<String>>)> {
-	let analyzer = build_analyzer(config.stop_words)?;
+fn canonical_identity(config: &EngineIdentityConfig) -> Result<CanonicalIdentity> {
+	let mut analyzer = build_analyzer(config.stop_words, None)?;
+	let mut normalizer = build_surface_analyzer(None);
 	let mut canonical = config.clone();
-	let mut sources = HashSet::with_capacity(config.synonyms.len());
+	let mut analyzed_sources = HashSet::with_capacity(config.synonyms.len());
+	let mut surface_sources = HashSet::with_capacity(config.synonyms.len());
 	let mut rules = Vec::with_capacity(config.synonyms.len());
-	let mut lookup = HashMap::with_capacity(config.synonyms.len());
+	let mut analyzed_lookup = HashMap::with_capacity(config.synonyms.len());
+	let mut surface_lookup = HashMap::with_capacity(config.synonyms.len());
 	for rule in &config.synonyms {
-		let source = canonical_synonym_term(&analyzer, &rule.source, "source")?;
-		if !sources.insert(source.clone()) {
+		let analyzed_source = canonical_synonym_term(&mut analyzer, &rule.source, "source")?;
+		let surface_source = canonical_synonym_term(&mut normalizer, &rule.source, "source")?;
+		if !analyzed_sources.insert(analyzed_source.clone()) || !surface_sources.insert(surface_source.clone()) {
 			return Err(FulltextError::invalid(format!(
-				"synonym source {source:?} is declared more than once after analysis"
+				"synonym source {surface_source:?} is declared more than once after analysis"
 			)));
 		}
-		let mut replacements = Vec::with_capacity(rule.replacements.len());
+		let mut analyzed_replacements = Vec::with_capacity(rule.replacements.len());
+		let mut surface_replacements = Vec::with_capacity(rule.replacements.len());
 		for replacement in &rule.replacements {
-			let replacement = canonical_synonym_term(&analyzer, replacement, "replacement")?;
-			if replacement == source {
+			let analyzed_replacement = canonical_synonym_term(&mut analyzer, replacement, "replacement")?;
+			let surface_replacement = canonical_synonym_term(&mut normalizer, replacement, "replacement")?;
+			if analyzed_replacement == analyzed_source || surface_replacement == surface_source {
 				return Err(FulltextError::invalid(
 					"a synonym replacement must differ from its source after analysis",
 				));
 			}
-			replacements.push(replacement);
+			analyzed_replacements.push(analyzed_replacement);
+			surface_replacements.push(surface_replacement);
 		}
-		replacements.sort();
-		replacements.dedup();
-		if replacements.len() != rule.replacements.len() {
+		analyzed_replacements.sort();
+		analyzed_replacements.dedup();
+		surface_replacements.sort();
+		surface_replacements.dedup();
+		if analyzed_replacements.len() != rule.replacements.len()
+			|| surface_replacements.len() != rule.replacements.len()
+		{
 			return Err(FulltextError::invalid(
 				"synonym replacements must be unique after analysis",
 			));
 		}
-		lookup.insert(source.clone(), replacements.clone());
-		rules.push(SynonymRule { source, replacements });
+		analyzed_lookup.insert(analyzed_source, analyzed_replacements);
+		surface_lookup.insert(surface_source.clone(), surface_replacements.clone());
+		rules.push(SynonymRule {
+			source: surface_source,
+			replacements: surface_replacements,
+		});
 	}
 	rules.sort_by(|left, right| left.source.cmp(&right.source));
 	canonical.synonyms = rules;
-	Ok((canonical, analyzer, lookup))
+	Ok(CanonicalIdentity {
+		config: canonical,
+		analyzer,
+		analyzed_synonyms: Arc::new(analyzed_lookup),
+		surface_synonyms: Arc::new(surface_lookup),
+	})
 }
 
-fn canonical_synonym_term(analyzer: &TextAnalyzer, text: &str, label: &str) -> Result<String> {
-	let mut analyzer = analyzer.clone();
+fn canonical_synonym_term(analyzer: &mut TextAnalyzer, text: &str, label: &str) -> Result<String> {
 	let mut stream = analyzer.token_stream(text);
 	if !stream.advance() {
 		return Err(FulltextError::invalid(format!(
@@ -1629,27 +1756,6 @@ fn canonical_synonym_term(analyzer: &TextAnalyzer, text: &str, label: &str) -> R
 		)));
 	}
 	Ok(term)
-}
-
-fn analyzed_tokens(
-	analyzer: &mut TextAnalyzer,
-	text: &str,
-	synonyms: Option<&HashMap<String, Vec<String>>>,
-) -> Vec<Token> {
-	let mut tokens = Vec::new();
-	let mut stream = analyzer.token_stream(text);
-	while stream.advance() {
-		let token = stream.token();
-		tokens.push(token.clone());
-		if let Some(replacements) = synonyms.and_then(|synonyms| synonyms.get(&token.text)) {
-			for replacement in replacements {
-				let mut expanded = token.clone();
-				expanded.text = replacement.clone();
-				tokens.push(expanded);
-			}
-		}
-	}
-	tokens
 }
 
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
@@ -1943,9 +2049,13 @@ mod tests {
 
 	#[test]
 	fn english_analyzer_normalizes_unicode_and_possessives_with_source_offsets() {
-		let mut analyzer = build_analyzer(true).unwrap();
+		let mut analyzer = build_analyzer(true, None).unwrap();
 		let source = "Müller's ＳＨＯＥＳ cafe\u{301} ß";
-		let tokens = analyzed_tokens(&mut analyzer, source, None);
+		let mut stream = analyzer.token_stream(source);
+		let mut tokens = Vec::new();
+		while stream.advance() {
+			tokens.push(stream.token().clone());
+		}
 		assert_eq!(
 			tokens.iter().map(|token| token.text.as_str()).collect::<Vec<_>>(),
 			["muller", "shoe", "cafe", "ss"]
@@ -1973,10 +2083,16 @@ mod tests {
 		let mut writer = engine.writer(&config).unwrap();
 		writer
 			.apply(MutationBatch {
-				upserts: vec![crate::protocol::Upsert {
-					id: "one".to_owned(),
-					fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
-				}],
+				upserts: vec![
+					crate::protocol::Upsert {
+						id: "one".to_owned(),
+						fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
+					},
+					crate::protocol::Upsert {
+						id: "two".to_owned(),
+						fields: vec![("title".to_owned(), vec!["monitor stand".to_owned()])],
+					},
+				],
 				deletes: Vec::new(),
 			})
 			.unwrap();
@@ -2035,7 +2151,10 @@ mod tests {
 				},
 			)
 			.unwrap()
-			.hits[0]
+			.hits
+			.into_iter()
+			.find(|hit| hit.id == "one")
+			.unwrap()
 			.score;
 		let mut baseline_config = config.clone();
 		baseline_config.identity.index_id = "baseline".to_owned();
@@ -2044,10 +2163,16 @@ mod tests {
 		let mut baseline_writer = baseline.writer(&baseline_config).unwrap();
 		baseline_writer
 			.apply(MutationBatch {
-				upserts: vec![crate::protocol::Upsert {
-					id: "one".to_owned(),
-					fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
-				}],
+				upserts: vec![
+					crate::protocol::Upsert {
+						id: "one".to_owned(),
+						fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
+					},
+					crate::protocol::Upsert {
+						id: "two".to_owned(),
+						fields: vec![("title".to_owned(), vec!["monitor stand".to_owned()])],
+					},
+				],
 				deletes: Vec::new(),
 			})
 			.unwrap();
@@ -2068,9 +2193,12 @@ mod tests {
 				},
 			)
 			.unwrap()
-			.hits[0]
+			.hits
+			.into_iter()
+			.find(|hit| hit.id == "one")
+			.unwrap()
 			.score;
-		assert_eq!(synonym_score, baseline_score);
+		assert!(synonym_score < baseline_score);
 		baseline_writer.close().unwrap();
 
 		writer.close().unwrap();
@@ -2097,6 +2225,12 @@ mod tests {
 			push_string(&mut identity, &field.name);
 		}
 		assert_eq!(persisted_index_id(&identity), Some("products"));
+		let directory = RamDirectory::create();
+		directory.atomic_write(Path::new(IDENTITY_PATH), &identity).unwrap();
+		assert_eq!(
+			Engine::inspect(directory, &config.identity).unwrap_err().code,
+			"E_IDENTITY_MISMATCH"
+		);
 	}
 
 	#[test]

@@ -107,24 +107,42 @@ test('normalizes English text and persists bounded index-time synonyms', async (
 	const indexPath = temporaryIndex(context);
 	const config = options(indexPath, {
 		surfaceTerms: true,
-		synonyms: [{ source: 'ＴＶ', replacements: ['telly', 'Televisions'] }],
+		synonyms: [
+			{ source: 'ＴＶ', replacements: ['telly', 'Televisions'] },
+			{ source: 'Televisions', replacements: ['display'] },
+		],
 	});
+	const source = "Müller's wireless ＴＶ television and cafe\u0301 shoes";
 	const index = await openNativeFullTextIndex(config);
 	await index.applyMutationBatch({
-		upserts: [{ id: 'one', fields: { title: "Müller's ＴＶ and cafe\u0301 shoes" } }],
+		upserts: [{ id: 'one', fields: { title: source } }],
 	});
 	await index.commit();
 	await index.reload();
-	for (const text of ['muller', 'tv', 'telly', 'television', 'cafe', 'shoe']) {
+	for (const text of ['muller', 'tv', 'telly', 'television', 'display', 'cafe', 'shoe']) {
 		assert.deepStrictEqual(
 			(await index.search({ text, exactTotal: true })).hits.map((hit) => hit.id),
 			['one'],
 		);
 	}
-	const trace = await index.traceMatches({ text: 'television' }, [
-		{ id: 'one', fields: { title: "Müller's ＴＶ and cafe\u0301 shoes" } },
+	const trace = await index.traceMatches({ text: 'television' }, [{ id: 'one', fields: { title: source } }]);
+	assert(trace.records[0].values[0].spans.some(({ start, end }) => source.slice(start, end) === 'ＴＶ'));
+	const phraseTrace = await index.traceMatches({ text: 'wireless television', mode: 'phrase' }, [
+		{ id: 'one', fields: { title: source } },
 	]);
-	assert.strictEqual(trace.records[0].values[0].spans.length, 1);
+	assert.strictEqual(phraseTrace.records[0].values[0].spans.length, 1);
+	assert.strictEqual(
+		source.slice(phraseTrace.records[0].values[0].spans[0].start, phraseTrace.records[0].values[0].spans[0].end),
+		'wireless ＴＶ',
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'televi', mode: 'prefix' })).hits.map((hit) => hit.id),
+		['one'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'café', mode: 'prefix' })).hits.map((hit) => hit.id),
+		['one'],
+	);
 	await index.close();
 
 	await assert.rejects(
@@ -480,6 +498,16 @@ test('admits native indexes under one idempotent process-wide budget', async (co
 		conflict: 'E_RESOURCE_LIMIT',
 		saturated: 'E_RESOURCE_LIMIT',
 	});
+});
+
+test('requires the process-wide budget to be configured before the first open', async (context) => {
+	const child = fork(
+		fileURLToPath(new URL('./fixtures/native-runtime-budget-child.mjs', import.meta.url)),
+		[fileURLToPath(new URL('../dist/native.js', import.meta.url)), 'late'],
+		{ stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
+	);
+	context.after(() => child.kill());
+	assert.deepStrictEqual(await childMessage(child), { lateConfiguration: 'E_RESOURCE_LIMIT' });
 });
 
 test('reclaims only retired trees generated for the requested index', async (context) => {

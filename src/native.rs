@@ -34,7 +34,7 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
-static RUNTIME_BUDGET: OnceLock<Arc<RuntimeBudget>> = OnceLock::new();
+static RUNTIME_BUDGET: OnceLock<Mutex<RuntimeBudgetState>> = OnceLock::new();
 const LIFECYCLE_ROOT: &str = ".fulltext-locks";
 const LEGACY_LIFECYCLE_LOCK: &str = ".harper-fulltext-lifecycle.lock";
 const RETIRED_ROOT: &str = ".fulltext-retired";
@@ -85,7 +85,7 @@ struct Runtime {
 	search_execution_nanoseconds: AtomicU64,
 	search_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 	closed: Arc<CompletionSignal>,
-	_admission: Option<RuntimeAdmission>,
+	admission: Option<RuntimeAdmission>,
 	#[cfg(feature = "test-panic")]
 	publish_fault: AtomicU8,
 	#[cfg(feature = "test-panic")]
@@ -102,6 +102,12 @@ struct RuntimeBudget {
 	writer_memory_bytes: AtomicUsize,
 	queued_bytes: AtomicUsize,
 	expensive_searches: AtomicUsize,
+}
+
+enum RuntimeBudgetState {
+	Unconfigured,
+	Configured(Arc<RuntimeBudget>),
+	OpenedWithoutBudget,
 }
 
 struct RuntimeAdmission {
@@ -546,29 +552,37 @@ pub fn native_status(env: Env, handle: u32) -> boundary::Result<Buffer> {
 }
 
 fn configure_runtime_budget(limits: RuntimeBudgetLimits) -> Result<()> {
-	if let Some(configured) = RUNTIME_BUDGET.get() {
-		return if configured.limits == limits {
-			Ok(())
-		} else {
-			Err(FulltextError::new(
-				"E_RESOURCE_LIMIT",
-				"the process-wide fulltext runtime budget is already configured differently",
-			))
-		};
-	}
-	match RUNTIME_BUDGET.set(Arc::new(RuntimeBudget::new(limits.clone()))) {
-		Ok(()) => Ok(()),
-		Err(_)
-			if RUNTIME_BUDGET
-				.get()
-				.is_some_and(|configured| configured.limits == limits) =>
-		{
+	let mut state = lock(runtime_budget_state());
+	match &*state {
+		RuntimeBudgetState::Unconfigured => {
+			*state = RuntimeBudgetState::Configured(Arc::new(RuntimeBudget::new(limits)));
 			Ok(())
 		}
-		Err(_) => Err(FulltextError::new(
+		RuntimeBudgetState::Configured(configured) if configured.limits == limits => Ok(()),
+		RuntimeBudgetState::Configured(_) => Err(FulltextError::new(
 			"E_RESOURCE_LIMIT",
-			"the process-wide fulltext runtime budget was configured differently",
+			"the process-wide fulltext runtime budget is already configured differently",
 		)),
+		RuntimeBudgetState::OpenedWithoutBudget => Err(FulltextError::new(
+			"E_RESOURCE_LIMIT",
+			"the process-wide fulltext runtime budget must be configured before the first index opens",
+		)),
+	}
+}
+
+fn runtime_budget_state() -> &'static Mutex<RuntimeBudgetState> {
+	RUNTIME_BUDGET.get_or_init(|| Mutex::new(RuntimeBudgetState::Unconfigured))
+}
+
+fn admit_runtime(limits: &crate::protocol::Limits) -> Result<Option<RuntimeAdmission>> {
+	let mut state = lock(runtime_budget_state());
+	match &*state {
+		RuntimeBudgetState::Unconfigured => {
+			*state = RuntimeBudgetState::OpenedWithoutBudget;
+			Ok(None)
+		}
+		RuntimeBudgetState::Configured(budget) => budget.admit(limits).map(Some),
+		RuntimeBudgetState::OpenedWithoutBudget => Ok(None),
 	}
 }
 
@@ -678,10 +692,10 @@ fn release(counter: &AtomicUsize, amount: usize) {
 	if amount == 0 {
 		return;
 	}
-	debug_assert!(counter
-		.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current
-			.checked_sub(amount))
-		.is_ok());
+	let released = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+		current.checked_sub(amount)
+	});
+	debug_assert!(released.is_ok());
 }
 
 impl Runtime {
@@ -733,7 +747,7 @@ impl Runtime {
 			search_execution_nanoseconds: AtomicU64::new(0),
 			search_threads: Mutex::new(Vec::with_capacity(search_thread_count)),
 			closed: Arc::new(CompletionSignal::new()),
-			_admission: parts.admission,
+			admission: parts.admission,
 			#[cfg(feature = "test-panic")]
 			publish_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
@@ -794,7 +808,7 @@ impl Runtime {
 	}
 
 	fn expensive_search_permit(&self) -> Result<Option<ExpensiveSearchPermit>> {
-		self._admission
+		self.admission
 			.as_ref()
 			.map(|admission| admission.budget.acquire_expensive())
 			.transpose()
@@ -1568,12 +1582,16 @@ fn execute_search_command(
 	let started = Instant::now();
 	let SearchCommand { operation, completion } = queued.value;
 	let result = catch_unwind(AssertUnwindSafe(|| {
-		let expensive = match &operation {
-			SearchOperation::Search(bytes) => search_mode(bytes)?.is_expensive(),
-			SearchOperation::Trace(_) => true,
-		};
-		let _permit = if expensive {
-			runtime.expensive_search_permit()?
+		let _permit = if runtime.admission.is_some() {
+			let expensive = match &operation {
+				SearchOperation::Search(bytes) => search_mode(bytes)?.is_expensive(),
+				SearchOperation::Trace(_) => true,
+			};
+			if expensive {
+				runtime.expensive_search_permit()?
+			} else {
+				None
+			}
 		} else {
 			None
 		};
@@ -2034,10 +2052,7 @@ fn open_runtime_with_directory(
 				))
 			}
 		}
-		let admission = RUNTIME_BUDGET
-			.get()
-			.map(|budget| budget.admit(&config.limits))
-			.transpose()?;
+		let admission = admit_runtime(&config.limits)?;
 		let engine = Engine::open(directory, &config)?;
 		let (writer, committed_payload) = engine.writer_with_payload(&config)?;
 		let reader = engine.reader_for_open()?;

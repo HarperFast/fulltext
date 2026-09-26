@@ -33,6 +33,19 @@ const options = (name) => ({
 });
 
 try {
+	if (process.argv[3] === 'late') {
+		const unbounded = await openNativeFullTextIndex(options('unbounded'));
+		let lateConfiguration;
+		try {
+			configureNativeFullTextRuntime(limits);
+		} catch (error) {
+			lateConfiguration = error.code;
+		}
+		await unbounded.close();
+		if (process.send) await new Promise((resolve) => process.send({ lateConfiguration }, resolve));
+		rmSync(root, { recursive: true, force: true });
+		process.exit(0);
+	}
 	configureNativeFullTextRuntime(limits);
 	configureNativeFullTextRuntime({ ...limits });
 	let conflict;
