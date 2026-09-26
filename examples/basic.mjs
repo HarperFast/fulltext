@@ -42,6 +42,11 @@ try {
 	} catch (error) {
 		closeError = error;
 	}
-	if (!closeError) await rm(root, { recursive: true, force: true });
-	else if (completed) throw closeError;
+	if (!closeError) {
+		try {
+			await rm(root, { recursive: true, force: true });
+		} catch (error) {
+			if (completed) throw error;
+		}
+	} else if (completed) throw closeError;
 }
