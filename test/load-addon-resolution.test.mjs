@@ -88,8 +88,8 @@ function createFixture(context, options) {
 				? "throw new Error('fixture load failure');\n"
 				: `module.exports = {
 					source: 'platform',
-					runtimeInfo() { return { packageVersion: ${JSON.stringify(options.nativeVersion)}, nativeAbiVersion: 6, queryApiVersion: 1, storageBackends: ['native'] }; },
-					__nativeInspect() {}, __nativeValidateOpen() {}, __nativeReset() {}
+					runtimeInfo() { return { packageVersion: ${JSON.stringify(options.nativeVersion)}, nativeAbiVersion: 7, queryApiVersion: 1, storageBackends: ['native'] }; },
+					__nativeInspect() {}, __nativeValidateOpen() {}, __nativeConfigureRuntime() {}, __nativeReset() {}
 				};\n`,
 		);
 	}

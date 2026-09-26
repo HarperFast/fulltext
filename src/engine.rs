@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use tantivy::collector::sort_key::{SortBySimilarityScore, SortByString};
@@ -12,24 +13,38 @@ use tantivy::query::{
 };
 use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{
-	Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TokenStream,
-	Tokenizer,
+	AsciiFoldingFilter, Language, LowerCaser, RemoveLongFilter, Stemmer, StopWordFilter, TextAnalyzer, Token,
+	TokenFilter, TokenStream, Tokenizer,
 };
 use tantivy::{DocAddress, Index, IndexReader, IndexSettings, IndexWriter, Order, ReloadPolicy, Searcher, Term};
+use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
+use unicode_normalization::is_nfkc;
 
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	validate_record_id, EngineConfig, EngineIdentityConfig, MutationBatch, SearchMode, SearchRequest, TraceRecord,
-	MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES,
+	validate_record_id, EngineConfig, EngineIdentityConfig, MutationBatch, SearchMode, SearchRequest, SynonymRule,
+	TraceRecord, MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES,
 	MAX_TRACE_SPANS,
 };
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
 pub(crate) const IDENTITY_PATH: &str = ".harper-fulltext-identity";
 const META_PATH: &str = "meta.json";
-const ANALYZER_NAME: &str = "english@1";
-const SURFACE_ANALYZER_NAME: &str = "english_surface@1";
+const ANALYZER_NAME: &str = "english@2";
+const SURFACE_ANALYZER_NAME: &str = "english_surface@2";
 pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_TRACE_TOKENS_PER_VALUE: usize = 262_144;
+const MAX_TOKEN_CHARACTERS: usize = 40;
+const MAX_NONSTARTERS: usize = 30;
+const COMBINING_GRAPHEME_JOINER: char = '\u{034f}';
+type SynonymMap = Arc<HashMap<String, Vec<String>>>;
+
+struct CanonicalIdentity {
+	config: EngineIdentityConfig,
+	analyzer: TextAnalyzer,
+	analyzed_synonyms: SynonymMap,
+	surface_synonyms: SynonymMap,
+}
 
 #[derive(Clone)]
 pub struct Engine {
@@ -39,6 +54,8 @@ pub struct Engine {
 	field_lookup: HashMap<String, usize>,
 	analyzer: TextAnalyzer,
 	surface_analyzer: TextAnalyzer,
+	index_analyzer: TextAnalyzer,
+	surface_index_analyzer: TextAnalyzer,
 	positions: bool,
 }
 
@@ -151,9 +168,14 @@ impl TracePlan {
 }
 
 impl Engine {
+	pub(crate) fn validate(config: &EngineConfig) -> Result<()> {
+		canonical_identity(&config.identity).map(|_| ())
+	}
+
 	pub fn inspect<D: Directory + Clone>(directory: D, config: &EngineIdentityConfig) -> Result<InspectionResult> {
-		let (expected_schema, _, _) = build_schema(config)?;
-		let expected_identity = identity_bytes(config);
+		let identity = canonical_identity(config)?.config;
+		let (expected_schema, _, _) = build_schema(&identity)?;
+		let expected_identity = identity_bytes(&identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
 		let meta_exists = directory.exists(Path::new(META_PATH)).map_err(storage_error)?;
 
@@ -190,8 +212,11 @@ impl Engine {
 	}
 
 	pub fn open<D: Directory + Clone>(directory: D, config: &EngineConfig) -> Result<Self> {
-		let (schema, id_field, fields) = build_schema(&config.identity)?;
-		let expected_identity = identity_bytes(&config.identity);
+		let canonical = canonical_identity(&config.identity)?;
+		let identity = canonical.config;
+		let analyzer = canonical.analyzer;
+		let (schema, id_field, fields) = build_schema(&identity)?;
+		let expected_identity = identity_bytes(&identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
 		let meta_exists = directory.exists(Path::new(META_PATH)).map_err(storage_error)?;
 
@@ -226,12 +251,13 @@ impl Engine {
 				"the persisted Tantivy schema does not match the requested configuration",
 			));
 		}
-		let analyzer = build_analyzer(config.identity.stop_words)?;
-		let surface_analyzer = build_surface_analyzer();
-		index.tokenizers().register(ANALYZER_NAME, analyzer.clone());
+		let surface_analyzer = build_surface_analyzer(None);
+		let index_analyzer = build_analyzer(identity.stop_words, Some(canonical.analyzed_synonyms))?;
+		let surface_index_analyzer = build_surface_analyzer(Some(canonical.surface_synonyms));
+		index.tokenizers().register(ANALYZER_NAME, index_analyzer.clone());
 		index
 			.tokenizers()
-			.register(SURFACE_ANALYZER_NAME, surface_analyzer.clone());
+			.register(SURFACE_ANALYZER_NAME, surface_index_analyzer.clone());
 		let field_lookup = fields
 			.iter()
 			.enumerate()
@@ -244,7 +270,9 @@ impl Engine {
 			field_lookup,
 			analyzer,
 			surface_analyzer,
-			positions: config.identity.positions,
+			index_analyzer,
+			surface_index_analyzer,
+			positions: identity.positions,
 		})
 	}
 
@@ -431,6 +459,8 @@ impl Engine {
 		let mut remaining_spans = MAX_TRACE_SPANS;
 		let mut response_bytes = 3usize;
 		let mut matched_records = Vec::new();
+		let mut analyzed_source_analyzer = self.index_analyzer.clone();
+		let mut surface_source_analyzer = self.surface_index_analyzer.clone();
 		for record in records {
 			check_deadline(deadline)?;
 			if candidates
@@ -444,6 +474,7 @@ impl Engine {
 			let mut found = HashSet::new();
 			let mut record_span_budget = remaining_spans;
 			let mut record_truncated = false;
+			let mut record_analysis_truncated = false;
 			for (field, source_values) in &record.fields {
 				if !seen_fields.insert(field.as_str()) {
 					return Err(FulltextError::invalid(format!("duplicate trace field {field}")));
@@ -456,8 +487,16 @@ impl Engine {
 				}
 				for (value_index, value) in source_values.iter().enumerate() {
 					check_deadline(deadline)?;
-					let (spans, terms, truncated) = self.trace_value(&plan, value, record_span_budget, deadline)?;
-					record_truncated |= truncated;
+					let (spans, terms, spans_truncated, analysis_truncated) = self.trace_value(
+						&plan,
+						value,
+						record_span_budget,
+						deadline,
+						&mut analyzed_source_analyzer,
+						&mut surface_source_analyzer,
+					)?;
+					record_truncated |= spans_truncated || analysis_truncated;
+					record_analysis_truncated |= analysis_truncated;
 					found.extend(terms);
 					if spans.is_empty() {
 						continue;
@@ -466,6 +505,7 @@ impl Engine {
 					pending_values.push((field.as_str(), value_index as u32, spans));
 				}
 			}
+			complete &= !record_analysis_truncated;
 			if plan.record_matches(&found) {
 				complete &= !record_truncated;
 				if pending_values.is_empty() {
@@ -540,7 +580,7 @@ impl Engine {
 					)));
 				}
 				Ok(TracePlan::Prefix {
-					completed: self.analyze(completed, false, true)?,
+					completed,
 					prefix,
 					fuzzy: request.mode == SearchMode::FuzzyPrefix,
 				})
@@ -568,13 +608,15 @@ impl Engine {
 		value: &str,
 		max_spans: usize,
 		deadline: Option<Instant>,
-	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool)> {
-		let analyzed = self.source_tokens(value, false, deadline)?;
+		analyzed_source_analyzer: &mut TextAnalyzer,
+		surface_source_analyzer: &mut TextAnalyzer,
+	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool, bool)> {
+		let (analyzed, mut analysis_truncated) = Self::source_tokens(analyzed_source_analyzer, value, deadline)?;
 		let utf16_offsets = utf16_offsets(value);
 		let mut spans = Vec::new();
 		let mut seen_spans = HashSet::new();
 		let mut found = HashSet::new();
-		let mut truncated = false;
+		let mut spans_truncated = false;
 		match plan {
 			TracePlan::Any(terms) | TracePlan::All(terms) => {
 				for (index, token) in analyzed.iter().enumerate() {
@@ -583,13 +625,13 @@ impl Engine {
 					}
 					if terms.contains(&token.text) {
 						found.insert(token.text.clone());
-						truncated |= push_trace_span(
+						spans_truncated |= push_trace_span(
 							&mut spans,
 							&mut seen_spans,
 							source_span(&utf16_offsets, token.start, token.end),
 							max_spans,
 						);
-						if truncated && plan.record_matches(&found) {
+						if spans_truncated && plan.record_matches(&found) {
 							break;
 						}
 					}
@@ -612,26 +654,29 @@ impl Engine {
 							while source_index < analyzed.len() && analyzed[source_index].position < expected_position {
 								source_index += 1;
 							}
-							let Some(token) = analyzed.get(source_index) else {
+							let position_start = source_index;
+							while source_index < analyzed.len() && analyzed[source_index].position == expected_position
+							{
+								source_index += 1;
+							}
+							let Some(token) = analyzed[position_start..source_index]
+								.iter()
+								.find(|token| token.text == *term)
+							else {
 								matches = false;
 								break;
 							};
-							if token.position != expected_position || token.text != *term {
-								matches = false;
-								break;
-							}
 							final_token = token;
-							source_index += 1;
 						}
 						if matches {
 							found.insert("__phrase".to_owned());
-							truncated |= push_trace_span(
+							spans_truncated |= push_trace_span(
 								&mut spans,
 								&mut seen_spans,
 								source_span(&utf16_offsets, anchor.start, final_token.end),
 								max_spans,
 							);
-							if truncated && plan.record_matches(&found) {
+							if spans_truncated && plan.record_matches(&found) {
 								break;
 							}
 						}
@@ -643,20 +688,21 @@ impl Engine {
 				prefix,
 				fuzzy,
 			} => {
-				let surface = self.source_tokens(value, true, deadline)?;
+				let (surface, surface_truncated) = Self::source_tokens(surface_source_analyzer, value, deadline)?;
+				analysis_truncated |= surface_truncated;
 				for (index, token) in analyzed.iter().enumerate() {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
 					if completed.contains(&token.text) {
 						found.insert(token.text.clone());
-						truncated |= push_trace_span(
+						spans_truncated |= push_trace_span(
 							&mut spans,
 							&mut seen_spans,
 							source_span(&utf16_offsets, token.start, token.end),
 							max_spans,
 						);
-						if truncated && plan.record_matches(&found) {
+						if spans_truncated && plan.record_matches(&found) {
 							break;
 						}
 					}
@@ -669,38 +715,44 @@ impl Engine {
 						|| (*fuzzy && fuzzy_eligible(prefix) && fuzzy_prefix_matches(prefix, &token.text))
 					{
 						found.insert("__prefix".to_owned());
-						truncated |= push_trace_span(
+						spans_truncated |= push_trace_span(
 							&mut spans,
 							&mut seen_spans,
 							source_span(&utf16_offsets, token.start, token.end),
 							max_spans,
 						);
-						if truncated && plan.record_matches(&found) {
+						if spans_truncated && plan.record_matches(&found) {
 							break;
 						}
 					}
 				}
 			}
 			TracePlan::Fuzzy(terms) => {
-				let surface = self.source_tokens(value, true, deadline)?;
-				let analyzed_by_position = analyzed
-					.iter()
-					.map(|token| (token.position, token.text.as_str()))
-					.collect::<HashMap<_, _>>();
+				let (surface, surface_truncated) = Self::source_tokens(surface_source_analyzer, value, deadline)?;
+				analysis_truncated |= surface_truncated;
+				let mut analyzed_by_position = HashMap::<usize, Vec<&str>>::new();
+				for token in &analyzed {
+					analyzed_by_position
+						.entry(token.position)
+						.or_default()
+						.push(token.text.as_str());
+				}
 				for (index, token) in surface.iter().enumerate() {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
 					for (analyzed_term, surface_term) in terms {
-						let analyzed_matches = analyzed_by_position.get(&token.position).is_some_and(|token| {
-							*token == analyzed_term
-								|| (fuzzy_eligible(surface_term) && within_one_edit(analyzed_term, token))
+						let analyzed_matches = analyzed_by_position.get(&token.position).is_some_and(|tokens| {
+							tokens.iter().any(|token| {
+								*token == analyzed_term
+									|| (fuzzy_eligible(surface_term) && within_one_edit(analyzed_term, token))
+							})
 						});
 						if analyzed_matches
 							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
 						{
 							found.insert(analyzed_term.clone());
-							truncated |= push_trace_span(
+							spans_truncated |= push_trace_span(
 								&mut spans,
 								&mut seen_spans,
 								source_span(&utf16_offsets, token.start, token.end),
@@ -709,7 +761,7 @@ impl Engine {
 							break;
 						}
 					}
-					if truncated && plan.record_matches(&found) {
+					if spans_truncated && plan.record_matches(&found) {
 						break;
 					}
 				}
@@ -717,20 +769,22 @@ impl Engine {
 		}
 		spans.sort_by_key(|span| (span.start, span.end));
 		spans.dedup();
-		Ok((spans, found, truncated))
+		Ok((spans, found, spans_truncated, analysis_truncated))
 	}
 
-	fn source_tokens(&self, text: &str, surface: bool, deadline: Option<Instant>) -> Result<Vec<SourceToken>> {
-		let mut analyzer = if surface {
-			self.surface_analyzer.clone()
-		} else {
-			self.analyzer.clone()
-		};
-		let mut tokens = Vec::new();
+	fn source_tokens(
+		analyzer: &mut TextAnalyzer,
+		text: &str,
+		deadline: Option<Instant>,
+	) -> Result<(Vec<SourceToken>, bool)> {
 		let mut stream = analyzer.token_stream(text);
+		let mut tokens = Vec::new();
 		while stream.advance() {
 			if tokens.len() % 256 == 0 {
 				check_deadline(deadline)?;
+			}
+			if tokens.len() == MAX_TRACE_TOKENS_PER_VALUE {
+				return Ok((tokens, true));
 			}
 			let token = stream.token();
 			tokens.push(SourceToken {
@@ -740,7 +794,7 @@ impl Engine {
 				position: token.position,
 			});
 		}
-		Ok(tokens)
+		Ok((tokens, false))
 	}
 
 	fn selected_fields(&self, requested: &[String]) -> Result<Vec<&EngineField>> {
@@ -906,7 +960,7 @@ impl Engine {
 		if text.chars().last().is_some_and(char::is_whitespace) {
 			return self.term_query(text, fields, Occur::Must);
 		}
-		let (completed_text, surface_prefix) = self.final_surface_term(text)?;
+		let (completed, surface_prefix) = self.final_surface_term(text)?;
 		let Some(surface_prefix) = surface_prefix else {
 			return Ok(Box::new(EmptyQuery));
 		};
@@ -917,7 +971,6 @@ impl Engine {
 				if fuzzy { "fuzzy" } else { "exact" }
 			)));
 		}
-		let completed = self.analyze(completed_text, false, true)?;
 		let completed_clause_count = completed.len().saturating_mul(fields.len());
 		let mut clauses = Vec::with_capacity(completed.len() + 1);
 		for term in completed {
@@ -956,22 +1009,35 @@ impl Engine {
 		Ok(Box::new(BooleanQuery::new(clauses)))
 	}
 
-	fn final_surface_term<'a>(&self, text: &'a str) -> Result<(&'a str, Option<String>)> {
-		let mut tokenizer = SimpleTokenizer::default();
-		let mut stream = tokenizer.token_stream(text);
+	fn final_surface_term(&self, text: &str) -> Result<(Vec<String>, Option<String>)> {
+		let mut analyzer = TextAnalyzer::builder(NfkcTokenizer::default())
+			.filter_dynamic(EnglishPossessiveFilter)
+			.filter_dynamic(LowerCaser)
+			.filter_dynamic(AsciiFoldingFilter)
+			.build();
+		let mut stream = analyzer.token_stream(text);
 		let mut final_term = None;
-		let mut final_offset = 0;
+		let mut final_position = None;
 		while stream.advance() {
 			let token = stream.token();
-			final_term = Some(token.text.to_lowercase());
-			final_offset = token.offset_from;
+			final_term = Some(token.text.clone());
+			final_position = Some(token.position);
 		}
 		if final_term.as_ref().is_some_and(|term| term.len() >= 40) {
 			return Err(FulltextError::invalid(
 				"the final prefix token must be shorter than 40 UTF-8 bytes",
 			));
 		}
-		Ok((&text[..final_offset], final_term))
+		let mut seen = HashSet::new();
+		let completed = match final_position {
+			Some(final_position) => self
+				.analyze_positioned(text)?
+				.into_iter()
+				.filter_map(|(position, term)| (position < final_position && seen.insert(term.clone())).then_some(term))
+				.collect(),
+			None => Vec::new(),
+		};
+		Ok((completed, final_term))
 	}
 
 	fn term_group(&self, term: &str, fields: &[&EngineField]) -> Box<dyn Query> {
@@ -1189,19 +1255,26 @@ fn utf16_offsets(source: &str) -> Option<Vec<u32>> {
 	Some(offsets)
 }
 
-fn source_span(utf16_offsets: &Option<Vec<u32>>, start: usize, end: usize) -> TraceSpan {
-	TraceSpan {
-		start: utf16_offsets.as_ref().map_or(start as u32, |offsets| offsets[start]),
-		end: utf16_offsets.as_ref().map_or(end as u32, |offsets| offsets[end]),
+fn source_span(utf16_offsets: &Option<Vec<u32>>, start: usize, end: usize) -> Option<TraceSpan> {
+	if start > end {
+		return None;
 	}
+	let (start, end) = match utf16_offsets {
+		Some(offsets) => (*offsets.get(start)?, *offsets.get(end)?),
+		None => (u32::try_from(start).ok()?, u32::try_from(end).ok()?),
+	};
+	(start <= end).then_some(TraceSpan { start, end })
 }
 
 fn push_trace_span(
 	spans: &mut Vec<TraceSpan>,
 	seen: &mut HashSet<TraceSpan>,
-	span: TraceSpan,
+	span: Option<TraceSpan>,
 	max_spans: usize,
 ) -> bool {
+	let Some(span) = span else {
+		return false;
+	};
 	if seen.contains(&span) {
 		return false;
 	}
@@ -1417,27 +1490,534 @@ fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Vec<Eng
 	Ok((builder.build(), id_field, fields))
 }
 
-fn build_analyzer(stop_words: bool) -> Result<TextAnalyzer> {
-	let mut builder = TextAnalyzer::builder(SimpleTokenizer::default())
-		.filter_dynamic(RemoveLongFilter::limit(40))
-		.filter_dynamic(LowerCaser);
+#[derive(Clone, Default)]
+struct NfkcTokenizer {
+	token: Token,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceSpan {
+	start: usize,
+	end: usize,
+}
+
+impl SourceSpan {
+	fn merge(&mut self, other: Self) {
+		self.start = self.start.min(other.start);
+		self.end = self.end.max(other.end);
+	}
+}
+
+#[derive(Clone, Copy)]
+struct MappedCharacter {
+	character: char,
+	span: SourceSpan,
+}
+
+enum MappedCharacters<'a> {
+	Original(std::str::CharIndices<'a>),
+	Normalized(MappedNfkc<'a>),
+}
+
+impl MappedCharacters<'_> {
+	fn next(&mut self) -> Option<MappedCharacter> {
+		match self {
+			Self::Original(characters) => characters.next().map(|(start, character)| MappedCharacter {
+				character,
+				span: SourceSpan {
+					start,
+					end: start + character.len_utf8(),
+				},
+			}),
+			Self::Normalized(characters) => characters.next(),
+		}
+	}
+}
+
+struct MappedNfkc<'a> {
+	source: std::str::CharIndices<'a>,
+	decomposed: Vec<char>,
+	decomposition_pending: Vec<(u8, MappedCharacter)>,
+	nonstarter_count: usize,
+	composee: Option<MappedCharacter>,
+	composition_pending: Vec<MappedCharacter>,
+	last_combining_class: Option<u8>,
+	output: Vec<MappedCharacter>,
+	output_offset: usize,
+	finished: bool,
+}
+
+impl<'a> MappedNfkc<'a> {
+	fn new(source: &'a str) -> Self {
+		Self {
+			source: source.char_indices(),
+			decomposed: Vec::new(),
+			decomposition_pending: Vec::new(),
+			nonstarter_count: 0,
+			composee: None,
+			composition_pending: Vec::new(),
+			last_combining_class: None,
+			output: Vec::new(),
+			output_offset: 0,
+			finished: false,
+		}
+	}
+
+	fn push_decomposed(&mut self, character: MappedCharacter) {
+		let combining_class = canonical_combining_class(character.character);
+		if combining_class == 0 {
+			self.flush_decomposition();
+			self.push_recomposition(character);
+		} else {
+			self.decomposition_pending.push((combining_class, character));
+		}
+	}
+
+	fn flush_decomposition(&mut self) {
+		let mut pending = std::mem::take(&mut self.decomposition_pending);
+		pending.sort_by_key(|(combining_class, _)| *combining_class);
+		for (_, character) in pending.drain(..) {
+			self.push_recomposition(character);
+		}
+		self.decomposition_pending = pending;
+	}
+
+	fn push_recomposition(&mut self, character: MappedCharacter) {
+		let combining_class = canonical_combining_class(character.character);
+		let Some(mut composee) = self.composee.take() else {
+			if combining_class == 0 {
+				self.composee = Some(character);
+			} else {
+				self.output.push(character);
+			}
+			return;
+		};
+		let composition = match self.last_combining_class {
+			None => compose(composee.character, character.character),
+			Some(last) if last < combining_class => compose(composee.character, character.character),
+			Some(_) => None,
+		};
+		if let Some(composed) = composition {
+			composee.character = composed;
+			composee.span.merge(character.span);
+			self.composee = Some(composee);
+			return;
+		}
+		if combining_class == 0 {
+			self.output.push(composee);
+			self.output.append(&mut self.composition_pending);
+			self.composee = Some(character);
+			self.last_combining_class = None;
+		} else {
+			self.composee = Some(composee);
+			self.composition_pending.push(character);
+			self.last_combining_class = Some(combining_class);
+		}
+	}
+
+	fn finish(&mut self) {
+		self.flush_decomposition();
+		if let Some(composee) = self.composee.take() {
+			self.output.push(composee);
+		}
+		self.output.append(&mut self.composition_pending);
+		self.finished = true;
+	}
+
+	fn next(&mut self) -> Option<MappedCharacter> {
+		loop {
+			if let Some(character) = self.output.get(self.output_offset).copied() {
+				self.output_offset += 1;
+				return Some(character);
+			}
+			self.output.clear();
+			self.output_offset = 0;
+			if self.finished {
+				return None;
+			}
+			if let Some((start, source_character)) = self.source.next() {
+				let span = SourceSpan {
+					start,
+					end: start + source_character.len_utf8(),
+				};
+				let mut decomposed = std::mem::take(&mut self.decomposed);
+				decomposed.clear();
+				decompose_compatible(source_character, |character| decomposed.push(character));
+				let leading_nonstarters = decomposed
+					.iter()
+					.take_while(|character| canonical_combining_class(**character) != 0)
+					.count();
+				if self.nonstarter_count + leading_nonstarters > MAX_NONSTARTERS {
+					self.push_decomposed(MappedCharacter {
+						character: COMBINING_GRAPHEME_JOINER,
+						span,
+					});
+					self.nonstarter_count = 0;
+				}
+				if leading_nonstarters == decomposed.len() {
+					self.nonstarter_count += decomposed.len();
+				} else {
+					self.nonstarter_count = decomposed
+						.iter()
+						.rev()
+						.take_while(|character| canonical_combining_class(**character) != 0)
+						.count();
+				}
+				for character in decomposed.drain(..) {
+					self.push_decomposed(MappedCharacter { character, span });
+				}
+				self.decomposed = decomposed;
+			} else {
+				self.finish();
+			}
+		}
+	}
+}
+
+fn is_stream_safe_nfkc(text: &str) -> bool {
+	if !is_nfkc(text) {
+		return false;
+	}
+	let mut nonstarter_count = 0;
+	for source_character in text.chars() {
+		let mut decomposition_length = 0;
+		let mut leading_nonstarters = 0;
+		let mut trailing_nonstarters = 0;
+		let mut saw_starter = false;
+		decompose_compatible(source_character, |character| {
+			decomposition_length += 1;
+			if canonical_combining_class(character) == 0 {
+				saw_starter = true;
+				trailing_nonstarters = 0;
+			} else {
+				if !saw_starter {
+					leading_nonstarters += 1;
+				}
+				trailing_nonstarters += 1;
+			}
+		});
+		if nonstarter_count + leading_nonstarters > MAX_NONSTARTERS {
+			return false;
+		}
+		nonstarter_count = if leading_nonstarters == decomposition_length {
+			nonstarter_count + decomposition_length
+		} else {
+			trailing_nonstarters
+		};
+	}
+	true
+}
+
+struct NfkcTokenStream<'a> {
+	characters: MappedCharacters<'a>,
+	token: &'a mut Token,
+}
+
+impl Tokenizer for NfkcTokenizer {
+	type TokenStream<'a> = NfkcTokenStream<'a>;
+
+	fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+		self.token.reset();
+		let characters = if text.is_ascii() || is_stream_safe_nfkc(text) {
+			MappedCharacters::Original(text.char_indices())
+		} else {
+			MappedCharacters::Normalized(MappedNfkc::new(text))
+		};
+		NfkcTokenStream {
+			characters,
+			token: &mut self.token,
+		}
+	}
+}
+
+impl TokenStream for NfkcTokenStream<'_> {
+	fn advance(&mut self) -> bool {
+		self.token.text.clear();
+		self.token.position = self.token.position.wrapping_add(1);
+		while let Some(character) = self.characters.next() {
+			if !character.character.is_alphanumeric() {
+				continue;
+			}
+			let mut source_span = character.span;
+			let mut token_characters = 1;
+			self.token.text.push(character.character);
+			while let Some(character) = self.characters.next() {
+				if !character.character.is_alphanumeric() {
+					break;
+				}
+				source_span.merge(character.span);
+				if token_characters < MAX_TOKEN_CHARACTERS {
+					self.token.text.push(character.character);
+					token_characters += 1;
+				}
+			}
+			self.token.offset_from = source_span.start;
+			self.token.offset_to = source_span.end;
+			return true;
+		}
+		false
+	}
+
+	fn token(&self) -> &Token {
+		self.token
+	}
+
+	fn token_mut(&mut self) -> &mut Token {
+		self.token
+	}
+}
+
+#[derive(Clone)]
+struct EnglishPossessiveFilter;
+
+impl TokenFilter for EnglishPossessiveFilter {
+	type Tokenizer<T: Tokenizer> = EnglishPossessiveFilterWrapper<T>;
+
+	fn transform<T: Tokenizer>(self, tokenizer: T) -> Self::Tokenizer<T> {
+		EnglishPossessiveFilterWrapper { tokenizer }
+	}
+}
+
+#[derive(Clone)]
+struct EnglishPossessiveFilterWrapper<T> {
+	tokenizer: T,
+}
+
+impl<T: Tokenizer> Tokenizer for EnglishPossessiveFilterWrapper<T> {
+	type TokenStream<'a> = EnglishPossessiveTokenStream<'a, T::TokenStream<'a>>;
+
+	fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+		EnglishPossessiveTokenStream {
+			source: text,
+			tail: self.tokenizer.token_stream(text),
+		}
+	}
+}
+
+struct EnglishPossessiveTokenStream<'a, T> {
+	source: &'a str,
+	tail: T,
+}
+
+impl<T: TokenStream> TokenStream for EnglishPossessiveTokenStream<'_, T> {
+	fn advance(&mut self) -> bool {
+		while self.tail.advance() {
+			let (position, possessive) = {
+				let token = self.tail.token();
+				(
+					token.position,
+					token.text.eq_ignore_ascii_case("s") && is_possessive_suffix(self.source, token.offset_from),
+				)
+			};
+			if possessive {
+				self.tail.token_mut().position = position.wrapping_sub(1);
+			} else {
+				return true;
+			}
+		}
+		false
+	}
+
+	fn token(&self) -> &Token {
+		self.tail.token()
+	}
+
+	fn token_mut(&mut self) -> &mut Token {
+		self.tail.token_mut()
+	}
+}
+
+fn is_possessive_suffix(source: &str, offset: usize) -> bool {
+	let Some(prefix) = source.get(..offset) else {
+		return false;
+	};
+	let stem = prefix
+		.strip_suffix('\'')
+		.or_else(|| prefix.strip_suffix('’'))
+		.or_else(|| prefix.strip_suffix('＇'));
+	stem.and_then(|stem| stem.chars().next_back())
+		.is_some_and(char::is_alphanumeric)
+}
+
+#[derive(Clone)]
+struct SynonymFilter {
+	rules: SynonymMap,
+}
+
+impl TokenFilter for SynonymFilter {
+	type Tokenizer<T: Tokenizer> = SynonymFilterWrapper<T>;
+
+	fn transform<T: Tokenizer>(self, tokenizer: T) -> Self::Tokenizer<T> {
+		SynonymFilterWrapper {
+			tokenizer,
+			rules: self.rules,
+			pending: Vec::new(),
+		}
+	}
+}
+
+#[derive(Clone)]
+struct SynonymFilterWrapper<T> {
+	tokenizer: T,
+	rules: SynonymMap,
+	pending: Vec<Token>,
+}
+
+impl<T: Tokenizer> Tokenizer for SynonymFilterWrapper<T> {
+	type TokenStream<'a> = SynonymTokenStream<'a, T::TokenStream<'a>>;
+
+	fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+		self.pending.clear();
+		SynonymTokenStream {
+			tail: self.tokenizer.token_stream(text),
+			rules: &self.rules,
+			pending: &mut self.pending,
+		}
+	}
+}
+
+struct SynonymTokenStream<'a, T> {
+	tail: T,
+	rules: &'a HashMap<String, Vec<String>>,
+	pending: &'a mut Vec<Token>,
+}
+
+impl<T: TokenStream> TokenStream for SynonymTokenStream<'_, T> {
+	fn advance(&mut self) -> bool {
+		self.pending.pop();
+		if !self.pending.is_empty() {
+			return true;
+		}
+		if !self.tail.advance() {
+			return false;
+		}
+		let token = self.tail.token();
+		if let Some(replacements) = self.rules.get(&token.text) {
+			for replacement in replacements.iter().rev() {
+				let mut expanded = token.clone();
+				expanded.text = replacement.clone();
+				self.pending.push(expanded);
+			}
+			self.pending.push(token.clone());
+		}
+		true
+	}
+
+	fn token(&self) -> &Token {
+		self.pending.last().unwrap_or_else(|| self.tail.token())
+	}
+
+	fn token_mut(&mut self) -> &mut Token {
+		self.pending.last_mut().unwrap_or_else(|| self.tail.token_mut())
+	}
+}
+
+fn build_analyzer(stop_words: bool, synonyms: Option<SynonymMap>) -> Result<TextAnalyzer> {
+	let mut builder = TextAnalyzer::builder(NfkcTokenizer::default())
+		.filter_dynamic(EnglishPossessiveFilter)
+		.filter_dynamic(LowerCaser)
+		.filter_dynamic(AsciiFoldingFilter)
+		.filter_dynamic(RemoveLongFilter::limit(40));
 	if stop_words {
 		let stop_filter = StopWordFilter::new(Language::English)
 			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "English stop words are unavailable"))?;
 		builder = builder.filter_dynamic(stop_filter);
 	}
-	Ok(builder.filter_dynamic(Stemmer::new(Language::English)).build())
+	builder = builder.filter_dynamic(Stemmer::new(Language::English));
+	if let Some(rules) = synonyms.filter(|rules| !rules.is_empty()) {
+		builder = builder.filter_dynamic(SynonymFilter { rules });
+	}
+	Ok(builder.build())
 }
 
-fn build_surface_analyzer() -> TextAnalyzer {
-	TextAnalyzer::builder(SimpleTokenizer::default())
-		.filter_dynamic(RemoveLongFilter::limit(40))
+fn build_surface_analyzer(synonyms: Option<SynonymMap>) -> TextAnalyzer {
+	let mut builder = TextAnalyzer::builder(NfkcTokenizer::default())
+		.filter_dynamic(EnglishPossessiveFilter)
 		.filter_dynamic(LowerCaser)
-		.build()
+		.filter_dynamic(AsciiFoldingFilter)
+		.filter_dynamic(RemoveLongFilter::limit(40));
+	if let Some(rules) = synonyms.filter(|rules| !rules.is_empty()) {
+		builder = builder.filter_dynamic(SynonymFilter { rules });
+	}
+	builder.build()
+}
+
+fn canonical_identity(config: &EngineIdentityConfig) -> Result<CanonicalIdentity> {
+	let mut analyzer = build_analyzer(config.stop_words, None)?;
+	let mut normalizer = build_surface_analyzer(None);
+	let mut canonical = config.clone();
+	let mut analyzed_sources = HashSet::with_capacity(config.synonyms.len());
+	let mut surface_sources = HashSet::with_capacity(config.synonyms.len());
+	let mut rules = Vec::with_capacity(config.synonyms.len());
+	let mut analyzed_lookup = HashMap::with_capacity(config.synonyms.len());
+	let mut surface_lookup = HashMap::with_capacity(config.synonyms.len());
+	for rule in &config.synonyms {
+		let analyzed_source = canonical_synonym_term(&mut analyzer, &rule.source, "source")?;
+		let surface_source = canonical_synonym_term(&mut normalizer, &rule.source, "source")?;
+		if !analyzed_sources.insert(analyzed_source.clone()) || !surface_sources.insert(surface_source.clone()) {
+			return Err(FulltextError::invalid(format!(
+				"synonym source {surface_source:?} is declared more than once after analysis"
+			)));
+		}
+		let mut analyzed_replacements = Vec::with_capacity(rule.replacements.len());
+		let mut surface_replacements = Vec::with_capacity(rule.replacements.len());
+		for replacement in &rule.replacements {
+			let analyzed_replacement = canonical_synonym_term(&mut analyzer, replacement, "replacement")?;
+			let surface_replacement = canonical_synonym_term(&mut normalizer, replacement, "replacement")?;
+			if analyzed_replacement == analyzed_source || surface_replacement == surface_source {
+				return Err(FulltextError::invalid(
+					"a synonym replacement must differ from its source after analysis",
+				));
+			}
+			analyzed_replacements.push(analyzed_replacement);
+			surface_replacements.push(surface_replacement);
+		}
+		analyzed_replacements.sort();
+		analyzed_replacements.dedup();
+		surface_replacements.sort();
+		surface_replacements.dedup();
+		if analyzed_replacements.len() != rule.replacements.len()
+			|| surface_replacements.len() != rule.replacements.len()
+		{
+			return Err(FulltextError::invalid(
+				"synonym replacements must be unique after analysis",
+			));
+		}
+		analyzed_lookup.insert(analyzed_source, analyzed_replacements);
+		surface_lookup.insert(surface_source.clone(), surface_replacements.clone());
+		rules.push(SynonymRule {
+			source: surface_source,
+			replacements: surface_replacements,
+		});
+	}
+	rules.sort_by(|left, right| left.source.cmp(&right.source));
+	canonical.synonyms = rules;
+	Ok(CanonicalIdentity {
+		config: canonical,
+		analyzer,
+		analyzed_synonyms: Arc::new(analyzed_lookup),
+		surface_synonyms: Arc::new(surface_lookup),
+	})
+}
+
+fn canonical_synonym_term(analyzer: &mut TextAnalyzer, text: &str, label: &str) -> Result<String> {
+	let mut stream = analyzer.token_stream(text);
+	if !stream.advance() {
+		return Err(FulltextError::invalid(format!(
+			"synonym {label} must produce exactly one analyzed term"
+		)));
+	}
+	let term = stream.token().text.clone();
+	if stream.advance() {
+		return Err(FulltextError::invalid(format!(
+			"synonym {label} must produce exactly one analyzed term"
+		)));
+	}
+	Ok(term)
 }
 
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
-	let mut bytes = b"HTFI\x02\x00".to_vec();
+	let mut bytes = b"HTFI\x03\x00".to_vec();
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
 	push_string(&mut bytes, &config.analyzer);
@@ -1446,6 +2026,14 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 		config.positions as u8,
 		config.surface_terms as u8,
 	]);
+	bytes.extend_from_slice(&(config.synonyms.len() as u16).to_le_bytes());
+	for rule in &config.synonyms {
+		push_string(&mut bytes, &rule.source);
+		bytes.extend_from_slice(&(rule.replacements.len() as u16).to_le_bytes());
+		for replacement in &rule.replacements {
+			push_string(&mut bytes, replacement);
+		}
+	}
 	bytes.extend_from_slice(&(config.fields.len() as u16).to_le_bytes());
 	for field in &config.fields {
 		push_string(&mut bytes, &field.name);
@@ -1455,7 +2043,7 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 
 pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	let version = bytes.get(4..6)?;
-	if bytes.get(..4)? != b"HTFI" || !matches!(version, b"\x01\x00" | b"\x02\x00") {
+	if bytes.get(..4)? != b"HTFI" || !matches!(version, b"\x01\x00" | b"\x02\x00" | b"\x03\x00") {
 		return None;
 	}
 	let mut offset = 6;
@@ -1470,6 +2058,19 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 		return None;
 	}
 	offset += 3;
+	if version == b"\x03\x00" {
+		let synonym_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
+		offset += 2;
+		for _ in 0..synonym_count {
+			take_string(bytes, &mut offset)?;
+			let replacement_count =
+				u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
+			offset += 2;
+			for _ in 0..replacement_count {
+				take_string(bytes, &mut offset)?;
+			}
+		}
+	}
 	let field_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 	offset += 2;
 	for _ in 0..field_count {
@@ -1645,6 +2246,7 @@ mod tests {
 				stop_words: true,
 				positions: true,
 				surface_terms: false,
+				synonyms: Vec::new(),
 			},
 			limits: Limits {
 				indexing_threads: 1,
@@ -1701,6 +2303,345 @@ mod tests {
 		assert!(fuzzy_prefix_matches("shoe", "shoestring"));
 		assert!(fuzzy_prefix_matches("shoe", "sjoestring"));
 		assert!(!fuzzy_prefix_matches("shoe", "boots"));
+	}
+
+	#[test]
+	fn english_analyzer_normalizes_unicode_and_possessives_with_source_offsets() {
+		let mut analyzer = build_analyzer(true, None).unwrap();
+		let source = "Müller's ＳＨＯＥＳ re\u{301}sume\u{301} ß";
+		let mut stream = analyzer.token_stream(source);
+		let mut tokens = Vec::new();
+		while stream.advance() {
+			tokens.push(stream.token().clone());
+		}
+		drop(stream);
+		assert_eq!(
+			tokens.iter().map(|token| token.text.as_str()).collect::<Vec<_>>(),
+			["muller", "shoe", "resum", "ss"]
+		);
+		let resume = &tokens[2];
+		assert_eq!(&source[resume.offset_from..resume.offset_to], "re\u{301}sume\u{301}");
+		let mut composed = analyzer.token_stream("résumé");
+		assert!(composed.advance());
+		assert_eq!(composed.token().text, "resum");
+		assert!(!composed.advance());
+		drop(composed);
+		let mut possessive = analyzer.token_stream("dog＇s shoe");
+		assert!(possessive.advance());
+		assert_eq!(
+			(possessive.token().position, possessive.token().text.as_str()),
+			(0, "dog")
+		);
+		assert!(possessive.advance());
+		assert_eq!(
+			(possessive.token().position, possessive.token().text.as_str()),
+			(1, "shoe")
+		);
+		assert!(!possessive.advance());
+		for token in tokens {
+			assert!(token.offset_from < token.offset_to);
+			assert!(source.get(token.offset_from..token.offset_to).is_some());
+		}
+		assert_eq!(
+			source_span(&utf16_offsets(source), source.len() + 1, source.len() + 2),
+			None
+		);
+	}
+
+	#[test]
+	fn nfkc_tokenizer_normalizes_across_source_character_boundaries() {
+		use unicode_normalization::UnicodeNormalization;
+
+		for source in [
+			"㉠ᅡ",
+			"A\u{315}\u{300}",
+			"\u{1100}\u{1161}\u{11a8}",
+			"\u{301}A\u{30a}",
+			"ﷺ\u{301}",
+		] {
+			let mut mapped = MappedNfkc::new(source);
+			let mut actual = String::new();
+			while let Some(character) = mapped.next() {
+				actual.push(character.character);
+				assert!(source.get(character.span.start..character.span.end).is_some());
+			}
+			assert_eq!(actual, source.nfkc().collect::<String>());
+		}
+		let source = format!("e\u{301}{}", "\u{315}".repeat(MAX_NONSTARTERS + 1));
+		let mut mapped = MappedNfkc::new(&source);
+		let mut actual = String::new();
+		while let Some(character) = mapped.next() {
+			actual.push(character.character);
+		}
+		assert_eq!(actual, source.stream_safe().nfkc().collect::<String>());
+		assert!(actual.contains(COMBINING_GRAPHEME_JOINER));
+		let source = "㉠ᅡ";
+		let mut tokenizer = NfkcTokenizer::default();
+		let mut stream = tokenizer.token_stream(source);
+		assert!(stream.advance());
+		assert_eq!(stream.token().text, "가");
+		assert_eq!(stream.token().offset_from, 0);
+		assert_eq!(stream.token().offset_to, source.len());
+		assert!(!stream.advance());
+	}
+
+	#[test]
+	fn mapped_nfkc_matches_stream_safe_unicode_normalization() {
+		use unicode_normalization::UnicodeNormalization;
+
+		let ranges = [
+			(0x20, 0x7e),
+			(0xa0, 0x24f),
+			(0x300, 0x36f),
+			(0x590, 0x6ff),
+			(0x1100, 0x11ff),
+			(0x1e00, 0x1eff),
+			(0x2100, 0x214f),
+			(0x2460, 0x24ff),
+			(0xfb00, 0xfb4f),
+			(0xff00, 0xffef),
+			(0x1f300, 0x1f64f),
+		];
+		let mut random = 0x9e37_79b9_u32;
+		for _ in 0..4_096 {
+			random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+			let length = (random as usize % 48) + 1;
+			let mut source = String::new();
+			for _ in 0..length {
+				random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+				let (start, end) = ranges[random as usize % ranges.len()];
+				random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+				let character = char::from_u32(start + random % (end - start + 1)).unwrap();
+				source.push(character);
+			}
+			let mut mapped = MappedNfkc::new(&source);
+			let mut actual = String::new();
+			while let Some(character) = mapped.next() {
+				actual.push(character.character);
+				assert!(source.get(character.span.start..character.span.end).is_some());
+			}
+			assert_eq!(actual, source.stream_safe().nfkc().collect::<String>());
+		}
+
+		let composed = format!("\u{e9}{}", "\u{315}".repeat(MAX_NONSTARTERS + 1));
+		let decomposed = format!("e\u{301}{}", "\u{315}".repeat(MAX_NONSTARTERS + 1));
+		let mut tokenizer = NfkcTokenizer::default();
+		let tokens = |tokenizer: &mut NfkcTokenizer, value: &str| {
+			let mut stream = tokenizer.token_stream(value);
+			let mut tokens = Vec::new();
+			while stream.advance() {
+				tokens.push(stream.token().text.clone());
+			}
+			tokens
+		};
+		assert_eq!(tokens(&mut tokenizer, &composed), tokens(&mut tokenizer, &decomposed));
+	}
+
+	#[test]
+	fn prefix_length_is_checked_after_normalization() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let query = "Ａ".repeat(14);
+		let (completed, prefix) = engine.final_surface_term(&query).unwrap();
+		assert!(completed.is_empty());
+		assert_eq!(prefix.unwrap(), "a".repeat(14));
+		let (completed, prefix) = engine.final_surface_term("½abc").unwrap();
+		assert_eq!(completed, ["1"]);
+		assert_eq!(prefix.unwrap(), "2abc");
+		let (_, prefix) = engine.final_surface_term(&"é".repeat(39)).unwrap();
+		assert_eq!(prefix.unwrap(), "e".repeat(39));
+	}
+
+	#[test]
+	fn trace_token_ceiling_marks_an_unmatched_record_incomplete() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut source = "x ".repeat(MAX_TRACE_TOKENS_PER_VALUE);
+		source.push_str("needle");
+		let trace = engine
+			.trace_matches(
+				&SearchRequest {
+					text: "needle".to_owned(),
+					mode: SearchMode::Any,
+					fields: vec!["description".to_owned()],
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+				&[TraceRecord {
+					id: "one".to_owned(),
+					fields: vec![("description".to_owned(), vec![source])],
+				}],
+				None,
+			)
+			.unwrap();
+		assert!(!trace.complete);
+		assert!(trace.records.is_empty());
+	}
+
+	#[test]
+	fn index_time_synonyms_are_canonical_persisted_and_traceable() {
+		let directory = RamDirectory::create();
+		let mut config = config();
+		config.identity.surface_terms = true;
+		config.identity.synonyms = vec![SynonymRule {
+			source: "ＴＶ".to_owned(),
+			replacements: vec!["telly".to_owned(), "Televisions".to_owned()],
+		}];
+		let engine = Engine::open(directory.clone(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![
+					crate::protocol::Upsert {
+						id: "one".to_owned(),
+						fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
+					},
+					crate::protocol::Upsert {
+						id: "two".to_owned(),
+						fields: vec![("title".to_owned(), vec!["monitor stand".to_owned()])],
+					},
+				],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let reader = engine.reader().unwrap();
+		for text in ["tv", "telly", "television"] {
+			let result = engine
+				.search(
+					&reader.searcher(),
+					&SearchRequest {
+						text: text.to_owned(),
+						mode: SearchMode::Any,
+						fields: Vec::new(),
+						candidate_ids: None,
+						offset: 0,
+						limit: 10,
+						exact_total: true,
+						budget_milliseconds: 30_000,
+					},
+				)
+				.unwrap();
+			assert_eq!(result.hits[0].id, "one");
+		}
+		let trace = engine
+			.trace_matches(
+				&SearchRequest {
+					text: "television".to_owned(),
+					mode: SearchMode::Any,
+					fields: Vec::new(),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+				&[TraceRecord {
+					id: "one".to_owned(),
+					fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
+				}],
+				None,
+			)
+			.unwrap();
+		assert_eq!(trace.records[0].values[0].spans, [TraceSpan { start: 0, end: 2 }]);
+		let synonym_score = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					text: "stand".to_owned(),
+					mode: SearchMode::Any,
+					fields: Vec::new(),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap()
+			.hits
+			.into_iter()
+			.find(|hit| hit.id == "one")
+			.unwrap()
+			.score;
+		let mut baseline_config = config.clone();
+		baseline_config.identity.index_id = "baseline".to_owned();
+		baseline_config.identity.synonyms.clear();
+		let baseline = Engine::open(RamDirectory::create(), &baseline_config).unwrap();
+		let mut baseline_writer = baseline.writer(&baseline_config).unwrap();
+		baseline_writer
+			.apply(MutationBatch {
+				upserts: vec![
+					crate::protocol::Upsert {
+						id: "one".to_owned(),
+						fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
+					},
+					crate::protocol::Upsert {
+						id: "two".to_owned(),
+						fields: vec![("title".to_owned(), vec!["monitor stand".to_owned()])],
+					},
+				],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		baseline_writer.commit().unwrap();
+		let baseline_reader = baseline.reader().unwrap();
+		let baseline_score = baseline
+			.search(
+				&baseline_reader.searcher(),
+				&SearchRequest {
+					text: "stand".to_owned(),
+					mode: SearchMode::Any,
+					fields: Vec::new(),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap()
+			.hits
+			.into_iter()
+			.find(|hit| hit.id == "one")
+			.unwrap()
+			.score;
+		assert!(synonym_score < baseline_score);
+		baseline_writer.close().unwrap();
+
+		writer.close().unwrap();
+		let mut reordered = config.clone();
+		reordered.identity.synonyms[0].replacements.reverse();
+		Engine::open(directory.clone(), &reordered).unwrap();
+		reordered.identity.synonyms[0].replacements[0] = "display".to_owned();
+		assert_eq!(
+			Engine::inspect(directory, &reordered.identity).unwrap_err().code,
+			"E_IDENTITY_MISMATCH"
+		);
+	}
+
+	#[test]
+	fn persisted_index_id_accepts_v2_sidecars_for_reset_only() {
+		let config = config();
+		let mut identity = b"HTFI\x02\x00".to_vec();
+		push_string(&mut identity, &config.identity.index_id);
+		push_string(&mut identity, &config.identity.generation);
+		push_string(&mut identity, &config.identity.analyzer);
+		identity.extend_from_slice(&[1, 1, 0]);
+		identity.extend_from_slice(&(config.identity.fields.len() as u16).to_le_bytes());
+		for field in &config.identity.fields {
+			push_string(&mut identity, &field.name);
+		}
+		assert_eq!(persisted_index_id(&identity), Some("products"));
+		let directory = RamDirectory::create();
+		directory.atomic_write(Path::new(IDENTITY_PATH), &identity).unwrap();
+		assert_eq!(
+			Engine::inspect(directory, &config.identity).unwrap_err().code,
+			"E_IDENTITY_MISMATCH"
+		);
 	}
 
 	#[test]

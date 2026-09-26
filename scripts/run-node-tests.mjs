@@ -4,14 +4,18 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const phase = process.argv[2];
-if (phase !== 'test' && phase !== 'release') {
-	throw new Error('Expected the test phase to be "test" or "release"');
+if (phase !== 'test' && phase !== 'optimized' && phase !== 'release') {
+	throw new Error('Expected the test phase to be "test", "optimized", or "release"');
 }
 
 const testDirectory = fileURLToPath(new URL('../test/', import.meta.url));
 const files = readdirSync(testDirectory, { recursive: true })
 	.filter((entry) => typeof entry === 'string' && entry.endsWith('.test.mjs'))
-	.filter((entry) => (phase === 'release') === entry.endsWith('.release.test.mjs'))
+	.filter((entry) => {
+		if (entry.endsWith('.release.test.mjs')) return phase === 'release';
+		if (entry.endsWith('.optimized.test.mjs')) return phase === 'optimized';
+		return phase === 'test';
+	})
 	.map((entry) => path.join(testDirectory, entry));
 
 if (files.length === 0) {
@@ -27,6 +31,9 @@ for (const batch of [concurrentFiles, isolatedFiles]) {
 		continue;
 	}
 	const arguments_ = ['--test'];
+	if (process.env.FULLTEXT_TEST_COVERAGE === '1') {
+		arguments_.push('--experimental-test-coverage', '--test-coverage-include=dist/**/*.js');
+	}
 	if (batch === isolatedFiles) {
 		arguments_.push(nodeMajorVersion < 24 ? '--experimental-test-isolation=none' : '--test-isolation=none');
 	}

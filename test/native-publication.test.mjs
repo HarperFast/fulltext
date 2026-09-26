@@ -16,7 +16,7 @@ function config() {
 		indexId: 'publication',
 		generation: 'one',
 		fields: [{ name: 'title', weight: 1 }],
-		analyzer: 'english@1',
+		analyzer: 'english@2',
 		stopWords: true,
 		positions: true,
 		surfaceTerms: false,

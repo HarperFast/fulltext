@@ -28,7 +28,7 @@ for (const [mode, expected] of [
 			indexId: 'crash-products',
 			generation: 'generation-1',
 			fields: [{ name: 'title' }],
-			analyzer: 'english@1',
+			analyzer: 'english@2',
 			limits: {
 				indexingThreads: 1,
 				searchThreads: 1,

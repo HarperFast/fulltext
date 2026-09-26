@@ -1,34 +1,34 @@
 # Native Tantivy backend implementation
 
-This document records the native backend contract. Native Tantivy files are also the selected
-storage for Harper's derived full-text indexes; RocksDB is not a Fulltext delivery target. See
-[native checkpoint publication](native-checkpoint-publication.md) for its durability boundary.
+This document records the standalone native backend contract. RocksDB is not a Fulltext delivery
+target. [Native checkpoint publication](native-checkpoint-publication.md) defines the durability
+boundary.
 
 ## Intent
 
 Implement `@harperfast/fulltext/native` as a usable standalone full-text index backed directly by
-Tantivy's `MmapDirectory`. This backend provides the engine and persistence path that Harper will
-also consume through its derived-index lifecycle.
+Tantivy's `MmapDirectory`.
 
 The backend covers native index creation and reopen, batched document upsert/delete, explicit
 commit and checkpoint publication, weighted BM25, phrase, bounded prefix/autocomplete, fuzzy and
 fuzzy-prefix queries, score-neutral candidate filtering, current-record match tracing, status, and
-deterministic close. Harper's derived-index watermark and readiness policy remain outside the
-wrapper.
+deterministic close. Source-data projection, replication, and readiness policy remain outside the
+package.
 
-It deliberately implements narrow prerequisites from issues #14 and #17 without closing either
-issue. From #14 it uses one versioned packed mutation request, one packed search result, stable error
-codes, and the lifecycle shape required by this backend. From #17 it uses one bounded dedicated
-writer actor and one bounded search executor per index so sustained work stays off JavaScript and
-libuv while search remains independent of write/commit latency. It does not implement the final
-process-wide governor, shared cross-index search pool, multi-environment handle registry,
-cancellation, or derived nonblocking admission.
+It implements the native portions of [the façade and lifecycle contract](https://github.com/HarperFast/fulltext/issues/14)
+and [bounded native execution](https://github.com/HarperFast/fulltext/issues/17). The facade uses
+versioned packed mutation and search frames, stable error codes, and explicit lifecycle operations.
+Each index has one bounded writer actor and a bounded search executor, while the optional process
+governor provides checked aggregate admission across indexes. Sustained work stays off JavaScript
+and libuv, and search remains independent of write and commit latency. Shared cross-index executors,
+multi-environment handles and cancellation of started Tantivy collectors remain outside this
+contract.
 
 ## Invariant
 
 The engine-facing schema, mutation, commit, search, and lifecycle contracts remain independent from
-Harper. The Node wrapper contributes canonical path handling and Tantivy `MmapDirectory`
-construction; Harper owns source projection, replay, and derived-index readiness.
+the consuming application. The Node package contributes canonical path handling and Tantivy
+`MmapDirectory` construction; the application owns source projection, replay, and readiness.
 
 ## Verified constraints
 
@@ -66,7 +66,7 @@ interface NativeFullTextIndexOptions {
 	indexId: string;
 	generation: string;
 	fields: Array<{ name: string; weight?: number }>;
-	analyzer: 'english@1';
+	analyzer: 'english@2';
 	stopWords?: boolean;
 	positions?: boolean;
 	surfaceTerms?: boolean;
@@ -140,16 +140,15 @@ type NativeFullTextIndexInspection =
 	  };
 ```
 
-These native-only limits are required in the pre-1.0 standalone factory so measurements are
-reproducible and memory is bounded without prematurely implementing #17's final process-wide budget
-allocator. The shared engine accepts resolved limits; the future runtime governor will supply them,
-and the Harper schema will never expose them.
+These native-only per-index limits keep standalone measurements reproducible. The optional process
+governor adds aggregate caps without moving policy into the shared engine. The application supplies
+resolved per-index limits and configures the process budget once before opening indexes.
 
 The exported flow is:
 
 1. `inspectNativeFullTextIndex(options)` synchronously checks durable identity, schema, and commit
    payload without creating files, reserving a handle, starting an actor, or acquiring the writer.
-   Harper validates the opaque payload against its own replay-cursor contract.
+   The application validates the opaque payload against its own replay-cursor contract.
 2. `openNativeFullTextIndex(options)` creates the directory when absent, canonicalizes it, reserves
    the canonical path, and asynchronously creates or reopens Tantivy state.
 3. `index.encodeMutationBatches(batch)` validates one logical batch against the opened schema and
@@ -167,15 +166,33 @@ The exported flow is:
    reservation, and is idempotent.
 7. `status()` reads bounded counters and state without entering either sustained-work queue.
 
-Only English analysis is accepted. `positions` defaults to true and selects frequencies with or
-without positions. Changing that default in a future release is an index-format change, not a
-silent reinterpretation. `generation` is an opaque caller-owned identity for this physical index
-generation; it is persisted in the engine fingerprint and must match on reopen. It is not a Tantivy
-opstamp or a Harper transaction-log position.
+Only the versioned `english@2` analysis contract is accepted. `positions` defaults to true and
+selects frequencies with or without positions. Changing that default in a future release is an
+index-format change, not a silent reinterpretation. `generation` is an opaque caller-owned identity
+for this physical index generation; it is persisted in the engine fingerprint and must match on
+reopen. It is not a Tantivy opstamp or an application transaction-log position.
 `surfaceTerms` creates a separately indexed, unstemmed companion term field for prefix,
 fuzzy-prefix, and current-record match tracing; it never stores source values. It defaults off
 because of its storage cost. Field weights are query-time boosts and may change when reopening the
 same physical index without rebuilding it.
+
+`configureNativeFullTextRuntime()` optionally installs one immutable process budget before the first
+successful open. Identical calls are idempotent; configuration while an open is pending returns
+retryable `E_LOCK_BUSY`, while configuration after an unbudgeted open returns `E_RESOURCE_LIMIT`.
+A failed first open releases its pending latch only after teardown proves native resources were
+released; an unproven teardown latches the process as opened without a budget until restart. The
+governor admits aggregate resident indexes, indexing/search threads,
+writer memory, configured queue capacity, and expensive searches with checked shared accounting.
+Each index reserves its writer queue and shared search-queue capacity, so process queue accounting
+charges twice the per-index `maxQueuedBytes`. Exceeding an open-time admission cap returns
+`E_RESOURCE_LIMIT`; it never evicts an active generation. Expensive searches wait on a condition
+variable off the JavaScript thread until process capacity is available, the request deadline
+expires, or close interrupts the wait. Callers that omit the governor retain per-index admission.
+The deadline controls whether queued or completed work is accepted, not when its promise settles.
+If every eligible worker is executing non-interruptible Tantivy work, an expired queued request is
+rejected when a worker next examines it. An unproven teardown quarantines the path and keeps its
+aggregate capacity charged until process restart; releasing an unverified reservation could
+oversubscribe threads or memory still held by native actors.
 
 The public search method accepts a small typed request and decodes a versioned native result buffer
 into bounded result objects. The N-API boundary receives one operation per batch or search;
@@ -188,10 +205,9 @@ requires IDs to be distinct across the logical batch, and defaults the total ret
 to 64 MiB. A caller can lower that ceiling with `maxTotalBytes`; exceeding it throws by default.
 With `allowPartial: true`, the result reports the leading upsert and delete counts consumed under
 that ceiling so a caller can apply the frames and continue with each array's remaining suffix
-without re-encoding earlier records. Aggregate frame overflow creates
-more frames; a mutation that cannot fit alone is reported to the caller. The call performs no native
-work. `apply()` then makes one
-required copy into Rust-owned memory before asynchronous admission. Callers apply every frame and
+without re-encoding earlier records. Aggregate frame overflow creates more frames; a mutation that
+cannot fit alone is reported to the caller. The call performs no native work. `apply()` then makes
+one required copy into Rust-owned memory before asynchronous admission. Callers apply every frame and
 commit or publish only after all succeed; otherwise they rollback-close the staged writer window.
 One caller owns that complete apply-and-publication sequence per handle; the low-level frame API
 does not provide a logical-batch fence between concurrent publishers. Searches remain concurrent.
@@ -223,16 +239,18 @@ rollback, and shutdown ordering explicit. A small configurable search pool share
 `IndexReader`; each request captures its immutable `Searcher`, so searches overlap each other as
 well as indexing and commit. `reload()` first crosses the writer queue as a barrier, reloads the
 shared reader under a short coordination lock, and publishes the new searcher to subsequent
-requests. Tantivy remains free to use its
-configured indexing and merge workers behind the writer actor. Independent indexes and their
-searches may run concurrently. #17 later replaces the per-index search pools with the bounded
-process pool without changing engine behavior.
+requests. Tantivy remains free to use its configured indexing and merge workers behind the writer
+actor. Independent indexes and their
+searches may run concurrently. The process governor bounds their aggregate resources without
+replacing the per-index search pools with a shared scheduler.
 
 With two or more search threads, one worker consumes only the ordinary BM25 lane. Every other
 worker prioritizes phrase, prefix, fuzzy, and trace requests, then steals ordinary work when the
 expensive lane is idle. This preserves ordinary-query capacity during expensive traffic without
 stranding half the pool during ordinary-only workloads. A one-thread configuration uses one shared
-lane and provides no query-class isolation.
+lane and provides no query-class isolation. In that configuration, a process-wide expensive permit
+held by another index can delay ordinary work behind an expensive request. Closing an index rejects
+an expensive request waiting for a permit with `E_CLOSED`.
 
 Both queues are bounded by command count and retained bytes. A JS-owned buffer is copied once into a
 Rust-owned `Vec<u8>` before admission; no native thread borrows memory owned by a Node environment.
@@ -241,10 +259,10 @@ writer arena, indexing-thread, and search-thread values are printed in every ben
 
 The registry rejects a second live open of the same canonical path. This is narrower than the
 eventual shared multi-environment registry, but it preserves the one-writer invariant without
-pretending two JavaScript handles have coordinated close ownership. The later registry issue can
-replace rejection with reference-counted shared handles without changing the index contract.
+pretending two JavaScript handles have coordinated close ownership. Reference-counted shared
+handles can replace rejection later without changing the index contract.
 
-Inspection is deliberately outside the handle registry and writer actor. It opens Tantivy's
+Inspection is outside the handle registry and writer actor. It opens Tantivy's
 managed directory read-only long enough to validate the persisted schema and read the current
 commit payload, then drops it before returning. A small synchronous lifecycle check is preferable
 to acquiring and closing an `IndexWriter`, but it is not a request-path API: callers cache the
@@ -254,21 +272,23 @@ result for their ownership epoch and repeat it only when lifecycle ownership cha
 
 ## Schema and query behavior
 
-Each Tantivy schema contains an internal indexed string fast field for the raw ID using Tantivy's raw tokenizer
-and one declared text field per configured source field. At creation, the engine atomically writes a
-small backend-neutral identity sidecar through `Directory::atomic_write()` and calls
+Each Tantivy schema contains an internal indexed string fast field for the raw ID, using Tantivy's
+raw tokenizer, and one declared text field per configured source field. At creation, the engine
+atomically writes a small backend-neutral identity sidecar through `Directory::atomic_write()` and calls
 `Directory::sync_directory()`. It contains a versioned fingerprint of the logical index ID, bounded
-generation, analyzer identity, stop-word policy, positions, surface-term storage, and structural
-schema. It deliberately excludes the Node wire ABI and Tantivy package version: wire changes do not
+generation, analyzer identity, stop-word policy, positions, surface-term storage, canonical
+single-token synonym rules, and structural schema. It excludes the Node wire ABI and Tantivy
+package version: wire changes do not
 change durable semantics, and Tantivy performs its own index-format compatibility check. Reopen
 compares both the generated Tantivy schema and this fingerprint before creating a writer. The
 immutable sidecar is separate from Tantivy's per-commit payload, which remains available for
 standalone checkpoints and derived watermarks.
+
 Unknown mutation fields, missing IDs, duplicate schema field names, unknown search fields, oversized
 batches, and excessive result windows fail before search/index work. Blank and stop-word-only
 queries return an exact empty result. Record IDs have a separate 4,096-byte UTF-8 ceiling; field
 values retain the general 1 MiB packed-string ceiling. The tighter ID invariant bounds the sort keys
-materialized for deterministic score-tie pagination and still admits Harper's maximum encoded key.
+materialized for deterministic score-tie pagination.
 
 Create treats `{sidecar, meta.json}` as a pair. If neither exists, it writes and syncs the sidecar
 first and then creates the Tantivy index. If both exist, it reopens and verifies them. A sidecar-only
@@ -276,16 +296,36 @@ state is an interrupted empty create and is completed automatically after verify
 `meta.json` without the sidecar is rejected as incomplete because it may contain durable data whose
 identity cannot be proven. Absent, unparseable, or mismatched identity is never accepted as
 legacy-compatible. Tantivy's persisted schema and versioned tokenizer names independently verify
-the structural and analyzer portions of the identity. Every declared count and length in packed input is checked
-against the remaining bytes before arithmetic or allocation, the version tag is checked first, and
+the structural and analyzer portions of the identity. Every declared count and length in packed
+input is checked against the remaining bytes before arithmetic or allocation, the version tag is checked first, and
 invalid UTF-8 is rejected on the writer actor rather than the JavaScript thread. Admission checks
 the fixed header and structural bounds only. `indexId` and `generation` have fixed encoded-length
 limits because they are persisted.
 
-The English analyzer is versioned by name and composed from Tantivy's tokenizer primitives:
-`SimpleTokenizer`, `RemoveLongFilter`, `LowerCaser`, optional built-in English
-`StopWordFilter`, and English `Stemmer`. The same registered analyzer tokenizes indexed text and
-search text.
+The English analyzer is versioned by name and starts with an NFKC-aware tokenizer so decomposed
+words are normalized before token boundaries are selected. Already-normalized input follows a
+zero-allocation iterator. Other input is compatibility-decomposed, canonically ordered, and
+recomposed as a stream carrying original byte spans; it does not materialize a normalized copy or
+one span per expanded character. Token text stops growing once it is guaranteed to be removed by
+the downstream byte-length filter. The tokenizer follows Unicode Stream-Safe Text Process by
+inserting a combining grapheme joiner before an input character whose compatibility decomposition
+would exceed 30 consecutive non-starters, bounding normalization buffers. Possessive removal,
+`LowerCaser`, `AsciiFoldingFilter`, `RemoveLongFilter`, optional English `StopWordFilter`, and English
+`Stemmer` follow. Golden fixtures cover combining marks, cross-source-character composition,
+full-width text, Latin diacritics, possessives, expansions, and adjacent emoji. The same analyzer
+tokenizes indexed and search text.
+The analyzer name and identity-sidecar version form the compatibility key; changing filter semantics
+requires bumping at least one of them.
+
+Synonym rules are bounded by count, replacement count, and encoded bytes in the native decoder.
+Each source and replacement must yield exactly one normalized and analyzed term. Canonical rules are
+sorted and fingerprinted in identity sidecar v3. A bounded token filter streams replacements once at
+the source position into both analyzed and surface fields; query text is not expanded. Tantivy counts
+the alternatives in BM25 field length, so enabling a rule can affect unrelated-term ranking for a
+document containing its source. Match tracing uses the same document-side expansion and maps every
+replacement to the source token span. Crossing its 262,144-token-per-value ceiling marks the trace
+incomplete instead of failing the request. Version 2 sidecars remain parseable for safe reset but
+mismatch v3 open/inspection so the application can retire and rebuild them.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`
@@ -302,11 +342,12 @@ duplicated in Tantivy's document store.
 Phrase queries preserve analyzer positions, including gaps left by removed stop words, and match
 tracing uses the same positional rule. Prefix expansion is capped; exceeding the cap returns
 `E_PREFIX_TOO_BROAD` rather than truncating the term set and silently biasing recall or rank. A
-caller such as Harper may catch that distinct code and choose a documented fallback. Fuzzy-prefix
-remains a preview capability until the catalog-scale benchmark qualifies it. Request budgets cover
+caller may catch that distinct code and choose a documented fallback. Fuzzy-prefix remains a
+preview capability until the catalog-scale benchmark qualifies it. Request budgets cover
 queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing;
 Tantivy's collector itself cannot be interrupted, so an expired search result is discarded after
-the collector returns.
+the collector returns. If all eligible workers are executing, an expired queued request is rejected
+when a worker next examines it rather than at the exact wall-clock deadline.
 
 ## Failure and lifecycle behavior
 
@@ -364,8 +405,8 @@ returns. Handles and completions are never reused across workers.
 
 ## Performance experiment
 
-Add a release-build benchmark that generates a deterministic high-cardinality product-style corpus
-and drives the public native API. It emits one versioned JSON record containing environment
+The release-build benchmark generates a deterministic high-cardinality product-style corpus and
+drives the public native API. It emits one versioned JSON record containing environment
 metadata and:
 
 - durable documents and packed MiB indexed per second by batch size and commit cadence;
@@ -383,9 +424,8 @@ explicitly. Correctness assertions run before timing results are accepted: expec
 reopen must preserve results, and every operation count must match. The benchmark's
 replacement-safe upserts emit delete terms, so `--commit-every` is an explicit workload dimension
 rather than allowing an unbounded final commit to masquerade as a production ingestion profile.
-The benchmark does not claim the 100-million-document or Harper p99-under-50-ms release gate; those
-remain paired fixed-host work. This slice establishes the standalone native baseline for comparison
-with the integrated Harper path and a no-index Harper control.
+The benchmark does not claim a 100-million-document or p99-under-50-ms release gate; those remain
+fixed-host qualification work. This slice establishes the standalone native baseline.
 
 CI runs correctness tests and an explicit small benchmark-smoke command that performs ranking,
 commit, close, and reopen assertions before validating nonzero measurements. Shared runners enforce
@@ -418,11 +458,9 @@ controls repeated passes, and requested index counts are capped at 10,000 total 
 - Decoder tests cover invalid counts, lengths, and UTF-8; randomized decoder fuzzing remains part of
   the hardening work.
 - MmapDirectory contract tests remain unchanged.
-- `npm run check`, the inspection benchmark smoke profile, and package artifact verification run
-  before review.
-- The release benchmark runs locally at two dataset sizes and commit cadences; raw JSON is retained
-  with the PR verification notes. It is built explicitly in release mode before measurements are
-  taken.
+- `npm run check`, benchmark smoke profiles, and package artifact verification run in CI.
+- Release benchmarks run in release mode and retain versioned JSON for comparison on equivalent
+  hardware.
 
 End-to-end route: a Node integration test loads the built addon through the published native
 subpath, creates an on-disk index, mutates and commits it, searches it, closes it, reopens it, and
@@ -430,33 +468,32 @@ repeats the search.
 
 ## Approaches considered
 
-### Different layer: implement native storage only in Harper
+### Different layer: implement native storage only in a host application
 
-The candidate layer is Harper's `DerivedIndexBackend`, which could own the engine and call a thin
-native filesystem binding. Rejected because standalone users and Harper-derived delivery need the
-same search and indexing behavior; putting the engine in Harper would force standalone use to
-depend on Harper or fork those semantics.
+The consuming application could own the engine and call a thin native filesystem binding. Rejected
+because standalone users need the complete search and indexing behavior without depending on a
+separate host or forking those semantics.
 
 ### Deeper cause: implement the complete storage-neutral runtime before either backend
 
 The bad state to prevent is a backend opening durable data whose analyzer or engine semantics it
 cannot interpret. The candidate is a backend-neutral persisted fingerprint and commit durability
-contract before either backend ships. This is adopted in the chosen approach. The complete #14/#17
-surface remains rejected for this issue because derived watermarks, multi-environment sharing, and a
-global scheduler are not needed to enforce that durable compatibility invariant.
+contract before either backend ships. This is adopted in the chosen approach. Derived watermarks and
+multi-environment sharing remain application responsibilities; the wrapper's optional process
+governor only enforces local aggregate resource caps.
 
 ### Do less: expose Tantivy's existing filesystem API or query parser directly
 
 Rejected because it would expose a third-party API, permit unbounded query syntax, and create a
-public contract Harper could not safely govern. A directory-only smoke also cannot provide the
+public contract a host could not safely govern. A directory-only smoke also cannot provide the
 performance baseline required for the wrapper.
 
 ### Do less on runtime: engine benchmark plus separate per-index writer and search executors
 
-Adopted. The engine is generic over `Directory`, and the Node slice uses byte-bounded per-index
-execution rather than implementing #17's process governor and shared cross-index search pool.
-Keeping search separate from the writer is the minimum needed for a baseline that measures Tantivy
-instead of temporary writer-queue head-of-line blocking.
+Partially adopted. The engine remains generic over `Directory`, and the Node slice keeps separate,
+byte-bounded per-index writer and search executors. A small optional process governor accounts for
+aggregate index, thread, writer-memory, queue-capacity, and expensive-search budgets; it does not
+introduce a shared cross-index executor or scheduler.
 
 ### Identity sidecar versus repeating identity in every commit payload
 
@@ -467,18 +504,15 @@ with `MmapDirectory` without custom filesystem code.
 
 ### Chosen: one shared engine slice with a thin MmapDirectory constructor
 
-This produces a usable standalone backend, keeps Tantivy storage mechanics out of Harper, avoids
-reimplementing Tantivy filesystem primitives, establishes bounded off-event-loop execution, and
-yields the reference implementation used by Harper's derived index.
+This produces a usable standalone backend, avoids reimplementing Tantivy filesystem primitives,
+and establishes bounded off-event-loop execution.
 
 ## Explicit deferrals
 
-- Derived-index delivery, replay, readiness, and Harper lifecycle hooks.
+- Source-data projection, replay, replication, and readiness policy.
 - Corpus-level query suggestions; bounded prefix search supplies text autocomplete.
 - Shared handles across multiple Node worker environments.
 - A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe
-  callback; this is part of the shared multi-environment runtime in issue #17.
-- Fixed-host regression thresholds comparing standalone native, Harper without full text, and
-  Harper using the native derived index.
-- Process-wide runtime budgets, cancellation, and cursor-based
-  deep pagination.
+  callback as part of a future shared multi-environment runtime.
+- Fixed-host regression thresholds for representative application workloads.
+- Cancellation of an already-running Tantivy collector and cursor-based deep pagination.

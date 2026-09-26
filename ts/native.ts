@@ -9,6 +9,7 @@ import {
 	encodeInspect,
 	encodeOpen,
 	encodeReset,
+	encodeRuntimeBudget,
 	encodeSearch,
 	encodeTrace,
 	MutationBatchFrameCursor,
@@ -49,7 +50,15 @@ export interface RuntimeInfo {
 		maxTraceRecords: number;
 		maxTraceSourceBytes: number;
 		maxTraceSpans: number;
+		maxSynonymRules: number;
+		maxSynonymReplacements: number;
+		maxSynonymBytes: number;
 	};
+}
+
+export interface FullTextSynonymRule {
+	source: string;
+	replacements: string[];
 }
 
 export interface NativeFullTextIndexOptions {
@@ -57,10 +66,11 @@ export interface NativeFullTextIndexOptions {
 	indexId: string;
 	generation: string;
 	fields: Array<{ name: string; weight?: number }>;
-	analyzer: 'english@1';
+	analyzer: 'english@2';
 	stopWords?: boolean;
 	positions?: boolean;
 	surfaceTerms?: boolean;
+	synonyms?: FullTextSynonymRule[];
 	limits: NativeFullTextIndexLimits;
 }
 
@@ -71,6 +81,15 @@ export interface NativeFullTextIndexLimits {
 	maxQueuedCommands: number;
 	maxQueuedBytes: number;
 	maxBatchBytes: number;
+}
+
+export interface NativeFullTextRuntimeBudget {
+	maxResidentIndexes: number;
+	maxIndexingThreads: number;
+	maxSearchThreads: number;
+	maxWriterMemoryBytes: number;
+	maxQueuedBytes: number;
+	maxExpensiveSearches: number;
 }
 
 export type NativeFullTextIndexInspectionOptions = Omit<NativeFullTextIndexOptions, 'limits'>;
@@ -840,6 +859,15 @@ export function validateNativeFullTextIndexOptions(options: NativeFullTextIndexO
 	}
 }
 
+export function configureNativeFullTextRuntime(limits: NativeFullTextRuntimeBudget): void {
+	try {
+		const cursor = decodeResponse(loadAddon().__nativeConfigureRuntime(encodeRuntimeBudget(limits)));
+		cursor.finish();
+	} catch (error) {
+		throw normalizeOptionsError(error);
+	}
+}
+
 export async function openNativeFullTextIndex(options: NativeFullTextIndexOptions): Promise<NativeFullTextIndex> {
 	let config: ReturnType<typeof packedOptions>;
 	let packed: Buffer;
@@ -847,8 +875,6 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 		config = packedOptions(options);
 		config.limits = { ...config.limits };
 		packed = encodeOpen(config);
-		const validation = decodeResponse(loadAddon().__nativeValidateOpen(packed));
-		validation.finish();
 	} catch (error) {
 		throw normalizeOptionsError(error);
 	}
@@ -897,6 +923,7 @@ function packedIndexIdentity(options: NativeFullTextIndexInspectionOptions) {
 		stopWords: options.stopWords ?? true,
 		positions: options.positions ?? true,
 		surfaceTerms: options.surfaceTerms ?? false,
+		synonyms: options.synonyms ?? [],
 	};
 }
 

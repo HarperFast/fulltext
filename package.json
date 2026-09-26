@@ -1,7 +1,7 @@
 {
 	"name": "@harperfast/fulltext",
-	"version": "0.1.2",
-	"description": "Tantivy full-text indexing for Node.js and Harper",
+	"version": "0.2.0",
+	"description": "Native Tantivy full-text indexing for Node.js",
 	"type": "module",
 	"exports": {
 		"./native": {
@@ -13,7 +13,10 @@
 		"dist/",
 		"README.md",
 		"LICENSE",
-		"dependencies.md"
+		"CONTRIBUTING.md",
+		"dependencies.md",
+		"docs/",
+		"examples/"
 	],
 	"napi": {
 		"binaryName": "fulltext",
@@ -29,11 +32,14 @@
 		"build:debug": "npm run build:typescript && napi build --platform --no-js --dts ts/addon.d.ts --features node-api",
 		"build:native": "napi build --platform --no-js --dts ts/addon.d.ts --release --features node-api",
 		"build:test-native": "napi build --platform --no-js --dts ts/addon.d.ts --features test-panic",
+		"build:test-native:release": "napi build --platform --no-js --dts ts/addon.d.ts --release --features test-panic",
 		"build:typescript": "npm run clean:typescript && tsc -p tsconfig.json",
 		"clean:typescript": "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
 		"benchmark:native": "npm run build && node scripts/run-local.mjs benchmarks/native.mjs",
+		"benchmark:multi-index": "npm run build && node scripts/run-local.mjs benchmarks/multi-index.mjs",
 		"benchmark:inspect": "npm run build && node scripts/run-local.mjs benchmarks/inspect.mjs",
 		"benchmark:inspect:smoke": "node scripts/run-local.mjs benchmarks/inspect.mjs --smoke",
+		"examples:smoke": "node scripts/run-local.mjs examples/basic.mjs && node scripts/run-local.mjs examples/query-modes.mjs && node scripts/run-local.mjs examples/checkpoint-recovery.mjs && node scripts/run-local.mjs examples/highlighting.mjs && node scripts/run-local.mjs examples/multi-index.mjs && node scripts/run-local.mjs examples/reset-rebuild.mjs",
 		"benchmark:smoke": "node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver logical && node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver low-level",
 		"check": "npm run format:check && npm run lint && npm run test",
 		"format": "prettier --write . && cargo fmt",
@@ -43,6 +49,7 @@
 		"test": "cargo test --locked --all-features && npm run test:node",
 		"test:rust": "cargo test --locked --all-features",
 		"test:node": "npm run build:test-native && npm run build:typescript && node scripts/run-node-tests.mjs test && npm run build:native && node scripts/run-node-tests.mjs release",
+		"test:optimized-native": "npm run build:test-native:release && npm run build:typescript && node scripts/run-node-tests.mjs optimized",
 		"verify:package-artifacts": "node scripts/verify-package-artifacts.mjs"
 	},
 	"engines": {
@@ -51,8 +58,7 @@
 	"keywords": [
 		"tantivy",
 		"full-text-search",
-		"node-api",
-		"harper"
+		"node-api"
 	],
 	"license": "Apache-2.0",
 	"repository": {
@@ -60,10 +66,10 @@
 		"url": "git+https://github.com/HarperFast/fulltext.git"
 	},
 	"optionalDependencies": {
-		"@harperfast/fulltext-darwin-arm64": "0.1.2",
-		"@harperfast/fulltext-linux-arm64-gnu": "0.1.2",
-		"@harperfast/fulltext-linux-x64-gnu": "0.1.2",
-		"@harperfast/fulltext-win32-x64-msvc": "0.1.2"
+		"@harperfast/fulltext-darwin-arm64": "0.2.0",
+		"@harperfast/fulltext-linux-arm64-gnu": "0.2.0",
+		"@harperfast/fulltext-linux-x64-gnu": "0.2.0",
+		"@harperfast/fulltext-win32-x64-msvc": "0.2.0"
 	},
 	"devDependencies": {
 		"@napi-rs/cli": "3.10.5",

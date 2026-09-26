@@ -3,7 +3,7 @@ use std::fs;
 use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,8 +21,9 @@ use crate::engine::{
 };
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	decode_batch, decode_inspect, decode_open, decode_reset, decode_search, decode_trace, search_budget, search_mode,
-	trace_budget, validate_batch_header, validate_search_header, validate_trace_header, EngineConfig, PROTOCOL_VERSION,
+	decode_batch, decode_inspect, decode_open, decode_reset, decode_runtime_budget, decode_search, decode_trace,
+	search_budget, search_mode, trace_budget, validate_batch_header, validate_search_header, validate_trace_header,
+	EngineConfig, RuntimeBudgetLimits, PROTOCOL_VERSION,
 };
 
 const STATE_OPEN: u8 = 0;
@@ -33,6 +34,9 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+static RUNTIME_BUDGET: OnceLock<Mutex<RuntimeBudgetState>> = OnceLock::new();
+#[cfg(feature = "test-panic")]
+static FAIL_NEXT_OPEN_CLEANUP: AtomicBool = AtomicBool::new(false);
 const LIFECYCLE_ROOT: &str = ".fulltext-locks";
 const LEGACY_LIFECYCLE_LOCK: &str = ".harper-fulltext-lifecycle.lock";
 const RETIRED_ROOT: &str = ".fulltext-retired";
@@ -83,12 +87,65 @@ struct Runtime {
 	search_execution_nanoseconds: AtomicU64,
 	search_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 	closed: Arc<CompletionSignal>,
+	reservation: Mutex<Option<RuntimeAdmission>>,
+	expensive_search_budget: Option<Arc<RuntimeBudget>>,
 	#[cfg(feature = "test-panic")]
 	publish_fault: AtomicU8,
 	#[cfg(feature = "test-panic")]
 	poison_before_admission: AtomicBool,
 	#[cfg(feature = "test-panic")]
 	close_fault: AtomicU8,
+	#[cfg(feature = "test-panic")]
+	expensive_search_delay_milliseconds: AtomicU64,
+	#[cfg(feature = "test-panic")]
+	ordinary_search_delay_milliseconds: AtomicU64,
+}
+
+struct RuntimeBudget {
+	limits: RuntimeBudgetLimits,
+	resident_indexes: AtomicUsize,
+	indexing_threads: AtomicUsize,
+	search_threads: AtomicUsize,
+	writer_memory_bytes: AtomicUsize,
+	queued_bytes: AtomicUsize,
+	expensive_searches: Mutex<usize>,
+	expensive_search_ready: Condvar,
+	expensive_search_wakes: Mutex<HashMap<usize, (Weak<QueueWake>, usize)>>,
+	#[cfg(feature = "test-panic")]
+	expensive_search_waiters: AtomicUsize,
+}
+
+enum RuntimeBudgetState {
+	Unconfigured { pending_opens: usize },
+	Configured(Arc<RuntimeBudget>),
+	OpenedWithoutBudget,
+}
+
+struct RuntimeAdmission {
+	kind: RuntimeAdmissionKind,
+}
+
+enum RuntimeAdmissionKind {
+	Budgeted(BudgetReservation),
+	Unbudgeted { pending: bool },
+}
+
+struct BudgetReservation {
+	budget: Arc<RuntimeBudget>,
+	resident: bool,
+	indexing_threads: usize,
+	search_threads: usize,
+	writer_memory_bytes: usize,
+	queued_bytes: usize,
+}
+
+struct ExpensiveSearchPermit {
+	budget: Arc<RuntimeBudget>,
+}
+
+struct ExpensiveWakeDemand {
+	budget: Arc<RuntimeBudget>,
+	wake_key: usize,
 }
 
 enum ResetResult {
@@ -108,6 +165,7 @@ struct RuntimeParts {
 	engine: Engine,
 	writer: Writer,
 	reader: IndexReader,
+	reservation: RuntimeAdmission,
 }
 
 struct CompletionSignal {
@@ -158,6 +216,11 @@ struct QueueWake {
 	ready: Condvar,
 }
 
+struct SearchQueueInspection {
+	expired: Vec<Queued<SearchCommand>>,
+	minimum_remaining: Option<Duration>,
+}
+
 struct Completion {
 	callback: Option<CompletionThreadsafeFunction>,
 	callbacks: Arc<CallbackGate>,
@@ -195,6 +258,17 @@ struct SearchCommand {
 enum SearchOperation {
 	Search(Vec<u8>),
 	Trace(Vec<u8>),
+}
+
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeConfigureRuntime")]
+pub fn native_configure_runtime(packed_limits: Buffer) -> boundary::Result<Buffer> {
+	boundary::run_stateless(|| {
+		let response = match decode_runtime_budget(&packed_limits).and_then(configure_runtime_budget) {
+			Ok(()) => success_envelope(Vec::new()),
+			Err(error) => error_envelope(error),
+		};
+		Ok(Buffer::from(response))
+	})?
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeOpen")]
@@ -236,8 +310,8 @@ pub fn native_inspect(packed_config: Buffer) -> boundary::Result<Buffer> {
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeValidateOpen")]
 pub fn native_validate_open(packed_config: Buffer) -> boundary::Result<Buffer> {
 	boundary::run_stateless(|| {
-		let response = match decode_open(&packed_config) {
-			Ok(_) => success_envelope(Vec::new()),
+		let response = match decode_open(&packed_config).and_then(|config| Engine::validate(&config.engine)) {
+			Ok(()) => success_envelope(Vec::new()),
 			Err(error) => error_envelope(error),
 		};
 		Buffer::from(response)
@@ -421,6 +495,7 @@ pub fn native_close(env: Env, handle: u32, rollback: bool, callback: CompletionC
 			.compare_exchange(STATE_OPEN, STATE_CLOSING, Ordering::AcqRel, Ordering::Acquire)
 		{
 			Ok(_) => {
+				runtime.notify_expensive_waiters();
 				#[cfg(feature = "test-panic")]
 				runtime.poison_before_admission();
 				runtime
@@ -499,6 +574,59 @@ pub fn test_fail_next_close(env: Env, handle: u32, quiesced: bool) -> boundary::
 	})?
 }
 
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailNextOpenCleanup")]
+pub fn test_fail_next_open_cleanup() {
+	FAIL_NEXT_OPEN_CLEANUP.store(true, Ordering::Release);
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testDelayNextExpensiveSearch")]
+pub fn test_delay_next_expensive_search(env: Env, handle: u32, milliseconds: u32) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		if milliseconds == 0 || milliseconds > 5_000 {
+			return Err(fulltext_napi_error(FulltextError::invalid(
+				"test search delay must be between 1 and 5000 milliseconds",
+			)));
+		}
+		runtime(&env, handle)?
+			.expensive_search_delay_milliseconds
+			.store(u64::from(milliseconds), Ordering::Release);
+		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testDelayNextOrdinarySearch")]
+pub fn test_delay_next_ordinary_search(env: Env, handle: u32, milliseconds: u32) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		if milliseconds == 0 || milliseconds > 5_000 {
+			return Err(fulltext_napi_error(FulltextError::invalid(
+				"test search delay must be between 1 and 5000 milliseconds",
+			)));
+		}
+		runtime(&env, handle)?
+			.ordinary_search_delay_milliseconds
+			.store(u64::from(milliseconds), Ordering::Release);
+		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testExpensiveSearchState")]
+pub fn test_expensive_search_state(env: Env, handle: u32) -> boundary::Result<Vec<u32>> {
+	boundary::run_stateless(|| {
+		let runtime = runtime(&env, handle)?;
+		Ok(vec![
+			u32::from(runtime.expensive_search_delay_milliseconds.load(Ordering::Acquire) != 0),
+			runtime.expensive_search_budget.as_ref().map_or(0, |budget| {
+				budget.expensive_search_waiters.load(Ordering::Acquire) as u32
+			}),
+			u32::from(runtime.ordinary_search_delay_milliseconds.load(Ordering::Acquire) != 0),
+		])
+	})?
+}
+
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeStatus")]
 pub fn native_status(env: Env, handle: u32) -> boundary::Result<Buffer> {
 	boundary::run_stateless(|| {
@@ -507,9 +635,314 @@ pub fn native_status(env: Env, handle: u32) -> boundary::Result<Buffer> {
 	})?
 }
 
+fn configure_runtime_budget(limits: RuntimeBudgetLimits) -> Result<()> {
+	configure_runtime_budget_in(runtime_budget_state(), limits)
+}
+
+fn configure_runtime_budget_in(state: &Mutex<RuntimeBudgetState>, limits: RuntimeBudgetLimits) -> Result<()> {
+	let mut state = lock(state);
+	match &*state {
+		RuntimeBudgetState::Unconfigured { pending_opens: 0 } => {
+			*state = RuntimeBudgetState::Configured(Arc::new(RuntimeBudget::new(limits)));
+			Ok(())
+		}
+		RuntimeBudgetState::Unconfigured { .. } => Err(FulltextError::new(
+			"E_LOCK_BUSY",
+			"the process-wide fulltext runtime budget cannot be configured while an index open is pending",
+		)),
+		RuntimeBudgetState::Configured(configured) if configured.limits == limits => Ok(()),
+		RuntimeBudgetState::Configured(_) => Err(FulltextError::new(
+			"E_RESOURCE_LIMIT",
+			"the process-wide fulltext runtime budget is already configured differently",
+		)),
+		RuntimeBudgetState::OpenedWithoutBudget => Err(FulltextError::new(
+			"E_RESOURCE_LIMIT",
+			"the process-wide fulltext runtime budget cannot be configured after an unbudgeted open or unproven teardown; restart the process",
+		)),
+	}
+}
+
+fn runtime_budget_state() -> &'static Mutex<RuntimeBudgetState> {
+	RUNTIME_BUDGET.get_or_init(|| Mutex::new(RuntimeBudgetState::Unconfigured { pending_opens: 0 }))
+}
+
+fn admit_runtime(limits: &crate::protocol::Limits) -> Result<RuntimeAdmission> {
+	let mut state = lock(runtime_budget_state());
+	match &mut *state {
+		RuntimeBudgetState::Unconfigured { pending_opens } => {
+			*pending_opens = pending_opens
+				.checked_add(1)
+				.ok_or_else(|| FulltextError::new("E_RESOURCE_LIMIT", "too many pending index opens"))?;
+			Ok(RuntimeAdmission {
+				kind: RuntimeAdmissionKind::Unbudgeted { pending: true },
+			})
+		}
+		RuntimeBudgetState::Configured(budget) => budget.admit(limits).map(|reservation| RuntimeAdmission {
+			kind: RuntimeAdmissionKind::Budgeted(reservation),
+		}),
+		RuntimeBudgetState::OpenedWithoutBudget => Ok(RuntimeAdmission {
+			kind: RuntimeAdmissionKind::Unbudgeted { pending: false },
+		}),
+	}
+}
+
+impl RuntimeBudget {
+	fn new(limits: RuntimeBudgetLimits) -> Self {
+		Self {
+			limits,
+			resident_indexes: AtomicUsize::new(0),
+			indexing_threads: AtomicUsize::new(0),
+			search_threads: AtomicUsize::new(0),
+			writer_memory_bytes: AtomicUsize::new(0),
+			queued_bytes: AtomicUsize::new(0),
+			expensive_searches: Mutex::new(0),
+			expensive_search_ready: Condvar::new(),
+			expensive_search_wakes: Mutex::new(HashMap::new()),
+			#[cfg(feature = "test-panic")]
+			expensive_search_waiters: AtomicUsize::new(0),
+		}
+	}
+
+	fn admit(self: &Arc<Self>, limits: &crate::protocol::Limits) -> Result<BudgetReservation> {
+		let mut admission = BudgetReservation {
+			budget: self.clone(),
+			resident: false,
+			indexing_threads: 0,
+			search_threads: 0,
+			writer_memory_bytes: 0,
+			queued_bytes: 0,
+		};
+		reserve(
+			&self.resident_indexes,
+			1,
+			self.limits.max_resident_indexes,
+			"resident indexes",
+		)?;
+		admission.resident = true;
+		reserve(
+			&self.indexing_threads,
+			limits.indexing_threads,
+			self.limits.max_indexing_threads,
+			"indexing threads",
+		)?;
+		admission.indexing_threads = limits.indexing_threads;
+		reserve(
+			&self.search_threads,
+			limits.search_threads,
+			self.limits.max_search_threads,
+			"search threads",
+		)?;
+		admission.search_threads = limits.search_threads;
+		reserve(
+			&self.writer_memory_bytes,
+			limits.writer_memory_bytes,
+			self.limits.max_writer_memory_bytes,
+			"writer memory",
+		)?;
+		admission.writer_memory_bytes = limits.writer_memory_bytes;
+		let queued_bytes = limits
+			.max_queued_bytes
+			.checked_mul(2)
+			.ok_or_else(|| FulltextError::new("E_RESOURCE_LIMIT", "configured queue capacity overflows"))?;
+		reserve(
+			&self.queued_bytes,
+			queued_bytes,
+			self.limits.max_queued_bytes,
+			"queued bytes",
+		)?;
+		admission.queued_bytes = queued_bytes;
+		Ok(admission)
+	}
+
+	fn acquire_expensive(
+		self: &Arc<Self>,
+		deadline: Instant,
+		runtime_state: &AtomicU8,
+	) -> Result<ExpensiveSearchPermit> {
+		let mut active = lock(&self.expensive_searches);
+		while *active >= self.limits.max_expensive_searches {
+			if runtime_state.load(Ordering::Acquire) != STATE_OPEN {
+				return Err(FulltextError::new("E_CLOSED", "index is closing or closed"));
+			}
+			let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+				return Err(search_timeout());
+			};
+			#[cfg(feature = "test-panic")]
+			self.expensive_search_waiters.fetch_add(1, Ordering::AcqRel);
+			let (next, timeout) = self
+				.expensive_search_ready
+				.wait_timeout(active, remaining)
+				.unwrap_or_else(|error| error.into_inner());
+			#[cfg(feature = "test-panic")]
+			self.expensive_search_waiters.fetch_sub(1, Ordering::AcqRel);
+			active = next;
+			if timeout.timed_out() && *active >= self.limits.max_expensive_searches {
+				return Err(search_timeout());
+			}
+		}
+		if runtime_state.load(Ordering::Acquire) != STATE_OPEN {
+			return Err(FulltextError::new("E_CLOSED", "index is closing or closed"));
+		}
+		*active += 1;
+		Ok(ExpensiveSearchPermit { budget: self.clone() })
+	}
+
+	fn try_acquire_expensive(self: &Arc<Self>, runtime_state: &AtomicU8) -> Option<ExpensiveSearchPermit> {
+		if runtime_state.load(Ordering::Acquire) != STATE_OPEN {
+			return None;
+		}
+		let mut active = lock(&self.expensive_searches);
+		if *active >= self.limits.max_expensive_searches || runtime_state.load(Ordering::Acquire) != STATE_OPEN {
+			return None;
+		}
+		*active += 1;
+		Some(ExpensiveSearchPermit { budget: self.clone() })
+	}
+
+	fn register_expensive_wake(self: &Arc<Self>, wake: &Arc<QueueWake>) -> ExpensiveWakeDemand {
+		let mut wakes = lock(&self.expensive_search_wakes);
+		let wake_key = Arc::as_ptr(wake) as usize;
+		let entry = wakes.entry(wake_key).or_insert_with(|| (Arc::downgrade(wake), 0));
+		entry.1 += 1;
+		ExpensiveWakeDemand {
+			budget: self.clone(),
+			wake_key,
+		}
+	}
+
+	fn notify_expensive_wakes(&self) {
+		let wakes = {
+			let mut registered = lock(&self.expensive_search_wakes);
+			registered.retain(|_, (wake, demand)| *demand > 0 && wake.strong_count() > 0);
+			registered
+				.values()
+				.filter_map(|(wake, _)| wake.upgrade())
+				.collect::<Vec<_>>()
+		};
+		for wake in wakes {
+			wake.notify(true);
+		}
+	}
+}
+
+impl RuntimeAdmission {
+	fn budget(&self) -> Option<Arc<RuntimeBudget>> {
+		match &self.kind {
+			RuntimeAdmissionKind::Budgeted(reservation) => Some(reservation.budget.clone()),
+			RuntimeAdmissionKind::Unbudgeted { .. } => None,
+		}
+	}
+
+	fn confirm_open(&mut self) {
+		let RuntimeAdmissionKind::Unbudgeted { pending } = &mut self.kind else {
+			return;
+		};
+		if !*pending {
+			return;
+		}
+		let mut state = lock(runtime_budget_state());
+		if matches!(&*state, RuntimeBudgetState::Unconfigured { pending_opens } if *pending_opens > 0) {
+			*state = RuntimeBudgetState::OpenedWithoutBudget;
+		}
+		*pending = false;
+	}
+
+	fn retain_until_restart(self) {
+		self.retain_until_restart_in(runtime_budget_state());
+	}
+
+	fn retain_until_restart_in(mut self, state: &Mutex<RuntimeBudgetState>) {
+		let pending = match &mut self.kind {
+			RuntimeAdmissionKind::Budgeted(_) => {
+				mem::forget(self);
+				return;
+			}
+			RuntimeAdmissionKind::Unbudgeted { pending } => pending,
+		};
+		if !*pending {
+			return;
+		}
+		let mut state = lock(state);
+		if matches!(&*state, RuntimeBudgetState::Unconfigured { .. }) {
+			*state = RuntimeBudgetState::OpenedWithoutBudget;
+		}
+		*pending = false;
+	}
+}
+
+impl Drop for RuntimeAdmission {
+	fn drop(&mut self) {
+		if !matches!(&self.kind, RuntimeAdmissionKind::Unbudgeted { pending: true }) {
+			return;
+		}
+		let mut state = lock(runtime_budget_state());
+		if let RuntimeBudgetState::Unconfigured { pending_opens } = &mut *state {
+			debug_assert!(*pending_opens > 0);
+			*pending_opens = pending_opens.saturating_sub(1);
+		}
+	}
+}
+
+impl Drop for BudgetReservation {
+	fn drop(&mut self) {
+		if self.resident {
+			release(&self.budget.resident_indexes, 1);
+		}
+		release(&self.budget.indexing_threads, self.indexing_threads);
+		release(&self.budget.search_threads, self.search_threads);
+		release(&self.budget.writer_memory_bytes, self.writer_memory_bytes);
+		release(&self.budget.queued_bytes, self.queued_bytes);
+	}
+}
+
+impl Drop for ExpensiveSearchPermit {
+	fn drop(&mut self) {
+		{
+			let mut active = lock(&self.budget.expensive_searches);
+			debug_assert!(*active > 0);
+			*active = active.saturating_sub(1);
+			self.budget.expensive_search_ready.notify_all();
+		}
+		self.budget.notify_expensive_wakes();
+	}
+}
+
+impl Drop for ExpensiveWakeDemand {
+	fn drop(&mut self) {
+		let mut wakes = lock(&self.budget.expensive_search_wakes);
+		if let Some((_, demand)) = wakes.get_mut(&self.wake_key) {
+			debug_assert!(*demand > 0);
+			*demand = demand.saturating_sub(1);
+			if *demand == 0 {
+				wakes.remove(&self.wake_key);
+			}
+		}
+	}
+}
+
+fn reserve(counter: &AtomicUsize, amount: usize, maximum: usize, resource: &str) -> Result<()> {
+	counter
+		.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+			current.checked_add(amount).filter(|next| *next <= maximum)
+		})
+		.map(|_| ())
+		.map_err(|_| FulltextError::new("E_RESOURCE_LIMIT", format!("process-wide {resource} limit exceeded")))
+}
+
+fn release(counter: &AtomicUsize, amount: usize) {
+	if amount == 0 {
+		return;
+	}
+	let released = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+		current.checked_sub(amount)
+	});
+	debug_assert!(released.is_ok());
+}
+
 impl Runtime {
 	fn start(handle: u32, environment: Arc<EnvironmentState>, parts: RuntimeParts) -> Result<Arc<Self>> {
 		let search_thread_count = parts.config.limits.search_threads;
+		let expensive_search_budget = parts.reservation.budget();
 		let engine = Arc::new(parts.engine);
 		let reader = Arc::new(parts.reader);
 		let writer_queue = Arc::new(BoundedQueue::new(
@@ -556,12 +989,18 @@ impl Runtime {
 			search_execution_nanoseconds: AtomicU64::new(0),
 			search_threads: Mutex::new(Vec::with_capacity(search_thread_count)),
 			closed: Arc::new(CompletionSignal::new()),
+			reservation: Mutex::new(Some(parts.reservation)),
+			expensive_search_budget,
 			#[cfg(feature = "test-panic")]
 			publish_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
 			poison_before_admission: AtomicBool::new(false),
 			#[cfg(feature = "test-panic")]
 			close_fault: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
+			expensive_search_delay_milliseconds: AtomicU64::new(0),
+			#[cfg(feature = "test-panic")]
+			ordinary_search_delay_milliseconds: AtomicU64::new(0),
 		});
 		let writer_runtime = runtime.clone();
 		let writer_engine = engine.clone();
@@ -615,6 +1054,54 @@ impl Runtime {
 		}
 	}
 
+	fn expensive_search_permit(&self, deadline: Instant) -> Result<Option<ExpensiveSearchPermit>> {
+		let Some(budget) = &self.expensive_search_budget else {
+			return Ok(None);
+		};
+		let started = Instant::now();
+		let permit = budget.acquire_expensive(deadline, &self.state);
+		self.search_queue_nanoseconds
+			.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+		permit.map(Some)
+	}
+
+	fn try_expensive_search_permit(&self) -> Option<ExpensiveSearchPermit> {
+		self.expensive_search_budget
+			.as_ref()
+			.and_then(|budget| budget.try_acquire_expensive(&self.state))
+	}
+
+	fn expensive_wake_demand(&self) -> Option<ExpensiveWakeDemand> {
+		Some(
+			self.expensive_search_budget
+				.as_ref()?
+				.register_expensive_wake(self.search_wake.as_ref()?),
+		)
+	}
+
+	fn confirm_open(&self) {
+		if let Some(reservation) = lock(&self.reservation).as_mut() {
+			reservation.confirm_open();
+		}
+	}
+
+	fn notify_expensive_waiters(&self) {
+		if let Some(budget) = &self.expensive_search_budget {
+			let _active = lock(&budget.expensive_searches);
+			budget.expensive_search_ready.notify_all();
+		}
+	}
+
+	fn release_reservation(&self) {
+		drop(lock(&self.reservation).take());
+	}
+
+	fn retain_reservation_until_restart(&self) {
+		if let Some(reservation) = lock(&self.reservation).take() {
+			reservation.retain_until_restart();
+		}
+	}
+
 	fn enqueue_writer(&self, command: WriterCommand, bytes: usize) -> boundary::Result<()> {
 		self.require_open().map_err(fulltext_napi_error)?;
 		#[cfg(feature = "test-panic")]
@@ -636,6 +1123,7 @@ impl Runtime {
 		if previous == STATE_CLOSED || previous == STATE_CLOSING {
 			return;
 		}
+		self.notify_expensive_waiters();
 		let _ = self.writer_queue.push_force(
 			WriterCommand {
 				operation: WriterOperation::Close { rollback: true },
@@ -650,6 +1138,7 @@ impl Runtime {
 
 	fn poison(&self, error: FulltextError) {
 		self.state.store(STATE_POISONED, Ordering::Release);
+		self.notify_expensive_waiters();
 		let mut close = None;
 		for command in self.writer_queue.drain() {
 			if matches!(&command.value.operation, WriterOperation::Close { .. }) && close.is_none() {
@@ -837,10 +1326,6 @@ impl<T> BoundedQueue<T> {
 		self.take_front(&mut lock(&self.state))
 	}
 
-	fn is_closed(&self) -> bool {
-		lock(&self.state).closed
-	}
-
 	fn take_front(&self, state: &mut QueueState<T>) -> Option<Queued<T>> {
 		let item = state.items.pop_front()?;
 		state.bytes -= item.bytes;
@@ -956,6 +1441,56 @@ impl QueueWake {
 			.ready
 			.wait_while(generation, |generation| *generation == observed)
 			.unwrap_or_else(|error| error.into_inner());
+	}
+
+	fn wait_for_change_timeout(&self, observed: u64, timeout: Duration) {
+		let generation = lock(&self.generation);
+		let _guard = self
+			.ready
+			.wait_timeout_while(generation, timeout, |generation| *generation == observed)
+			.unwrap_or_else(|error| error.into_inner());
+	}
+}
+
+impl BoundedQueue<SearchCommand> {
+	fn state_summary(&self) -> (bool, bool) {
+		let state = lock(&self.state);
+		(!state.items.is_empty(), state.closed)
+	}
+
+	fn inspect_and_take_expired(&self) -> SearchQueueInspection {
+		let mut state = lock(&self.state);
+		let mut expired = Vec::new();
+		let mut minimum_remaining = None;
+		let mut expired_bytes = 0;
+		let queued_count = state.items.len();
+		for _ in 0..queued_count {
+			let queued = state.items.pop_front().unwrap();
+			let milliseconds = match &queued.value.operation {
+				SearchOperation::Search(bytes) => search_budget(bytes),
+				SearchOperation::Trace(bytes) => trace_budget(bytes),
+			}
+			.unwrap_or(0);
+			let remaining = Duration::from_millis(u64::from(milliseconds))
+				.checked_sub(queued.enqueued.elapsed())
+				.unwrap_or(Duration::ZERO);
+			if remaining.is_zero() {
+				expired_bytes += queued.bytes;
+				expired.push(queued);
+			} else {
+				minimum_remaining =
+					Some(minimum_remaining.map_or(remaining, |minimum: Duration| minimum.min(remaining)));
+				state.items.push_back(queued);
+			}
+		}
+		state.bytes -= expired_bytes;
+		self.queued_commands.fetch_sub(expired.len() as u64, Ordering::Relaxed);
+		self.queued_bytes.fetch_sub(expired_bytes as u64, Ordering::Relaxed);
+		self.release_shared(expired.len(), expired_bytes);
+		SearchQueueInspection {
+			expired,
+			minimum_remaining,
+		}
 	}
 }
 
@@ -1254,9 +1789,11 @@ fn finish_runtime(
 	runtime.writer_queue.close();
 	if outcome.quiesced {
 		runtime.state.store(STATE_CLOSED, Ordering::Release);
+		runtime.release_reservation();
 		release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
 	} else {
 		runtime.state.store(STATE_POISONED, Ordering::Release);
+		runtime.retain_reservation_until_restart();
 		release_runtime_handle(
 			runtime.handle,
 			&runtime.path,
@@ -1277,6 +1814,7 @@ fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
 	}
 	runtime.writer_queue.close();
 	runtime.state.store(STATE_POISONED, Ordering::Release);
+	runtime.retain_reservation_until_restart();
 	release_runtime_handle(
 		runtime.handle,
 		&runtime.path,
@@ -1340,7 +1878,14 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 
 fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
 	while let Some(queued) = runtime.ordinary_search_queue.pop() {
-		if !execute_search_command(&runtime, &engine, &reader, queued) {
+		#[cfg(feature = "test-panic")]
+		{
+			let milliseconds = runtime.ordinary_search_delay_milliseconds.swap(0, Ordering::AcqRel);
+			if milliseconds > 0 {
+				thread::sleep(Duration::from_millis(milliseconds));
+			}
+		}
+		if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 			return;
 		}
 	}
@@ -1351,22 +1896,74 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 	let wake = runtime.search_wake.as_ref().unwrap();
 	loop {
 		let observed = wake.snapshot();
-		let queued = expensive.try_pop().or_else(|| runtime.ordinary_search_queue.try_pop());
-		if let Some(queued) = queued {
-			if !execute_search_command(&runtime, &engine, &reader, queued) {
+		let (has_expensive, expensive_closed) = expensive.state_summary();
+		let wake_demand = has_expensive.then(|| runtime.expensive_wake_demand()).flatten();
+		let permit = has_expensive.then(|| runtime.try_expensive_search_permit()).flatten();
+		if has_expensive && (permit.is_some() || runtime.expensive_search_budget.is_none()) {
+			if let Some(queued) = expensive.try_pop() {
+				drop(wake_demand);
+				if !execute_search_command(&runtime, &engine, &reader, queued, permit) {
+					return;
+				}
+				continue;
+			}
+		}
+		drop(permit);
+		let inspection = if has_expensive {
+			expensive.inspect_and_take_expired()
+		} else {
+			SearchQueueInspection {
+				expired: Vec::new(),
+				minimum_remaining: None,
+			}
+		};
+		let had_expired = !inspection.expired.is_empty();
+		for queued in inspection.expired {
+			if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 				return;
 			}
+		}
+		if had_expired {
+			drop(wake_demand);
 			continue;
 		}
-		if expensive.is_closed() {
+		#[cfg(feature = "test-panic")]
+		let ordinary_steal_allowed = runtime.ordinary_search_delay_milliseconds.load(Ordering::Acquire) == 0;
+		#[cfg(not(feature = "test-panic"))]
+		let ordinary_steal_allowed = true;
+		if ordinary_steal_allowed {
+			if let Some(queued) = runtime.ordinary_search_queue.try_pop() {
+				drop(wake_demand);
+				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+					return;
+				}
+				continue;
+			}
+		}
+		if runtime.state.load(Ordering::Acquire) != STATE_OPEN {
+			if let Some(queued) = expensive.try_pop() {
+				drop(wake_demand);
+				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+					return;
+				}
+				continue;
+			}
+		}
+		if expensive_closed {
+			drop(wake_demand);
 			while let Some(queued) = runtime.ordinary_search_queue.pop() {
-				if !execute_search_command(&runtime, &engine, &reader, queued) {
+				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 					return;
 				}
 			}
 			return;
 		}
-		wake.wait_for_change(observed);
+		if let Some(remaining) = inspection.minimum_remaining {
+			wake.wait_for_change_timeout(observed, remaining);
+		} else {
+			wake.wait_for_change(observed);
+		}
+		drop(wake_demand);
 	}
 }
 
@@ -1375,25 +1972,62 @@ fn execute_search_command(
 	engine: &Engine,
 	reader: &IndexReader,
 	queued: Queued<SearchCommand>,
+	preacquired_permit: Option<ExpensiveSearchPermit>,
 ) -> bool {
 	let queued_for = queued.enqueued.elapsed();
 	runtime
 		.search_queue_nanoseconds
 		.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
-	let started = Instant::now();
 	let SearchCommand { operation, completion } = queued.value;
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
 		SearchOperation::Search(bytes) => {
 			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
-			decode_search(&bytes).and_then(|request| {
+			let expensive = search_mode(&bytes)?.is_expensive();
+			let _permit = if expensive {
+				match preacquired_permit {
+					Some(permit) => Some(permit),
+					None => runtime.expensive_search_permit(deadline)?,
+				}
+			} else {
+				None
+			};
+			let started = Instant::now();
+			#[cfg(feature = "test-panic")]
+			{
+				let milliseconds = if expensive {
+					runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel)
+				} else {
+					0
+				};
+				if milliseconds > 0 {
+					thread::sleep(Duration::from_millis(milliseconds));
+				}
+			}
+			let result = decode_search(&bytes).and_then(|request| {
 				engine
 					.search_with_deadline(&reader.searcher(), &request, deadline)
 					.map(SearchOutcome::Search)
-			})
+			});
+			runtime
+				.search_execution_nanoseconds
+				.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+			result
 		}
 		SearchOperation::Trace(bytes) => {
 			let deadline = operation_deadline(trace_budget(&bytes)?, queued.enqueued.elapsed())?;
-			decode_trace(&bytes).and_then(|request| {
+			let _permit = match preacquired_permit {
+				Some(permit) => Some(permit),
+				None => runtime.expensive_search_permit(deadline)?,
+			};
+			let started = Instant::now();
+			#[cfg(feature = "test-panic")]
+			if _permit.is_some() {
+				let milliseconds = runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel);
+				if milliseconds > 0 {
+					thread::sleep(Duration::from_millis(milliseconds));
+				}
+			}
+			let result = decode_trace(&bytes).and_then(|request| {
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
 				}
@@ -1402,12 +2036,13 @@ fn execute_search_command(
 					return Err(search_timeout());
 				}
 				Ok(SearchOutcome::Trace(result))
-			})
+			});
+			runtime
+				.search_execution_nanoseconds
+				.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+			result
 		}
 	}));
-	runtime
-		.search_execution_nanoseconds
-		.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
 	match result {
 		Ok(Ok(SearchOutcome::Search(result))) => completion.success(search_body(result)),
 		Ok(Ok(SearchOutcome::Trace(result))) => completion.success(trace_body(result)),
@@ -1463,6 +2098,7 @@ fn open_on_thread_inner(handle: u32, bytes: Vec<u8>, completion: Completion, env
 
 fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>) -> Result<Option<String>> {
 	let open = decode_open(&bytes)?;
+	Engine::validate(&open.engine)?;
 	let canonical = create_and_canonicalize(Path::new(&open.path))?;
 	let (_lifecycle_directory, _lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
 	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
@@ -1526,7 +2162,7 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
 		Err(error) => return Err(storage_error(error)),
 	};
-	if metadata.file_type().is_symlink() {
+	if is_link_like(&metadata) {
 		return Err(FulltextError::invalid("reset path must not be a symbolic link"));
 	}
 	if !metadata.is_dir() {
@@ -1542,12 +2178,23 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 		.ok_or_else(|| FulltextError::invalid("reset path must not be a filesystem root"))?;
 	let initial_identity = path_identity_from_metadata(&canonical, &metadata);
 	let (lifecycle_directory, lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
+	let public_metadata = match fs::symlink_metadata(path) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
+		Err(error) => return Err(storage_error(error)),
+	};
+	if is_link_like(&public_metadata) || !public_metadata.is_dir() {
+		return Err(FulltextError::new(
+			"E_LOCK_BUSY",
+			"the physical index path changed before reset acquired ownership",
+		));
+	}
 	let current_metadata = match fs::symlink_metadata(&canonical) {
 		Ok(metadata) => metadata,
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
 		Err(error) => return Err(storage_error(error)),
 	};
-	if current_metadata.file_type().is_symlink() || !current_metadata.is_dir() {
+	if is_link_like(&current_metadata) || !current_metadata.is_dir() {
 		return Err(FulltextError::new(
 			"E_LOCK_BUSY",
 			"the physical index path changed before reset acquired ownership",
@@ -1612,7 +2259,7 @@ fn validate_reset_target(path: &Path, expected_index_id: &str) -> Result<()> {
 		let name = entry.file_name();
 		if name == IDENTITY_PATH {
 			let metadata = fs::symlink_metadata(entry.path()).map_err(storage_error)?;
-			if !metadata.is_file() || metadata.file_type().is_symlink() {
+			if !metadata.is_file() || is_link_like(&metadata) {
 				return Err(FulltextError::new(
 					"E_INDEX_CORRUPT",
 					"the persisted index identity is invalid",
@@ -1695,12 +2342,16 @@ fn ensure_directory_root(path: &Path, label: &str) -> Result<()> {
 }
 
 fn validate_directory_root(metadata: fs::Metadata, label: &str) -> Result<()> {
-	if metadata.file_type().is_symlink() || !metadata.is_dir() {
+	if is_link_like(&metadata) || !metadata.is_dir() {
 		return Err(FulltextError::invalid(format!(
 			"{label} must be a directory and must not be a symbolic link"
 		)));
 	}
 	Ok(())
+}
+
+fn is_link_like(metadata: &fs::Metadata) -> bool {
+	metadata.file_type().is_symlink()
 }
 
 fn acquire_lifecycle_lock(index_path: &Path) -> Result<(MmapDirectory, DirectoryLock)> {
@@ -1838,6 +2489,7 @@ fn open_runtime_with_directory(
 				))
 			}
 		}
+		let reservation = admit_runtime(&config.limits)?;
 		let engine = Engine::open(directory, &config)?;
 		let (writer, committed_payload) = engine.writer_with_payload(&config)?;
 		let reader = engine.reader_for_open()?;
@@ -1851,8 +2503,16 @@ fn open_runtime_with_directory(
 				engine,
 				writer,
 				reader,
+				reservation,
 			},
 		)?;
+		#[cfg(feature = "test-panic")]
+		if FAIL_NEXT_OPEN_CLEANUP.swap(false, Ordering::AcqRel) {
+			runtime.close_fault.store(2, Ordering::Release);
+			runtime.force_close();
+			let _ = runtime.wait_closed(CLEANUP_TIMEOUT);
+			return Err(FulltextError::new("E_CLOSED", "injected open cleanup failure"));
+		}
 		let mut registry = registry();
 		if registry.cancelled.remove(&handle) || !environment.callbacks.is_alive() {
 			drop(registry);
@@ -1863,6 +2523,7 @@ fn open_runtime_with_directory(
 				"Node environment closed during index open",
 			));
 		}
+		runtime.confirm_open();
 		registry.handles.insert(handle, runtime);
 		registry.opening.remove(&handle);
 		Ok(committed_payload)
@@ -2230,6 +2891,199 @@ mod tests {
 		assert!(matches!(second.acquire_lock(&lifecycle_lock), Err(LockError::LockBusy)));
 		drop(guard);
 		assert!(second.acquire_lock(&lifecycle_lock).is_ok());
+	}
+
+	#[test]
+	fn process_budget_rolls_back_partial_admission_and_conserves_counters() {
+		let budget = Arc::new(RuntimeBudget::new(RuntimeBudgetLimits {
+			max_resident_indexes: 2,
+			max_indexing_threads: 1,
+			max_search_threads: 2,
+			max_writer_memory_bytes: 15_000_000,
+			max_queued_bytes: 32,
+			max_expensive_searches: 1,
+		}));
+		let limits = crate::protocol::Limits {
+			indexing_threads: 1,
+			search_threads: 2,
+			writer_memory_bytes: 15_000_000,
+			max_queued_commands: 8,
+			max_queued_bytes: 16,
+			max_batch_bytes: 16,
+		};
+		let reservation = budget.admit(&limits).unwrap();
+		assert_eq!(budget.admit(&limits).err().unwrap().code, "E_RESOURCE_LIMIT");
+		assert_eq!(budget.resident_indexes.load(Ordering::Acquire), 1);
+		let state = AtomicU8::new(STATE_OPEN);
+		let permit = budget
+			.acquire_expensive(Instant::now() + Duration::from_secs(1), &state)
+			.unwrap();
+		drop(permit);
+		drop(reservation);
+		assert_eq!(budget.resident_indexes.load(Ordering::Acquire), 0);
+		assert_eq!(budget.indexing_threads.load(Ordering::Acquire), 0);
+		assert_eq!(budget.search_threads.load(Ordering::Acquire), 0);
+		assert_eq!(budget.writer_memory_bytes.load(Ordering::Acquire), 0);
+		assert_eq!(budget.queued_bytes.load(Ordering::Acquire), 0);
+		assert_eq!(*lock(&budget.expensive_searches), 0);
+	}
+
+	#[test]
+	fn unproven_pending_open_blocks_later_runtime_configuration() {
+		let state = Mutex::new(RuntimeBudgetState::Unconfigured { pending_opens: 1 });
+		RuntimeAdmission {
+			kind: RuntimeAdmissionKind::Unbudgeted { pending: true },
+		}
+		.retain_until_restart_in(&state);
+		assert!(matches!(*lock(&state), RuntimeBudgetState::OpenedWithoutBudget));
+	}
+
+	#[test]
+	fn pending_open_reports_retryable_runtime_configuration_error() {
+		let state = Mutex::new(RuntimeBudgetState::Unconfigured { pending_opens: 1 });
+		let error = configure_runtime_budget_in(
+			&state,
+			RuntimeBudgetLimits {
+				max_resident_indexes: 1,
+				max_indexing_threads: 1,
+				max_search_threads: 1,
+				max_writer_memory_bytes: 15_000_000,
+				max_queued_bytes: 32,
+				max_expensive_searches: 1,
+			},
+		)
+		.unwrap_err();
+		assert_eq!(error.code, "E_LOCK_BUSY");
+		assert!(matches!(
+			*lock(&state),
+			RuntimeBudgetState::Unconfigured { pending_opens: 1 }
+		));
+	}
+
+	#[test]
+	fn expensive_search_budget_applies_backpressure() {
+		let budget = Arc::new(RuntimeBudget::new(RuntimeBudgetLimits {
+			max_resident_indexes: 1,
+			max_indexing_threads: 1,
+			max_search_threads: 2,
+			max_writer_memory_bytes: 15_000_000,
+			max_queued_bytes: 32,
+			max_expensive_searches: 1,
+		}));
+		let state = Arc::new(AtomicU8::new(STATE_OPEN));
+		let first = budget
+			.acquire_expensive(Instant::now() + Duration::from_secs(1), &state)
+			.unwrap();
+		let waiting_budget = budget.clone();
+		let waiting_state = state.clone();
+		let (started_sender, started_receiver) = mpsc::channel();
+		let (acquired_sender, acquired_receiver) = mpsc::channel();
+		let waiting = thread::spawn(move || {
+			started_sender.send(()).unwrap();
+			let _permit = waiting_budget
+				.acquire_expensive(Instant::now() + Duration::from_secs(1), &waiting_state)
+				.unwrap();
+			acquired_sender.send(()).unwrap();
+		});
+		started_receiver.recv().unwrap();
+		assert!(acquired_receiver.recv_timeout(Duration::from_millis(20)).is_err());
+		drop(first);
+		acquired_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+		waiting.join().unwrap();
+	}
+
+	#[test]
+	fn expensive_search_budget_respects_deadline_and_close() {
+		let budget = Arc::new(RuntimeBudget::new(RuntimeBudgetLimits {
+			max_resident_indexes: 1,
+			max_indexing_threads: 1,
+			max_search_threads: 2,
+			max_writer_memory_bytes: 15_000_000,
+			max_queued_bytes: 32,
+			max_expensive_searches: 1,
+		}));
+		let state = AtomicU8::new(STATE_OPEN);
+		let permit = budget
+			.acquire_expensive(Instant::now() + Duration::from_secs(1), &state)
+			.unwrap();
+		assert_eq!(
+			budget
+				.acquire_expensive(Instant::now() + Duration::from_millis(1), &state)
+				.err()
+				.unwrap()
+				.code,
+			"E_TIMEOUT"
+		);
+		let state = Arc::new(state);
+		let waiting_state = state.clone();
+		let waiting_budget = budget.clone();
+		let (started_sender, started_receiver) = mpsc::channel();
+		let (result_sender, result_receiver) = mpsc::channel();
+		let waiting = thread::spawn(move || {
+			started_sender.send(()).unwrap();
+			let code = waiting_budget
+				.acquire_expensive(Instant::now() + Duration::from_secs(1), &waiting_state)
+				.err()
+				.map(|error| error.code);
+			result_sender.send(code).unwrap();
+		});
+		started_receiver.recv().unwrap();
+		assert!(result_receiver.recv_timeout(Duration::from_millis(20)).is_err());
+		state.store(STATE_CLOSING, Ordering::Release);
+		let active = lock(&budget.expensive_searches);
+		budget.expensive_search_ready.notify_all();
+		drop(active);
+		assert_eq!(
+			result_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+			Some("E_CLOSED")
+		);
+		waiting.join().unwrap();
+		drop(permit);
+	}
+
+	#[test]
+	fn closing_waiter_does_not_consume_a_released_expensive_search_permit() {
+		let budget = Arc::new(RuntimeBudget::new(RuntimeBudgetLimits {
+			max_resident_indexes: 1,
+			max_indexing_threads: 1,
+			max_search_threads: 3,
+			max_writer_memory_bytes: 15_000_000,
+			max_queued_bytes: 32,
+			max_expensive_searches: 1,
+		}));
+		let holder_state = AtomicU8::new(STATE_OPEN);
+		let holder = budget
+			.acquire_expensive(Instant::now() + Duration::from_secs(1), &holder_state)
+			.unwrap();
+		let closing_state = Arc::new(AtomicU8::new(STATE_OPEN));
+		let open_state = Arc::new(AtomicU8::new(STATE_OPEN));
+		let (started_sender, started_receiver) = mpsc::channel();
+		let (result_sender, result_receiver) = mpsc::channel();
+		let mut waiters = Vec::new();
+		for (state, name) in [(closing_state.clone(), "closing"), (open_state.clone(), "open")] {
+			let waiting_budget = budget.clone();
+			let started_sender = started_sender.clone();
+			let result_sender = result_sender.clone();
+			waiters.push(thread::spawn(move || {
+				started_sender.send(()).unwrap();
+				let result = waiting_budget.acquire_expensive(Instant::now() + Duration::from_secs(1), &state);
+				result_sender
+					.send((name, result.as_ref().err().map(|error| error.code)))
+					.unwrap();
+			}));
+		}
+		started_receiver.recv().unwrap();
+		started_receiver.recv().unwrap();
+		assert!(result_receiver.recv_timeout(Duration::from_millis(20)).is_err());
+		closing_state.store(STATE_CLOSING, Ordering::Release);
+		drop(holder);
+		let mut results = [result_receiver.recv_timeout(Duration::from_secs(1)).unwrap(); 2];
+		results[1] = result_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+		results.sort_by_key(|(name, _)| *name);
+		assert_eq!(results, [("closing", Some("E_CLOSED")), ("open", None)]);
+		for waiter in waiters {
+			waiter.join().unwrap();
+		}
 	}
 
 	#[test]

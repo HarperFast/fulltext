@@ -29,11 +29,15 @@ interface NativeRuntimeInfo {
 		maxTraceRecords: number;
 		maxTraceSourceBytes: number;
 		maxTraceSpans: number;
+		maxSynonymRules: number;
+		maxSynonymReplacements: number;
+		maxSynonymBytes: number;
 	};
 }
 
 interface NativeAddonApi {
 	runtimeInfo(): NativeRuntimeInfo;
+	__nativeConfigureRuntime(config: Buffer): Buffer;
 	__nativeValidateOpen(config: Buffer): Buffer;
 	__nativeInspect(config: Buffer): Buffer;
 	__nativeReset(config: Buffer, callback: NativeCallback): void;
@@ -53,12 +57,15 @@ interface NativeAddonApi {
 	__testPoisonBeforeNextAdmission?(handle: number): void;
 	__testFailNextPublish?(handle: number, afterCommit: boolean): void;
 	__testFailNextClose?(handle: number, quiesced: boolean): void;
+	__testFailNextOpenCleanup?(): void;
+	__testDelayNextExpensiveSearch?(handle: number, milliseconds: number): void;
+	__testExpensiveSearchState?(handle: number): number[];
 }
 
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 6;
+const expectedNativeAbiVersion = 7;
 const packageManifest = require('../package.json') as { name: string; version: string };
 let loadedAddon: NativeAddonApi | undefined;
 let runtimeUsesGlibc: boolean | undefined;
@@ -204,6 +211,12 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',
 			`Fulltext native artifact ${artifactPath} does not provide open configuration validation`,
+		);
+	}
+	if (typeof addon.__nativeConfigureRuntime !== 'function') {
+		throw new FulltextError(
+			'E_NATIVE_CAPABILITY_MISMATCH',
+			`Fulltext native artifact ${artifactPath} does not provide process-wide runtime admission`,
 		);
 	}
 	if (typeof addon.__nativeReset !== 'function') {

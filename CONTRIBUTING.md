@@ -25,13 +25,14 @@ of `npm pack` into a temporary consumer project.
 
 ## Design constraints
 
-- Keep search, indexing, scheduling, and lifecycle behavior independent from Harper.
+- Keep search, indexing, scheduling, and lifecycle behavior independent from any host application.
 - Keep the package on Tantivy's native filesystem storage; do not add storage fallback.
-- Harper integration and source-data lifecycle belong in Harper rather than this package.
+- Source-data projection, replication, and readiness policy belong in the consuming application.
 - Do not expose generated Node-API declarations as the public TypeScript API.
-- Keep CPU and sustained I/O work off the Node.js event loop. The promise-shaped capability call may
-  synchronously load the addon once. Bounded, synchronous native index inspection is permitted only
-  for lifecycle ownership changes; search, indexing, commit, and request-path storage remain async.
+- Keep CPU and sustained I/O work off the Node.js event loop. The promise-shaped capability call and
+  process-budget configuration may synchronously load the addon once; budget configuration performs
+  no storage I/O. Bounded, synchronous native index inspection is permitted only for lifecycle
+  ownership changes; search, indexing, commit, and request-path storage remain async.
 - Add a direct test for each source module.
 
 Open an issue before changing a public package entry point, native ABI, persistence contract, or

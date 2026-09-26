@@ -23,7 +23,7 @@ const base = {
 	indexId: 'inspection-benchmark',
 	generation: 'benchmark-v1',
 	fields: [{ name: 'title' }, { name: 'description' }],
-	analyzer: 'english@1',
+	analyzer: 'english@2',
 	limits: {
 		indexingThreads: 1,
 		searchThreads: 1,

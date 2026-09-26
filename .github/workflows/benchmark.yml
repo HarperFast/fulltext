@@ -52,11 +52,24 @@ jobs:
           --queries "$QUERIES"
           --revision "$REVISION"
           --output "${{ matrix.output }}"
+      - name: Run multi-index query matrix
+        env:
+          DOCUMENTS: ${{ inputs.documents || '100000' }}
+          QUERIES: ${{ inputs.queries || '500' }}
+          REVISION: ${{ github.event.release.tag_name || github.sha }}
+        run: >-
+          node scripts/run-local.mjs benchmarks/multi-index.mjs
+          --documents "$DOCUMENTS"
+          --queries "$QUERIES"
+          --revision "$REVISION"
+          --output "benchmark-multi-index-${{ matrix.target }}.json"
       - name: Store workflow result
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-native-${{ matrix.target }}-${{ github.sha }}
-          path: ${{ matrix.output }}
+          path: |
+            ${{ matrix.output }}
+            benchmark-multi-index-${{ matrix.target }}.json
           if-no-files-found: error
           retention-days: 90
 
@@ -77,4 +90,4 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" benchmark-native*.json --clobber
+        run: gh release upload "$RELEASE_TAG" benchmark-*.json --clobber

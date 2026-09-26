@@ -1,9 +1,10 @@
 # Native checkpoint publication
 
-Native checkpoint publication supplies the persistence boundary used by standalone callers and
-Harper's derived-index integration. Fulltext stores the opaque checkpoint in Tantivy's commit
-metadata; it does not add another checkpoint file, journal, storage provider, or RocksDB dependency.
-Harper owns checkpoint contents, validation, replay, replication, and source-log retention.
+Native checkpoint publication supplies the persistence boundary for callers that maintain an
+authoritative source alongside the derived index. Fulltext stores the opaque checkpoint in Tantivy's
+commit metadata; it does not add another checkpoint file, journal, storage provider, or RocksDB
+dependency. The host application owns checkpoint contents, validation, replay, replication, and
+source-log retention.
 
 ## Contract
 
@@ -36,8 +37,8 @@ if JavaScript completions arrive out of order.
 The getter throws `E_POISONED` on uncertain publication. Reuse
 monotonic local publication sequence numbers: calls synchronously enqueue in that order, while
 their callbacks may settle in another order. Track whether native admission succeeded so a
-definite queue rejection does not invalidate a known checkpoint. A native opstamp is not a
-Harper generation or cursor.
+definite queue rejection does not invalidate a known checkpoint. A native opstamp is not an
+application generation or cursor.
 
 Readback is local sequence state, not a synchronous native status call. Once payload-bearing
 commit execution begins, the writer keeps its checkpoint guard even if the commit reports an
@@ -51,7 +52,7 @@ error: metadata may already have changed. Reopen determines whether anything per
   Do not reread files on every commit merely to enforce the guard.
 - Preserve existing dirty-close, rollback, lifecycle, queue limits, metrics and search behavior.
 - Keep test fault injection behind the existing test feature and out of shipped binaries.
-- Keep the payload opaque. Fulltext must not parse Harper cursors or make replay and rebuild
+- Keep the payload opaque. Fulltext must not parse application cursors or make replay and rebuild
   decisions.
 - Use only the native Tantivy filesystem entry point. There is no hosted compatibility delegate.
 

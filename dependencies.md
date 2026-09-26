@@ -1,19 +1,20 @@
 # Dependencies
 
-Direct dependency versions are exact so the native artifact is reproducible and upgrades are
-reviewed deliberately.
+Direct dependency versions are exact so the native artifact is reproducible and every upgrade is
+reviewed before merge.
 
 ## Rust runtime and build graph
 
-| Dependency          | Scope                           | Purpose                                                                    |
-| ------------------- | ------------------------------- | -------------------------------------------------------------------------- |
-| `tantivy` 0.26.1    | runtime                         | Full-text indexing and search engine, including native filesystem storage. |
-| `napi` 3.13.0       | optional runtime                | Node-API values, error conversion, and addon-image retention.              |
-| `napi-derive` 3.6.9 | optional build/runtime boundary | Generates Node-API exports.                                                |
-| `napi-build` 2.5.0  | build                           | Configures platform-specific addon linking.                                |
+| Dependency                     | Scope                           | Purpose                                                                    |
+| ------------------------------ | ------------------------------- | -------------------------------------------------------------------------- |
+| `tantivy` 0.26.1               | runtime                         | Full-text indexing and search engine, including native filesystem storage. |
+| `unicode-normalization` 0.1.24 | runtime                         | Applies the versioned English analyzer's NFKC token normalization.         |
+| `napi` 3.13.0                  | optional runtime                | Node-API values, error conversion, and addon-image retention.              |
+| `napi-derive` 3.6.9            | optional build/runtime boundary | Generates Node-API exports.                                                |
+| `napi-build` 2.5.0             | build                           | Configures platform-specific addon linking.                                |
 
-The Rust dependency graph must not include RocksDB. Harper uses the native filesystem backend for
-its rebuildable derived index rather than linking a second RocksDB runtime into this addon.
+The Rust dependency graph must not include RocksDB. The library uses Tantivy's native filesystem
+backend and does not link another database runtime into the addon.
 
 ### Updating Tantivy
 
@@ -32,6 +33,14 @@ Scheduled Cargo version updates are limited to Tantivy. Dependabot security upda
 for the full Cargo graph; they share the `dependencies` label used for Slack notifications. The
 per-dependency `version-update:` filters preserve that distinction and must not be replaced with a
 bare dependency-name ignore rule.
+
+### Updating Unicode semantics
+
+`unicode-normalization` data and Rust's `char` classification determine durable token output. Any
+change to `unicode-normalization` or the Rust toolchain floor requires reviewing normalization and
+token-boundary behavior. If indexed output can change, bump the public analyzer name or identity
+sidecar version so an existing index fails closed and is rebuilt. Run the differential Unicode
+normalization test and the Unicode-aware native benchmarks before merging the update.
 
 napi-rs generates an outer unwind boundary only for exports marked `catch_unwind`. Every
 fulltext function, method, and constructor uses that option to contain argument and result

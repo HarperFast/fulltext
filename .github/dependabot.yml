@@ -3,7 +3,7 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
-    versioning-strategy: increase
+    versioning-strategy: auto
     schedule:
       interval: weekly
       day: monday
@@ -21,6 +21,11 @@ updates:
           - version-update:semver-minor
           - version-update:semver-patch
       - dependency-name: napi-build
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+      - dependency-name: unicode-normalization
         update-types:
           - version-update:semver-major
           - version-update:semver-minor

@@ -35,7 +35,7 @@ function options(indexPath, overrides = {}) {
 		indexId: 'products',
 		generation: 'generation-1',
 		fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
-		analyzer: 'english@1',
+		analyzer: 'english@2',
 		limits: {
 			indexingThreads: 1,
 			searchThreads: 2,
@@ -52,6 +52,27 @@ function temporaryIndex(context) {
 	const directory = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-index-'));
 	context.after(() => rmSync(directory, { recursive: true, force: true }));
 	return directory;
+}
+
+function legacyV2Identity(config) {
+	const string = (value) => {
+		const encoded = Buffer.from(value);
+		const length = Buffer.alloc(4);
+		length.writeUInt32LE(encoded.length);
+		return [length, encoded];
+	};
+	const fieldCount = Buffer.alloc(2);
+	fieldCount.writeUInt16LE(config.fields.length);
+	return Buffer.concat([
+		Buffer.from('HTFI'),
+		Buffer.from([2, 0]),
+		...string(config.indexId),
+		...string(config.generation),
+		...string(config.analyzer),
+		Buffer.from([config.stopWords === false ? 0 : 1, config.positions === false ? 0 : 1, config.surfaceTerms ? 1 : 0]),
+		fieldCount,
+		...config.fields.flatMap((field) => string(field.name)),
+	]);
 }
 
 test('runs the public create, mutate, BM25 search, close, and reopen route', async (context) => {
@@ -101,6 +122,64 @@ test('runs the public create, mutate, BM25 search, close, and reopen route', asy
 	);
 	assert(afterDelete.hits[0].score > 0);
 	await index.close();
+});
+
+test('normalizes English text and persists bounded index-time synonyms', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath, {
+		surfaceTerms: true,
+		synonyms: [
+			{ source: 'ＴＶ', replacements: ['telly', 'Televisions'] },
+			{ source: 'Televisions', replacements: ['display'] },
+		],
+	});
+	const source = "Müller's wireless ＴＶ television and cafe\u0301 shoes";
+	const index = await openNativeFullTextIndex(config);
+	await index.applyMutationBatch({
+		upserts: [{ id: 'one', fields: { title: source } }],
+	});
+	await index.commit();
+	await index.reload();
+	for (const text of ['muller', 'tv', 'telly', 'television', 'display', 'cafe', 'shoe']) {
+		assert.deepStrictEqual(
+			(await index.search({ text, exactTotal: true })).hits.map((hit) => hit.id),
+			['one'],
+		);
+	}
+	const trace = await index.traceMatches({ text: 'television' }, [{ id: 'one', fields: { title: source } }]);
+	assert(trace.records[0].values[0].spans.some(({ start, end }) => source.slice(start, end) === 'ＴＶ'));
+	const phraseTrace = await index.traceMatches({ text: 'wireless television', mode: 'phrase' }, [
+		{ id: 'one', fields: { title: source } },
+	]);
+	assert.strictEqual(phraseTrace.records[0].values[0].spans.length, 1);
+	assert.strictEqual(
+		source.slice(phraseTrace.records[0].values[0].spans[0].start, phraseTrace.records[0].values[0].spans[0].end),
+		'wireless ＴＶ',
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'televi', mode: 'prefix' })).hits.map((hit) => hit.id),
+		['one'],
+	);
+	assert.deepStrictEqual(
+		(await index.search({ text: 'café', mode: 'prefix' })).hits.map((hit) => hit.id),
+		['one'],
+	);
+	await index.close();
+
+	await assert.rejects(
+		openNativeFullTextIndex({
+			...config,
+			synonyms: [{ source: 'television set', replacements: ['tv'] }],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		openNativeFullTextIndex({
+			...config,
+			synonyms: [{ source: 'tv', replacements: ['display'] }],
+		}),
+		(error) => error.code === 'E_IDENTITY_MISMATCH',
+	);
 });
 
 test('runs every structured query mode and score-neutral candidate filtering', async (context) => {
@@ -411,11 +490,91 @@ test('validates native configuration without creating index storage', async (con
 		() => validateNativeFullTextIndexOptions({ ...config, fields: undefined }),
 		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
 	);
+	assert.throws(
+		() =>
+			validateNativeFullTextIndexOptions({
+				...config,
+				synonyms: Array.from({ length: 1_025 }, (_, index) => ({
+					source: `source${index}`,
+					replacements: [`replacement${index}`],
+				})),
+			}),
+		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.throws(
+		() =>
+			validateNativeFullTextIndexOptions({
+				...config,
+				synonyms: [{ source: 'television set', replacements: ['tv'] }],
+			}),
+		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.throws(
+		() =>
+			validateNativeFullTextIndexOptions({
+				...config,
+				synonyms: [{ source: 'x'.repeat(600_000), replacements: ['y'.repeat(600_000)] }],
+			}),
+		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
+	);
 	await assert.rejects(
 		openNativeFullTextIndex({ ...config, fields: undefined }),
 		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
 	);
+	await assert.rejects(
+		openNativeFullTextIndex({
+			...options(indexPath),
+			synonyms: [{ source: 'television set', replacements: ['tv'] }],
+		}),
+		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
+	);
 	assert.strictEqual(existsSync(indexPath), false);
+});
+
+test('admits native indexes under one idempotent process-wide budget', async (context) => {
+	const child = fork(
+		fileURLToPath(new URL('./fixtures/native-runtime-budget-child.mjs', import.meta.url)),
+		[fileURLToPath(new URL('../dist/native.js', import.meta.url))],
+		{ stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
+	);
+	context.after(() => child.kill());
+	assert.deepStrictEqual(await childMessage(child), {
+		conflict: 'E_RESOURCE_LIMIT',
+		saturated: 'E_RESOURCE_LIMIT',
+	});
+});
+
+test('requires the process-wide budget to be configured before the first open', async (context) => {
+	const child = fork(
+		fileURLToPath(new URL('./fixtures/native-runtime-budget-child.mjs', import.meta.url)),
+		[fileURLToPath(new URL('../dist/native.js', import.meta.url)), 'late'],
+		{ stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
+	);
+	context.after(() => child.kill());
+	assert.deepStrictEqual(await childMessage(child), { lateConfiguration: 'E_RESOURCE_LIMIT' });
+});
+
+test('allows process-wide budget configuration after a failed first open', async (context) => {
+	const child = fork(
+		fileURLToPath(new URL('./fixtures/native-runtime-budget-child.mjs', import.meta.url)),
+		[fileURLToPath(new URL('../dist/native.js', import.meta.url)), 'failed-first'],
+		{ stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
+	);
+	context.after(() => child.kill());
+	assert.deepStrictEqual(await childMessage(child), { failedOpen: 'E_INCOMPLETE_CREATE' });
+});
+
+test('blocks late runtime configuration after unproven first-open teardown', async (context) => {
+	const child = fork(
+		fileURLToPath(new URL('./fixtures/native-runtime-budget-child.mjs', import.meta.url)),
+		[fileURLToPath(new URL('../dist/native.js', import.meta.url)), 'unproven-first'],
+		{ stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
+	);
+	context.after(() => child.kill());
+	assert.deepStrictEqual(await childMessage(child), {
+		failedOpen: 'E_CLOSED',
+		lateConfiguration: 'E_RESOURCE_LIMIT',
+	});
 });
 
 test('reclaims only retired trees generated for the requested index', async (context) => {
@@ -557,6 +716,28 @@ test('retires a closed index, preserves its checkpoint, and permits a clean rebu
 	index = await openNativeFullTextIndex(config);
 	assert.strictEqual((await index.search({ text: 'trail running', exactTotal: true })).total, 0);
 	await index.close();
+});
+
+test('resets a real native directory with a legacy v2 identity and rejects a truncated sidecar', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'legacy content' } }] });
+	await index.commit();
+	await index.close();
+	const identityPath = path.join(indexPath, '.harper-fulltext-identity');
+	writeFileSync(identityPath, Buffer.from('HTFI\u0002\u0000'));
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_INDEX_CORRUPT',
+	);
+	writeFileSync(identityPath, legacyV2Identity(config));
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+		state: 'incompatible',
+		code: 'E_IDENTITY_MISMATCH',
+	});
+	const reset = await resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId });
+	assert.strictEqual(reset.state, 'reset');
 });
 
 test('close waits for background merges before retiring native files', async (context) => {
@@ -715,16 +896,13 @@ test('reset accepts an empty index directory', async (context) => {
 	assert.strictEqual((await resetNativeFullTextIndex({ path: lockOnlyPath, indexId: 'products' })).state, 'reset');
 });
 
-test('reset does not follow a symbolic-link path', async (context) => {
-	if (process.platform === 'win32') {
-		context.skip('creating directory symbolic links requires host privileges on Windows');
-		return;
-	}
+test('reset does not follow a symbolic-link or junction path', async (context) => {
 	const parent = temporaryIndex(context);
 	const target = path.join(parent, 'target');
 	const alias = path.join(parent, 'alias');
 	mkdirSync(target);
-	symlinkSync(target, alias, 'dir');
+	const directoryLinkType = process.platform === 'win32' ? 'junction' : 'dir';
+	symlinkSync(target, alias, directoryLinkType);
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: alias, indexId: 'products' }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
@@ -737,13 +915,13 @@ test('reset does not follow a symbolic-link path', async (context) => {
 	await index.close();
 	const lifecycleRoot = path.join(parent, '.fulltext-locks');
 	rmSync(lifecycleRoot, { recursive: true });
-	symlinkSync(target, lifecycleRoot, 'dir');
+	symlinkSync(target, lifecycleRoot, directoryLinkType);
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	unlinkSync(lifecycleRoot);
-	symlinkSync(target, path.join(parent, '.fulltext-retired'), 'dir');
+	symlinkSync(target, path.join(parent, '.fulltext-retired'), directoryLinkType);
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
@@ -930,7 +1108,7 @@ test('distinguishes oversized mutation batches from invalid input', async (conte
 	await index.close();
 });
 
-test('partitions a Harper maximum-key delete workload into admissible native frames', async (context) => {
+test('partitions a maximum-key delete workload into admissible native frames', async (context) => {
 	const config = options(temporaryIndex(context));
 	let index = await openNativeFullTextIndex(config);
 	const id = `1.${Buffer.alloc(1978, 1).toString('base64url')}`;
@@ -1784,9 +1962,9 @@ function childMessage(child, expected) {
 			child.off('exit', onExit);
 		};
 		const onMessage = (message) => {
-			if (message !== expected) return;
+			if (expected !== undefined && message !== expected) return;
 			cleanup();
-			resolve();
+			resolve(message);
 		};
 		const onError = (error) => {
 			cleanup();

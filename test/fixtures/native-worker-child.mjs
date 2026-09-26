@@ -7,7 +7,7 @@ const openIndex = (indexPath) =>
 		indexId: 'worker-products',
 		generation: 'generation-1',
 		fields: [{ name: 'title' }],
-		analyzer: 'english@1',
+		analyzer: 'english@2',
 		limits: {
 			indexingThreads: 2,
 			searchThreads: 2,
@@ -57,7 +57,7 @@ async function runOwner() {
 				indexId: 'worker-products',
 				generation: 'generation-1',
 				fields: [{ name: 'title', weight: 1 }],
-				analyzer: 'english@1',
+				analyzer: 'english@2',
 				stopWords: true,
 				positions: true,
 				surfaceTerms: false,

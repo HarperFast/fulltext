@@ -2,12 +2,11 @@
 
 ## Intent
 
-Harper must be able to retire an unusable local Tantivy index and rebuild it from authoritative
-records without adding writer acquisition or recovery machinery to the shared derived-index
-runtime. Standalone callers need the same safe operation. This change strengthens the existing
-native close contract and adds one path-scoped reset operation; it does not add a generation
-catalog, replication behavior, source-log interpretation, cleanup scheduler, or query-readiness
-policy.
+Applications must be able to retire an unusable local Tantivy index and rebuild it from
+authoritative records without adding writer acquisition or recovery machinery. This change
+strengthens the existing native close contract and adds one path-scoped reset operation; it does
+not add a generation catalog, replication behavior, source-log interpretation, cleanup scheduler,
+or query-readiness policy.
 
 ## Invariant
 
@@ -32,9 +31,9 @@ physical index path.
 - `inspectNativeFullTextIndex()` is synchronous and read-only. It validates native identity,
   schema, metadata, and checkpoint payload without registering a handle or acquiring a writer
   (`ts/native.ts`, `src/native.rs`, `src/engine.rs`).
-- Harper's derived-index runtime already treats backend shutdown as the owner handoff barrier.
-  Harper decides whether to reuse, replay, rebuild, activate, or clean up derived state; the wrapper
-  owns only native resource safety.
+- The consuming application treats backend shutdown as the owner handoff barrier and decides
+  whether to reuse, replay, rebuild, activate, or clean up derived state. The wrapper owns only
+  native resource safety.
 
 ## Public contract
 
@@ -79,8 +78,7 @@ The operation has the following behavior:
   retired tree. The wrapper's separate reclaimer removes only generated retired names belonging to
   the requested live path and ignores unrelated entries. Passing reset's opaque `retiredPath` back
   to the reclaimer verifies that the hint belongs to the requested index. Reset and reclaim must use
-  the same `path` value so generated names match. Applications decide when to invoke it; Harper does
-  so during derived-index initialization and after reset.
+  the same `path` value so generated names match. Applications decide when to invoke it.
 - Open and reset require a writable sibling `.fulltext-locks` directory. The wrapper creates it when
   absent and leaves it in place; errors include its path so deployment-permission failures are
   actionable.
@@ -96,20 +94,20 @@ capability. The TypeScript loader verifies the symbol before exposing the operat
 
 ```mermaid
 sequenceDiagram
-	participant Harper as Harper or standalone caller
+	participant Application as Host application
 	participant Wrapper as TypeScript facade
 	participant Registry as Native path registry
 	participant Actors as Writer/search actors
 	participant Disk as Tantivy directory
 
-	Harper->>Wrapper: index.close({ mode: "rollback" })
+	Application->>Wrapper: index.close({ mode: "rollback" })
 	Wrapper->>Actors: reject new work and enqueue close
 	Actors->>Actors: settle writer queue, stop searches, join workers
 	Actors->>Actors: close writer and drop reader/engine mappings
 	Actors->>Registry: release physical path
 	Actors-->>Wrapper: close complete
-	Wrapper-->>Harper: quiescence proven
-	Harper->>Wrapper: resetNativeFullTextIndex({ path, indexId })
+	Wrapper-->>Application: quiescence proven
+	Application->>Wrapper: resetNativeFullTextIndex({ path, indexId })
 	Wrapper->>Disk: acquire external Fulltext lifecycle lock
 	Wrapper->>Registry: reserve physical identity
 	Registry-->>Wrapper: reserved or E_LOCK_BUSY
@@ -118,7 +116,7 @@ sequenceDiagram
 	Wrapper->>Disk: rename path to unique retired sibling
 	Wrapper->>Disk: release lifecycle lock
 	Wrapper->>Registry: release reset reservation
-	Wrapper-->>Harper: { state: "reset", retiredPath }
+	Wrapper-->>Application: { state: "reset", retiredPath }
 ```
 
 `Engine` and `IndexReader` ownership moves from the shared `Runtime` object to the actors that use
@@ -161,7 +159,7 @@ directory while that lock-file handle is open inside it. This is safe for suppor
 every opener acquires the external lifecycle lock before requesting a writer; direct access by an
 older addon or an independent Tantivy writer is outside the ABI contract. A sharing violation fails
 without publication and is surfaced as `E_LOCK_BUSY`. `EXDEV`, mount-point rename, and permission
-failures surface as `E_STORAGE`; Harper leaves the index unready and requires path or operator
+failures surface as `E_STORAGE`; the host leaves the index unready and requires path or operator
 remediation rather than falling back to in-place deletion.
 
 ## Failure and ownership rules
@@ -171,9 +169,9 @@ remediation rather than falling back to in-place deletion.
 - A failed close does not prove quiescence. Tantivy 0.26.1 can return early from
   `wait_merging_threads()` after an indexing-worker failure without joining every remaining worker.
   The wrapper therefore removes the unusable handle and quarantines its canonical path until process
-  restart. The quarantine is deliberately path-scoped so another index using the same logical ID is
+  restart. The quarantine is path-scoped so another index using the same logical ID is
   unaffected. Callers must not rename or remove an unproven directory; external filesystem mutation
-  is outside this lifecycle protocol and cannot establish safety. Harper keeps the affected index
+  is outside this lifecycle protocol and cannot establish safety. The host keeps the affected index
   unavailable; availability is not allowed to weaken the file-lifetime invariant.
 - Close has no internal timeout. Resolving while a writer or merge thread may still own files would
   violate the barrier. Node-environment cleanup logs after its bounded wait, while process shutdown
@@ -184,7 +182,7 @@ remediation rather than falling back to in-place deletion.
 - Reset does not interpret or validate checkpoint payloads. Inspection remains the cursor and
   compatibility boundary.
 - Reset does not select or delete a retired generation, open a new writer, or make queries ready.
-  Harper follows its ordinary rebuild path after reset; standalone callers may open the live path.
+  The host follows its ordinary rebuild path after reset and may then open the live path.
 - Reset is not secure erasure. It publishes retirement with a same-filesystem rename; durability of
   the containing directory and eventual deletion remain caller policy.
 - The registry mutex remains a brief process-global lookup on native admission, as it is today, but
@@ -197,7 +195,7 @@ The wrapper retires the live directory with a same-filesystem rename instead of 
 place. This avoids recursive deletion overlapping a new directory created at the same path, creates
 one publication point, and keeps deletion recoverable. Reset never force-closes by path because a
 caller cannot prove it owns a handle opened by another Node environment. It also does not wait or
-retry; Harper already owns that policy, and `E_LOCK_BUSY` is sufficient for standalone callers.
+retry; the consuming application owns that policy, and `E_LOCK_BUSY` is sufficient for callers.
 
 Reset checks the logical `indexId`, but not the full schema or generation. Schema and generation
 incompatibility are reasons to rebuild; requiring them to match would block the repair operation.
