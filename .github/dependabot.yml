@@ -3,7 +3,7 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
-    versioning-strategy: increase
+    versioning-strategy: auto
     schedule:
       interval: weekly
       day: monday
