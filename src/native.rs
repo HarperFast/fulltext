@@ -86,6 +86,7 @@ struct Runtime {
 	search_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 	closed: Arc<CompletionSignal>,
 	reservation: Mutex<Option<RuntimeAdmission>>,
+	expensive_search_budget: Option<Arc<RuntimeBudget>>,
 	#[cfg(feature = "test-panic")]
 	publish_fault: AtomicU8,
 	#[cfg(feature = "test-panic")]
@@ -757,8 +758,7 @@ impl Drop for ExpensiveSearchPermit {
 		let mut active = lock(&self.budget.expensive_searches);
 		debug_assert!(*active > 0);
 		*active = active.saturating_sub(1);
-		drop(active);
-		self.budget.expensive_search_ready.notify_one();
+		self.budget.expensive_search_ready.notify_all();
 	}
 }
 
@@ -784,6 +784,7 @@ fn release(counter: &AtomicUsize, amount: usize) {
 impl Runtime {
 	fn start(handle: u32, environment: Arc<EnvironmentState>, parts: RuntimeParts) -> Result<Arc<Self>> {
 		let search_thread_count = parts.config.limits.search_threads;
+		let expensive_search_budget = parts.reservation.budget();
 		let engine = Arc::new(parts.engine);
 		let reader = Arc::new(parts.reader);
 		let writer_queue = Arc::new(BoundedQueue::new(
@@ -831,6 +832,7 @@ impl Runtime {
 			search_threads: Mutex::new(Vec::with_capacity(search_thread_count)),
 			closed: Arc::new(CompletionSignal::new()),
 			reservation: Mutex::new(Some(parts.reservation)),
+			expensive_search_budget,
 			#[cfg(feature = "test-panic")]
 			publish_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
@@ -891,8 +893,8 @@ impl Runtime {
 	}
 
 	fn expensive_search_permit(&self, deadline: Instant) -> Result<Option<ExpensiveSearchPermit>> {
-		let budget = lock(&self.reservation).as_ref().and_then(RuntimeAdmission::budget);
-		budget
+		self.expensive_search_budget
+			.as_ref()
 			.map(|budget| budget.acquire_expensive(deadline, &self.state))
 			.transpose()
 	}
@@ -904,7 +906,8 @@ impl Runtime {
 	}
 
 	fn notify_expensive_waiters(&self) {
-		if let Some(budget) = lock(&self.reservation).as_ref().and_then(RuntimeAdmission::budget) {
+		if let Some(budget) = &self.expensive_search_budget {
+			let _active = lock(&budget.expensive_searches);
 			budget.expensive_search_ready.notify_all();
 		}
 	}
@@ -915,7 +918,9 @@ impl Runtime {
 
 	fn retain_reservation_until_restart(&self) {
 		if let Some(reservation) = lock(&self.reservation).take() {
-			mem::forget(reservation);
+			if matches!(&reservation.kind, RuntimeAdmissionKind::Budgeted(_)) {
+				mem::forget(reservation);
+			}
 		}
 	}
 
@@ -2655,13 +2660,60 @@ mod tests {
 		started_receiver.recv().unwrap();
 		assert!(result_receiver.recv_timeout(Duration::from_millis(20)).is_err());
 		state.store(STATE_CLOSING, Ordering::Release);
+		let active = lock(&budget.expensive_searches);
 		budget.expensive_search_ready.notify_all();
+		drop(active);
 		assert_eq!(
 			result_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
 			Some("E_CLOSED")
 		);
 		waiting.join().unwrap();
 		drop(permit);
+	}
+
+	#[test]
+	fn closing_waiter_does_not_consume_a_released_expensive_search_permit() {
+		let budget = Arc::new(RuntimeBudget::new(RuntimeBudgetLimits {
+			max_resident_indexes: 1,
+			max_indexing_threads: 1,
+			max_search_threads: 3,
+			max_writer_memory_bytes: 15_000_000,
+			max_queued_bytes: 32,
+			max_expensive_searches: 1,
+		}));
+		let holder_state = AtomicU8::new(STATE_OPEN);
+		let holder = budget
+			.acquire_expensive(Instant::now() + Duration::from_secs(1), &holder_state)
+			.unwrap();
+		let closing_state = Arc::new(AtomicU8::new(STATE_OPEN));
+		let open_state = Arc::new(AtomicU8::new(STATE_OPEN));
+		let (started_sender, started_receiver) = mpsc::channel();
+		let (result_sender, result_receiver) = mpsc::channel();
+		let mut waiters = Vec::new();
+		for (state, name) in [(closing_state.clone(), "closing"), (open_state.clone(), "open")] {
+			let waiting_budget = budget.clone();
+			let started_sender = started_sender.clone();
+			let result_sender = result_sender.clone();
+			waiters.push(thread::spawn(move || {
+				started_sender.send(()).unwrap();
+				let result = waiting_budget.acquire_expensive(Instant::now() + Duration::from_secs(1), &state);
+				result_sender
+					.send((name, result.as_ref().err().map(|error| error.code)))
+					.unwrap();
+			}));
+		}
+		started_receiver.recv().unwrap();
+		started_receiver.recv().unwrap();
+		assert!(result_receiver.recv_timeout(Duration::from_millis(20)).is_err());
+		closing_state.store(STATE_CLOSING, Ordering::Release);
+		drop(holder);
+		let mut results = [result_receiver.recv_timeout(Duration::from_secs(1)).unwrap(); 2];
+		results[1] = result_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+		results.sort_by_key(|(name, _)| *name);
+		assert_eq!(results, [("closing", Some("E_CLOSED")), ("open", None)]);
+		for waiter in waiters {
+			waiter.join().unwrap();
+		}
 	}
 
 	#[test]

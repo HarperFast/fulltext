@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -18,8 +17,8 @@ use tantivy::tokenizer::{
 	TokenFilter, TokenStream, Tokenizer,
 };
 use tantivy::{DocAddress, Index, IndexReader, IndexSettings, IndexWriter, Order, ReloadPolicy, Searcher, Term};
-use unicode_normalization::char::is_combining_mark;
-use unicode_normalization::{is_nfkc, UnicodeNormalization};
+use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
+use unicode_normalization::is_nfkc;
 
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
@@ -35,6 +34,7 @@ const ANALYZER_NAME: &str = "english@2";
 const SURFACE_ANALYZER_NAME: &str = "english_surface@2";
 pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_TRACE_TOKENS_PER_VALUE: usize = 262_144;
+const MAX_TOKEN_CHARACTERS: usize = 40;
 type SynonymMap = Arc<HashMap<String, Vec<String>>>;
 
 struct CanonicalIdentity {
@@ -1484,17 +1484,161 @@ struct NfkcTokenizer {
 	token: Token,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SourceSpan {
 	start: usize,
 	end: usize,
 }
 
+impl SourceSpan {
+	fn merge(&mut self, other: Self) {
+		self.start = self.start.min(other.start);
+		self.end = self.end.max(other.end);
+	}
+}
+
+#[derive(Clone, Copy)]
+struct MappedCharacter {
+	character: char,
+	span: SourceSpan,
+}
+
+enum MappedCharacters<'a> {
+	Original(std::str::CharIndices<'a>),
+	Normalized(MappedNfkc<'a>),
+}
+
+impl MappedCharacters<'_> {
+	fn next(&mut self) -> Option<MappedCharacter> {
+		match self {
+			Self::Original(characters) => characters.next().map(|(start, character)| MappedCharacter {
+				character,
+				span: SourceSpan {
+					start,
+					end: start + character.len_utf8(),
+				},
+			}),
+			Self::Normalized(characters) => characters.next(),
+		}
+	}
+}
+
+struct MappedNfkc<'a> {
+	source: std::str::CharIndices<'a>,
+	decomposition_pending: Vec<(u8, MappedCharacter)>,
+	composee: Option<MappedCharacter>,
+	composition_pending: Vec<MappedCharacter>,
+	last_combining_class: Option<u8>,
+	output: Vec<MappedCharacter>,
+	output_offset: usize,
+	finished: bool,
+}
+
+impl<'a> MappedNfkc<'a> {
+	fn new(source: &'a str) -> Self {
+		Self {
+			source: source.char_indices(),
+			decomposition_pending: Vec::new(),
+			composee: None,
+			composition_pending: Vec::new(),
+			last_combining_class: None,
+			output: Vec::new(),
+			output_offset: 0,
+			finished: false,
+		}
+	}
+
+	fn push_decomposed(&mut self, character: MappedCharacter) {
+		let combining_class = canonical_combining_class(character.character);
+		if combining_class == 0 {
+			self.flush_decomposition();
+			self.push_recomposition(character);
+		} else {
+			self.decomposition_pending.push((combining_class, character));
+		}
+	}
+
+	fn flush_decomposition(&mut self) {
+		let mut pending = std::mem::take(&mut self.decomposition_pending);
+		pending.sort_by_key(|(combining_class, _)| *combining_class);
+		for (_, character) in pending.drain(..) {
+			self.push_recomposition(character);
+		}
+		self.decomposition_pending = pending;
+	}
+
+	fn push_recomposition(&mut self, character: MappedCharacter) {
+		let combining_class = canonical_combining_class(character.character);
+		let Some(mut composee) = self.composee.take() else {
+			if combining_class == 0 {
+				self.composee = Some(character);
+			} else {
+				self.output.push(character);
+			}
+			return;
+		};
+		let composition = match self.last_combining_class {
+			None => compose(composee.character, character.character),
+			Some(last) if last < combining_class => compose(composee.character, character.character),
+			Some(_) => None,
+		};
+		if let Some(composed) = composition {
+			composee.character = composed;
+			composee.span.merge(character.span);
+			self.composee = Some(composee);
+			return;
+		}
+		if combining_class == 0 {
+			self.output.push(composee);
+			self.output.append(&mut self.composition_pending);
+			self.composee = Some(character);
+			self.last_combining_class = None;
+		} else {
+			self.composee = Some(composee);
+			self.composition_pending.push(character);
+			self.last_combining_class = Some(combining_class);
+		}
+	}
+
+	fn finish(&mut self) {
+		self.flush_decomposition();
+		if let Some(composee) = self.composee.take() {
+			self.output.push(composee);
+		}
+		self.output.append(&mut self.composition_pending);
+		self.finished = true;
+	}
+
+	fn next(&mut self) -> Option<MappedCharacter> {
+		loop {
+			if let Some(character) = self.output.get(self.output_offset).copied() {
+				self.output_offset += 1;
+				return Some(character);
+			}
+			self.output.clear();
+			self.output_offset = 0;
+			if self.finished {
+				return None;
+			}
+			if let Some((start, source_character)) = self.source.next() {
+				let span = SourceSpan {
+					start,
+					end: start + source_character.len_utf8(),
+				};
+				let mut decomposed = Vec::new();
+				decompose_compatible(source_character, |character| decomposed.push(character));
+				for character in decomposed {
+					self.push_decomposed(MappedCharacter { character, span });
+				}
+			} else {
+				self.finish();
+			}
+		}
+	}
+}
+
 struct NfkcTokenStream<'a> {
-	text: Cow<'a, str>,
-	source_spans: Option<Vec<SourceSpan>>,
-	byte_offset: usize,
-	character_offset: usize,
+	characters: MappedCharacters<'a>,
 	token: &'a mut Token,
 }
 
@@ -1503,38 +1647,15 @@ impl Tokenizer for NfkcTokenizer {
 
 	fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
 		self.token.reset();
-		let (text, source_spans) = normalize_for_tokenization(text);
+		let characters = if text.is_ascii() || is_nfkc(text) {
+			MappedCharacters::Original(text.char_indices())
+		} else {
+			MappedCharacters::Normalized(MappedNfkc::new(text))
+		};
 		NfkcTokenStream {
-			text,
-			source_spans,
-			byte_offset: 0,
-			character_offset: 0,
+			characters,
 			token: &mut self.token,
 		}
-	}
-}
-
-impl NfkcTokenStream<'_> {
-	fn next_character(&self) -> Option<char> {
-		self.text.get(self.byte_offset..)?.chars().next()
-	}
-
-	fn source_span(&self, character_offset: usize, byte_start: usize, byte_end: usize) -> SourceSpan {
-		self.source_spans
-			.as_ref()
-			.map(|spans| spans[character_offset])
-			.unwrap_or(SourceSpan {
-				start: byte_start,
-				end: byte_end,
-			})
-	}
-
-	fn consume_character(&mut self, character: char) -> SourceSpan {
-		let byte_start = self.byte_offset;
-		self.byte_offset += character.len_utf8();
-		let span = self.source_span(self.character_offset, byte_start, self.byte_offset);
-		self.character_offset += 1;
-		span
 	}
 }
 
@@ -1542,21 +1663,25 @@ impl TokenStream for NfkcTokenStream<'_> {
 	fn advance(&mut self) -> bool {
 		self.token.text.clear();
 		self.token.position = self.token.position.wrapping_add(1);
-		while let Some(character) = self.next_character() {
-			let normalized_start = self.byte_offset;
-			let mut source_span = self.consume_character(character);
-			if !character.is_alphanumeric() {
+		while let Some(character) = self.characters.next() {
+			if !character.character.is_alphanumeric() {
 				continue;
 			}
-			while let Some(character) = self.next_character() {
-				if !character.is_alphanumeric() {
+			let mut source_span = character.span;
+			let mut token_characters = 1;
+			self.token.text.push(character.character);
+			while let Some(character) = self.characters.next() {
+				if !character.character.is_alphanumeric() {
 					break;
 				}
-				source_span.end = self.consume_character(character).end;
+				source_span.merge(character.span);
+				if token_characters < MAX_TOKEN_CHARACTERS {
+					self.token.text.push(character.character);
+					token_characters += 1;
+				}
 			}
 			self.token.offset_from = source_span.start;
 			self.token.offset_to = source_span.end;
-			self.token.text.push_str(&self.text[normalized_start..self.byte_offset]);
 			return true;
 		}
 		false
@@ -1569,34 +1694,6 @@ impl TokenStream for NfkcTokenStream<'_> {
 	fn token_mut(&mut self) -> &mut Token {
 		self.token
 	}
-}
-
-fn normalize_for_tokenization(text: &str) -> (Cow<'_, str>, Option<Vec<SourceSpan>>) {
-	if text.is_ascii() || is_nfkc(text) {
-		return (Cow::Borrowed(text), None);
-	}
-	let mut normalized = String::with_capacity(text.len());
-	let mut source_spans = Vec::with_capacity(text.chars().count());
-	let mut characters = text.char_indices().peekable();
-	while let Some((start, character)) = characters.next() {
-		let mut end = start + character.len_utf8();
-		let word = character.is_alphanumeric() || is_combining_mark(character);
-		if word {
-			while let Some(&(offset, next)) = characters.peek() {
-				if !next.is_alphanumeric() && !is_combining_mark(next) {
-					break;
-				}
-				characters.next();
-				end = offset + next.len_utf8();
-			}
-		}
-		let chunk = &text[start..end];
-		for normalized_character in chunk.nfkc() {
-			normalized.push(normalized_character);
-			source_spans.push(SourceSpan { start, end });
-		}
-	}
-	(Cow::Owned(normalized), Some(source_spans))
 }
 
 #[derive(Clone)]
@@ -2178,6 +2275,35 @@ mod tests {
 			source_span(&utf16_offsets(source), source.len() + 1, source.len() + 2),
 			None
 		);
+	}
+
+	#[test]
+	fn nfkc_tokenizer_normalizes_across_source_character_boundaries() {
+		use unicode_normalization::UnicodeNormalization;
+
+		for source in [
+			"㉠ᅡ",
+			"A\u{315}\u{300}",
+			"\u{1100}\u{1161}\u{11a8}",
+			"\u{301}A\u{30a}",
+			"ﷺ\u{301}",
+		] {
+			let mut mapped = MappedNfkc::new(source);
+			let mut actual = String::new();
+			while let Some(character) = mapped.next() {
+				actual.push(character.character);
+				assert!(source.get(character.span.start..character.span.end).is_some());
+			}
+			assert_eq!(actual, source.nfkc().collect::<String>());
+		}
+		let source = "㉠ᅡ";
+		let mut tokenizer = NfkcTokenizer::default();
+		let mut stream = tokenizer.token_stream(source);
+		assert!(stream.advance());
+		assert_eq!(stream.token().text, "가");
+		assert_eq!(stream.token().offset_from, 0);
+		assert_eq!(stream.token().offset_to, source.len());
+		assert!(!stream.advance());
 	}
 
 	#[test]

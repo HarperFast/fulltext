@@ -181,7 +181,9 @@ boosts and may change on reopen without rebuilding the index.
 
 `english@2` applies Unicode NFKC normalization, lowercase and Latin-to-ASCII folding, English
 possessive removal, optional English stop words, and English stemming. Token offsets continue to
-refer to the original source value. Index-time synonyms are optional and bounded. Each `source`
+refer to the original source value. Normalization is streamed with source-span tracking, and token
+text is bounded before Tantivy's long-token filter, avoiding memory growth proportional to Unicode
+compatibility expansion. Index-time synonyms are optional and bounded. Each `source`
 and replacement must produce exactly one normalized and analyzed term. Rules are canonicalized,
 persisted in the index identity, and expanded once at the source token's position; query text is not
 synonym-expanded. The expansion is also written to the surface field, so prefix autocomplete can
