@@ -1,9 +1,12 @@
 use crate::error::{FulltextError, Result};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 const MAX_STRING_BYTES: usize = 1 << 20;
 pub const MAX_RECORD_ID_BYTES: usize = 4 << 10;
 const MAX_FIELDS: usize = 1_024;
+pub const MAX_SYNONYM_RULES: usize = 1_024;
+pub const MAX_SYNONYM_REPLACEMENTS: usize = 16;
+pub const MAX_SYNONYM_BYTES: usize = 1 << 20;
 const MUTATION_BATCH_HEADER_BYTES: usize = 14;
 const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 7;
 
@@ -23,6 +26,22 @@ pub struct Limits {
 	pub max_batch_bytes: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeBudgetLimits {
+	pub max_resident_indexes: usize,
+	pub max_indexing_threads: usize,
+	pub max_search_threads: usize,
+	pub max_writer_memory_bytes: usize,
+	pub max_queued_bytes: usize,
+	pub max_expensive_searches: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SynonymRule {
+	pub source: String,
+	pub replacements: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineIdentityConfig {
 	pub index_id: String,
@@ -32,6 +51,7 @@ pub struct EngineIdentityConfig {
 	pub stop_words: bool,
 	pub positions: bool,
 	pub surface_terms: bool,
+	pub synonyms: Vec<SynonymRule>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -146,6 +166,31 @@ pub fn decode_open(bytes: &[u8]) -> Result<NativeOpenConfig> {
 	Ok(NativeOpenConfig { path, engine })
 }
 
+pub fn decode_runtime_budget(bytes: &[u8]) -> Result<RuntimeBudgetLimits> {
+	let mut cursor = Cursor::new(bytes, *b"FTGC")?;
+	let limits = RuntimeBudgetLimits {
+		max_resident_indexes: cursor.u32()? as usize,
+		max_indexing_threads: cursor.u32()? as usize,
+		max_search_threads: cursor.u32()? as usize,
+		max_writer_memory_bytes: cursor.u64_usize()?,
+		max_queued_bytes: cursor.u64_usize()?,
+		max_expensive_searches: cursor.u32()? as usize,
+	};
+	cursor.finish()?;
+	if limits.max_resident_indexes == 0
+		|| limits.max_indexing_threads == 0
+		|| limits.max_search_threads == 0
+		|| limits.max_writer_memory_bytes == 0
+		|| limits.max_queued_bytes == 0
+		|| limits.max_expensive_searches == 0
+	{
+		return Err(FulltextError::invalid(
+			"runtime budget limits must be greater than zero",
+		));
+	}
+	Ok(limits)
+}
+
 pub fn decode_inspect(bytes: &[u8]) -> Result<NativeInspectConfig> {
 	let mut cursor = Cursor::new(bytes, *b"FTIP")?;
 	let path = validate_path(cursor.string()?)?;
@@ -193,6 +238,33 @@ fn decode_engine_identity_config(cursor: &mut Cursor<'_>) -> Result<EngineIdenti
 	let stop_words = cursor.boolean()?;
 	let positions = cursor.boolean()?;
 	let surface_terms = cursor.boolean()?;
+	let synonym_count = cursor.u16()? as usize;
+	if synonym_count > MAX_SYNONYM_RULES {
+		return Err(FulltextError::invalid(format!(
+			"synonyms must not contain more than {MAX_SYNONYM_RULES} rules"
+		)));
+	}
+	let synonym_start = cursor.offset;
+	let mut synonyms = Vec::with_capacity(synonym_count);
+	for _ in 0..synonym_count {
+		let source = cursor.string()?;
+		let replacement_count = cursor.u16()? as usize;
+		if replacement_count == 0 || replacement_count > MAX_SYNONYM_REPLACEMENTS {
+			return Err(FulltextError::invalid(format!(
+				"each synonym rule must contain between 1 and {MAX_SYNONYM_REPLACEMENTS} replacements"
+			)));
+		}
+		let mut replacements = Vec::with_capacity(replacement_count);
+		for _ in 0..replacement_count {
+			replacements.push(cursor.string()?);
+		}
+		synonyms.push(SynonymRule { source, replacements });
+	}
+	if cursor.offset.saturating_sub(synonym_start) > MAX_SYNONYM_BYTES {
+		return Err(FulltextError::invalid(format!(
+			"encoded synonyms must not exceed {MAX_SYNONYM_BYTES} bytes"
+		)));
+	}
 	let field_count = cursor.u16()? as usize;
 	if field_count == 0 || field_count > MAX_FIELDS {
 		return Err(FulltextError::invalid("fields must contain between 1 and 1024 entries"));
@@ -216,6 +288,7 @@ fn decode_engine_identity_config(cursor: &mut Cursor<'_>) -> Result<EngineIdenti
 		stop_words,
 		positions,
 		surface_terms,
+		synonyms,
 	})
 }
 
@@ -544,6 +617,32 @@ fn validate_identity_config(config: &EngineIdentityConfig) -> Result<()> {
 	if config.analyzer != "english@1" {
 		return Err(FulltextError::invalid("only analyzer english@1 is supported"));
 	}
+	if config.synonyms.len() > MAX_SYNONYM_RULES {
+		return Err(FulltextError::invalid(format!(
+			"synonyms must not contain more than {MAX_SYNONYM_RULES} rules"
+		)));
+	}
+	let mut synonym_bytes = 0usize;
+	for rule in &config.synonyms {
+		if rule.source.is_empty() || rule.replacements.is_empty() || rule.replacements.len() > MAX_SYNONYM_REPLACEMENTS
+		{
+			return Err(FulltextError::invalid(format!(
+				"synonym rules require a source and between 1 and {MAX_SYNONYM_REPLACEMENTS} replacements"
+			)));
+		}
+		synonym_bytes = synonym_bytes.saturating_add(rule.source.len());
+		for replacement in &rule.replacements {
+			if replacement.is_empty() {
+				return Err(FulltextError::invalid("synonym replacements must not be empty"));
+			}
+			synonym_bytes = synonym_bytes.saturating_add(replacement.len());
+		}
+	}
+	if synonym_bytes > MAX_SYNONYM_BYTES {
+		return Err(FulltextError::invalid(format!(
+			"synonyms must not exceed {MAX_SYNONYM_BYTES} UTF-8 bytes"
+		)));
+	}
 	let mut names = std::collections::HashSet::with_capacity(config.fields.len());
 	for field in &config.fields {
 		if field.name.is_empty() || field.name.starts_with("__fulltext_") || !names.insert(field.name.as_str()) {
@@ -664,7 +763,7 @@ mod tests {
 
 	#[test]
 	fn reset_frame_contains_only_path_and_logical_index_id() {
-		let mut bytes = b"FTRX\x02\x00".to_vec();
+		let mut bytes = b"FTRX\x03\x00".to_vec();
 		for value in ["/tmp/index", "products"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -685,12 +784,13 @@ mod tests {
 
 	#[test]
 	fn inspection_frame_is_distinct_and_rejects_trailing_limits() {
-		let mut bytes = b"FTIP\x02\x00".to_vec();
+		let mut bytes = b"FTIP\x03\x00".to_vec();
 		for value in ["/tmp/index", "products", "one", "english@1"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
 		}
 		bytes.extend_from_slice(&[1, 1, 0]);
+		bytes.extend_from_slice(&0u16.to_le_bytes());
 		bytes.extend_from_slice(&1u16.to_le_bytes());
 		bytes.extend_from_slice(&5u32.to_le_bytes());
 		bytes.extend_from_slice(b"title");
@@ -707,7 +807,7 @@ mod tests {
 
 	#[test]
 	fn rejects_counts_before_allocating() {
-		let mut bytes = b"FTMB\x02\x00".to_vec();
+		let mut bytes = b"FTMB\x03\x00".to_vec();
 		bytes.extend_from_slice(&u32::MAX.to_le_bytes());
 		bytes.extend_from_slice(&0u32.to_le_bytes());
 		assert_eq!(decode_batch(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
@@ -715,7 +815,7 @@ mod tests {
 
 	#[test]
 	fn distinguishes_batch_size_from_invalid_encoding() {
-		let bytes = b"FTMB\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+		let bytes = b"FTMB\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 		assert_eq!(
 			validate_batch_header(bytes, bytes.len() - 1).unwrap_err().code,
 			"E_BATCH_TOO_LARGE"
@@ -740,6 +840,7 @@ mod tests {
 			stop_words: true,
 			positions: true,
 			surface_terms: false,
+			synonyms: Vec::new(),
 		};
 		let limits = Limits {
 			indexing_threads: 1,
@@ -777,14 +878,14 @@ mod tests {
 
 	#[test]
 	fn rejects_nested_counts_before_allocating() {
-		let mut fields = b"FTMB\x02\x00".to_vec();
+		let mut fields = b"FTMB\x03\x00".to_vec();
 		fields.extend_from_slice(&1u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&u16::MAX.to_le_bytes());
 		assert_eq!(decode_batch(&fields).unwrap_err().code, "E_INVALID_ARGUMENT");
 
-		let mut values = b"FTMB\x02\x00".to_vec();
+		let mut values = b"FTMB\x03\x00".to_vec();
 		values.extend_from_slice(&1u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());

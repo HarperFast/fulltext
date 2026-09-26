@@ -3,7 +3,7 @@ use std::fs;
 use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,8 +21,9 @@ use crate::engine::{
 };
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	decode_batch, decode_inspect, decode_open, decode_reset, decode_search, decode_trace, search_budget, search_mode,
-	trace_budget, validate_batch_header, validate_search_header, validate_trace_header, EngineConfig, PROTOCOL_VERSION,
+	decode_batch, decode_inspect, decode_open, decode_reset, decode_runtime_budget, decode_search, decode_trace,
+	search_budget, search_mode, trace_budget, validate_batch_header, validate_search_header, validate_trace_header,
+	EngineConfig, RuntimeBudgetLimits, PROTOCOL_VERSION,
 };
 
 const STATE_OPEN: u8 = 0;
@@ -33,6 +34,7 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+static RUNTIME_BUDGET: OnceLock<Arc<RuntimeBudget>> = OnceLock::new();
 const LIFECYCLE_ROOT: &str = ".fulltext-locks";
 const LEGACY_LIFECYCLE_LOCK: &str = ".harper-fulltext-lifecycle.lock";
 const RETIRED_ROOT: &str = ".fulltext-retired";
@@ -83,12 +85,36 @@ struct Runtime {
 	search_execution_nanoseconds: AtomicU64,
 	search_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 	closed: Arc<CompletionSignal>,
+	_admission: Option<RuntimeAdmission>,
 	#[cfg(feature = "test-panic")]
 	publish_fault: AtomicU8,
 	#[cfg(feature = "test-panic")]
 	poison_before_admission: AtomicBool,
 	#[cfg(feature = "test-panic")]
 	close_fault: AtomicU8,
+}
+
+struct RuntimeBudget {
+	limits: RuntimeBudgetLimits,
+	resident_indexes: AtomicUsize,
+	indexing_threads: AtomicUsize,
+	search_threads: AtomicUsize,
+	writer_memory_bytes: AtomicUsize,
+	queued_bytes: AtomicUsize,
+	expensive_searches: AtomicUsize,
+}
+
+struct RuntimeAdmission {
+	budget: Arc<RuntimeBudget>,
+	resident: bool,
+	indexing_threads: usize,
+	search_threads: usize,
+	writer_memory_bytes: usize,
+	queued_bytes: usize,
+}
+
+struct ExpensiveSearchPermit {
+	budget: Arc<RuntimeBudget>,
 }
 
 enum ResetResult {
@@ -108,6 +134,7 @@ struct RuntimeParts {
 	engine: Engine,
 	writer: Writer,
 	reader: IndexReader,
+	admission: Option<RuntimeAdmission>,
 }
 
 struct CompletionSignal {
@@ -195,6 +222,17 @@ struct SearchCommand {
 enum SearchOperation {
 	Search(Vec<u8>),
 	Trace(Vec<u8>),
+}
+
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeConfigureRuntime")]
+pub fn native_configure_runtime(packed_limits: Buffer) -> boundary::Result<Buffer> {
+	boundary::run_stateless(|| {
+		let response = match decode_runtime_budget(&packed_limits).and_then(configure_runtime_budget) {
+			Ok(()) => success_envelope(Vec::new()),
+			Err(error) => error_envelope(error),
+		};
+		Ok(Buffer::from(response))
+	})?
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeOpen")]
@@ -507,6 +545,145 @@ pub fn native_status(env: Env, handle: u32) -> boundary::Result<Buffer> {
 	})?
 }
 
+fn configure_runtime_budget(limits: RuntimeBudgetLimits) -> Result<()> {
+	if let Some(configured) = RUNTIME_BUDGET.get() {
+		return if configured.limits == limits {
+			Ok(())
+		} else {
+			Err(FulltextError::new(
+				"E_RESOURCE_LIMIT",
+				"the process-wide fulltext runtime budget is already configured differently",
+			))
+		};
+	}
+	match RUNTIME_BUDGET.set(Arc::new(RuntimeBudget::new(limits.clone()))) {
+		Ok(()) => Ok(()),
+		Err(_)
+			if RUNTIME_BUDGET
+				.get()
+				.is_some_and(|configured| configured.limits == limits) =>
+		{
+			Ok(())
+		}
+		Err(_) => Err(FulltextError::new(
+			"E_RESOURCE_LIMIT",
+			"the process-wide fulltext runtime budget was configured differently",
+		)),
+	}
+}
+
+impl RuntimeBudget {
+	fn new(limits: RuntimeBudgetLimits) -> Self {
+		Self {
+			limits,
+			resident_indexes: AtomicUsize::new(0),
+			indexing_threads: AtomicUsize::new(0),
+			search_threads: AtomicUsize::new(0),
+			writer_memory_bytes: AtomicUsize::new(0),
+			queued_bytes: AtomicUsize::new(0),
+			expensive_searches: AtomicUsize::new(0),
+		}
+	}
+
+	fn admit(self: &Arc<Self>, limits: &crate::protocol::Limits) -> Result<RuntimeAdmission> {
+		let mut admission = RuntimeAdmission {
+			budget: self.clone(),
+			resident: false,
+			indexing_threads: 0,
+			search_threads: 0,
+			writer_memory_bytes: 0,
+			queued_bytes: 0,
+		};
+		reserve(
+			&self.resident_indexes,
+			1,
+			self.limits.max_resident_indexes,
+			"resident indexes",
+		)?;
+		admission.resident = true;
+		reserve(
+			&self.indexing_threads,
+			limits.indexing_threads,
+			self.limits.max_indexing_threads,
+			"indexing threads",
+		)?;
+		admission.indexing_threads = limits.indexing_threads;
+		reserve(
+			&self.search_threads,
+			limits.search_threads,
+			self.limits.max_search_threads,
+			"search threads",
+		)?;
+		admission.search_threads = limits.search_threads;
+		reserve(
+			&self.writer_memory_bytes,
+			limits.writer_memory_bytes,
+			self.limits.max_writer_memory_bytes,
+			"writer memory",
+		)?;
+		admission.writer_memory_bytes = limits.writer_memory_bytes;
+		let queued_bytes = limits
+			.max_queued_bytes
+			.checked_mul(2)
+			.ok_or_else(|| FulltextError::new("E_RESOURCE_LIMIT", "configured queue capacity overflows"))?;
+		reserve(
+			&self.queued_bytes,
+			queued_bytes,
+			self.limits.max_queued_bytes,
+			"queued bytes",
+		)?;
+		admission.queued_bytes = queued_bytes;
+		Ok(admission)
+	}
+
+	fn acquire_expensive(self: &Arc<Self>) -> Result<ExpensiveSearchPermit> {
+		reserve(
+			&self.expensive_searches,
+			1,
+			self.limits.max_expensive_searches,
+			"concurrent expensive searches",
+		)?;
+		Ok(ExpensiveSearchPermit { budget: self.clone() })
+	}
+}
+
+impl Drop for RuntimeAdmission {
+	fn drop(&mut self) {
+		if self.resident {
+			release(&self.budget.resident_indexes, 1);
+		}
+		release(&self.budget.indexing_threads, self.indexing_threads);
+		release(&self.budget.search_threads, self.search_threads);
+		release(&self.budget.writer_memory_bytes, self.writer_memory_bytes);
+		release(&self.budget.queued_bytes, self.queued_bytes);
+	}
+}
+
+impl Drop for ExpensiveSearchPermit {
+	fn drop(&mut self) {
+		release(&self.budget.expensive_searches, 1);
+	}
+}
+
+fn reserve(counter: &AtomicUsize, amount: usize, maximum: usize, resource: &str) -> Result<()> {
+	counter
+		.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+			current.checked_add(amount).filter(|next| *next <= maximum)
+		})
+		.map(|_| ())
+		.map_err(|_| FulltextError::new("E_RESOURCE_LIMIT", format!("process-wide {resource} limit exceeded")))
+}
+
+fn release(counter: &AtomicUsize, amount: usize) {
+	if amount == 0 {
+		return;
+	}
+	debug_assert!(counter
+		.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current
+			.checked_sub(amount))
+		.is_ok());
+}
+
 impl Runtime {
 	fn start(handle: u32, environment: Arc<EnvironmentState>, parts: RuntimeParts) -> Result<Arc<Self>> {
 		let search_thread_count = parts.config.limits.search_threads;
@@ -556,6 +733,7 @@ impl Runtime {
 			search_execution_nanoseconds: AtomicU64::new(0),
 			search_threads: Mutex::new(Vec::with_capacity(search_thread_count)),
 			closed: Arc::new(CompletionSignal::new()),
+			_admission: parts.admission,
 			#[cfg(feature = "test-panic")]
 			publish_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
@@ -613,6 +791,13 @@ impl Runtime {
 		} else {
 			&self.ordinary_search_queue
 		}
+	}
+
+	fn expensive_search_permit(&self) -> Result<Option<ExpensiveSearchPermit>> {
+		self._admission
+			.as_ref()
+			.map(|admission| admission.budget.acquire_expensive())
+			.transpose()
 	}
 
 	fn enqueue_writer(&self, command: WriterCommand, bytes: usize) -> boundary::Result<()> {
@@ -1382,27 +1567,38 @@ fn execute_search_command(
 		.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
 	let started = Instant::now();
 	let SearchCommand { operation, completion } = queued.value;
-	let result = catch_unwind(AssertUnwindSafe(|| match operation {
-		SearchOperation::Search(bytes) => {
-			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
-			decode_search(&bytes).and_then(|request| {
-				engine
-					.search_with_deadline(&reader.searcher(), &request, deadline)
-					.map(SearchOutcome::Search)
-			})
-		}
-		SearchOperation::Trace(bytes) => {
-			let deadline = operation_deadline(trace_budget(&bytes)?, queued.enqueued.elapsed())?;
-			decode_trace(&bytes).and_then(|request| {
-				if Instant::now() >= deadline {
-					return Err(search_timeout());
-				}
-				let result = engine.trace_matches(&request.search, &request.records, Some(deadline))?;
-				if Instant::now() >= deadline {
-					return Err(search_timeout());
-				}
-				Ok(SearchOutcome::Trace(result))
-			})
+	let result = catch_unwind(AssertUnwindSafe(|| {
+		let expensive = match &operation {
+			SearchOperation::Search(bytes) => search_mode(bytes)?.is_expensive(),
+			SearchOperation::Trace(_) => true,
+		};
+		let _permit = if expensive {
+			runtime.expensive_search_permit()?
+		} else {
+			None
+		};
+		match operation {
+			SearchOperation::Search(bytes) => {
+				let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
+				decode_search(&bytes).and_then(|request| {
+					engine
+						.search_with_deadline(&reader.searcher(), &request, deadline)
+						.map(SearchOutcome::Search)
+				})
+			}
+			SearchOperation::Trace(bytes) => {
+				let deadline = operation_deadline(trace_budget(&bytes)?, queued.enqueued.elapsed())?;
+				decode_trace(&bytes).and_then(|request| {
+					if Instant::now() >= deadline {
+						return Err(search_timeout());
+					}
+					let result = engine.trace_matches(&request.search, &request.records, Some(deadline))?;
+					if Instant::now() >= deadline {
+						return Err(search_timeout());
+					}
+					Ok(SearchOutcome::Trace(result))
+				})
+			}
 		}
 	}));
 	runtime
@@ -1838,6 +2034,10 @@ fn open_runtime_with_directory(
 				))
 			}
 		}
+		let admission = RUNTIME_BUDGET
+			.get()
+			.map(|budget| budget.admit(&config.limits))
+			.transpose()?;
 		let engine = Engine::open(directory, &config)?;
 		let (writer, committed_payload) = engine.writer_with_payload(&config)?;
 		let reader = engine.reader_for_open()?;
@@ -1851,6 +2051,7 @@ fn open_runtime_with_directory(
 				engine,
 				writer,
 				reader,
+				admission,
 			},
 		)?;
 		let mut registry = registry();
@@ -2230,6 +2431,39 @@ mod tests {
 		assert!(matches!(second.acquire_lock(&lifecycle_lock), Err(LockError::LockBusy)));
 		drop(guard);
 		assert!(second.acquire_lock(&lifecycle_lock).is_ok());
+	}
+
+	#[test]
+	fn process_budget_rolls_back_partial_admission_and_conserves_counters() {
+		let budget = Arc::new(RuntimeBudget::new(RuntimeBudgetLimits {
+			max_resident_indexes: 2,
+			max_indexing_threads: 1,
+			max_search_threads: 2,
+			max_writer_memory_bytes: 15_000_000,
+			max_queued_bytes: 32,
+			max_expensive_searches: 1,
+		}));
+		let limits = crate::protocol::Limits {
+			indexing_threads: 1,
+			search_threads: 2,
+			writer_memory_bytes: 15_000_000,
+			max_queued_commands: 8,
+			max_queued_bytes: 16,
+			max_batch_bytes: 16,
+		};
+		let admission = budget.admit(&limits).unwrap();
+		assert_eq!(budget.admit(&limits).err().unwrap().code, "E_RESOURCE_LIMIT");
+		assert_eq!(budget.resident_indexes.load(Ordering::Acquire), 1);
+		let permit = budget.acquire_expensive().unwrap();
+		assert_eq!(budget.acquire_expensive().err().unwrap().code, "E_RESOURCE_LIMIT");
+		drop(permit);
+		drop(admission);
+		assert_eq!(budget.resident_indexes.load(Ordering::Acquire), 0);
+		assert_eq!(budget.indexing_threads.load(Ordering::Acquire), 0);
+		assert_eq!(budget.search_threads.load(Ordering::Acquire), 0);
+		assert_eq!(budget.writer_memory_bytes.load(Ordering::Acquire), 0);
+		assert_eq!(budget.queued_bytes.load(Ordering::Acquire), 0);
+		assert_eq!(budget.expensive_searches.load(Ordering::Acquire), 0);
 	}
 
 	#[test]

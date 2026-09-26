@@ -31,4 +31,7 @@ export interface RuntimeLimits {
   maxTraceRecords: number
   maxTraceSourceBytes: number
   maxTraceSpans: number
+  maxSynonymRules: number
+  maxSynonymReplacements: number
+  maxSynonymBytes: number
 }

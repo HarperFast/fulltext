@@ -25,7 +25,7 @@ test('loads the artifact for the executing platform', async () => {
 	assert.deepStrictEqual(info, {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
-		nativeAbiVersion: 6,
+		nativeAbiVersion: 7,
 		queryApiVersion: 1,
 		queryClassIsolationMinimumSearchThreads: 2,
 		lifecycleApiVersion: 1,
@@ -49,6 +49,9 @@ test('loads the artifact for the executing platform', async () => {
 			maxTraceRecords: 100,
 			maxTraceSourceBytes: 1 << 20,
 			maxTraceSpans: 1_024,
+			maxSynonymRules: 1_024,
+			maxSynonymReplacements: 16,
+			maxSynonymBytes: 1 << 20,
 		},
 	});
 	assert.strictEqual(cargoPackageVersion, packageManifest.version);

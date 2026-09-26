@@ -167,7 +167,7 @@ The exported flow is:
    reservation, and is idempotent.
 7. `status()` reads bounded counters and state without entering either sustained-work queue.
 
-Only English analysis is accepted. `positions` defaults to true and selects frequencies with or
+Only the versioned `english@1` analysis contract is accepted. `positions` defaults to true and selects frequencies with or
 without positions. Changing that default in a future release is an index-format change, not a
 silent reinterpretation. `generation` is an opaque caller-owned identity for this physical index
 generation; it is persisted in the engine fingerprint and must match on reopen. It is not a Tantivy
@@ -176,6 +176,12 @@ opstamp or a Harper transaction-log position.
 fuzzy-prefix, and current-record match tracing; it never stores source values. It defaults off
 because of its storage cost. Field weights are query-time boosts and may change when reopening the
 same physical index without rebuilding it.
+
+`configureNativeFullTextRuntime()` optionally installs one immutable process budget before indexes
+open. Identical calls are idempotent. It admits aggregate resident indexes, indexing/search threads,
+writer memory, configured queue capacity, and expensive searches with checked atomic counters.
+Exceeding a cap returns `E_RESOURCE_LIMIT`; it never evicts an active generation. Callers that omit
+it retain current per-index admission behavior.
 
 The public search method accepts a small typed request and decodes a versioned native result buffer
 into bounded result objects. The N-API boundary receives one operation per batch or search;
@@ -258,7 +264,8 @@ Each Tantivy schema contains an internal indexed string fast field for the raw I
 and one declared text field per configured source field. At creation, the engine atomically writes a
 small backend-neutral identity sidecar through `Directory::atomic_write()` and calls
 `Directory::sync_directory()`. It contains a versioned fingerprint of the logical index ID, bounded
-generation, analyzer identity, stop-word policy, positions, surface-term storage, and structural
+generation, analyzer identity, stop-word policy, positions, surface-term storage, canonical
+single-token synonym rules, and structural
 schema. It deliberately excludes the Node wire ABI and Tantivy package version: wire changes do not
 change durable semantics, and Tantivy performs its own index-format compatibility check. Reopen
 compares both the generated Tantivy schema and this fingerprint before creating a writer. The
@@ -282,10 +289,18 @@ invalid UTF-8 is rejected on the writer actor rather than the JavaScript thread.
 the fixed header and structural bounds only. `indexId` and `generation` have fixed encoded-length
 limits because they are persisted.
 
-The English analyzer is versioned by name and composed from Tantivy's tokenizer primitives:
-`SimpleTokenizer`, `RemoveLongFilter`, `LowerCaser`, optional built-in English
-`StopWordFilter`, and English `Stemmer`. The same registered analyzer tokenizes indexed text and
-search text.
+The English analyzer is versioned by name and composed from `SimpleTokenizer`, possessive removal,
+Unicode NFKC normalization, `LowerCaser`, `AsciiFoldingFilter`, `RemoveLongFilter`, optional English
+`StopWordFilter`, and English `Stemmer`. Filters mutate token text without replacing the tokenizer's
+original byte offsets. Golden fixtures cover combining marks, full-width text, Latin diacritics,
+possessives, expansions, and adjacent emoji. The same analyzer tokenizes indexed and search text.
+
+Synonym rules are bounded by count, replacement count, and encoded bytes in the native decoder.
+Each source and replacement must yield exactly one analyzed term. Canonical rules are sorted and
+fingerprinted in identity sidecar v3. Documents receive replacements once at the source position;
+query text is not expanded. Match tracing uses the same document-side expansion and maps every
+replacement to the source token span. Version 2 sidecars remain parseable for safe reset but mismatch
+v3 open/inspection so Harper can retire and rebuild them.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`
@@ -480,5 +495,4 @@ yields the reference implementation used by Harper's derived index.
   callback; this is part of the shared multi-environment runtime in issue #17.
 - Fixed-host regression thresholds comparing standalone native, Harper without full text, and
   Harper using the native derived index.
-- Process-wide runtime budgets, cancellation, and cursor-based
-  deep pagination.
+- Cancellation of an already-running Tantivy collector and cursor-based deep pagination.

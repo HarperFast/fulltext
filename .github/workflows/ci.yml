@@ -109,6 +109,8 @@ jobs:
         run: node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver logical --output benchmark-logical.json
       - name: Run low-level mutation benchmark smoke
         run: node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver low-level --output benchmark-low-level.json
+      - name: Run multi-index benchmark smoke
+        run: node scripts/run-local.mjs benchmarks/multi-index.mjs --smoke --output benchmark-multi-index.json
       - run: npm run benchmark:inspect:smoke
       - name: Store benchmark smoke results
         if: always()

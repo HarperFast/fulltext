@@ -1,6 +1,6 @@
 import { FulltextError, type FulltextErrorCode } from './errors.js';
 
-const protocolVersion = 2;
+const protocolVersion = 3;
 const maxStringBytes = 1 << 20;
 export const maxRecordIdBytes = 4 << 10;
 export const maxFields = 1_024;
@@ -22,6 +22,7 @@ export interface PackedIndexIdentityConfig {
 	stopWords: boolean;
 	positions: boolean;
 	surfaceTerms: boolean;
+	synonyms: Array<{ source: string; replacements: string[] }>;
 }
 
 export interface PackedEngineConfig extends PackedIndexIdentityConfig {
@@ -46,6 +47,15 @@ export interface PackedInspectConfig extends PackedIndexIdentityConfig {
 export interface PackedResetConfig {
 	path: string;
 	indexId: string;
+}
+
+export interface PackedRuntimeBudgetLimits {
+	maxResidentIndexes: number;
+	maxIndexingThreads: number;
+	maxSearchThreads: number;
+	maxWriterMemoryBytes: number;
+	maxQueuedBytes: number;
+	maxExpensiveSearches: number;
 }
 
 export interface PackedMutationBatch {
@@ -346,6 +356,18 @@ export function encodeReset(config: PackedResetConfig): Buffer {
 	return writer.finish();
 }
 
+export function encodeRuntimeBudget(limits: PackedRuntimeBudgetLimits): Buffer {
+	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
+	writer.header('FTGC');
+	writer.u32(limits.maxResidentIndexes, 'maxResidentIndexes');
+	writer.u32(limits.maxIndexingThreads, 'maxIndexingThreads');
+	writer.u32(limits.maxSearchThreads, 'maxSearchThreads');
+	writer.u64(limits.maxWriterMemoryBytes, 'maxWriterMemoryBytes');
+	writer.u64(limits.maxQueuedBytes, 'maxQueuedBytes');
+	writer.u32(limits.maxExpensiveSearches, 'maxExpensiveSearches');
+	return writer.finish();
+}
+
 function encodeEngine(writer: ByteWriter, config: PackedEngineConfig): void {
 	encodeIndexIdentity(writer, config);
 	writer.u16(config.limits.indexingThreads, 'limits.indexingThreads');
@@ -363,6 +385,13 @@ function encodeIndexIdentity(writer: ByteWriter, config: PackedIndexIdentityConf
 	writer.boolean(config.stopWords);
 	writer.boolean(config.positions);
 	writer.boolean(config.surfaceTerms);
+	const synonyms = config.synonyms ?? [];
+	writer.u16(synonyms.length, 'synonyms.length');
+	for (const rule of synonyms) {
+		writer.string(rule.source);
+		writer.u16(rule.replacements.length, 'synonym.replacements.length');
+		for (const replacement of rule.replacements) writer.string(replacement);
+	}
 	writer.u16(config.fields.length, 'fields.length');
 	for (const field of config.fields) {
 		writer.string(field.name);

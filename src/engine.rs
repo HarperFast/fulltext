@@ -12,15 +12,16 @@ use tantivy::query::{
 };
 use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{
-	Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TokenStream,
-	Tokenizer,
+	AsciiFoldingFilter, Language, LowerCaser, PreTokenizedString, RemoveLongFilter, SimpleTokenizer, Stemmer,
+	StopWordFilter, TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer,
 };
 use tantivy::{DocAddress, Index, IndexReader, IndexSettings, IndexWriter, Order, ReloadPolicy, Searcher, Term};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	validate_record_id, EngineConfig, EngineIdentityConfig, MutationBatch, SearchMode, SearchRequest, TraceRecord,
-	MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES,
+	validate_record_id, EngineConfig, EngineIdentityConfig, MutationBatch, SearchMode, SearchRequest, SynonymRule,
+	TraceRecord, MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES,
 	MAX_TRACE_SPANS,
 };
 
@@ -39,6 +40,7 @@ pub struct Engine {
 	field_lookup: HashMap<String, usize>,
 	analyzer: TextAnalyzer,
 	surface_analyzer: TextAnalyzer,
+	synonyms: HashMap<String, Vec<String>>,
 	positions: bool,
 }
 
@@ -63,6 +65,8 @@ pub struct Writer {
 	id_field: Field,
 	fields: Vec<EngineField>,
 	field_lookup: HashMap<String, usize>,
+	analyzer: TextAnalyzer,
+	synonyms: HashMap<String, Vec<String>>,
 }
 
 pub(crate) struct PreparedBatch {
@@ -152,8 +156,9 @@ impl TracePlan {
 
 impl Engine {
 	pub fn inspect<D: Directory + Clone>(directory: D, config: &EngineIdentityConfig) -> Result<InspectionResult> {
-		let (expected_schema, _, _) = build_schema(config)?;
-		let expected_identity = identity_bytes(config);
+		let (identity, _, _) = canonical_identity(config)?;
+		let (expected_schema, _, _) = build_schema(&identity)?;
+		let expected_identity = identity_bytes(&identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
 		let meta_exists = directory.exists(Path::new(META_PATH)).map_err(storage_error)?;
 
@@ -190,8 +195,9 @@ impl Engine {
 	}
 
 	pub fn open<D: Directory + Clone>(directory: D, config: &EngineConfig) -> Result<Self> {
-		let (schema, id_field, fields) = build_schema(&config.identity)?;
-		let expected_identity = identity_bytes(&config.identity);
+		let (identity, analyzer, synonyms) = canonical_identity(&config.identity)?;
+		let (schema, id_field, fields) = build_schema(&identity)?;
+		let expected_identity = identity_bytes(&identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
 		let meta_exists = directory.exists(Path::new(META_PATH)).map_err(storage_error)?;
 
@@ -226,7 +232,6 @@ impl Engine {
 				"the persisted Tantivy schema does not match the requested configuration",
 			));
 		}
-		let analyzer = build_analyzer(config.identity.stop_words)?;
 		let surface_analyzer = build_surface_analyzer();
 		index.tokenizers().register(ANALYZER_NAME, analyzer.clone());
 		index
@@ -244,7 +249,8 @@ impl Engine {
 			field_lookup,
 			analyzer,
 			surface_analyzer,
-			positions: config.identity.positions,
+			synonyms,
+			positions: identity.positions,
 		})
 	}
 
@@ -275,6 +281,8 @@ impl Engine {
 				id_field: self.id_field,
 				fields: self.fields.clone(),
 				field_lookup: self.field_lookup.clone(),
+				analyzer: self.analyzer.clone(),
+				synonyms: self.synonyms.clone(),
 			},
 			payload,
 		))
@@ -726,15 +734,14 @@ impl Engine {
 		} else {
 			self.analyzer.clone()
 		};
-		let mut tokens = Vec::new();
-		let mut stream = analyzer.token_stream(text);
-		while stream.advance() {
+		let analyzed = analyzed_tokens(&mut analyzer, text, (!surface).then_some(&self.synonyms));
+		let mut tokens = Vec::with_capacity(analyzed.len());
+		for token in analyzed {
 			if tokens.len() % 256 == 0 {
 				check_deadline(deadline)?;
 			}
-			let token = stream.token();
 			tokens.push(SourceToken {
-				text: token.text.clone(),
+				text: token.text,
 				start: token.offset_from,
 				end: token.offset_to,
 				position: token.position,
@@ -1189,19 +1196,26 @@ fn utf16_offsets(source: &str) -> Option<Vec<u32>> {
 	Some(offsets)
 }
 
-fn source_span(utf16_offsets: &Option<Vec<u32>>, start: usize, end: usize) -> TraceSpan {
-	TraceSpan {
-		start: utf16_offsets.as_ref().map_or(start as u32, |offsets| offsets[start]),
-		end: utf16_offsets.as_ref().map_or(end as u32, |offsets| offsets[end]),
+fn source_span(utf16_offsets: &Option<Vec<u32>>, start: usize, end: usize) -> Option<TraceSpan> {
+	if start > end {
+		return None;
 	}
+	let (start, end) = match utf16_offsets {
+		Some(offsets) => (*offsets.get(start)?, *offsets.get(end)?),
+		None => (u32::try_from(start).ok()?, u32::try_from(end).ok()?),
+	};
+	(start <= end).then_some(TraceSpan { start, end })
 }
 
 fn push_trace_span(
 	spans: &mut Vec<TraceSpan>,
 	seen: &mut HashSet<TraceSpan>,
-	span: TraceSpan,
+	span: Option<TraceSpan>,
 	max_spans: usize,
 ) -> bool {
+	let Some(span) = span else {
+		return false;
+	};
 	if seen.contains(&span) {
 		return false;
 	}
@@ -1296,6 +1310,7 @@ impl Writer {
 
 	pub(crate) fn prepare(&self, batch: MutationBatch) -> Result<PreparedBatch> {
 		let mutation_count = batch.upserts.len() + batch.deletes.len();
+		let mut analyzer = self.analyzer.clone();
 		for id in &batch.deletes {
 			validate_record_id(id)?;
 		}
@@ -1315,7 +1330,14 @@ impl Writer {
 					.ok_or_else(|| FulltextError::invalid(format!("unknown mutation field {name}")))?;
 				for value in values {
 					let field = &self.fields[*index];
-					document.add_text(field.field, &value);
+					let tokens = analyzed_tokens(&mut analyzer, &value, Some(&self.synonyms));
+					document.add_pre_tokenized_text(
+						field.field,
+						PreTokenizedString {
+							text: value.clone(),
+							tokens,
+						},
+					);
 					if let Some(surface_field) = field.surface_field {
 						document.add_text(surface_field, &value);
 					}
@@ -1417,10 +1439,123 @@ fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Vec<Eng
 	Ok((builder.build(), id_field, fields))
 }
 
+#[derive(Clone)]
+struct NfkcFilter;
+
+impl TokenFilter for NfkcFilter {
+	type Tokenizer<T: Tokenizer> = NfkcFilterWrapper<T>;
+
+	fn transform<T: Tokenizer>(self, tokenizer: T) -> Self::Tokenizer<T> {
+		NfkcFilterWrapper { tokenizer }
+	}
+}
+
+#[derive(Clone)]
+struct NfkcFilterWrapper<T> {
+	tokenizer: T,
+}
+
+impl<T: Tokenizer> Tokenizer for NfkcFilterWrapper<T> {
+	type TokenStream<'a> = NfkcTokenStream<T::TokenStream<'a>>;
+
+	fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+		NfkcTokenStream {
+			tail: self.tokenizer.token_stream(text),
+		}
+	}
+}
+
+struct NfkcTokenStream<T> {
+	tail: T,
+}
+
+impl<T: TokenStream> TokenStream for NfkcTokenStream<T> {
+	fn advance(&mut self) -> bool {
+		if !self.tail.advance() {
+			return false;
+		}
+		let normalized = self.tail.token().text.nfkc().collect::<String>();
+		self.tail.token_mut().text = normalized;
+		true
+	}
+
+	fn token(&self) -> &Token {
+		self.tail.token()
+	}
+
+	fn token_mut(&mut self) -> &mut Token {
+		self.tail.token_mut()
+	}
+}
+
+#[derive(Clone)]
+struct EnglishPossessiveFilter;
+
+impl TokenFilter for EnglishPossessiveFilter {
+	type Tokenizer<T: Tokenizer> = EnglishPossessiveFilterWrapper<T>;
+
+	fn transform<T: Tokenizer>(self, tokenizer: T) -> Self::Tokenizer<T> {
+		EnglishPossessiveFilterWrapper { tokenizer }
+	}
+}
+
+#[derive(Clone)]
+struct EnglishPossessiveFilterWrapper<T> {
+	tokenizer: T,
+}
+
+impl<T: Tokenizer> Tokenizer for EnglishPossessiveFilterWrapper<T> {
+	type TokenStream<'a> = EnglishPossessiveTokenStream<'a, T::TokenStream<'a>>;
+
+	fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+		EnglishPossessiveTokenStream {
+			source: text,
+			tail: self.tokenizer.token_stream(text),
+		}
+	}
+}
+
+struct EnglishPossessiveTokenStream<'a, T> {
+	source: &'a str,
+	tail: T,
+}
+
+impl<T: TokenStream> TokenStream for EnglishPossessiveTokenStream<'_, T> {
+	fn advance(&mut self) -> bool {
+		while self.tail.advance() {
+			let token = self.tail.token();
+			if !token.text.eq_ignore_ascii_case("s") || !is_possessive_suffix(self.source, token.offset_from) {
+				return true;
+			}
+		}
+		false
+	}
+
+	fn token(&self) -> &Token {
+		self.tail.token()
+	}
+
+	fn token_mut(&mut self) -> &mut Token {
+		self.tail.token_mut()
+	}
+}
+
+fn is_possessive_suffix(source: &str, offset: usize) -> bool {
+	let Some(prefix) = source.get(..offset) else {
+		return false;
+	};
+	let stem = prefix.strip_suffix('\'').or_else(|| prefix.strip_suffix('’'));
+	stem.and_then(|stem| stem.chars().next_back())
+		.is_some_and(char::is_alphanumeric)
+}
+
 fn build_analyzer(stop_words: bool) -> Result<TextAnalyzer> {
 	let mut builder = TextAnalyzer::builder(SimpleTokenizer::default())
-		.filter_dynamic(RemoveLongFilter::limit(40))
-		.filter_dynamic(LowerCaser);
+		.filter_dynamic(EnglishPossessiveFilter)
+		.filter_dynamic(NfkcFilter)
+		.filter_dynamic(LowerCaser)
+		.filter_dynamic(AsciiFoldingFilter)
+		.filter_dynamic(RemoveLongFilter::limit(40));
 	if stop_words {
 		let stop_filter = StopWordFilter::new(Language::English)
 			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "English stop words are unavailable"))?;
@@ -1431,13 +1566,94 @@ fn build_analyzer(stop_words: bool) -> Result<TextAnalyzer> {
 
 fn build_surface_analyzer() -> TextAnalyzer {
 	TextAnalyzer::builder(SimpleTokenizer::default())
-		.filter_dynamic(RemoveLongFilter::limit(40))
+		.filter_dynamic(EnglishPossessiveFilter)
+		.filter_dynamic(NfkcFilter)
 		.filter_dynamic(LowerCaser)
+		.filter_dynamic(AsciiFoldingFilter)
+		.filter_dynamic(RemoveLongFilter::limit(40))
 		.build()
 }
 
+fn canonical_identity(
+	config: &EngineIdentityConfig,
+) -> Result<(EngineIdentityConfig, TextAnalyzer, HashMap<String, Vec<String>>)> {
+	let analyzer = build_analyzer(config.stop_words)?;
+	let mut canonical = config.clone();
+	let mut sources = HashSet::with_capacity(config.synonyms.len());
+	let mut rules = Vec::with_capacity(config.synonyms.len());
+	let mut lookup = HashMap::with_capacity(config.synonyms.len());
+	for rule in &config.synonyms {
+		let source = canonical_synonym_term(&analyzer, &rule.source, "source")?;
+		if !sources.insert(source.clone()) {
+			return Err(FulltextError::invalid(format!(
+				"synonym source {source:?} is declared more than once after analysis"
+			)));
+		}
+		let mut replacements = Vec::with_capacity(rule.replacements.len());
+		for replacement in &rule.replacements {
+			let replacement = canonical_synonym_term(&analyzer, replacement, "replacement")?;
+			if replacement == source {
+				return Err(FulltextError::invalid(
+					"a synonym replacement must differ from its source after analysis",
+				));
+			}
+			replacements.push(replacement);
+		}
+		replacements.sort();
+		replacements.dedup();
+		if replacements.len() != rule.replacements.len() {
+			return Err(FulltextError::invalid(
+				"synonym replacements must be unique after analysis",
+			));
+		}
+		lookup.insert(source.clone(), replacements.clone());
+		rules.push(SynonymRule { source, replacements });
+	}
+	rules.sort_by(|left, right| left.source.cmp(&right.source));
+	canonical.synonyms = rules;
+	Ok((canonical, analyzer, lookup))
+}
+
+fn canonical_synonym_term(analyzer: &TextAnalyzer, text: &str, label: &str) -> Result<String> {
+	let mut analyzer = analyzer.clone();
+	let mut stream = analyzer.token_stream(text);
+	if !stream.advance() {
+		return Err(FulltextError::invalid(format!(
+			"synonym {label} must produce exactly one analyzed term"
+		)));
+	}
+	let term = stream.token().text.clone();
+	if stream.advance() {
+		return Err(FulltextError::invalid(format!(
+			"synonym {label} must produce exactly one analyzed term"
+		)));
+	}
+	Ok(term)
+}
+
+fn analyzed_tokens(
+	analyzer: &mut TextAnalyzer,
+	text: &str,
+	synonyms: Option<&HashMap<String, Vec<String>>>,
+) -> Vec<Token> {
+	let mut tokens = Vec::new();
+	let mut stream = analyzer.token_stream(text);
+	while stream.advance() {
+		let token = stream.token();
+		tokens.push(token.clone());
+		if let Some(replacements) = synonyms.and_then(|synonyms| synonyms.get(&token.text)) {
+			for replacement in replacements {
+				let mut expanded = token.clone();
+				expanded.text = replacement.clone();
+				tokens.push(expanded);
+			}
+		}
+	}
+	tokens
+}
+
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
-	let mut bytes = b"HTFI\x02\x00".to_vec();
+	let mut bytes = b"HTFI\x03\x00".to_vec();
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
 	push_string(&mut bytes, &config.analyzer);
@@ -1446,6 +1662,14 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 		config.positions as u8,
 		config.surface_terms as u8,
 	]);
+	bytes.extend_from_slice(&(config.synonyms.len() as u16).to_le_bytes());
+	for rule in &config.synonyms {
+		push_string(&mut bytes, &rule.source);
+		bytes.extend_from_slice(&(rule.replacements.len() as u16).to_le_bytes());
+		for replacement in &rule.replacements {
+			push_string(&mut bytes, replacement);
+		}
+	}
 	bytes.extend_from_slice(&(config.fields.len() as u16).to_le_bytes());
 	for field in &config.fields {
 		push_string(&mut bytes, &field.name);
@@ -1455,7 +1679,7 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 
 pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	let version = bytes.get(4..6)?;
-	if bytes.get(..4)? != b"HTFI" || !matches!(version, b"\x01\x00" | b"\x02\x00") {
+	if bytes.get(..4)? != b"HTFI" || !matches!(version, b"\x01\x00" | b"\x02\x00" | b"\x03\x00") {
 		return None;
 	}
 	let mut offset = 6;
@@ -1470,6 +1694,19 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 		return None;
 	}
 	offset += 3;
+	if version == b"\x03\x00" {
+		let synonym_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
+		offset += 2;
+		for _ in 0..synonym_count {
+			take_string(bytes, &mut offset)?;
+			let replacement_count =
+				u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
+			offset += 2;
+			for _ in 0..replacement_count {
+				take_string(bytes, &mut offset)?;
+			}
+		}
+	}
 	let field_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 	offset += 2;
 	for _ in 0..field_count {
@@ -1645,6 +1882,7 @@ mod tests {
 				stop_words: true,
 				positions: true,
 				surface_terms: false,
+				synonyms: Vec::new(),
 			},
 			limits: Limits {
 				indexing_threads: 1,
@@ -1701,6 +1939,164 @@ mod tests {
 		assert!(fuzzy_prefix_matches("shoe", "shoestring"));
 		assert!(fuzzy_prefix_matches("shoe", "sjoestring"));
 		assert!(!fuzzy_prefix_matches("shoe", "boots"));
+	}
+
+	#[test]
+	fn english_analyzer_normalizes_unicode_and_possessives_with_source_offsets() {
+		let mut analyzer = build_analyzer(true).unwrap();
+		let source = "Müller's ＳＨＯＥＳ cafe\u{301} ß";
+		let tokens = analyzed_tokens(&mut analyzer, source, None);
+		assert_eq!(
+			tokens.iter().map(|token| token.text.as_str()).collect::<Vec<_>>(),
+			["muller", "shoe", "cafe", "ss"]
+		);
+		for token in tokens {
+			assert!(token.offset_from < token.offset_to);
+			assert!(source.get(token.offset_from..token.offset_to).is_some());
+		}
+		assert_eq!(
+			source_span(&utf16_offsets(source), source.len() + 1, source.len() + 2),
+			None
+		);
+	}
+
+	#[test]
+	fn index_time_synonyms_are_canonical_persisted_and_traceable() {
+		let directory = RamDirectory::create();
+		let mut config = config();
+		config.identity.surface_terms = true;
+		config.identity.synonyms = vec![SynonymRule {
+			source: "ＴＶ".to_owned(),
+			replacements: vec!["telly".to_owned(), "Televisions".to_owned()],
+		}];
+		let engine = Engine::open(directory.clone(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "one".to_owned(),
+					fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let reader = engine.reader().unwrap();
+		for text in ["tv", "telly", "television"] {
+			let result = engine
+				.search(
+					&reader.searcher(),
+					&SearchRequest {
+						text: text.to_owned(),
+						mode: SearchMode::Any,
+						fields: Vec::new(),
+						candidate_ids: None,
+						offset: 0,
+						limit: 10,
+						exact_total: true,
+						budget_milliseconds: 30_000,
+					},
+				)
+				.unwrap();
+			assert_eq!(result.hits[0].id, "one");
+		}
+		let trace = engine
+			.trace_matches(
+				&SearchRequest {
+					text: "television".to_owned(),
+					mode: SearchMode::Any,
+					fields: Vec::new(),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+				&[TraceRecord {
+					id: "one".to_owned(),
+					fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
+				}],
+				None,
+			)
+			.unwrap();
+		assert_eq!(trace.records[0].values[0].spans, [TraceSpan { start: 0, end: 2 }]);
+		let synonym_score = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					text: "stand".to_owned(),
+					mode: SearchMode::Any,
+					fields: Vec::new(),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap()
+			.hits[0]
+			.score;
+		let mut baseline_config = config.clone();
+		baseline_config.identity.index_id = "baseline".to_owned();
+		baseline_config.identity.synonyms.clear();
+		let baseline = Engine::open(RamDirectory::create(), &baseline_config).unwrap();
+		let mut baseline_writer = baseline.writer(&baseline_config).unwrap();
+		baseline_writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "one".to_owned(),
+					fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		baseline_writer.commit().unwrap();
+		let baseline_reader = baseline.reader().unwrap();
+		let baseline_score = baseline
+			.search(
+				&baseline_reader.searcher(),
+				&SearchRequest {
+					text: "stand".to_owned(),
+					mode: SearchMode::Any,
+					fields: Vec::new(),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap()
+			.hits[0]
+			.score;
+		assert_eq!(synonym_score, baseline_score);
+		baseline_writer.close().unwrap();
+
+		writer.close().unwrap();
+		let mut reordered = config.clone();
+		reordered.identity.synonyms[0].replacements.reverse();
+		Engine::open(directory.clone(), &reordered).unwrap();
+		reordered.identity.synonyms[0].replacements[0] = "display".to_owned();
+		assert_eq!(
+			Engine::inspect(directory, &reordered.identity).unwrap_err().code,
+			"E_IDENTITY_MISMATCH"
+		);
+	}
+
+	#[test]
+	fn persisted_index_id_accepts_v2_sidecars_for_reset_only() {
+		let config = config();
+		let mut identity = b"HTFI\x02\x00".to_vec();
+		push_string(&mut identity, &config.identity.index_id);
+		push_string(&mut identity, &config.identity.generation);
+		push_string(&mut identity, &config.identity.analyzer);
+		identity.extend_from_slice(&[1, 1, 0]);
+		identity.extend_from_slice(&(config.identity.fields.len() as u16).to_le_bytes());
+		for field in &config.identity.fields {
+			push_string(&mut identity, &field.name);
+		}
+		assert_eq!(persisted_index_id(&identity), Some("products"));
 	}
 
 	#[test]

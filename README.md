@@ -23,6 +23,7 @@ entry point is first used; importing the JavaScript facade does not eagerly load
 
 ```js
 import {
+	configureNativeFullTextRuntime,
 	inspectNativeFullTextIndex,
 	openNativeFullTextIndex,
 	reclaimRetiredNativeFullTextIndexes,
@@ -30,12 +31,22 @@ import {
 	validateNativeFullTextIndexOptions,
 } from '@harperfast/fulltext/native';
 
+configureNativeFullTextRuntime({
+	maxResidentIndexes: 64,
+	maxIndexingThreads: 16,
+	maxSearchThreads: 64,
+	maxWriterMemoryBytes: 2_000_000_000,
+	maxQueuedBytes: 2_000_000_000,
+	maxExpensiveSearches: 16,
+});
+
 const index = await openNativeFullTextIndex({
 	path: './search/products',
 	indexId: 'products',
 	generation: 'v1',
 	fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
 	analyzer: 'english@1',
+	synonyms: [{ source: 'tv', replacements: ['television'] }],
 	limits: {
 		indexingThreads: 2,
 		searchThreads: 4,
@@ -86,6 +97,14 @@ only races an in-flight logical batch rejects with `E_BATCH_ACTIVE`; wait for th
 and retry instead of rolling it back. This prevents a later publish from exposing part of a logical
 batch. A closing or closed handle rejects every logical batch with `E_CLOSED`, including an empty
 batch, without taking the latch.
+
+`configureNativeFullTextRuntime()` is optional and idempotent for an identical configuration. Call
+it before opening indexes when one process may host many indexes. It bounds aggregate resident
+indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
+expensive searches. A conflicting second configuration or an open/search that would exceed the
+budget fails with `E_RESOURCE_LIMIT`; the wrapper never evicts a live generation. Closing an index
+releases its reservation. Callers that omit this function retain per-index limits and current
+standalone behavior.
 
 Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
 as record-local rejection could remove many documents under the wrong schema. The option applies
@@ -149,6 +168,14 @@ an internal unstemmed companion term field used by prefix, fuzzy-prefix, and mat
 not store source values. Both settings are persisted and must match when the index is reopened.
 Enable `surfaceTerms` only on indexes that need those operations. Field weights are query-time
 boosts and may change on reopen without rebuilding the index.
+
+`english@1` applies Unicode NFKC normalization, lowercase and Latin-to-ASCII folding, English
+possessive removal, optional English stop words, and English stemming. Token offsets continue to
+refer to the original source value. Index-time synonyms are optional and bounded. Each `source`
+and replacement must produce exactly one analyzed term. Rules are canonicalized, persisted in the
+index identity, and expanded once at the source token's position; query text is not synonym-expanded.
+Changing analyzer settings or synonyms requires a new generation/rebuild. Match tracing applies the
+same index-time expansion so synonym-derived hits map back to the original token span.
 
 Highlighting is opt-in and operates on caller-supplied current source values, so the wrapper never
 returns stale stored text. It returns UTF-16 half-open offsets and no HTML. Snippets are also off by
@@ -257,8 +284,10 @@ the handoff lock while renaming the native directory on Windows. The wrapper doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 6. The loader rejects older addon binaries. Query protocol and native index
-identity changes require rebuilding prototype indexes created by earlier unreleased builds.
+This API uses native ABI 7 and packed protocol 3. The loader rejects older addon binaries. Native
+identity sidecar v3 fingerprints canonical synonyms and the completed `english@1` semantics. Older
+v2 indexes are identifiable for safe reset but cannot be reopened under the new meaning; rebuild
+them from the authoritative source.
 
 ## Storage boundary
 
@@ -280,6 +309,7 @@ npm test
 npm run lint
 npm run format:check
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000
+npm run benchmark:multi-index -- --indexes 8 --documents 100000 --concurrency 16
 npm run benchmark:native -- --documents 100000 --revision v0.1.0 --output benchmark-native.json
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000 --mutation-driver low-level
 npm run benchmark:inspect -- --indexes 1,10,100,1000 --commits 64 --warm-rounds 10
@@ -298,6 +328,12 @@ the logical API performs both inside one call. `--commit-every` sets the target 
 between durability points; it materially affects throughput and peak memory because
 replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
 comparisons require controlled hardware.
+
+`benchmark:multi-index` exercises independent writers in parallel under the process budget. It
+includes heavy-tail field sizes, bounded synonyms, update/delete churn, resource-cap rejection,
+warm concurrent queries, close/reopen, and cold queries. CI runs the two-index smoke profile; the
+release workflow records the larger eight-index profile per architecture. These results measure
+the wrapper's native path, not Harper projection, authorization, or record retrieval.
 
 `--revision` labels a result and `--output` writes the same JSON record printed to stdout. Pull
 requests keep smoke records as GitHub Actions artifacts for 30 days. The release benchmark keeps

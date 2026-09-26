@@ -103,6 +103,46 @@ test('runs the public create, mutate, BM25 search, close, and reopen route', asy
 	await index.close();
 });
 
+test('normalizes English text and persists bounded index-time synonyms', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath, {
+		surfaceTerms: true,
+		synonyms: [{ source: 'ＴＶ', replacements: ['telly', 'Televisions'] }],
+	});
+	const index = await openNativeFullTextIndex(config);
+	await index.applyMutationBatch({
+		upserts: [{ id: 'one', fields: { title: "Müller's ＴＶ and cafe\u0301 shoes" } }],
+	});
+	await index.commit();
+	await index.reload();
+	for (const text of ['muller', 'tv', 'telly', 'television', 'cafe', 'shoe']) {
+		assert.deepStrictEqual(
+			(await index.search({ text, exactTotal: true })).hits.map((hit) => hit.id),
+			['one'],
+		);
+	}
+	const trace = await index.traceMatches({ text: 'television' }, [
+		{ id: 'one', fields: { title: "Müller's ＴＶ and cafe\u0301 shoes" } },
+	]);
+	assert.strictEqual(trace.records[0].values[0].spans.length, 1);
+	await index.close();
+
+	await assert.rejects(
+		openNativeFullTextIndex({
+			...config,
+			synonyms: [{ source: 'television set', replacements: ['tv'] }],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		openNativeFullTextIndex({
+			...config,
+			synonyms: [{ source: 'tv', replacements: ['display'] }],
+		}),
+		(error) => error.code === 'E_IDENTITY_MISMATCH',
+	);
+});
+
 test('runs every structured query mode and score-neutral candidate filtering', async (context) => {
 	const index = await openNativeFullTextIndex(
 		options(temporaryIndex(context), { positions: true, surfaceTerms: true }),
@@ -411,11 +451,35 @@ test('validates native configuration without creating index storage', async (con
 		() => validateNativeFullTextIndexOptions({ ...config, fields: undefined }),
 		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
 	);
+	assert.throws(
+		() =>
+			validateNativeFullTextIndexOptions({
+				...config,
+				synonyms: Array.from({ length: 1_025 }, (_, index) => ({
+					source: `source${index}`,
+					replacements: [`replacement${index}`],
+				})),
+			}),
+		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
+	);
 	await assert.rejects(
 		openNativeFullTextIndex({ ...config, fields: undefined }),
 		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
 	);
 	assert.strictEqual(existsSync(indexPath), false);
+});
+
+test('admits native indexes under one idempotent process-wide budget', async (context) => {
+	const child = fork(
+		fileURLToPath(new URL('./fixtures/native-runtime-budget-child.mjs', import.meta.url)),
+		[fileURLToPath(new URL('../dist/native.js', import.meta.url))],
+		{ stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
+	);
+	context.after(() => child.kill());
+	assert.deepStrictEqual(await childMessage(child), {
+		conflict: 'E_RESOURCE_LIMIT',
+		saturated: 'E_RESOURCE_LIMIT',
+	});
 });
 
 test('reclaims only retired trees generated for the requested index', async (context) => {
@@ -1784,9 +1848,9 @@ function childMessage(child, expected) {
 			child.off('exit', onExit);
 		};
 		const onMessage = (message) => {
-			if (message !== expected) return;
+			if (expected !== undefined && message !== expected) return;
 			cleanup();
-			resolve();
+			resolve(message);
 		};
 		const onError = (error) => {
 			cleanup();

@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "test-panic")]
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const NATIVE_ABI_VERSION: u32 = 6;
+pub const NATIVE_ABI_VERSION: u32 = 7;
 pub const TANTIVY_VERSION: &str = "0.26.1";
 
 #[cfg(feature = "node-api")]
@@ -46,6 +46,9 @@ pub struct RuntimeLimits {
 	pub max_trace_records: u32,
 	pub max_trace_source_bytes: u32,
 	pub max_trace_spans: u32,
+	pub max_synonym_rules: u32,
+	pub max_synonym_replacements: u32,
+	pub max_synonym_bytes: u32,
 }
 
 #[cfg(feature = "node-api")]
@@ -88,6 +91,9 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 			max_trace_records: protocol::MAX_TRACE_RECORDS as u32,
 			max_trace_source_bytes: protocol::MAX_TRACE_SOURCE_BYTES as u32,
 			max_trace_spans: protocol::MAX_TRACE_SPANS as u32,
+			max_synonym_rules: protocol::MAX_SYNONYM_RULES as u32,
+			max_synonym_replacements: protocol::MAX_SYNONYM_REPLACEMENTS as u32,
+			max_synonym_bytes: protocol::MAX_SYNONYM_BYTES as u32,
 		},
 	})
 }
