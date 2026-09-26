@@ -106,12 +106,21 @@ struct RuntimeBudget {
 }
 
 enum RuntimeBudgetState {
-	Unconfigured,
+	Unconfigured { pending_opens: usize },
 	Configured(Arc<RuntimeBudget>),
 	OpenedWithoutBudget,
 }
 
 struct RuntimeAdmission {
+	kind: RuntimeAdmissionKind,
+}
+
+enum RuntimeAdmissionKind {
+	Budgeted(BudgetReservation),
+	Unbudgeted { pending: bool },
+}
+
+struct BudgetReservation {
 	budget: Arc<RuntimeBudget>,
 	resident: bool,
 	indexing_threads: usize,
@@ -141,7 +150,7 @@ struct RuntimeParts {
 	engine: Engine,
 	writer: Writer,
 	reader: IndexReader,
-	reservation: Option<RuntimeAdmission>,
+	reservation: RuntimeAdmission,
 }
 
 struct CompletionSignal {
@@ -281,8 +290,8 @@ pub fn native_inspect(packed_config: Buffer) -> boundary::Result<Buffer> {
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeValidateOpen")]
 pub fn native_validate_open(packed_config: Buffer) -> boundary::Result<Buffer> {
 	boundary::run_stateless(|| {
-		let response = match decode_open(&packed_config) {
-			Ok(_) => success_envelope(Vec::new()),
+		let response = match decode_open(&packed_config).and_then(|config| Engine::validate(&config.engine)) {
+			Ok(()) => success_envelope(Vec::new()),
 			Err(error) => error_envelope(error),
 		};
 		Buffer::from(response)
@@ -466,6 +475,7 @@ pub fn native_close(env: Env, handle: u32, rollback: bool, callback: CompletionC
 			.compare_exchange(STATE_OPEN, STATE_CLOSING, Ordering::AcqRel, Ordering::Acquire)
 		{
 			Ok(_) => {
+				runtime.notify_expensive_waiters();
 				#[cfg(feature = "test-panic")]
 				runtime.poison_before_admission();
 				runtime
@@ -555,10 +565,14 @@ pub fn native_status(env: Env, handle: u32) -> boundary::Result<Buffer> {
 fn configure_runtime_budget(limits: RuntimeBudgetLimits) -> Result<()> {
 	let mut state = lock(runtime_budget_state());
 	match &*state {
-		RuntimeBudgetState::Unconfigured => {
+		RuntimeBudgetState::Unconfigured { pending_opens: 0 } => {
 			*state = RuntimeBudgetState::Configured(Arc::new(RuntimeBudget::new(limits)));
 			Ok(())
 		}
+		RuntimeBudgetState::Unconfigured { .. } => Err(FulltextError::new(
+			"E_RESOURCE_LIMIT",
+			"the process-wide fulltext runtime budget cannot be configured while an index open is pending",
+		)),
 		RuntimeBudgetState::Configured(configured) if configured.limits == limits => Ok(()),
 		RuntimeBudgetState::Configured(_) => Err(FulltextError::new(
 			"E_RESOURCE_LIMIT",
@@ -572,18 +586,26 @@ fn configure_runtime_budget(limits: RuntimeBudgetLimits) -> Result<()> {
 }
 
 fn runtime_budget_state() -> &'static Mutex<RuntimeBudgetState> {
-	RUNTIME_BUDGET.get_or_init(|| Mutex::new(RuntimeBudgetState::Unconfigured))
+	RUNTIME_BUDGET.get_or_init(|| Mutex::new(RuntimeBudgetState::Unconfigured { pending_opens: 0 }))
 }
 
-fn admit_runtime(limits: &crate::protocol::Limits) -> Result<Option<RuntimeAdmission>> {
+fn admit_runtime(limits: &crate::protocol::Limits) -> Result<RuntimeAdmission> {
 	let mut state = lock(runtime_budget_state());
-	match &*state {
-		RuntimeBudgetState::Unconfigured => {
-			*state = RuntimeBudgetState::OpenedWithoutBudget;
-			Ok(None)
+	match &mut *state {
+		RuntimeBudgetState::Unconfigured { pending_opens } => {
+			*pending_opens = pending_opens
+				.checked_add(1)
+				.ok_or_else(|| FulltextError::new("E_RESOURCE_LIMIT", "too many pending index opens"))?;
+			Ok(RuntimeAdmission {
+				kind: RuntimeAdmissionKind::Unbudgeted { pending: true },
+			})
 		}
-		RuntimeBudgetState::Configured(budget) => budget.admit(limits).map(Some),
-		RuntimeBudgetState::OpenedWithoutBudget => Ok(None),
+		RuntimeBudgetState::Configured(budget) => budget.admit(limits).map(|reservation| RuntimeAdmission {
+			kind: RuntimeAdmissionKind::Budgeted(reservation),
+		}),
+		RuntimeBudgetState::OpenedWithoutBudget => Ok(RuntimeAdmission {
+			kind: RuntimeAdmissionKind::Unbudgeted { pending: false },
+		}),
 	}
 }
 
@@ -601,8 +623,8 @@ impl RuntimeBudget {
 		}
 	}
 
-	fn admit(self: &Arc<Self>, limits: &crate::protocol::Limits) -> Result<RuntimeAdmission> {
-		let mut admission = RuntimeAdmission {
+	fn admit(self: &Arc<Self>, limits: &crate::protocol::Limits) -> Result<BudgetReservation> {
+		let mut admission = BudgetReservation {
 			budget: self.clone(),
 			resident: false,
 			indexing_threads: 0,
@@ -652,20 +674,73 @@ impl RuntimeBudget {
 		Ok(admission)
 	}
 
-	fn acquire_expensive(self: &Arc<Self>) -> ExpensiveSearchPermit {
+	fn acquire_expensive(
+		self: &Arc<Self>,
+		deadline: Instant,
+		runtime_state: &AtomicU8,
+	) -> Result<ExpensiveSearchPermit> {
 		let mut active = lock(&self.expensive_searches);
 		while *active >= self.limits.max_expensive_searches {
-			active = self
+			if runtime_state.load(Ordering::Acquire) != STATE_OPEN {
+				return Err(FulltextError::new("E_CLOSED", "index is closing or closed"));
+			}
+			let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+				return Err(search_timeout());
+			};
+			let (next, timeout) = self
 				.expensive_search_ready
-				.wait(active)
+				.wait_timeout(active, remaining)
 				.unwrap_or_else(|error| error.into_inner());
+			active = next;
+			if timeout.timed_out() && *active >= self.limits.max_expensive_searches {
+				return Err(search_timeout());
+			}
+		}
+		if runtime_state.load(Ordering::Acquire) != STATE_OPEN {
+			return Err(FulltextError::new("E_CLOSED", "index is closing or closed"));
 		}
 		*active += 1;
-		ExpensiveSearchPermit { budget: self.clone() }
+		Ok(ExpensiveSearchPermit { budget: self.clone() })
+	}
+}
+
+impl RuntimeAdmission {
+	fn budget(&self) -> Option<Arc<RuntimeBudget>> {
+		match &self.kind {
+			RuntimeAdmissionKind::Budgeted(reservation) => Some(reservation.budget.clone()),
+			RuntimeAdmissionKind::Unbudgeted { .. } => None,
+		}
+	}
+
+	fn confirm_open(&mut self) {
+		let RuntimeAdmissionKind::Unbudgeted { pending } = &mut self.kind else {
+			return;
+		};
+		if !*pending {
+			return;
+		}
+		let mut state = lock(runtime_budget_state());
+		if matches!(&*state, RuntimeBudgetState::Unconfigured { pending_opens } if *pending_opens > 0) {
+			*state = RuntimeBudgetState::OpenedWithoutBudget;
+		}
+		*pending = false;
 	}
 }
 
 impl Drop for RuntimeAdmission {
+	fn drop(&mut self) {
+		if !matches!(&self.kind, RuntimeAdmissionKind::Unbudgeted { pending: true }) {
+			return;
+		}
+		let mut state = lock(runtime_budget_state());
+		if let RuntimeBudgetState::Unconfigured { pending_opens } = &mut *state {
+			debug_assert!(*pending_opens > 0);
+			*pending_opens = pending_opens.saturating_sub(1);
+		}
+	}
+}
+
+impl Drop for BudgetReservation {
 	fn drop(&mut self) {
 		if self.resident {
 			release(&self.budget.resident_indexes, 1);
@@ -755,7 +830,7 @@ impl Runtime {
 			search_execution_nanoseconds: AtomicU64::new(0),
 			search_threads: Mutex::new(Vec::with_capacity(search_thread_count)),
 			closed: Arc::new(CompletionSignal::new()),
-			reservation: Mutex::new(parts.reservation),
+			reservation: Mutex::new(Some(parts.reservation)),
 			#[cfg(feature = "test-panic")]
 			publish_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
@@ -815,11 +890,23 @@ impl Runtime {
 		}
 	}
 
-	fn expensive_search_permit(&self) -> Option<ExpensiveSearchPermit> {
-		let budget = lock(&self.reservation)
-			.as_ref()
-			.map(|reservation| reservation.budget.clone());
-		budget.map(|budget| budget.acquire_expensive())
+	fn expensive_search_permit(&self, deadline: Instant) -> Result<Option<ExpensiveSearchPermit>> {
+		let budget = lock(&self.reservation).as_ref().and_then(RuntimeAdmission::budget);
+		budget
+			.map(|budget| budget.acquire_expensive(deadline, &self.state))
+			.transpose()
+	}
+
+	fn confirm_open(&self) {
+		if let Some(reservation) = lock(&self.reservation).as_mut() {
+			reservation.confirm_open();
+		}
+	}
+
+	fn notify_expensive_waiters(&self) {
+		if let Some(budget) = lock(&self.reservation).as_ref().and_then(RuntimeAdmission::budget) {
+			budget.expensive_search_ready.notify_all();
+		}
 	}
 
 	fn release_reservation(&self) {
@@ -853,6 +940,7 @@ impl Runtime {
 		if previous == STATE_CLOSED || previous == STATE_CLOSING {
 			return;
 		}
+		self.notify_expensive_waiters();
 		let _ = self.writer_queue.push_force(
 			WriterCommand {
 				operation: WriterOperation::Close { rollback: true },
@@ -867,6 +955,7 @@ impl Runtime {
 
 	fn poison(&self, error: FulltextError) {
 		self.state.store(STATE_POISONED, Ordering::Release);
+		self.notify_expensive_waiters();
 		let mut close = None;
 		for command in self.writer_queue.drain() {
 			if matches!(&command.value.operation, WriterOperation::Close { .. }) && close.is_none() {
@@ -1602,38 +1691,33 @@ fn execute_search_command(
 		.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
 	let started = Instant::now();
 	let SearchCommand { operation, completion } = queued.value;
-	let result = catch_unwind(AssertUnwindSafe(|| {
-		let expensive = match &operation {
-			SearchOperation::Search(bytes) => search_mode(bytes)?.is_expensive(),
-			SearchOperation::Trace(_) => true,
-		};
-		let _permit = if expensive {
-			runtime.expensive_search_permit()
-		} else {
-			None
-		};
-		match operation {
-			SearchOperation::Search(bytes) => {
-				let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
-				decode_search(&bytes).and_then(|request| {
-					engine
-						.search_with_deadline(&reader.searcher(), &request, deadline)
-						.map(SearchOutcome::Search)
-				})
-			}
-			SearchOperation::Trace(bytes) => {
-				let deadline = operation_deadline(trace_budget(&bytes)?, queued.enqueued.elapsed())?;
-				decode_trace(&bytes).and_then(|request| {
-					if Instant::now() >= deadline {
-						return Err(search_timeout());
-					}
-					let result = engine.trace_matches(&request.search, &request.records, Some(deadline))?;
-					if Instant::now() >= deadline {
-						return Err(search_timeout());
-					}
-					Ok(SearchOutcome::Trace(result))
-				})
-			}
+	let result = catch_unwind(AssertUnwindSafe(|| match operation {
+		SearchOperation::Search(bytes) => {
+			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
+			let _permit = if search_mode(&bytes)?.is_expensive() {
+				runtime.expensive_search_permit(deadline)?
+			} else {
+				None
+			};
+			decode_search(&bytes).and_then(|request| {
+				engine
+					.search_with_deadline(&reader.searcher(), &request, deadline)
+					.map(SearchOutcome::Search)
+			})
+		}
+		SearchOperation::Trace(bytes) => {
+			let deadline = operation_deadline(trace_budget(&bytes)?, queued.enqueued.elapsed())?;
+			let _permit = runtime.expensive_search_permit(deadline)?;
+			decode_trace(&bytes).and_then(|request| {
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				let result = engine.trace_matches(&request.search, &request.records, Some(deadline))?;
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				Ok(SearchOutcome::Trace(result))
+			})
 		}
 	}));
 	runtime
@@ -2096,6 +2180,7 @@ fn open_runtime_with_directory(
 				"Node environment closed during index open",
 			));
 		}
+		runtime.confirm_open();
 		registry.handles.insert(handle, runtime);
 		registry.opening.remove(&handle);
 		Ok(committed_payload)
@@ -2486,7 +2571,10 @@ mod tests {
 		let reservation = budget.admit(&limits).unwrap();
 		assert_eq!(budget.admit(&limits).err().unwrap().code, "E_RESOURCE_LIMIT");
 		assert_eq!(budget.resident_indexes.load(Ordering::Acquire), 1);
-		let permit = budget.acquire_expensive();
+		let state = AtomicU8::new(STATE_OPEN);
+		let permit = budget
+			.acquire_expensive(Instant::now() + Duration::from_secs(1), &state)
+			.unwrap();
 		drop(permit);
 		drop(reservation);
 		assert_eq!(budget.resident_indexes.load(Ordering::Acquire), 0);
@@ -2507,13 +2595,19 @@ mod tests {
 			max_queued_bytes: 32,
 			max_expensive_searches: 1,
 		}));
-		let first = budget.acquire_expensive();
+		let state = Arc::new(AtomicU8::new(STATE_OPEN));
+		let first = budget
+			.acquire_expensive(Instant::now() + Duration::from_secs(1), &state)
+			.unwrap();
 		let waiting_budget = budget.clone();
+		let waiting_state = state.clone();
 		let (started_sender, started_receiver) = mpsc::channel();
 		let (acquired_sender, acquired_receiver) = mpsc::channel();
 		let waiting = thread::spawn(move || {
 			started_sender.send(()).unwrap();
-			let _permit = waiting_budget.acquire_expensive();
+			let _permit = waiting_budget
+				.acquire_expensive(Instant::now() + Duration::from_secs(1), &waiting_state)
+				.unwrap();
 			acquired_sender.send(()).unwrap();
 		});
 		started_receiver.recv().unwrap();
@@ -2521,6 +2615,53 @@ mod tests {
 		drop(first);
 		acquired_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
 		waiting.join().unwrap();
+	}
+
+	#[test]
+	fn expensive_search_budget_respects_deadline_and_close() {
+		let budget = Arc::new(RuntimeBudget::new(RuntimeBudgetLimits {
+			max_resident_indexes: 1,
+			max_indexing_threads: 1,
+			max_search_threads: 2,
+			max_writer_memory_bytes: 15_000_000,
+			max_queued_bytes: 32,
+			max_expensive_searches: 1,
+		}));
+		let state = AtomicU8::new(STATE_OPEN);
+		let permit = budget
+			.acquire_expensive(Instant::now() + Duration::from_secs(1), &state)
+			.unwrap();
+		assert_eq!(
+			budget
+				.acquire_expensive(Instant::now() + Duration::from_millis(1), &state)
+				.err()
+				.unwrap()
+				.code,
+			"E_TIMEOUT"
+		);
+		let state = Arc::new(state);
+		let waiting_state = state.clone();
+		let waiting_budget = budget.clone();
+		let (started_sender, started_receiver) = mpsc::channel();
+		let (result_sender, result_receiver) = mpsc::channel();
+		let waiting = thread::spawn(move || {
+			started_sender.send(()).unwrap();
+			let code = waiting_budget
+				.acquire_expensive(Instant::now() + Duration::from_secs(1), &waiting_state)
+				.err()
+				.map(|error| error.code);
+			result_sender.send(code).unwrap();
+		});
+		started_receiver.recv().unwrap();
+		assert!(result_receiver.recv_timeout(Duration::from_millis(20)).is_err());
+		state.store(STATE_CLOSING, Ordering::Release);
+		budget.expensive_search_ready.notify_all();
+		assert_eq!(
+			result_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+			Some("E_CLOSED")
+		);
+		waiting.join().unwrap();
+		drop(permit);
 	}
 
 	#[test]

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -21,7 +21,7 @@ const options = (name) => ({
 	indexId: name,
 	generation: 'one',
 	fields: [{ name: 'title' }],
-	analyzer: 'english@1',
+	analyzer: 'english@2',
 	limits: {
 		indexingThreads: 1,
 		searchThreads: 1,
@@ -33,6 +33,23 @@ const options = (name) => ({
 });
 
 try {
+	if (process.argv[3] === 'failed-first') {
+		const failedPath = path.join(root, 'failed');
+		mkdirSync(failedPath);
+		writeFileSync(path.join(failedPath, 'meta.json'), '{}');
+		let failedOpen;
+		try {
+			await openNativeFullTextIndex(options('failed'));
+		} catch (error) {
+			failedOpen = error.code;
+		}
+		configureNativeFullTextRuntime(limits);
+		const recovered = await openNativeFullTextIndex(options('recovered'));
+		await recovered.close();
+		if (process.send) await new Promise((resolve) => process.send({ failedOpen }, resolve));
+		rmSync(root, { recursive: true, force: true });
+		process.exit(0);
+	}
 	if (process.argv[3] === 'late') {
 		const unbounded = await openNativeFullTextIndex(options('unbounded'));
 		let lateConfiguration;

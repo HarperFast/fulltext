@@ -35,7 +35,7 @@ function options(indexPath, overrides = {}) {
 		indexId: 'products',
 		generation: 'generation-1',
 		fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
-		analyzer: 'english@1',
+		analyzer: 'english@2',
 		limits: {
 			indexingThreads: 1,
 			searchThreads: 2,
@@ -480,6 +480,22 @@ test('validates native configuration without creating index storage', async (con
 			}),
 		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
 	);
+	assert.throws(
+		() =>
+			validateNativeFullTextIndexOptions({
+				...config,
+				synonyms: [{ source: 'television set', replacements: ['tv'] }],
+			}),
+		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
+	);
+	assert.throws(
+		() =>
+			validateNativeFullTextIndexOptions({
+				...config,
+				synonyms: [{ source: 'x'.repeat(600_000), replacements: ['y'.repeat(600_000)] }],
+			}),
+		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
+	);
 	await assert.rejects(
 		openNativeFullTextIndex({ ...config, fields: undefined }),
 		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
@@ -508,6 +524,16 @@ test('requires the process-wide budget to be configured before the first open', 
 	);
 	context.after(() => child.kill());
 	assert.deepStrictEqual(await childMessage(child), { lateConfiguration: 'E_RESOURCE_LIMIT' });
+});
+
+test('allows process-wide budget configuration after a failed first open', async (context) => {
+	const child = fork(
+		fileURLToPath(new URL('./fixtures/native-runtime-budget-child.mjs', import.meta.url)),
+		[fileURLToPath(new URL('../dist/native.js', import.meta.url)), 'failed-first'],
+		{ stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
+	);
+	context.after(() => child.kill());
+	assert.deepStrictEqual(await childMessage(child), { failedOpen: 'E_INCOMPLETE_CREATE' });
 });
 
 test('reclaims only retired trees generated for the requested index', async (context) => {

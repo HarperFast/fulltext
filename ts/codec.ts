@@ -2,6 +2,9 @@ import { FulltextError, type FulltextErrorCode } from './errors.js';
 
 const protocolVersion = 3;
 const maxStringBytes = 1 << 20;
+const maxSynonymRules = 1_024;
+const maxSynonymReplacements = 16;
+const maxSynonymBytes = 1 << 20;
 export const maxRecordIdBytes = 4 << 10;
 export const maxFields = 1_024;
 export const mutationBatchHeaderBytes = 14;
@@ -386,6 +389,7 @@ function encodeIndexIdentity(writer: ByteWriter, config: PackedIndexIdentityConf
 	writer.boolean(config.positions);
 	writer.boolean(config.surfaceTerms);
 	const synonyms = config.synonyms ?? [];
+	validateSynonyms(synonyms);
 	writer.u16(synonyms.length, 'synonyms.length');
 	for (const rule of synonyms) {
 		writer.string(rule.source);
@@ -396,6 +400,35 @@ function encodeIndexIdentity(writer: ByteWriter, config: PackedIndexIdentityConf
 	for (const field of config.fields) {
 		writer.string(field.name);
 		writer.f32(field.weight, 'field.weight');
+	}
+}
+
+function validateSynonyms(synonyms: Array<{ source: string; replacements: string[] }>): void {
+	if (synonyms.length > maxSynonymRules) {
+		throw new FulltextError('E_INVALID_ARGUMENT', `synonyms must not contain more than ${maxSynonymRules} rules`);
+	}
+	let bytes = 0;
+	for (const rule of synonyms) {
+		if (!rule.source || !Array.isArray(rule.replacements) || rule.replacements.length === 0) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'synonym rules require a source and at least one replacement');
+		}
+		if (rule.replacements.length > maxSynonymReplacements) {
+			throw new FulltextError(
+				'E_INVALID_ARGUMENT',
+				`each synonym rule must not contain more than ${maxSynonymReplacements} replacements`,
+			);
+		}
+		bytes += Buffer.byteLength(rule.source);
+		if (bytes > maxSynonymBytes) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `synonyms must not exceed ${maxSynonymBytes} UTF-8 bytes`);
+		}
+		for (const replacement of rule.replacements) {
+			if (!replacement) throw new FulltextError('E_INVALID_ARGUMENT', 'synonym replacements must not be empty');
+			bytes += Buffer.byteLength(replacement);
+			if (bytes > maxSynonymBytes) {
+				throw new FulltextError('E_INVALID_ARGUMENT', `synonyms must not exceed ${maxSynonymBytes} UTF-8 bytes`);
+			}
+		}
 	}
 }
 

@@ -33,10 +33,10 @@ import {
 
 configureNativeFullTextRuntime({
 	maxResidentIndexes: 64,
-	maxIndexingThreads: 16,
-	maxSearchThreads: 64,
-	maxWriterMemoryBytes: 2_000_000_000,
-	maxQueuedBytes: 2_000_000_000,
+	maxIndexingThreads: 128,
+	maxSearchThreads: 256,
+	maxWriterMemoryBytes: 4_000_000_000,
+	maxQueuedBytes: 2_200_000_000,
 	maxExpensiveSearches: 16,
 });
 
@@ -45,7 +45,7 @@ const index = await openNativeFullTextIndex({
 	indexId: 'products',
 	generation: 'v1',
 	fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
-	analyzer: 'english@1',
+	analyzer: 'english@2',
 	surfaceTerms: true,
 	synonyms: [{ source: 'tv', replacements: ['television'] }],
 	limits: {
@@ -78,7 +78,7 @@ console.log(
 		indexId: 'products',
 		generation: 'v1',
 		fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
-		analyzer: 'english@1',
+		analyzer: 'english@2',
 		surfaceTerms: true,
 		synonyms: [{ source: 'tv', replacements: ['television'] }],
 	}),
@@ -102,14 +102,18 @@ batch. A closing or closed handle rejects every logical batch with `E_CLOSED`, i
 batch, without taking the latch.
 
 `configureNativeFullTextRuntime()` is optional and idempotent for an identical configuration. It
-must be called before the first open attempt when one process may host many indexes; configuring
-after an unbudgeted open fails with `E_RESOURCE_LIMIT`. It bounds aggregate resident
+must be called before the first successful open when one process may host many indexes; configuring
+while an open is pending or after an unbudgeted open fails with `E_RESOURCE_LIMIT`. A failed first
+open does not prevent later configuration. It bounds aggregate resident
 indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
 expensive searches. Aggregate queue accounting reserves each index's writer queue plus its shared
 search queues, or twice that index's `maxQueuedBytes`. A conflicting second configuration or an
 open that would exceed an admission cap fails with `E_RESOURCE_LIMIT`; the wrapper never evicts a
-live generation. Expensive searches wait off the JavaScript thread for process capacity, allowing
-the bounded search queues to apply backpressure. A completed close has released its reservation.
+live generation. Expensive searches wait off the JavaScript thread for process capacity, bounded
+by the request deadline and interrupted by close, allowing the search queues to apply backpressure.
+A completed close has released its reservation.
+If teardown cannot prove native resources were released, the path is quarantined and its aggregate
+capacity remains reserved until process restart.
 Callers that omit this function retain per-index limits and current standalone behavior.
 
 Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
@@ -175,7 +179,7 @@ not store source values. Both settings are persisted and must match when the ind
 Enable `surfaceTerms` only on indexes that need those operations. Field weights are query-time
 boosts and may change on reopen without rebuilding the index.
 
-`english@1` applies Unicode NFKC normalization, lowercase and Latin-to-ASCII folding, English
+`english@2` applies Unicode NFKC normalization, lowercase and Latin-to-ASCII folding, English
 possessive removal, optional English stop words, and English stemming. Token offsets continue to
 refer to the original source value. Index-time synonyms are optional and bounded. Each `source`
 and replacement must produce exactly one normalized and analyzed term. Rules are canonicalized,
@@ -299,7 +303,7 @@ lock directory. The parent must permit creating this directory, and `.fulltext-l
 writable while indices are opened or reset; failures name the lock-directory path.
 
 This API uses native ABI 7 and packed protocol 3. The loader rejects older addon binaries. Native
-identity sidecar v3 fingerprints canonical synonyms and the completed `english@1` semantics. Older
+identity sidecar v3 fingerprints canonical synonyms and the completed `english@2` semantics. Older
 v2 indexes are identifiable for safe reset but cannot be reopened under the new meaning; rebuild
 them from the authoritative source.
 

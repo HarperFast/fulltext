@@ -66,7 +66,7 @@ interface NativeFullTextIndexOptions {
 	indexId: string;
 	generation: string;
 	fields: Array<{ name: string; weight?: number }>;
-	analyzer: 'english@1';
+	analyzer: 'english@2';
 	stopWords?: boolean;
 	positions?: boolean;
 	surfaceTerms?: boolean;
@@ -167,7 +167,7 @@ The exported flow is:
    reservation, and is idempotent.
 7. `status()` reads bounded counters and state without entering either sustained-work queue.
 
-Only the versioned `english@1` analysis contract is accepted. `positions` defaults to true and selects frequencies with or
+Only the versioned `english@2` analysis contract is accepted. `positions` defaults to true and selects frequencies with or
 without positions. Changing that default in a future release is an index-format change, not a
 silent reinterpretation. `generation` is an opaque caller-owned identity for this physical index
 generation; it is persisted in the engine fingerprint and must match on reopen. It is not a Tantivy
@@ -178,14 +178,19 @@ because of its storage cost. Field weights are query-time boosts and may change 
 same physical index without rebuilding it.
 
 `configureNativeFullTextRuntime()` optionally installs one immutable process budget before the first
-open attempt. Identical calls are idempotent; configuration after an unbudgeted open is rejected. It
+successful open. Identical calls are idempotent; configuration while an open is pending or after an
+unbudgeted open is rejected, while a failed first open releases its pending latch. It
 admits aggregate resident indexes, indexing/search threads,
 writer memory, configured queue capacity, and expensive searches with checked shared accounting.
 Each index reserves its writer queue and shared search-queue capacity, so process queue accounting
 charges twice the per-index `maxQueuedBytes`. Exceeding an open-time admission cap returns
 `E_RESOURCE_LIMIT`; it never evicts an active generation. Expensive searches wait on a condition
-variable off the JavaScript thread until process capacity is available. Callers that omit the
-governor retain current per-index admission behavior.
+variable off the JavaScript thread until process capacity is available, the request deadline
+expires, or close interrupts the wait. Callers that omit the governor retain current per-index
+admission behavior.
+An unproven teardown quarantines the path and keeps its aggregate capacity charged until process
+restart; releasing an unverified reservation could oversubscribe threads or memory still held by
+native actors.
 
 The public search method accepts a small typed request and decodes a versioned native result buffer
 into bounded result objects. The N-API boundary receives one operation per batch or search;

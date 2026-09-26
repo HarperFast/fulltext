@@ -31,8 +31,8 @@ use crate::protocol::{
 const ID_FIELD_NAME: &str = "__fulltext_id";
 pub(crate) const IDENTITY_PATH: &str = ".harper-fulltext-identity";
 const META_PATH: &str = "meta.json";
-const ANALYZER_NAME: &str = "english@1";
-const SURFACE_ANALYZER_NAME: &str = "english_surface@1";
+const ANALYZER_NAME: &str = "english@2";
+const SURFACE_ANALYZER_NAME: &str = "english_surface@2";
 pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_TRACE_TOKENS_PER_VALUE: usize = 262_144;
 type SynonymMap = Arc<HashMap<String, Vec<String>>>;
@@ -166,6 +166,10 @@ impl TracePlan {
 }
 
 impl Engine {
+	pub(crate) fn validate(config: &EngineConfig) -> Result<()> {
+		canonical_identity(&config.identity).map(|_| ())
+	}
+
 	pub fn inspect<D: Directory + Clone>(directory: D, config: &EngineIdentityConfig) -> Result<InspectionResult> {
 		let identity = canonical_identity(config)?.config;
 		let (expected_schema, _, _) = build_schema(&identity)?;
@@ -466,6 +470,7 @@ impl Engine {
 			let mut found = HashSet::new();
 			let mut record_span_budget = remaining_spans;
 			let mut record_truncated = false;
+			let mut record_analysis_truncated = false;
 			for (field, source_values) in &record.fields {
 				if !seen_fields.insert(field.as_str()) {
 					return Err(FulltextError::invalid(format!("duplicate trace field {field}")));
@@ -478,8 +483,10 @@ impl Engine {
 				}
 				for (value_index, value) in source_values.iter().enumerate() {
 					check_deadline(deadline)?;
-					let (spans, terms, truncated) = self.trace_value(&plan, value, record_span_budget, deadline)?;
-					record_truncated |= truncated;
+					let (spans, terms, spans_truncated, analysis_truncated) =
+						self.trace_value(&plan, value, record_span_budget, deadline)?;
+					record_truncated |= spans_truncated || analysis_truncated;
+					record_analysis_truncated |= analysis_truncated;
 					found.extend(terms);
 					if spans.is_empty() {
 						continue;
@@ -488,6 +495,7 @@ impl Engine {
 					pending_values.push((field.as_str(), value_index as u32, spans));
 				}
 			}
+			complete &= !record_analysis_truncated;
 			if plan.record_matches(&found) {
 				complete &= !record_truncated;
 				if pending_values.is_empty() {
@@ -562,7 +570,7 @@ impl Engine {
 					)));
 				}
 				Ok(TracePlan::Prefix {
-					completed: self.analyze(completed, false, true)?,
+					completed,
 					prefix,
 					fuzzy: request.mode == SearchMode::FuzzyPrefix,
 				})
@@ -590,12 +598,13 @@ impl Engine {
 		value: &str,
 		max_spans: usize,
 		deadline: Option<Instant>,
-	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool)> {
-		let (analyzed, mut truncated) = self.source_tokens(value, false, deadline)?;
+	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool, bool)> {
+		let (analyzed, mut analysis_truncated) = self.source_tokens(value, false, deadline)?;
 		let utf16_offsets = utf16_offsets(value);
 		let mut spans = Vec::new();
 		let mut seen_spans = HashSet::new();
 		let mut found = HashSet::new();
+		let mut spans_truncated = false;
 		match plan {
 			TracePlan::Any(terms) | TracePlan::All(terms) => {
 				for (index, token) in analyzed.iter().enumerate() {
@@ -604,13 +613,13 @@ impl Engine {
 					}
 					if terms.contains(&token.text) {
 						found.insert(token.text.clone());
-						truncated |= push_trace_span(
+						spans_truncated |= push_trace_span(
 							&mut spans,
 							&mut seen_spans,
 							source_span(&utf16_offsets, token.start, token.end),
 							max_spans,
 						);
-						if truncated && plan.record_matches(&found) {
+						if spans_truncated && plan.record_matches(&found) {
 							break;
 						}
 					}
@@ -649,13 +658,13 @@ impl Engine {
 						}
 						if matches {
 							found.insert("__phrase".to_owned());
-							truncated |= push_trace_span(
+							spans_truncated |= push_trace_span(
 								&mut spans,
 								&mut seen_spans,
 								source_span(&utf16_offsets, anchor.start, final_token.end),
 								max_spans,
 							);
-							if truncated && plan.record_matches(&found) {
+							if spans_truncated && plan.record_matches(&found) {
 								break;
 							}
 						}
@@ -668,20 +677,20 @@ impl Engine {
 				fuzzy,
 			} => {
 				let (surface, surface_truncated) = self.source_tokens(value, true, deadline)?;
-				truncated |= surface_truncated;
+				analysis_truncated |= surface_truncated;
 				for (index, token) in analyzed.iter().enumerate() {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
 					if completed.contains(&token.text) {
 						found.insert(token.text.clone());
-						truncated |= push_trace_span(
+						spans_truncated |= push_trace_span(
 							&mut spans,
 							&mut seen_spans,
 							source_span(&utf16_offsets, token.start, token.end),
 							max_spans,
 						);
-						if truncated && plan.record_matches(&found) {
+						if spans_truncated && plan.record_matches(&found) {
 							break;
 						}
 					}
@@ -694,13 +703,13 @@ impl Engine {
 						|| (*fuzzy && fuzzy_eligible(prefix) && fuzzy_prefix_matches(prefix, &token.text))
 					{
 						found.insert("__prefix".to_owned());
-						truncated |= push_trace_span(
+						spans_truncated |= push_trace_span(
 							&mut spans,
 							&mut seen_spans,
 							source_span(&utf16_offsets, token.start, token.end),
 							max_spans,
 						);
-						if truncated && plan.record_matches(&found) {
+						if spans_truncated && plan.record_matches(&found) {
 							break;
 						}
 					}
@@ -708,7 +717,7 @@ impl Engine {
 			}
 			TracePlan::Fuzzy(terms) => {
 				let (surface, surface_truncated) = self.source_tokens(value, true, deadline)?;
-				truncated |= surface_truncated;
+				analysis_truncated |= surface_truncated;
 				let mut analyzed_by_position = HashMap::<usize, Vec<&str>>::new();
 				for token in &analyzed {
 					analyzed_by_position
@@ -731,7 +740,7 @@ impl Engine {
 							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
 						{
 							found.insert(analyzed_term.clone());
-							truncated |= push_trace_span(
+							spans_truncated |= push_trace_span(
 								&mut spans,
 								&mut seen_spans,
 								source_span(&utf16_offsets, token.start, token.end),
@@ -740,7 +749,7 @@ impl Engine {
 							break;
 						}
 					}
-					if truncated && plan.record_matches(&found) {
+					if spans_truncated && plan.record_matches(&found) {
 						break;
 					}
 				}
@@ -748,7 +757,7 @@ impl Engine {
 		}
 		spans.sort_by_key(|span| (span.start, span.end));
 		spans.dedup();
-		Ok((spans, found, truncated))
+		Ok((spans, found, spans_truncated, analysis_truncated))
 	}
 
 	fn source_tokens(&self, text: &str, surface: bool, deadline: Option<Instant>) -> Result<(Vec<SourceToken>, bool)> {
@@ -940,7 +949,7 @@ impl Engine {
 		if text.chars().last().is_some_and(char::is_whitespace) {
 			return self.term_query(text, fields, Occur::Must);
 		}
-		let (completed_text, surface_prefix) = self.final_surface_term(text)?;
+		let (completed, surface_prefix) = self.final_surface_term(text)?;
 		let Some(surface_prefix) = surface_prefix else {
 			return Ok(Box::new(EmptyQuery));
 		};
@@ -951,7 +960,6 @@ impl Engine {
 				if fuzzy { "fuzzy" } else { "exact" }
 			)));
 		}
-		let completed = self.analyze(completed_text, false, true)?;
 		let completed_clause_count = completed.len().saturating_mul(fields.len());
 		let mut clauses = Vec::with_capacity(completed.len() + 1);
 		for term in completed {
@@ -990,33 +998,35 @@ impl Engine {
 		Ok(Box::new(BooleanQuery::new(clauses)))
 	}
 
-	fn final_surface_term<'a>(&self, text: &'a str) -> Result<(&'a str, Option<String>)> {
-		let mut tokenizer = NfkcTokenizer::default();
-		let mut raw_stream = tokenizer.token_stream(text);
-		let mut raw_final_length = 0;
-		while raw_stream.advance() {
-			raw_final_length = raw_stream.token().text.len();
-		}
-		if raw_final_length >= 40 {
-			return Err(FulltextError::invalid(
-				"the final prefix token must be shorter than 40 UTF-8 bytes",
-			));
-		}
-		let mut analyzer = self.surface_analyzer.clone();
+	fn final_surface_term(&self, text: &str) -> Result<(Vec<String>, Option<String>)> {
+		let mut analyzer = TextAnalyzer::builder(NfkcTokenizer::default())
+			.filter_dynamic(EnglishPossessiveFilter)
+			.filter_dynamic(LowerCaser)
+			.filter_dynamic(AsciiFoldingFilter)
+			.build();
 		let mut stream = analyzer.token_stream(text);
 		let mut final_term = None;
-		let mut final_offset = 0;
+		let mut final_position = None;
 		while stream.advance() {
 			let token = stream.token();
 			final_term = Some(token.text.clone());
-			final_offset = token.offset_from;
+			final_position = Some(token.position);
 		}
 		if final_term.as_ref().is_some_and(|term| term.len() >= 40) {
 			return Err(FulltextError::invalid(
 				"the final prefix token must be shorter than 40 UTF-8 bytes",
 			));
 		}
-		Ok((&text[..final_offset], final_term))
+		let mut seen = HashSet::new();
+		let completed = match final_position {
+			Some(final_position) => self
+				.analyze_positioned(text)?
+				.into_iter()
+				.filter_map(|(position, term)| (position < final_position && seen.insert(term.clone())).then_some(term))
+				.collect(),
+			None => Vec::new(),
+		};
+		Ok((completed, final_term))
 	}
 
 	fn term_group(&self, term: &str, fields: &[&EngineField]) -> Box<dyn Query> {
@@ -1624,8 +1634,16 @@ struct EnglishPossessiveTokenStream<'a, T> {
 impl<T: TokenStream> TokenStream for EnglishPossessiveTokenStream<'_, T> {
 	fn advance(&mut self) -> bool {
 		while self.tail.advance() {
-			let token = self.tail.token();
-			if !token.text.eq_ignore_ascii_case("s") || !is_possessive_suffix(self.source, token.offset_from) {
+			let (position, possessive) = {
+				let token = self.tail.token();
+				(
+					token.position,
+					token.text.eq_ignore_ascii_case("s") && is_possessive_suffix(self.source, token.offset_from),
+				)
+			};
+			if possessive {
+				self.tail.token_mut().position = position.wrapping_sub(1);
+			} else {
 				return true;
 			}
 		}
@@ -1645,7 +1663,10 @@ fn is_possessive_suffix(source: &str, offset: usize) -> bool {
 	let Some(prefix) = source.get(..offset) else {
 		return false;
 	};
-	let stem = prefix.strip_suffix('\'').or_else(|| prefix.strip_suffix('’'));
+	let stem = prefix
+		.strip_suffix('\'')
+		.or_else(|| prefix.strip_suffix('’'))
+		.or_else(|| prefix.strip_suffix('＇'));
 	stem.and_then(|stem| stem.chars().next_back())
 		.is_some_and(char::is_alphanumeric)
 }
@@ -2136,6 +2157,19 @@ mod tests {
 		assert!(composed.advance());
 		assert_eq!(composed.token().text, "resum");
 		assert!(!composed.advance());
+		drop(composed);
+		let mut possessive = analyzer.token_stream("dog＇s shoe");
+		assert!(possessive.advance());
+		assert_eq!(
+			(possessive.token().position, possessive.token().text.as_str()),
+			(0, "dog")
+		);
+		assert!(possessive.advance());
+		assert_eq!(
+			(possessive.token().position, possessive.token().text.as_str()),
+			(1, "shoe")
+		);
+		assert!(!possessive.advance());
 		for token in tokens {
 			assert!(token.offset_from < token.offset_to);
 			assert!(source.get(token.offset_from..token.offset_to).is_some());
@@ -2151,8 +2185,43 @@ mod tests {
 		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
 		let query = "Ａ".repeat(14);
 		let (completed, prefix) = engine.final_surface_term(&query).unwrap();
-		assert_eq!(completed, "");
+		assert!(completed.is_empty());
 		assert_eq!(prefix.unwrap(), "a".repeat(14));
+		let (completed, prefix) = engine.final_surface_term("½abc").unwrap();
+		assert_eq!(completed, ["1"]);
+		assert_eq!(prefix.unwrap(), "2abc");
+		let (_, prefix) = engine.final_surface_term(&"é".repeat(39)).unwrap();
+		assert_eq!(prefix.unwrap(), "e".repeat(39));
+	}
+
+	#[test]
+	fn trace_token_ceiling_marks_an_unmatched_record_incomplete() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut source = "x ".repeat(MAX_TRACE_TOKENS_PER_VALUE);
+		source.push_str("needle");
+		let trace = engine
+			.trace_matches(
+				&SearchRequest {
+					text: "needle".to_owned(),
+					mode: SearchMode::Any,
+					fields: vec!["description".to_owned()],
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+				&[TraceRecord {
+					id: "one".to_owned(),
+					fields: vec![("description".to_owned(), vec![source])],
+				}],
+				None,
+			)
+			.unwrap();
+		assert!(!trace.complete);
+		assert!(trace.records.is_empty());
 	}
 
 	#[test]

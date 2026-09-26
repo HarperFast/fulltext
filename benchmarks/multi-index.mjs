@@ -32,7 +32,7 @@ const configs = Array.from({ length: indexCount }, (_, index) => ({
 	indexId: `catalog-${index}`,
 	generation: 'benchmark-v1',
 	fields: [{ name: 'title', weight: 3 }, { name: 'description' }, { name: 'category', weight: 1.5 }],
-	analyzer: 'english@1',
+	analyzer: 'english@2',
 	positions: true,
 	surfaceTerms: true,
 	synonyms: [{ source: 'tv', replacements: ['television'] }],

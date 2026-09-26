@@ -615,8 +615,8 @@ fn validate_identity_config(config: &EngineIdentityConfig) -> Result<()> {
 			"indexId and generation must not exceed 4096 UTF-8 bytes",
 		));
 	}
-	if config.analyzer != "english@1" {
-		return Err(FulltextError::invalid("only analyzer english@1 is supported"));
+	if config.analyzer != "english@2" {
+		return Err(FulltextError::invalid("only analyzer english@2 is supported"));
 	}
 	if config.synonyms.len() > MAX_SYNONYM_RULES {
 		return Err(FulltextError::invalid(format!(
@@ -806,7 +806,7 @@ mod tests {
 	#[test]
 	fn inspection_frame_is_distinct_and_rejects_trailing_limits() {
 		let mut bytes = b"FTIP\x03\x00".to_vec();
-		for value in ["/tmp/index", "products", "one", "english@1"] {
+		for value in ["/tmp/index", "products", "one", "english@2"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
 		}
@@ -874,7 +874,7 @@ mod tests {
 				name: "title".to_owned(),
 				weight: 1.0,
 			}],
-			analyzer: "english@1".to_owned(),
+			analyzer: "english@2".to_owned(),
 			stop_words: true,
 			positions: true,
 			surface_terms: false,

@@ -66,7 +66,7 @@ export interface NativeFullTextIndexOptions {
 	indexId: string;
 	generation: string;
 	fields: Array<{ name: string; weight?: number }>;
-	analyzer: 'english@1';
+	analyzer: 'english@2';
 	stopWords?: boolean;
 	positions?: boolean;
 	surfaceTerms?: boolean;
