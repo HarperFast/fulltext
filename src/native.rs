@@ -111,6 +111,7 @@ struct RuntimeBudget {
 	expensive_searches: Mutex<usize>,
 	expensive_search_ready: Condvar,
 	expensive_search_wakes: Mutex<Vec<Weak<QueueWake>>>,
+	expensive_wake_demand: AtomicUsize,
 	#[cfg(feature = "test-panic")]
 	expensive_search_waiters: AtomicUsize,
 }
@@ -140,6 +141,10 @@ struct BudgetReservation {
 }
 
 struct ExpensiveSearchPermit {
+	budget: Arc<RuntimeBudget>,
+}
+
+struct ExpensiveWakeDemand {
 	budget: Arc<RuntimeBudget>,
 }
 
@@ -688,6 +693,7 @@ impl RuntimeBudget {
 			expensive_searches: Mutex::new(0),
 			expensive_search_ready: Condvar::new(),
 			expensive_search_wakes: Mutex::new(Vec::new()),
+			expensive_wake_demand: AtomicUsize::new(0),
 			#[cfg(feature = "test-panic")]
 			expensive_search_waiters: AtomicUsize::new(0),
 		}
@@ -799,6 +805,9 @@ impl RuntimeBudget {
 	}
 
 	fn notify_expensive_wakes(&self) {
+		if self.expensive_wake_demand.load(Ordering::Acquire) == 0 {
+			return;
+		}
 		let mut wakes = lock(&self.expensive_search_wakes);
 		wakes.retain(|registered| {
 			if let Some(wake) = registered.upgrade() {
@@ -890,6 +899,13 @@ impl Drop for ExpensiveSearchPermit {
 			self.budget.expensive_search_ready.notify_all();
 		}
 		self.budget.notify_expensive_wakes();
+	}
+}
+
+impl Drop for ExpensiveWakeDemand {
+	fn drop(&mut self) {
+		let previous = self.budget.expensive_wake_demand.fetch_sub(1, Ordering::AcqRel);
+		debug_assert!(previous > 0);
 	}
 }
 
@@ -1045,6 +1061,12 @@ impl Runtime {
 		self.expensive_search_budget
 			.as_ref()
 			.and_then(|budget| budget.try_acquire_expensive(&self.state))
+	}
+
+	fn expensive_wake_demand(&self) -> Option<ExpensiveWakeDemand> {
+		let budget = self.expensive_search_budget.as_ref()?.clone();
+		budget.expensive_wake_demand.fetch_add(1, Ordering::AcqRel);
+		Some(ExpensiveWakeDemand { budget })
 	}
 
 	fn confirm_open(&self) {
@@ -1417,6 +1439,31 @@ impl QueueWake {
 			.ready
 			.wait_while(generation, |generation| *generation == observed)
 			.unwrap_or_else(|error| error.into_inner());
+	}
+
+	fn wait_for_change_timeout(&self, observed: u64, timeout: Duration) {
+		let generation = lock(&self.generation);
+		let _guard = self
+			.ready
+			.wait_timeout_while(generation, timeout, |generation| *generation == observed)
+			.unwrap_or_else(|error| error.into_inner());
+	}
+}
+
+impl BoundedQueue<SearchCommand> {
+	fn front_remaining_budget(&self) -> Option<Duration> {
+		let state = lock(&self.state);
+		let queued = state.items.front()?;
+		let milliseconds = match &queued.value.operation {
+			SearchOperation::Search(bytes) => search_budget(bytes),
+			SearchOperation::Trace(bytes) => trace_budget(bytes),
+		}
+		.unwrap_or(0);
+		Some(
+			Duration::from_millis(u64::from(milliseconds))
+				.checked_sub(queued.enqueued.elapsed())
+				.unwrap_or(Duration::ZERO),
+		)
 	}
 }
 
@@ -1804,6 +1851,13 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 
 fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
 	while let Some(queued) = runtime.ordinary_search_queue.pop() {
+		#[cfg(feature = "test-panic")]
+		{
+			let milliseconds = runtime.ordinary_search_delay_milliseconds.swap(0, Ordering::AcqRel);
+			if milliseconds > 0 {
+				thread::sleep(Duration::from_millis(milliseconds));
+			}
+		}
 		if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 			return;
 		}
@@ -1816,9 +1870,19 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 	loop {
 		let observed = wake.snapshot();
 		let has_expensive = expensive.has_items();
+		if has_expensive && expensive.front_remaining_budget() == Some(Duration::ZERO) {
+			if let Some(queued) = expensive.try_pop() {
+				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+					return;
+				}
+				continue;
+			}
+		}
+		let wake_demand = has_expensive.then(|| runtime.expensive_wake_demand()).flatten();
 		let permit = has_expensive.then(|| runtime.try_expensive_search_permit()).flatten();
 		if has_expensive && (permit.is_some() || runtime.expensive_search_budget.is_none()) {
 			if let Some(queued) = expensive.try_pop() {
+				drop(wake_demand);
 				if !execute_search_command(&runtime, &engine, &reader, queued, permit) {
 					return;
 				}
@@ -1827,6 +1891,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		}
 		drop(permit);
 		if let Some(queued) = runtime.ordinary_search_queue.try_pop() {
+			drop(wake_demand);
 			if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 				return;
 			}
@@ -1834,6 +1899,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		}
 		if runtime.state.load(Ordering::Acquire) != STATE_OPEN {
 			if let Some(queued) = expensive.try_pop() {
+				drop(wake_demand);
 				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 					return;
 				}
@@ -1841,6 +1907,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 			}
 		}
 		if expensive.is_closed() {
+			drop(wake_demand);
 			while let Some(queued) = runtime.ordinary_search_queue.pop() {
 				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 					return;
@@ -1848,7 +1915,12 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 			}
 			return;
 		}
-		wake.wait_for_change(observed);
+		if let Some(remaining) = expensive.front_remaining_budget() {
+			wake.wait_for_change_timeout(observed, remaining);
+		} else {
+			wake.wait_for_change(observed);
+		}
+		drop(wake_demand);
 	}
 }
 
@@ -1882,7 +1954,7 @@ fn execute_search_command(
 				let milliseconds = if expensive {
 					runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel)
 				} else {
-					runtime.ordinary_search_delay_milliseconds.swap(0, Ordering::AcqRel)
+					0
 				};
 				if milliseconds > 0 {
 					thread::sleep(Duration::from_millis(milliseconds));
@@ -2235,12 +2307,6 @@ fn validate_directory_root(metadata: fs::Metadata, label: &str) -> Result<()> {
 	Ok(())
 }
 
-#[cfg(windows)]
-fn is_link_like(metadata: &fs::Metadata) -> bool {
-	metadata.file_type().is_symlink()
-}
-
-#[cfg(not(windows))]
 fn is_link_like(metadata: &fs::Metadata) -> bool {
 	metadata.file_type().is_symlink()
 }

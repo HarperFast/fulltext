@@ -61,9 +61,19 @@ test('optimized native searches preserve ordinary capacity and close queued expe
 	const beforeContention = index.status();
 	const first = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });
 	await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
-	await assert.rejects(
-		index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 10 }),
-		(error) => error.code === 'E_TIMEOUT',
+	const short = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 10 });
+	assert.strictEqual(
+		await Promise.race([
+			short.then(
+				() => 'completed',
+				(error) => {
+					assert.strictEqual(error.code, 'E_TIMEOUT');
+					return 'timeout';
+				},
+			),
+			first.then(() => 'holder'),
+		]),
+		'timeout',
 	);
 	assert.strictEqual((await first).total, 1);
 	const afterContention = index.status();
@@ -85,7 +95,12 @@ test('optimized native searches preserve ordinary capacity and close queued expe
 		{ remainingBudgetMilliseconds: 1_000 },
 	);
 	await waitFor(() => index.status().searchQueuedCommands > 0n);
-	assert.strictEqual((await index.search({ text: 'waterproof' })).total, 1);
+	const ordinary = index.search({ text: 'waterproof' });
+	assert.strictEqual(
+		await Promise.race([ordinary.then(() => 'ordinary'), expensiveHolder.then(() => 'expensive')]),
+		'ordinary',
+	);
+	assert.strictEqual((await ordinary).total, 1);
 	await Promise.all([ordinaryBlocker, expensiveHolder, expensiveQueued]);
 
 	addon.__testDelayNextExpensiveSearch(handle, 150);
