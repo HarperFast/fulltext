@@ -110,8 +110,7 @@ struct RuntimeBudget {
 	queued_bytes: AtomicUsize,
 	expensive_searches: Mutex<usize>,
 	expensive_search_ready: Condvar,
-	expensive_search_wakes: Mutex<Vec<Weak<QueueWake>>>,
-	expensive_wake_demand: AtomicUsize,
+	expensive_search_wakes: Mutex<HashMap<usize, (Weak<QueueWake>, usize)>>,
 	#[cfg(feature = "test-panic")]
 	expensive_search_waiters: AtomicUsize,
 }
@@ -146,6 +145,7 @@ struct ExpensiveSearchPermit {
 
 struct ExpensiveWakeDemand {
 	budget: Arc<RuntimeBudget>,
+	wake_key: usize,
 }
 
 enum ResetResult {
@@ -214,6 +214,11 @@ struct QueueBudget {
 struct QueueWake {
 	generation: Mutex<u64>,
 	ready: Condvar,
+}
+
+struct SearchQueueInspection {
+	expired: Vec<Queued<SearchCommand>>,
+	minimum_remaining: Option<Duration>,
 }
 
 struct Completion {
@@ -692,8 +697,7 @@ impl RuntimeBudget {
 			queued_bytes: AtomicUsize::new(0),
 			expensive_searches: Mutex::new(0),
 			expensive_search_ready: Condvar::new(),
-			expensive_search_wakes: Mutex::new(Vec::new()),
-			expensive_wake_demand: AtomicUsize::new(0),
+			expensive_search_wakes: Mutex::new(HashMap::new()),
 			#[cfg(feature = "test-panic")]
 			expensive_search_waiters: AtomicUsize::new(0),
 		}
@@ -795,28 +799,29 @@ impl RuntimeBudget {
 		Some(ExpensiveSearchPermit { budget: self.clone() })
 	}
 
-	fn register_expensive_wake(&self, wake: &Arc<QueueWake>) {
+	fn register_expensive_wake(self: &Arc<Self>, wake: &Arc<QueueWake>) -> ExpensiveWakeDemand {
 		let mut wakes = lock(&self.expensive_search_wakes);
-		wakes.retain(|registered| registered.strong_count() > 0);
-		let weak = Arc::downgrade(wake);
-		if !wakes.iter().any(|registered| registered.ptr_eq(&weak)) {
-			wakes.push(weak);
+		let wake_key = Arc::as_ptr(wake) as usize;
+		let entry = wakes.entry(wake_key).or_insert_with(|| (Arc::downgrade(wake), 0));
+		entry.1 += 1;
+		ExpensiveWakeDemand {
+			budget: self.clone(),
+			wake_key,
 		}
 	}
 
 	fn notify_expensive_wakes(&self) {
-		if self.expensive_wake_demand.load(Ordering::Acquire) == 0 {
-			return;
+		let wakes = {
+			let mut registered = lock(&self.expensive_search_wakes);
+			registered.retain(|_, (wake, demand)| *demand > 0 && wake.strong_count() > 0);
+			registered
+				.values()
+				.filter_map(|(wake, _)| wake.upgrade())
+				.collect::<Vec<_>>()
+		};
+		for wake in wakes {
+			wake.notify(true);
 		}
-		let mut wakes = lock(&self.expensive_search_wakes);
-		wakes.retain(|registered| {
-			if let Some(wake) = registered.upgrade() {
-				wake.notify(true);
-				true
-			} else {
-				false
-			}
-		});
 	}
 }
 
@@ -904,8 +909,14 @@ impl Drop for ExpensiveSearchPermit {
 
 impl Drop for ExpensiveWakeDemand {
 	fn drop(&mut self) {
-		let previous = self.budget.expensive_wake_demand.fetch_sub(1, Ordering::AcqRel);
-		debug_assert!(previous > 0);
+		let mut wakes = lock(&self.budget.expensive_search_wakes);
+		if let Some((_, demand)) = wakes.get_mut(&self.wake_key) {
+			debug_assert!(*demand > 0);
+			*demand = demand.saturating_sub(1);
+			if *demand == 0 {
+				wakes.remove(&self.wake_key);
+			}
+		}
 	}
 }
 
@@ -991,9 +1002,6 @@ impl Runtime {
 			#[cfg(feature = "test-panic")]
 			ordinary_search_delay_milliseconds: AtomicU64::new(0),
 		});
-		if let (Some(budget), Some(wake)) = (&runtime.expensive_search_budget, &runtime.search_wake) {
-			budget.register_expensive_wake(wake);
-		}
 		let writer_runtime = runtime.clone();
 		let writer_engine = engine.clone();
 		let writer_reader = reader.clone();
@@ -1064,9 +1072,11 @@ impl Runtime {
 	}
 
 	fn expensive_wake_demand(&self) -> Option<ExpensiveWakeDemand> {
-		let budget = self.expensive_search_budget.as_ref()?.clone();
-		budget.expensive_wake_demand.fetch_add(1, Ordering::AcqRel);
-		Some(ExpensiveWakeDemand { budget })
+		Some(
+			self.expensive_search_budget
+				.as_ref()?
+				.register_expensive_wake(self.search_wake.as_ref()?),
+		)
 	}
 
 	fn confirm_open(&self) {
@@ -1316,14 +1326,6 @@ impl<T> BoundedQueue<T> {
 		self.take_front(&mut lock(&self.state))
 	}
 
-	fn is_closed(&self) -> bool {
-		lock(&self.state).closed
-	}
-
-	fn has_items(&self) -> bool {
-		!lock(&self.state).items.is_empty()
-	}
-
 	fn take_front(&self, state: &mut QueueState<T>) -> Option<Queued<T>> {
 		let item = state.items.pop_front()?;
 		state.bytes -= item.bytes;
@@ -1451,19 +1453,44 @@ impl QueueWake {
 }
 
 impl BoundedQueue<SearchCommand> {
-	fn front_remaining_budget(&self) -> Option<Duration> {
+	fn state_summary(&self) -> (bool, bool) {
 		let state = lock(&self.state);
-		let queued = state.items.front()?;
-		let milliseconds = match &queued.value.operation {
-			SearchOperation::Search(bytes) => search_budget(bytes),
-			SearchOperation::Trace(bytes) => trace_budget(bytes),
-		}
-		.unwrap_or(0);
-		Some(
-			Duration::from_millis(u64::from(milliseconds))
+		(!state.items.is_empty(), state.closed)
+	}
+
+	fn inspect_and_take_expired(&self) -> SearchQueueInspection {
+		let mut state = lock(&self.state);
+		let mut expired = Vec::new();
+		let mut minimum_remaining = None;
+		let mut expired_bytes = 0;
+		let queued_count = state.items.len();
+		for _ in 0..queued_count {
+			let queued = state.items.pop_front().unwrap();
+			let milliseconds = match &queued.value.operation {
+				SearchOperation::Search(bytes) => search_budget(bytes),
+				SearchOperation::Trace(bytes) => trace_budget(bytes),
+			}
+			.unwrap_or(0);
+			let remaining = Duration::from_millis(u64::from(milliseconds))
 				.checked_sub(queued.enqueued.elapsed())
-				.unwrap_or(Duration::ZERO),
-		)
+				.unwrap_or(Duration::ZERO);
+			if remaining.is_zero() {
+				expired_bytes += queued.bytes;
+				expired.push(queued);
+			} else {
+				minimum_remaining =
+					Some(minimum_remaining.map_or(remaining, |minimum: Duration| minimum.min(remaining)));
+				state.items.push_back(queued);
+			}
+		}
+		state.bytes -= expired_bytes;
+		self.queued_commands.fetch_sub(expired.len() as u64, Ordering::Relaxed);
+		self.queued_bytes.fetch_sub(expired_bytes as u64, Ordering::Relaxed);
+		self.release_shared(expired.len(), expired_bytes);
+		SearchQueueInspection {
+			expired,
+			minimum_remaining,
+		}
 	}
 }
 
@@ -1869,15 +1896,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 	let wake = runtime.search_wake.as_ref().unwrap();
 	loop {
 		let observed = wake.snapshot();
-		let has_expensive = expensive.has_items();
-		if has_expensive && expensive.front_remaining_budget() == Some(Duration::ZERO) {
-			if let Some(queued) = expensive.try_pop() {
-				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
-					return;
-				}
-				continue;
-			}
-		}
+		let (has_expensive, expensive_closed) = expensive.state_summary();
 		let wake_demand = has_expensive.then(|| runtime.expensive_wake_demand()).flatten();
 		let permit = has_expensive.then(|| runtime.try_expensive_search_permit()).flatten();
 		if has_expensive && (permit.is_some() || runtime.expensive_search_budget.is_none()) {
@@ -1890,12 +1909,36 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 			}
 		}
 		drop(permit);
-		if let Some(queued) = runtime.ordinary_search_queue.try_pop() {
-			drop(wake_demand);
+		let inspection = if has_expensive {
+			expensive.inspect_and_take_expired()
+		} else {
+			SearchQueueInspection {
+				expired: Vec::new(),
+				minimum_remaining: None,
+			}
+		};
+		let had_expired = !inspection.expired.is_empty();
+		for queued in inspection.expired {
 			if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 				return;
 			}
+		}
+		if had_expired {
+			drop(wake_demand);
 			continue;
+		}
+		#[cfg(feature = "test-panic")]
+		let ordinary_steal_allowed = runtime.ordinary_search_delay_milliseconds.load(Ordering::Acquire) == 0;
+		#[cfg(not(feature = "test-panic"))]
+		let ordinary_steal_allowed = true;
+		if ordinary_steal_allowed {
+			if let Some(queued) = runtime.ordinary_search_queue.try_pop() {
+				drop(wake_demand);
+				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+					return;
+				}
+				continue;
+			}
 		}
 		if runtime.state.load(Ordering::Acquire) != STATE_OPEN {
 			if let Some(queued) = expensive.try_pop() {
@@ -1906,7 +1949,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 				continue;
 			}
 		}
-		if expensive.is_closed() {
+		if expensive_closed {
 			drop(wake_demand);
 			while let Some(queued) = runtime.ordinary_search_queue.pop() {
 				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
@@ -1915,7 +1958,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 			}
 			return;
 		}
-		if let Some(remaining) = expensive.front_remaining_budget() {
+		if let Some(remaining) = inspection.minimum_remaining {
 			wake.wait_for_change_timeout(observed, remaining);
 		} else {
 			wake.wait_for_change(observed);

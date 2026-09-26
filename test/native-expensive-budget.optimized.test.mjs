@@ -61,6 +61,8 @@ test('optimized native searches preserve ordinary capacity and close queued expe
 	const beforeContention = index.status();
 	const first = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });
 	await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
+	const long = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });
+	await waitFor(() => index.status().searchQueuedCommands > 0n);
 	const short = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 10 });
 	assert.strictEqual(
 		await Promise.race([
@@ -76,6 +78,7 @@ test('optimized native searches preserve ordinary capacity and close queued expe
 		'timeout',
 	);
 	assert.strictEqual((await first).total, 1);
+	assert.strictEqual((await long).total, 1);
 	const afterContention = index.status();
 	assert(
 		afterContention.metrics.searchQueueNanoseconds - beforeContention.metrics.searchQueueNanoseconds >= 5_000_000n,
