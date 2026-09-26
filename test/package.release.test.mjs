@@ -1,6 +1,6 @@
 import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -38,7 +38,10 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 	assert(includedPaths.includes('dist/native.d.ts'));
 	assert(includedPaths.includes('CONTRIBUTING.md'));
 	assert(includedPaths.includes('docs/native-backend-implementation.md'));
-	assert(includedPaths.includes('examples/basic.mjs'));
+	const examples = readdirSync(new URL('../examples/', import.meta.url))
+		.filter((entry) => entry.endsWith('.mjs'))
+		.sort();
+	for (const example of examples) assert(includedPaths.includes(`examples/${example}`));
 	assert(!includedPaths.some((file) => /^fulltext\..+\.node$/.test(file)));
 	assert(!includedPaths.some((file) => file.startsWith('src/') || file === 'ts/addon.d.ts'));
 	assert.doesNotMatch(readFileSync(new URL('../ts/addon.d.ts', import.meta.url), 'utf8'), /__(?:test|phase0)/);
@@ -106,10 +109,12 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 		{ cwd: projectDirectory, encoding: 'utf8', env: consumerEnvironment },
 	);
 	assert.match(output, /tantivyVersion: '0\.26\.1'/);
-	const exampleOutput = execFileSync(
-		process.execPath,
-		[path.join(projectDirectory, 'node_modules/@harperfast/fulltext/examples/basic.mjs')],
-		{ cwd: projectDirectory, encoding: 'utf8', env: consumerEnvironment },
-	);
-	assert(exampleOutput.trim().length > 0);
+	for (const example of examples) {
+		const exampleOutput = execFileSync(
+			process.execPath,
+			[path.join(projectDirectory, 'node_modules/@harperfast/fulltext/examples', example)],
+			{ cwd: projectDirectory, encoding: 'utf8', env: consumerEnvironment },
+		);
+		assert(exampleOutput.trim().length > 0, `examples/${example} produced no output`);
+	}
 });

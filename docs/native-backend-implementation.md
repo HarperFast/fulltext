@@ -1,8 +1,8 @@
 # Native Tantivy backend implementation
 
 This document records the standalone native backend contract. RocksDB is not a Fulltext delivery
-target. See
-[native checkpoint publication](native-checkpoint-publication.md) for its durability boundary.
+target. [Native checkpoint publication](native-checkpoint-publication.md) defines the durability
+boundary.
 
 ## Intent
 
@@ -13,7 +13,7 @@ The backend covers native index creation and reopen, batched document upsert/del
 commit and checkpoint publication, weighted BM25, phrase, bounded prefix/autocomplete, fuzzy and
 fuzzy-prefix queries, score-neutral candidate filtering, current-record match tracing, status, and
 deterministic close. Source-data projection, replication, and readiness policy remain outside the
-wrapper.
+package.
 
 It implements the native portions of [the façade and lifecycle contract](https://github.com/HarperFast/fulltext/issues/14)
 and [bounded native execution](https://github.com/HarperFast/fulltext/issues/17). The facade uses
@@ -27,8 +27,8 @@ contract.
 ## Invariant
 
 The engine-facing schema, mutation, commit, search, and lifecycle contracts remain independent from
-the consuming application. The Node wrapper contributes canonical path handling and Tantivy
-`MmapDirectory` construction; the host owns source projection, replay, and readiness.
+the consuming application. The Node package contributes canonical path handling and Tantivy
+`MmapDirectory` construction; the application owns source projection, replay, and readiness.
 
 ## Verified constraints
 
@@ -166,11 +166,11 @@ The exported flow is:
    reservation, and is idempotent.
 7. `status()` reads bounded counters and state without entering either sustained-work queue.
 
-Only the versioned `english@2` analysis contract is accepted. `positions` defaults to true and selects frequencies with or
-without positions. Changing that default in a future release is an index-format change, not a
-silent reinterpretation. `generation` is an opaque caller-owned identity for this physical index
-generation; it is persisted in the engine fingerprint and must match on reopen. It is not a Tantivy
-opstamp or an application transaction-log position.
+Only the versioned `english@2` analysis contract is accepted. `positions` defaults to true and
+selects frequencies with or without positions. Changing that default in a future release is an
+index-format change, not a silent reinterpretation. `generation` is an opaque caller-owned identity
+for this physical index generation; it is persisted in the engine fingerprint and must match on
+reopen. It is not a Tantivy opstamp or an application transaction-log position.
 `surfaceTerms` creates a separately indexed, unstemmed companion term field for prefix,
 fuzzy-prefix, and current-record match tracing; it never stores source values. It defaults off
 because of its storage cost. Field weights are query-time boosts and may change when reopening the
@@ -179,22 +179,20 @@ same physical index without rebuilding it.
 `configureNativeFullTextRuntime()` optionally installs one immutable process budget before the first
 successful open. Identical calls are idempotent; configuration while an open is pending returns
 retryable `E_LOCK_BUSY`, while configuration after an unbudgeted open returns `E_RESOURCE_LIMIT`.
-A failed first open releases its pending latch only after teardown
-proves native resources were released; an unproven teardown latches the process as opened without a
-budget until restart. The governor admits aggregate resident indexes, indexing/search threads,
+A failed first open releases its pending latch only after teardown proves native resources were
+released; an unproven teardown latches the process as opened without a budget until restart. The
+governor admits aggregate resident indexes, indexing/search threads,
 writer memory, configured queue capacity, and expensive searches with checked shared accounting.
 Each index reserves its writer queue and shared search-queue capacity, so process queue accounting
 charges twice the per-index `maxQueuedBytes`. Exceeding an open-time admission cap returns
 `E_RESOURCE_LIMIT`; it never evicts an active generation. Expensive searches wait on a condition
 variable off the JavaScript thread until process capacity is available, the request deadline
-expires, or close interrupts the wait. Callers that omit the governor retain current per-index
-admission behavior.
+expires, or close interrupts the wait. Callers that omit the governor retain per-index admission.
 The deadline controls whether queued or completed work is accepted, not when its promise settles.
-When every eligible worker is already executing non-interruptible Tantivy work, an expired queued
-request is rejected when a worker next examines it.
-An unproven teardown quarantines the path and keeps its aggregate capacity charged until process
-restart; releasing an unverified reservation could oversubscribe threads or memory still held by
-native actors.
+If every eligible worker is executing non-interruptible Tantivy work, an expired queued request is
+rejected when a worker next examines it. An unproven teardown quarantines the path and keeps its
+aggregate capacity charged until process restart; releasing an unverified reservation could
+oversubscribe threads or memory still held by native actors.
 
 The public search method accepts a small typed request and decodes a versioned native result buffer
 into bounded result objects. The N-API boundary receives one operation per batch or search;
@@ -207,10 +205,9 @@ requires IDs to be distinct across the logical batch, and defaults the total ret
 to 64 MiB. A caller can lower that ceiling with `maxTotalBytes`; exceeding it throws by default.
 With `allowPartial: true`, the result reports the leading upsert and delete counts consumed under
 that ceiling so a caller can apply the frames and continue with each array's remaining suffix
-without re-encoding earlier records. Aggregate frame overflow creates
-more frames; a mutation that cannot fit alone is reported to the caller. The call performs no native
-work. `apply()` then makes one
-required copy into Rust-owned memory before asynchronous admission. Callers apply every frame and
+without re-encoding earlier records. Aggregate frame overflow creates more frames; a mutation that
+cannot fit alone is reported to the caller. The call performs no native work. `apply()` then makes
+one required copy into Rust-owned memory before asynchronous admission. Callers apply every frame and
 commit or publish only after all succeed; otherwise they rollback-close the staged writer window.
 One caller owns that complete apply-and-publication sequence per handle; the low-level frame API
 does not provide a logical-batch fence between concurrent publishers. Searches remain concurrent.
@@ -242,8 +239,8 @@ rollback, and shutdown ordering explicit. A small configurable search pool share
 `IndexReader`; each request captures its immutable `Searcher`, so searches overlap each other as
 well as indexing and commit. `reload()` first crosses the writer queue as a barrier, reloads the
 shared reader under a short coordination lock, and publishes the new searcher to subsequent
-requests. Tantivy remains free to use its
-configured indexing and merge workers behind the writer actor. Independent indexes and their
+requests. Tantivy remains free to use its configured indexing and merge workers behind the writer
+actor. Independent indexes and their
 searches may run concurrently. The process governor bounds their aggregate resources without
 replacing the per-index search pools with a shared scheduler.
 
@@ -262,10 +259,10 @@ writer arena, indexing-thread, and search-thread values are printed in every ben
 
 The registry rejects a second live open of the same canonical path. This is narrower than the
 eventual shared multi-environment registry, but it preserves the one-writer invariant without
-pretending two JavaScript handles have coordinated close ownership. The later registry issue can
-replace rejection with reference-counted shared handles without changing the index contract.
+pretending two JavaScript handles have coordinated close ownership. Reference-counted shared
+handles can replace rejection later without changing the index contract.
 
-Inspection is deliberately outside the handle registry and writer actor. It opens Tantivy's
+Inspection is outside the handle registry and writer actor. It opens Tantivy's
 managed directory read-only long enough to validate the persisted schema and read the current
 commit payload, then drops it before returning. A small synchronous lifecycle check is preferable
 to acquiring and closing an `IndexWriter`, but it is not a request-path API: callers cache the
@@ -275,17 +272,18 @@ result for their ownership epoch and repeat it only when lifecycle ownership cha
 
 ## Schema and query behavior
 
-Each Tantivy schema contains an internal indexed string fast field for the raw ID using Tantivy's raw tokenizer
-and one declared text field per configured source field. At creation, the engine atomically writes a
-small backend-neutral identity sidecar through `Directory::atomic_write()` and calls
+Each Tantivy schema contains an internal indexed string fast field for the raw ID, using Tantivy's
+raw tokenizer, and one declared text field per configured source field. At creation, the engine
+atomically writes a small backend-neutral identity sidecar through `Directory::atomic_write()` and calls
 `Directory::sync_directory()`. It contains a versioned fingerprint of the logical index ID, bounded
 generation, analyzer identity, stop-word policy, positions, surface-term storage, canonical
-single-token synonym rules, and structural
-schema. It deliberately excludes the Node wire ABI and Tantivy package version: wire changes do not
+single-token synonym rules, and structural schema. It excludes the Node wire ABI and Tantivy
+package version: wire changes do not
 change durable semantics, and Tantivy performs its own index-format compatibility check. Reopen
 compares both the generated Tantivy schema and this fingerprint before creating a writer. The
 immutable sidecar is separate from Tantivy's per-commit payload, which remains available for
 standalone checkpoints and derived watermarks.
+
 Unknown mutation fields, missing IDs, duplicate schema field names, unknown search fields, oversized
 batches, and excessive result windows fail before search/index work. Blank and stop-word-only
 queries return an exact empty result. Record IDs have a separate 4,096-byte UTF-8 ceiling; field
@@ -298,8 +296,8 @@ state is an interrupted empty create and is completed automatically after verify
 `meta.json` without the sidecar is rejected as incomplete because it may contain durable data whose
 identity cannot be proven. Absent, unparseable, or mismatched identity is never accepted as
 legacy-compatible. Tantivy's persisted schema and versioned tokenizer names independently verify
-the structural and analyzer portions of the identity. Every declared count and length in packed input is checked
-against the remaining bytes before arithmetic or allocation, the version tag is checked first, and
+the structural and analyzer portions of the identity. Every declared count and length in packed
+input is checked against the remaining bytes before arithmetic or allocation, the version tag is checked first, and
 invalid UTF-8 is rejected on the writer actor rather than the JavaScript thread. Admission checks
 the fixed header and structural bounds only. `indexId` and `generation` have fixed encoded-length
 limits because they are persisted.
@@ -344,8 +342,8 @@ duplicated in Tantivy's document store.
 Phrase queries preserve analyzer positions, including gaps left by removed stop words, and match
 tracing uses the same positional rule. Prefix expansion is capped; exceeding the cap returns
 `E_PREFIX_TOO_BROAD` rather than truncating the term set and silently biasing recall or rank. A
-caller may catch that distinct code and choose a documented fallback. Fuzzy-prefix
-remains a preview capability until the catalog-scale benchmark qualifies it. Request budgets cover
+caller may catch that distinct code and choose a documented fallback. Fuzzy-prefix remains a
+preview capability until the catalog-scale benchmark qualifies it. Request budgets cover
 queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing;
 Tantivy's collector itself cannot be interrupted, so an expired search result is discarded after
 the collector returns. If all eligible workers are executing, an expired queued request is rejected
@@ -407,8 +405,8 @@ returns. Handles and completions are never reused across workers.
 
 ## Performance experiment
 
-Add a release-build benchmark that generates a deterministic high-cardinality product-style corpus
-and drives the public native API. It emits one versioned JSON record containing environment
+The release-build benchmark generates a deterministic high-cardinality product-style corpus and
+drives the public native API. It emits one versioned JSON record containing environment
 metadata and:
 
 - durable documents and packed MiB indexed per second by batch size and commit cadence;
@@ -460,11 +458,9 @@ controls repeated passes, and requested index counts are capped at 10,000 total 
 - Decoder tests cover invalid counts, lengths, and UTF-8; randomized decoder fuzzing remains part of
   the hardening work.
 - MmapDirectory contract tests remain unchanged.
-- `npm run check`, the inspection benchmark smoke profile, and package artifact verification run
-  before review.
-- The release benchmark runs locally at two dataset sizes and commit cadences; raw JSON is retained
-  with the PR verification notes. It is built explicitly in release mode before measurements are
-  taken.
+- `npm run check`, benchmark smoke profiles, and package artifact verification run in CI.
+- Release benchmarks run in release mode and retain versioned JSON for comparison on equivalent
+  hardware.
 
 End-to-end route: a Node integration test loads the built addon through the published native
 subpath, creates an on-disk index, mutates and commits it, searches it, closes it, reopens it, and

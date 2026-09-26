@@ -1,7 +1,7 @@
 # Dependencies
 
-Direct dependency versions are exact so the native artifact is reproducible and upgrades are
-reviewed deliberately.
+Direct dependency versions are exact so the native artifact is reproducible and every upgrade is
+reviewed before merge.
 
 ## Rust runtime and build graph
 

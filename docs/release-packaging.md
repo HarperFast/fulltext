@@ -66,9 +66,9 @@ installation.
 - Unsupported platform or libc: `E_NATIVE_ADDON_NOT_FOUND` names the computed platform triple and
   the expected optional package.
 - Missing optional package: the same error is raised before opening an index; npm installation of
-  the JavaScript facade itself remains possible. A package that resolves but cannot be loaded is wrapped as
-  `E_NATIVE_LOAD_FAILED` with its original error as the cause rather than leaking a raw `dlopen`
-  error.
+  the JavaScript facade itself remains possible. A package that resolves but cannot be loaded is
+  wrapped as `E_NATIVE_LOAD_FAILED` with its original error as the cause rather than leaking a raw
+  `dlopen` error.
 - Wrong native ABI or capability set: existing loader validation rejects the artifact.
 - Partial release: platform packages are published first, so the root version is never published
   until every supported native artifact has been built, packed, and validated. A failed root

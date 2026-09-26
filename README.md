@@ -67,7 +67,7 @@ together.
 
 ## Examples
 
-Every example is executable and runs in CI:
+Every example runs against the local build and the packed npm package in CI:
 
 | Example                                                                | Demonstrates                                               |
 | ---------------------------------------------------------------------- | ---------------------------------------------------------- |
@@ -107,13 +107,13 @@ batch, without taking the latch.
 `configureNativeFullTextRuntime()` is optional and idempotent for an identical configuration. It
 must be called before the first successful open when one process may host many indexes; configuring
 while an open is pending fails with retryable `E_LOCK_BUSY`; configuration after an unbudgeted open
-fails with `E_RESOURCE_LIMIT`. A failed first
-open that proves its native resources were released does not prevent later configuration. An
+fails with `E_RESOURCE_LIMIT`. A failed first open that proves its native resources were released
+does not prevent later configuration. An
 unproven pre-publication teardown blocks configuration until restart. The governor bounds aggregate
 resident indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
 expensive searches. Aggregate queue accounting reserves each index's writer queue plus its shared
 search queues, or twice that index's `maxQueuedBytes`. A conflicting second configuration or an
-open that would exceed an admission cap fails with `E_RESOURCE_LIMIT`; the wrapper never evicts a
+open that would exceed an admission cap fails with `E_RESOURCE_LIMIT`; the library never evicts a
 live generation. Expensive searches wait off the JavaScript thread for process capacity, bounded
 by the request deadline and interrupted by close, allowing the search queues to apply backpressure.
 A flexible worker serves ordinary searches while the expensive-search budget is saturated. With a
@@ -123,7 +123,7 @@ interrupts expensive requests that are waiting for a permit with `E_CLOSED`.
 A completed close has released its reservation.
 If teardown cannot prove native resources were released, the path is quarantined and its aggregate
 capacity remains reserved until process restart.
-Callers that omit this function retain per-index limits and current standalone behavior.
+Callers that omit this function retain the per-index limits.
 
 ### Rejected records and schema errors
 
@@ -137,7 +137,7 @@ handle incomplete when earlier frames were already admitted.
 
 Trusted callers that already enforce distinct IDs may pass `assumeDistinctIds: true` to skip the
 whole-batch duplicate prepass. Supplying duplicates with that option violates the API contract.
-The wrapper snapshots the two mutation arrays, but callers must not mutate record objects, field
+The library snapshots the two mutation arrays, but callers must not mutate record objects, field
 maps, or nested field-value arrays until the returned promise settles.
 
 `encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
@@ -197,8 +197,8 @@ refer to the original source value. Normalization is streamed with source-span t
 text is bounded before Tantivy's long-token filter, avoiding memory growth proportional to Unicode
 compatibility expansion. Inputs that exceed Unicode's 30-non-starter Stream-Safe limit receive a
 standard combining-grapheme-joiner boundary before normalization. Index-time synonyms are optional
-and bounded. Each `source`
-and replacement must produce exactly one normalized and analyzed term. Rules are canonicalized,
+and bounded. Each source and replacement must produce exactly one normalized and analyzed term.
+Rules are canonicalized,
 persisted in the index identity, and expanded once at the source token's position; query text is not
 synonym-expanded. The expansion is also written to the surface field, so prefix autocomplete can
 match replacement terms. Tantivy counts the stacked alternatives in BM25 field length, which can
@@ -212,7 +212,7 @@ indexes fail closed and rebuild instead of silently changing recall.
 
 ### Highlighting and snippets
 
-Highlighting is opt-in and operates on caller-supplied current source values, so the wrapper never
+Highlighting is opt-in and operates on caller-supplied current source values, so the library never
 returns stale stored text. It returns UTF-16 half-open offsets and no HTML. Snippets are also off by
 default:
 
@@ -237,8 +237,8 @@ shorter remaining request budget through the second method argument; larger valu
 callback timer. If every eligible worker is already executing non-interruptible work, an expired
 queued request is rejected when a worker next examines it. Tantivy search itself is not
 interruptible, so a search that expires in flight is discarded after Tantivy returns. Match tracing
-checks its deadline while tokenizing and matching. With at
-least two search threads, one worker is reserved for ordinary `any`/`all` BM25. The remaining
+checks its deadline while tokenizing and matching. With at least two search threads, one worker is
+reserved for ordinary `any`/`all` BM25. The remaining
 workers prioritize phrase, prefix, fuzzy, and trace work, then steal ordinary work when that queue
 is idle. A one-thread configuration remains valid but cannot isolate query classes.
 
@@ -304,7 +304,7 @@ if (result.state === 'reset') {
 
 The resolved close result is `{}` normally. If native resources were released but shutdown also
 reported an operational cleanup error, it is `{ cleanupError }` and that error has code
-`E_CLOSE_FAILED`; the path is still safe to reset. `E_QUIESCENCE_FAILED` rejects because the wrapper
+`E_CLOSE_FAILED`; the path is still safe to reset. `E_QUIESCENCE_FAILED` rejects because the library
 could not prove all native work stopped. Do not reset, remove, or rename that path until the process
 restarts.
 
@@ -312,7 +312,7 @@ Reset returns `missing` without creating the path. It rejects a live owner with 
 different persisted logical index with `E_IDENTITY_MISMATCH`, and unrelated nonempty directories
 with `E_INVALID_ARGUMENT`. A malformed identity sidecar fails closed with `E_INDEX_CORRUPT`. On
 success, reset renames the live directory into a unique path below the parent's `.fulltext-retired`
-directory. The wrapper does not delete it automatically. Call
+directory. The library does not delete it automatically. Call
 `reclaimRetiredNativeFullTextIndexes({ path, retiredPath: result.retiredPath })` at a lifecycle point
 chosen by the application. Passing the opaque reset result verifies that the hint belongs to the
 requested index. Use the same `path` value for reset and reclaim so generated names match. The
@@ -323,7 +323,7 @@ to reclaim.
 An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.
 Lifecycle lock files are stored in the index parent's `.fulltext-locks` directory so reset can keep
-the handoff lock while renaming the native directory on Windows. The wrapper does not remove this
+the handoff lock while renaming the native directory on Windows. The library does not remove this
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
@@ -358,12 +358,9 @@ storage backend, and hard protocol limits. It does not open an index or create f
 
 ## Storage boundary
 
-The package has one public entry point: `@harperfast/fulltext/native`. It uses Tantivy's native
-filesystem directory and has no rocksdb-js dependency. There is no hosted key-value storage entry
-point and no automatic storage fallback.
-
-The local Tantivy files are application-owned derived data. The addon does not link RocksDB or
-depend on rocksdb-js.
+The package has one public entry point: `@harperfast/fulltext/native`. It stores application-owned
+derived indexes in Tantivy's native filesystem directory. The addon does not link RocksDB, depend
+on rocksdb-js, or fall back to another storage backend.
 
 ## Development
 
@@ -402,8 +399,8 @@ comparisons require controlled hardware.
 includes heavy-tail field sizes, bounded synonyms, update/delete churn, resource-cap rejection,
 warm concurrent queries, close/reopen, and cold queries. CI runs the two-index smoke profile; the
 release workflow records the larger eight-index profile per architecture. These results measure
-the wrapper's native path, not source projection, authorization, or record retrieval performed by
-a host application.
+the library's native path, not source projection, authorization, or record retrieval performed by
+an application.
 
 `--revision` labels a result and `--output` writes the same JSON record printed to stdout. Pull
 requests keep smoke records as GitHub Actions artifacts for 30 days. The release benchmark keeps

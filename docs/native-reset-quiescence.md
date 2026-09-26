@@ -169,7 +169,7 @@ remediation rather than falling back to in-place deletion.
 - A failed close does not prove quiescence. Tantivy 0.26.1 can return early from
   `wait_merging_threads()` after an indexing-worker failure without joining every remaining worker.
   The wrapper therefore removes the unusable handle and quarantines its canonical path until process
-  restart. The quarantine is deliberately path-scoped so another index using the same logical ID is
+  restart. The quarantine is path-scoped so another index using the same logical ID is
   unaffected. Callers must not rename or remove an unproven directory; external filesystem mutation
   is outside this lifecycle protocol and cannot establish safety. The host keeps the affected index
   unavailable; availability is not allowed to weaken the file-lifetime invariant.
