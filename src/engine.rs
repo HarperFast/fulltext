@@ -35,6 +35,8 @@ const SURFACE_ANALYZER_NAME: &str = "english_surface@2";
 pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_TRACE_TOKENS_PER_VALUE: usize = 262_144;
 const MAX_TOKEN_CHARACTERS: usize = 40;
+const MAX_NONSTARTERS: usize = 30;
+const COMBINING_GRAPHEME_JOINER: char = '\u{034f}';
 type SynonymMap = Arc<HashMap<String, Vec<String>>>;
 
 struct CanonicalIdentity {
@@ -1525,7 +1527,9 @@ impl MappedCharacters<'_> {
 
 struct MappedNfkc<'a> {
 	source: std::str::CharIndices<'a>,
+	decomposed: Vec<char>,
 	decomposition_pending: Vec<(u8, MappedCharacter)>,
+	nonstarter_count: usize,
 	composee: Option<MappedCharacter>,
 	composition_pending: Vec<MappedCharacter>,
 	last_combining_class: Option<u8>,
@@ -1538,7 +1542,9 @@ impl<'a> MappedNfkc<'a> {
 	fn new(source: &'a str) -> Self {
 		Self {
 			source: source.char_indices(),
+			decomposed: Vec::new(),
 			decomposition_pending: Vec::new(),
+			nonstarter_count: 0,
 			composee: None,
 			composition_pending: Vec::new(),
 			last_combining_class: None,
@@ -1625,16 +1631,72 @@ impl<'a> MappedNfkc<'a> {
 					start,
 					end: start + source_character.len_utf8(),
 				};
-				let mut decomposed = Vec::new();
+				let mut decomposed = std::mem::take(&mut self.decomposed);
+				decomposed.clear();
 				decompose_compatible(source_character, |character| decomposed.push(character));
-				for character in decomposed {
+				let leading_nonstarters = decomposed
+					.iter()
+					.take_while(|character| canonical_combining_class(**character) != 0)
+					.count();
+				if self.nonstarter_count + leading_nonstarters > MAX_NONSTARTERS {
+					self.push_decomposed(MappedCharacter {
+						character: COMBINING_GRAPHEME_JOINER,
+						span,
+					});
+					self.nonstarter_count = 0;
+				}
+				if leading_nonstarters == decomposed.len() {
+					self.nonstarter_count += decomposed.len();
+				} else {
+					self.nonstarter_count = decomposed
+						.iter()
+						.rev()
+						.take_while(|character| canonical_combining_class(**character) != 0)
+						.count();
+				}
+				for character in decomposed.drain(..) {
 					self.push_decomposed(MappedCharacter { character, span });
 				}
+				self.decomposed = decomposed;
 			} else {
 				self.finish();
 			}
 		}
 	}
+}
+
+fn is_stream_safe_nfkc(text: &str) -> bool {
+	if !is_nfkc(text) {
+		return false;
+	}
+	let mut nonstarter_count = 0;
+	for source_character in text.chars() {
+		let mut decomposition_length = 0;
+		let mut leading_nonstarters = 0;
+		let mut trailing_nonstarters = 0;
+		let mut saw_starter = false;
+		decompose_compatible(source_character, |character| {
+			decomposition_length += 1;
+			if canonical_combining_class(character) == 0 {
+				saw_starter = true;
+				trailing_nonstarters = 0;
+			} else {
+				if !saw_starter {
+					leading_nonstarters += 1;
+				}
+				trailing_nonstarters += 1;
+			}
+		});
+		if nonstarter_count + leading_nonstarters > MAX_NONSTARTERS {
+			return false;
+		}
+		nonstarter_count = if leading_nonstarters == decomposition_length {
+			nonstarter_count + decomposition_length
+		} else {
+			trailing_nonstarters
+		};
+	}
+	true
 }
 
 struct NfkcTokenStream<'a> {
@@ -1647,7 +1709,7 @@ impl Tokenizer for NfkcTokenizer {
 
 	fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
 		self.token.reset();
-		let characters = if text.is_ascii() || is_nfkc(text) {
+		let characters = if text.is_ascii() || is_stream_safe_nfkc(text) {
 			MappedCharacters::Original(text.char_indices())
 		} else {
 			MappedCharacters::Normalized(MappedNfkc::new(text))
@@ -2296,6 +2358,14 @@ mod tests {
 			}
 			assert_eq!(actual, source.nfkc().collect::<String>());
 		}
+		let source = format!("e\u{301}{}", "\u{315}".repeat(MAX_NONSTARTERS + 1));
+		let mut mapped = MappedNfkc::new(&source);
+		let mut actual = String::new();
+		while let Some(character) = mapped.next() {
+			actual.push(character.character);
+		}
+		assert_eq!(actual, source.stream_safe().nfkc().collect::<String>());
+		assert!(actual.contains(COMBINING_GRAPHEME_JOINER));
 		let source = "㉠ᅡ";
 		let mut tokenizer = NfkcTokenizer::default();
 		let mut stream = tokenizer.token_stream(source);

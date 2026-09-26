@@ -303,10 +303,13 @@ words are normalized before token boundaries are selected. Already-normalized in
 zero-allocation iterator. Other input is compatibility-decomposed, canonically ordered, and
 recomposed as a stream carrying original byte spans; it does not materialize a normalized copy or
 one span per expanded character. Token text stops growing once it is guaranteed to be removed by
-the downstream byte-length filter. Possessive removal, `LowerCaser`, `AsciiFoldingFilter`,
-`RemoveLongFilter`, optional English `StopWordFilter`, and English `Stemmer` follow. Golden fixtures
-cover combining marks, cross-source-character composition, full-width text, Latin diacritics,
-possessives, expansions, and adjacent emoji. The same analyzer tokenizes indexed and search text.
+the downstream byte-length filter. The tokenizer follows Unicode Stream-Safe Text Process by
+inserting a combining grapheme joiner before an input character whose compatibility decomposition
+would exceed 30 consecutive non-starters, bounding normalization buffers. Possessive removal,
+`LowerCaser`, `AsciiFoldingFilter`, `RemoveLongFilter`, optional English `StopWordFilter`, and English
+`Stemmer` follow. Golden fixtures cover combining marks, cross-source-character composition,
+full-width text, Latin diacritics, possessives, expansions, and adjacent emoji. The same analyzer
+tokenizes indexed and search text.
 The analyzer name and identity-sidecar version form the compatibility key; changing filter semantics
 requires bumping at least one of them.
 
