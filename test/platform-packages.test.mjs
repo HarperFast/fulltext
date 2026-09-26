@@ -109,8 +109,12 @@ test('release workflow installs local packages and runs the packaged example', (
 	const workflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
 	assert.match(workflow, /npm pack "\.\/release\/\$\{\{ matrix\.target \}\}"/);
 	assert.doesNotMatch(workflow, /npm pack "release\/\$\{\{ matrix\.target \}\}"/);
-	assert.match(workflow, /node node_modules\/@harperfast\/fulltext\/examples\/basic\.mjs/);
-	assert.doesNotMatch(workflow, /analyzer:\s*['"]english@/);
+	const packedConsumerStart = workflow.indexOf('\n  packed-consumer:');
+	const publishStart = workflow.indexOf('\n  publish:', packedConsumerStart);
+	assert(packedConsumerStart >= 0 && publishStart > packedConsumerStart);
+	const packedConsumer = workflow.slice(packedConsumerStart, publishStart);
+	assert.match(packedConsumer, /node node_modules\/@harperfast\/fulltext\/examples\/basic\.mjs/);
+	assert.doesNotMatch(packedConsumer, /openNativeFullTextIndex|applyMutationBatch|analyzer:/);
 });
 
 test('release workflow reports publication success and failure to Slack', () => {

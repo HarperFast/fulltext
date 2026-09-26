@@ -137,7 +137,7 @@ jobs:
         with:
           name: release-package-${{ matrix.target }}
           path: packages/native
-      - name: Install packed artifacts without lifecycle scripts
+      - name: Install packed artifacts and run public example
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}

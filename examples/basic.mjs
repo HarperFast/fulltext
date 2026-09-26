@@ -1,3 +1,4 @@
+import assert from 'node:assert';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -27,7 +28,10 @@ try {
 	});
 	await index.commit();
 	await index.reload();
-	console.log(await index.search({ text: 'waterproof running shoes', limit: 10 }));
+	const result = await index.search({ text: 'waterproof running shoes', limit: 10 });
+	assert.strictEqual(result.total, 1);
+	assert.strictEqual(result.hits[0]?.id, 'shoe-1');
+	console.log(result);
 } finally {
 	await index?.close({ mode: 'rollback' });
 	await rm(root, { recursive: true, force: true });
