@@ -1,10 +1,10 @@
 # @harperfast/fulltext
 
-Native Tantivy full-text indexing for Node.js and Harper.
+Native Tantivy full-text indexing for Node.js.
 
-This repository is under active development. The native entry point provides a Tantivy index
-backed by `MmapDirectory`, for standalone use and the planned Harper derived-index integration.
-Harper remains the source of truth; each node maintains its own rebuildable Tantivy files.
+This repository is under active development. The native entry point provides a standalone Tantivy
+index backed by `MmapDirectory`. Applications own their source records and may reuse compatible
+local index files or rebuild them from that authoritative data.
 
 ## Requirements
 
@@ -14,6 +14,15 @@ Harper remains the source of truth; each node maintains its own rebuildable Tant
 The package never compiles or downloads native code during installation. It installs a matching
 exact-version native package through npm optional dependencies.
 
+## Installation
+
+```bash
+npm install @harperfast/fulltext
+```
+
+Do not omit optional dependencies: the matching native package is selected from them at runtime.
+Applications import the single public entry point, `@harperfast/fulltext/native`.
+
 The CI-qualified targets are Linux x64 and Linux arm64 with glibc 2.35 or newer, macOS arm64, and
 Windows x64. Additional targets are added only after their packed artifacts are loaded and tested
 on the target runtime. Unsupported targets fail with `E_NATIVE_ADDON_NOT_FOUND` when the native
@@ -22,23 +31,7 @@ entry point is first used; importing the JavaScript facade does not eagerly load
 ## Native usage
 
 ```js
-import {
-	configureNativeFullTextRuntime,
-	inspectNativeFullTextIndex,
-	openNativeFullTextIndex,
-	reclaimRetiredNativeFullTextIndexes,
-	resetNativeFullTextIndex,
-	validateNativeFullTextIndexOptions,
-} from '@harperfast/fulltext/native';
-
-configureNativeFullTextRuntime({
-	maxResidentIndexes: 64,
-	maxIndexingThreads: 128,
-	maxSearchThreads: 256,
-	maxWriterMemoryBytes: 4_000_000_000,
-	maxQueuedBytes: 2_200_000_000,
-	maxExpensiveSearches: 16,
-});
+import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
 
 const index = await openNativeFullTextIndex({
 	path: './search/products',
@@ -46,8 +39,6 @@ const index = await openNativeFullTextIndex({
 	generation: 'v1',
 	fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
 	analyzer: 'english@2',
-	surfaceTerms: true,
-	synonyms: [{ source: 'tv', replacements: ['television'] }],
 	limits: {
 		indexingThreads: 2,
 		searchThreads: 4,
@@ -58,32 +49,44 @@ const index = await openNativeFullTextIndex({
 	},
 });
 
-const applied = await index.applyMutationBatch(
-	{
+try {
+	await index.applyMutationBatch({
 		upserts: [{ id: 'shoe-1', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
-	},
-	{ rejectedUpsert: 'delete' },
-);
-if (applied.rejected.length) console.warn(`${applied.rejected.length} products were removed from the index`);
-await index.commit();
-await index.reload();
-console.log(await index.search({ text: 'waterproof running shoes', limit: 10 }));
-console.log(await index.search({ text: 'waterproof runn', mode: 'prefix', limit: 10 }));
-await index.publish('source-checkpoint-42');
-await index.close();
-
-console.log(
-	inspectNativeFullTextIndex({
-		path: './search/products',
-		indexId: 'products',
-		generation: 'v1',
-		fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
-		analyzer: 'english@2',
-		surfaceTerms: true,
-		synonyms: [{ source: 'tv', replacements: ['television'] }],
-	}),
-); // { state: 'checkpointed', committedPayload: 'source-checkpoint-42' }
+	});
+	await index.commit();
+	await index.reload();
+	console.log(await index.search({ text: 'waterproof running shoes', limit: 10 }));
+} finally {
+	await index.close({ mode: 'rollback' });
+}
 ```
+
+The quick start uses standalone commit and reload. Applications that track an external checkpoint
+should use `publish(payload)` instead, as shown below, so mutations and that checkpoint commit
+together.
+
+## Examples
+
+Every example is executable and runs in CI:
+
+| Example                                                                | Demonstrates                                               |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------- |
+| [`examples/basic.mjs`](examples/basic.mjs)                             | Open, mutate, commit, search, and close                    |
+| [`examples/query-modes.mjs`](examples/query-modes.mjs)                 | BM25, phrase, prefix, fuzzy, and candidate filtering       |
+| [`examples/checkpoint-recovery.mjs`](examples/checkpoint-recovery.mjs) | Atomic checkpoint publication, inspection, and reopen      |
+| [`examples/highlighting.mjs`](examples/highlighting.mjs)               | Match tracing, UTF-16 spans, and opt-in snippets           |
+| [`examples/multi-index.mjs`](examples/multi-index.mjs)                 | Optional process limits and concurrent independent indexes |
+| [`examples/reset-rebuild.mjs`](examples/reset-rebuild.mjs)             | Safe retirement, cleanup, and rebuilding a generation      |
+
+From a repository checkout, build the native addon and run any example through the local-build
+loader:
+
+```bash
+npm run build
+node scripts/run-local.mjs examples/basic.mjs
+```
+
+## Mutations and backpressure
 
 Mutation batches are versioned packed values, so indexing crosses Node-API once per batch rather
 than once per document. One dedicated actor owns Tantivy's single writer for each index. A bounded
@@ -116,6 +119,8 @@ A completed close has released its reservation.
 If teardown cannot prove native resources were released, the path is quarantined and its aggregate
 capacity remains reserved until process restart.
 Callers that omit this function retain per-index limits and current standalone behavior.
+
+### Rejected records and schema errors
 
 Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
 as record-local rejection could remove many documents under the wrong schema. The option applies
@@ -158,6 +163,8 @@ blocks low-level writer interleaving while its logical batch is active. The low-
 not infer logical batch boundaries, so callers using it remain responsible for excluding another
 publisher between frames. Searches may still run concurrently with either writer sequence.
 
+## Search
+
 Search uses weighted BM25 and a typed request; raw Tantivy query syntax is not exposed. `mode` is
 `any`, `all`, `phrase`, `prefix`, `fuzzy`, or `fuzzy-prefix`. The older `operator: 'any' | 'all'`
 spelling remains a compatibility alias and cannot be combined with `mode`. Candidate IDs compile to
@@ -167,8 +174,7 @@ and execution ceilings. Prefix expansion fails with `E_PREFIX_TOO_BROAD` instead
 truncating the term set and returning incomplete rankings. `fuzzy-prefix` is a preview capability
 until catalog-scale benchmark qualification is complete.
 
-Record IDs are limited to 4,096 UTF-8 bytes. This is above Harper's maximum encoded record key and
-keeps deterministic tie-page sorting memory bounded for standalone callers.
+Record IDs are limited to 4,096 UTF-8 bytes, keeping deterministic tie-page sorting memory bounded.
 
 `total` is bounded by default so Tantivy can retain block-max WAND pruning. Set `exactTotal: true`
 only when an exact match count is worth a second full-match traversal. Ranking is score descending,
@@ -199,6 +205,8 @@ The public analyzer name and identity-sidecar version jointly identify persisted
 Any future filter or ordering change must use a new analyzer name or sidecar version so existing
 indexes fail closed and rebuild instead of silently changing recall.
 
+### Highlighting and snippets
+
 Highlighting is opt-in and operates on caller-supplied current source values, so the wrapper never
 returns stale stored text. It returns UTF-16 half-open offsets and no HTML. Snippets are also off by
 default:
@@ -216,13 +224,17 @@ Analysis is limited to 262,144 emitted tokens per value after synonym expansion.
 ceiling, a span ceiling, or the response ceiling is reached, `complete` is false and later matches
 may be omitted.
 
-Search and tracing share a maximum 30-second queue-plus-execution budget. Harper passes its shorter
-remaining request budget through the second method argument; larger values are clamped to 30
-seconds. Tantivy search itself is not interruptible, so a search that expires in flight is discarded
+### Deadlines and query isolation
+
+Search and tracing share a maximum 30-second queue-plus-execution budget. Applications can pass a
+shorter remaining request budget through the second method argument; larger values are clamped to
+30 seconds. Tantivy search itself is not interruptible, so a search that expires in flight is discarded
 after Tantivy returns. Match tracing checks its deadline while tokenizing and matching. With at
 least two search threads, one worker is reserved for ordinary `any`/`all` BM25. The remaining
 workers prioritize phrase, prefix, fuzzy, and trace work, then steal ordinary work when that queue
 is idle. A one-thread configuration remains valid but cannot isolate query classes.
+
+## Lifecycle and recovery
 
 `close()` rejects uncommitted data by default. Use `close({ mode: 'rollback' })` to discard it
 explicitly. `commit()` publishes mutations, and `reload()` makes the latest commit visible to this
@@ -297,8 +309,8 @@ directory. The wrapper does not delete it automatically. Call
 chosen by the application. Passing the opaque reset result verifies that the hint belongs to the
 requested index. Use the same `path` value for reset and reclaim so generated names match. The
 reclaimer removes only retired trees generated for that index path, ignores unrelated entries and
-other indices, and returns `{ removed, failed }`. Harper invokes it during derived-index
-initialization and after reset.
+other indices, and returns `{ removed, failed }`. Applications choose when retired files are safe
+to reclaim.
 
 An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.
@@ -312,16 +324,38 @@ identity sidecar v3 fingerprints canonical synonyms and the completed `english@2
 v2 indexes are identifiable for safe reset but cannot be reopened under the new meaning; rebuild
 them from the authoritative source.
 
+## Diagnostics and errors
+
+All public failures are `FulltextError` instances with a stable `code`. Branch on the code instead
+of parsing the message:
+
+```js
+import { FulltextError, openNativeFullTextIndex, runtimeInfo } from '@harperfast/fulltext/native';
+
+console.log(await runtimeInfo());
+
+try {
+	await openNativeFullTextIndex(options);
+} catch (error) {
+	if (error instanceof FulltextError && error.code === 'E_IDENTITY_MISMATCH') {
+		// Retire and rebuild this derived index generation.
+	} else {
+		throw error;
+	}
+}
+```
+
+`runtimeInfo()` reports the package, Tantivy, ABI, query API, lifecycle API, mutation API, supported
+storage backend, and hard protocol limits. It does not open an index or create files.
+
 ## Storage boundary
 
 The package has one public entry point: `@harperfast/fulltext/native`. It uses Tantivy's native
 filesystem directory and has no rocksdb-js dependency. There is no hosted key-value storage entry
 point and no automatic storage fallback.
 
-Harper uses the same native entry point for its locally rebuildable derived index. Harper records
-and transaction logs remain the source of truth; the local Tantivy files and their committed replay
-payload can be reused on restart or rebuilt from Harper data when necessary. The addon does not link
-RocksDB or depend on rocksdb-js.
+The local Tantivy files are application-owned derived data. The addon does not link RocksDB or
+depend on rocksdb-js.
 
 ## Development
 
@@ -337,6 +371,10 @@ npm run benchmark:native -- --documents 100000 --revision v0.1.0 --output benchm
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000 --mutation-driver low-level
 npm run benchmark:inspect -- --indexes 1,10,100,1000 --commits 64 --warm-rounds 10
 ```
+
+CI reports JavaScript/TypeScript and Rust coverage separately. The Node report uses the built-in
+test runner coverage and stores raw V8 coverage; the Rust report stores LCOV output. Coverage is
+reported for visibility and release-to-release comparison, not enforced as a single blended gate.
 
 The benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
 JSON record. It reports packing, apply, durable end-to-end ingestion, actor queue and execution
@@ -356,7 +394,8 @@ comparisons require controlled hardware.
 includes heavy-tail field sizes, bounded synonyms, update/delete churn, resource-cap rejection,
 warm concurrent queries, close/reopen, and cold queries. CI runs the two-index smoke profile; the
 release workflow records the larger eight-index profile per architecture. These results measure
-the wrapper's native path, not Harper projection, authorization, or record retrieval.
+the wrapper's native path, not source projection, authorization, or record retrieval performed by
+a host application.
 
 `--revision` labels a result and `--output` writes the same JSON record printed to stdout. Pull
 requests keep smoke records as GitHub Actions artifacts for 30 days. The release benchmark keeps

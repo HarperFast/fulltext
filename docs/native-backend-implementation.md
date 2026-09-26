@@ -1,19 +1,18 @@
 # Native Tantivy backend implementation
 
-This document records the native backend contract. Native Tantivy files are also the selected
-storage for Harper's derived full-text indexes; RocksDB is not a Fulltext delivery target. See
+This document records the standalone native backend contract. RocksDB is not a Fulltext delivery
+target. See
 [native checkpoint publication](native-checkpoint-publication.md) for its durability boundary.
 
 ## Intent
 
 Implement `@harperfast/fulltext/native` as a usable standalone full-text index backed directly by
-Tantivy's `MmapDirectory`. This backend provides the engine and persistence path that Harper will
-also consume through its derived-index lifecycle.
+Tantivy's `MmapDirectory`.
 
 The backend covers native index creation and reopen, batched document upsert/delete, explicit
 commit and checkpoint publication, weighted BM25, phrase, bounded prefix/autocomplete, fuzzy and
 fuzzy-prefix queries, score-neutral candidate filtering, current-record match tracing, status, and
-deterministic close. Harper's derived-index watermark and readiness policy remain outside the
+deterministic close. Source-data projection, replication, and readiness policy remain outside the
 wrapper.
 
 It implements the native portions of [the façade and lifecycle contract](https://github.com/HarperFast/fulltext/issues/14)
@@ -22,14 +21,14 @@ versioned packed mutation and search frames, stable error codes, and explicit li
 Each index has one bounded writer actor and a bounded search executor, while the optional process
 governor provides checked aggregate admission across indexes. Sustained work stays off JavaScript
 and libuv, and search remains independent of write and commit latency. Shared cross-index executors,
-multi-environment handles, cancellation of started Tantivy collectors, and Harper derived-index
-admission remain outside this contract.
+multi-environment handles and cancellation of started Tantivy collectors remain outside this
+contract.
 
 ## Invariant
 
 The engine-facing schema, mutation, commit, search, and lifecycle contracts remain independent from
-Harper. The Node wrapper contributes canonical path handling and Tantivy `MmapDirectory`
-construction; Harper owns source projection, replay, and derived-index readiness.
+the consuming application. The Node wrapper contributes canonical path handling and Tantivy
+`MmapDirectory` construction; the host owns source projection, replay, and readiness.
 
 ## Verified constraints
 
@@ -142,15 +141,14 @@ type NativeFullTextIndexInspection =
 ```
 
 These native-only per-index limits keep standalone measurements reproducible. The optional process
-governor adds aggregate caps without moving policy into the shared engine. Harper supplies resolved
-per-index limits and configures the process budget once before opening indexes; the schema does not
-expose runtime resource policy.
+governor adds aggregate caps without moving policy into the shared engine. The application supplies
+resolved per-index limits and configures the process budget once before opening indexes.
 
 The exported flow is:
 
 1. `inspectNativeFullTextIndex(options)` synchronously checks durable identity, schema, and commit
    payload without creating files, reserving a handle, starting an actor, or acquiring the writer.
-   Harper validates the opaque payload against its own replay-cursor contract.
+   The application validates the opaque payload against its own replay-cursor contract.
 2. `openNativeFullTextIndex(options)` creates the directory when absent, canonicalizes it, reserves
    the canonical path, and asynchronously creates or reopens Tantivy state.
 3. `index.encodeMutationBatches(batch)` validates one logical batch against the opened schema and
@@ -172,7 +170,7 @@ Only the versioned `english@2` analysis contract is accepted. `positions` defaul
 without positions. Changing that default in a future release is an index-format change, not a
 silent reinterpretation. `generation` is an opaque caller-owned identity for this physical index
 generation; it is persisted in the engine fingerprint and must match on reopen. It is not a Tantivy
-opstamp or a Harper transaction-log position.
+opstamp or an application transaction-log position.
 `surfaceTerms` creates a separately indexed, unstemmed companion term field for prefix,
 fuzzy-prefix, and current-record match tracing; it never stores source values. It defaults off
 because of its storage cost. Field weights are query-time boosts and may change when reopening the
@@ -286,7 +284,7 @@ Unknown mutation fields, missing IDs, duplicate schema field names, unknown sear
 batches, and excessive result windows fail before search/index work. Blank and stop-word-only
 queries return an exact empty result. Record IDs have a separate 4,096-byte UTF-8 ceiling; field
 values retain the general 1 MiB packed-string ceiling. The tighter ID invariant bounds the sort keys
-materialized for deterministic score-tie pagination and still admits Harper's maximum encoded key.
+materialized for deterministic score-tie pagination.
 
 Create treats `{sidecar, meta.json}` as a pair. If neither exists, it writes and syncs the sidecar
 first and then creates the Tantivy index. If both exist, it reopens and verifies them. A sidecar-only
@@ -323,7 +321,7 @@ the alternatives in BM25 field length, so enabling a rule can affect unrelated-t
 document containing its source. Match tracing uses the same document-side expansion and maps every
 replacement to the source token span. Crossing its 262,144-token-per-value ceiling marks the trace
 incomplete instead of failing the request. Version 2 sidecars remain parseable for safe reset but
-mismatch v3 open/inspection so Harper can retire and rebuild them.
+mismatch v3 open/inspection so the application can retire and rebuild them.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`
@@ -340,7 +338,7 @@ duplicated in Tantivy's document store.
 Phrase queries preserve analyzer positions, including gaps left by removed stop words, and match
 tracing uses the same positional rule. Prefix expansion is capped; exceeding the cap returns
 `E_PREFIX_TOO_BROAD` rather than truncating the term set and silently biasing recall or rank. A
-caller such as Harper may catch that distinct code and choose a documented fallback. Fuzzy-prefix
+caller may catch that distinct code and choose a documented fallback. Fuzzy-prefix
 remains a preview capability until the catalog-scale benchmark qualifies it. Request budgets cover
 queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing;
 Tantivy's collector itself cannot be interrupted, so an expired search result is discarded after
@@ -421,9 +419,8 @@ explicitly. Correctness assertions run before timing results are accepted: expec
 reopen must preserve results, and every operation count must match. The benchmark's
 replacement-safe upserts emit delete terms, so `--commit-every` is an explicit workload dimension
 rather than allowing an unbounded final commit to masquerade as a production ingestion profile.
-The benchmark does not claim the 100-million-document or Harper p99-under-50-ms release gate; those
-remain paired fixed-host work. This slice establishes the standalone native baseline for comparison
-with the integrated Harper path and a no-index Harper control.
+The benchmark does not claim a 100-million-document or p99-under-50-ms release gate; those remain
+fixed-host qualification work. This slice establishes the standalone native baseline.
 
 CI runs correctness tests and an explicit small benchmark-smoke command that performs ranking,
 commit, close, and reopen assertions before validating nonzero measurements. Shared runners enforce
@@ -468,25 +465,24 @@ repeats the search.
 
 ## Approaches considered
 
-### Different layer: implement native storage only in Harper
+### Different layer: implement native storage only in a host application
 
-The candidate layer is Harper's `DerivedIndexBackend`, which could own the engine and call a thin
-native filesystem binding. Rejected because standalone users and Harper-derived delivery need the
-same search and indexing behavior; putting the engine in Harper would force standalone use to
-depend on Harper or fork those semantics.
+The consuming application could own the engine and call a thin native filesystem binding. Rejected
+because standalone users need the complete search and indexing behavior without depending on a
+separate host or forking those semantics.
 
 ### Deeper cause: implement the complete storage-neutral runtime before either backend
 
 The bad state to prevent is a backend opening durable data whose analyzer or engine semantics it
 cannot interpret. The candidate is a backend-neutral persisted fingerprint and commit durability
 contract before either backend ships. This is adopted in the chosen approach. Derived watermarks and
-multi-environment sharing remain Harper responsibilities; the wrapper's optional process governor
-only enforces local aggregate resource caps.
+multi-environment sharing remain application responsibilities; the wrapper's optional process
+governor only enforces local aggregate resource caps.
 
 ### Do less: expose Tantivy's existing filesystem API or query parser directly
 
 Rejected because it would expose a third-party API, permit unbounded query syntax, and create a
-public contract Harper could not safely govern. A directory-only smoke also cannot provide the
+public contract a host could not safely govern. A directory-only smoke also cannot provide the
 performance baseline required for the wrapper.
 
 ### Do less on runtime: engine benchmark plus separate per-index writer and search executors
@@ -505,17 +501,15 @@ with `MmapDirectory` without custom filesystem code.
 
 ### Chosen: one shared engine slice with a thin MmapDirectory constructor
 
-This produces a usable standalone backend, keeps Tantivy storage mechanics out of Harper, avoids
-reimplementing Tantivy filesystem primitives, establishes bounded off-event-loop execution, and
-yields the reference implementation used by Harper's derived index.
+This produces a usable standalone backend, avoids reimplementing Tantivy filesystem primitives,
+and establishes bounded off-event-loop execution.
 
 ## Explicit deferrals
 
-- Derived-index delivery, replay, readiness, and Harper lifecycle hooks.
+- Source-data projection, replay, replication, and readiness policy.
 - Corpus-level query suggestions; bounded prefix search supplies text autocomplete.
 - Shared handles across multiple Node worker environments.
 - A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe
   callback as part of a future shared multi-environment runtime.
-- Fixed-host regression thresholds comparing standalone native, Harper without full text, and
-  Harper using the native derived index.
+- Fixed-host regression thresholds for representative application workloads.
 - Cancellation of an already-running Tantivy collector and cursor-based deep pagination.

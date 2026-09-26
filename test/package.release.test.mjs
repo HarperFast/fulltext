@@ -36,8 +36,9 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 	const includedPaths = files.map((file) => file.path);
 	assert(includedPaths.includes('dist/native.js'));
 	assert(includedPaths.includes('dist/native.d.ts'));
-	assert(!includedPaths.includes('dist/harper.js'));
-	assert(!includedPaths.includes('dist/host-storage.js'));
+	assert(includedPaths.includes('CONTRIBUTING.md'));
+	assert(includedPaths.includes('docs/native-backend-implementation.md'));
+	assert(includedPaths.includes('examples/basic.mjs'));
 	assert(!includedPaths.some((file) => /^fulltext\..+\.node$/.test(file)));
 	assert(!includedPaths.some((file) => file.startsWith('src/') || file === 'ts/addon.d.ts'));
 	assert.doesNotMatch(readFileSync(new URL('../ts/addon.d.ts', import.meta.url), 'utf8'), /__(?:test|phase0)/);
@@ -99,10 +100,16 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 		[
 			'--input-type=module',
 			'--eval',
-			"import { createRequire } from 'node:module'; const addon = createRequire(import.meta.url)(process.argv[1]); if (Object.keys(addon).some(key => key.startsWith('__test') || key.startsWith('__phase0') || key.startsWith('__harper') || key.startsWith('__hostStorage'))) process.exit(1); try { await import('@harperfast/fulltext/harper'); process.exit(2); } catch (error) { if (error.code !== 'ERR_PACKAGE_PATH_NOT_EXPORTED') throw error; } const info = await import('@harperfast/fulltext/native').then(x => x.runtimeInfo()); if (info.storageBackends.join(',') !== 'native') process.exit(3); console.log(info);",
+			"import { createRequire } from 'node:module'; const addon = createRequire(import.meta.url)(process.argv[1]); if (Object.keys(addon).some(key => key.startsWith('__test') || key.startsWith('__phase0'))) process.exit(1); const info = await import('@harperfast/fulltext/native').then(x => x.runtimeInfo()); if (info.storageBackends.join(',') !== 'native') process.exit(2); console.log(info);",
 			nativePackageName,
 		],
 		{ cwd: projectDirectory, encoding: 'utf8', env: consumerEnvironment },
 	);
 	assert.match(output, /tantivyVersion: '0\.26\.1'/);
+	const exampleOutput = execFileSync(
+		process.execPath,
+		[path.join(projectDirectory, 'node_modules/@harperfast/fulltext/examples/basic.mjs')],
+		{ cwd: projectDirectory, encoding: 'utf8', env: consumerEnvironment },
+	);
+	assert(exampleOutput.trim().length > 0);
 });

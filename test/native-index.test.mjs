@@ -54,6 +54,27 @@ function temporaryIndex(context) {
 	return directory;
 }
 
+function legacyV2Identity(config) {
+	const string = (value) => {
+		const encoded = Buffer.from(value);
+		const length = Buffer.alloc(4);
+		length.writeUInt32LE(encoded.length);
+		return [length, encoded];
+	};
+	const fieldCount = Buffer.alloc(2);
+	fieldCount.writeUInt16LE(config.fields.length);
+	return Buffer.concat([
+		Buffer.from('HTFI'),
+		Buffer.from([2, 0]),
+		...string(config.indexId),
+		...string(config.generation),
+		...string(config.analyzer),
+		Buffer.from([config.stopWords === false ? 0 : 1, config.positions === false ? 0 : 1, config.surfaceTerms ? 1 : 0]),
+		fieldCount,
+		...config.fields.flatMap((field) => string(field.name)),
+	]);
+}
+
 test('runs the public create, mutate, BM25 search, close, and reopen route', async (context) => {
 	const indexPath = temporaryIndex(context);
 	const config = options(indexPath);
@@ -536,6 +557,19 @@ test('allows process-wide budget configuration after a failed first open', async
 	assert.deepStrictEqual(await childMessage(child), { failedOpen: 'E_INCOMPLETE_CREATE' });
 });
 
+test('blocks late runtime configuration after unproven first-open teardown', async (context) => {
+	const child = fork(
+		fileURLToPath(new URL('./fixtures/native-runtime-budget-child.mjs', import.meta.url)),
+		[fileURLToPath(new URL('../dist/native.js', import.meta.url)), 'unproven-first'],
+		{ stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
+	);
+	context.after(() => child.kill());
+	assert.deepStrictEqual(await childMessage(child), {
+		failedOpen: 'E_CLOSED',
+		lateConfiguration: 'E_RESOURCE_LIMIT',
+	});
+});
+
 test('reclaims only retired trees generated for the requested index', async (context) => {
 	const parent = temporaryIndex(context);
 	const productsPath = path.join(parent, 'products');
@@ -675,6 +709,28 @@ test('retires a closed index, preserves its checkpoint, and permits a clean rebu
 	index = await openNativeFullTextIndex(config);
 	assert.strictEqual((await index.search({ text: 'trail running', exactTotal: true })).total, 0);
 	await index.close();
+});
+
+test('resets a real native directory with a legacy v2 identity and rejects a truncated sidecar', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const index = await openNativeFullTextIndex(config);
+	await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'legacy content' } }] });
+	await index.commit();
+	await index.close();
+	const identityPath = path.join(indexPath, '.harper-fulltext-identity');
+	writeFileSync(identityPath, Buffer.from('HTFI\u0002\u0000'));
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_INDEX_CORRUPT',
+	);
+	writeFileSync(identityPath, legacyV2Identity(config));
+	assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+		state: 'incompatible',
+		code: 'E_IDENTITY_MISMATCH',
+	});
+	const reset = await resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId });
+	assert.strictEqual(reset.state, 'reset');
 });
 
 test('close waits for background merges before retiring native files', async (context) => {
@@ -1048,7 +1104,7 @@ test('distinguishes oversized mutation batches from invalid input', async (conte
 	await index.close();
 });
 
-test('partitions a Harper maximum-key delete workload into admissible native frames', async (context) => {
+test('partitions a maximum-key delete workload into admissible native frames', async (context) => {
 	const config = options(temporaryIndex(context));
 	let index = await openNativeFullTextIndex(config);
 	const id = `1.${Buffer.alloc(1978, 1).toString('base64url')}`;

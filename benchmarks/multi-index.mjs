@@ -95,6 +95,7 @@ try {
 		{ text: 'wireless hea', mode: 'prefix' },
 		{ text: 'waterprof', mode: 'fuzzy' },
 		{ text: 'television', mode: 'any' },
+		{ text: 'cafe resume', mode: 'all' },
 	];
 	const warm = await measureSearch(indexes, queryMix, queryCount, concurrency);
 	const statuses = indexes.map((index) => index.status());
@@ -117,7 +118,17 @@ try {
 			node: process.version,
 			cpus: navigator.hardwareConcurrency,
 		},
-		workload: { indexCount, documents, batchSize, queryCount, concurrency, heavyTail: true, synonyms: true },
+		workload: {
+			indexCount,
+			documents,
+			batchSize,
+			queryCount,
+			concurrency,
+			heavyTail: true,
+			synonyms: true,
+			unicode: true,
+			streamSafeStress: true,
+		},
 		ingestion: {
 			milliseconds: ingestMilliseconds,
 			documentsPerSecond: (documents * 1_000) / ingestMilliseconds,
@@ -150,6 +161,11 @@ function product(id, suffix = '') {
 		['Wireless TV Headphones', 'Portable television audio with long battery life', 'electronics'],
 		['Organic Cotton Blue Shirt', 'Comfortable everyday apparel in multiple sizes', 'clothing'],
 		['Stainless Steel Water Bottle', 'Insulated outdoor product for hiking and travel', 'outdoors'],
+		[
+			'Café Résumé Organizer',
+			`Müller’s crème brûlée guide ${'e\u0315'.repeat(31)} with ＦＵＬＬＷＩＤＴＨ text`,
+			'books',
+		],
 	];
 	const [title, description, category] = variants[Math.floor(id / indexCount) % variants.length];
 	const repeat = id % 100 === 0 ? 64 : id % 10 === 0 ? 8 : 1;

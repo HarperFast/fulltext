@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { loadAddon } from '../../dist/load-addon.js';
+
 const [{ configureNativeFullTextRuntime, openNativeFullTextIndex }] = await Promise.all([
 	import(pathToFileURL(process.argv[2]).href),
 ]);
@@ -33,6 +35,25 @@ const options = (name) => ({
 });
 
 try {
+	if (process.argv[3] === 'unproven-first') {
+		const addon = loadAddon();
+		addon.__testFailNextOpenCleanup();
+		let failedOpen;
+		try {
+			await openNativeFullTextIndex(options('unproven'));
+		} catch (error) {
+			failedOpen = error.code;
+		}
+		let lateConfiguration;
+		try {
+			configureNativeFullTextRuntime(limits);
+		} catch (error) {
+			lateConfiguration = error.code;
+		}
+		if (process.send) await new Promise((resolve) => process.send({ failedOpen, lateConfiguration }, resolve));
+		rmSync(root, { recursive: true, force: true });
+		process.exit(0);
+	}
 	if (process.argv[3] === 'failed-first') {
 		const failedPath = path.join(root, 'failed');
 		mkdirSync(failedPath);

@@ -57,6 +57,9 @@ interface NativeAddonApi {
 	__testPoisonBeforeNextAdmission?(handle: number): void;
 	__testFailNextPublish?(handle: number, afterCommit: boolean): void;
 	__testFailNextClose?(handle: number, quiesced: boolean): void;
+	__testFailNextOpenCleanup?(): void;
+	__testDelayNextExpensiveSearch?(handle: number, milliseconds: number): void;
+	__testExpensiveSearchState?(handle: number): number[];
 }
 
 export type NativeCallback = (response: Buffer) => void;

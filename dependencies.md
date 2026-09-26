@@ -13,8 +13,8 @@ reviewed deliberately.
 | `napi-derive` 3.6.9            | optional build/runtime boundary | Generates Node-API exports.                                                |
 | `napi-build` 2.5.0             | build                           | Configures platform-specific addon linking.                                |
 
-The Rust dependency graph must not include RocksDB. Harper uses the native filesystem backend for
-its rebuildable derived index rather than linking a second RocksDB runtime into this addon.
+The Rust dependency graph must not include RocksDB. The library uses Tantivy's native filesystem
+backend and does not link another database runtime into the addon.
 
 ### Updating Tantivy
 

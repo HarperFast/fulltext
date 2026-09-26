@@ -35,6 +35,8 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 static RUNTIME_BUDGET: OnceLock<Mutex<RuntimeBudgetState>> = OnceLock::new();
+#[cfg(feature = "test-panic")]
+static FAIL_NEXT_OPEN_CLEANUP: AtomicBool = AtomicBool::new(false);
 const LIFECYCLE_ROOT: &str = ".fulltext-locks";
 const LEGACY_LIFECYCLE_LOCK: &str = ".harper-fulltext-lifecycle.lock";
 const RETIRED_ROOT: &str = ".fulltext-retired";
@@ -93,6 +95,8 @@ struct Runtime {
 	poison_before_admission: AtomicBool,
 	#[cfg(feature = "test-panic")]
 	close_fault: AtomicU8,
+	#[cfg(feature = "test-panic")]
+	expensive_search_delay_milliseconds: AtomicU64,
 }
 
 struct RuntimeBudget {
@@ -104,6 +108,8 @@ struct RuntimeBudget {
 	queued_bytes: AtomicUsize,
 	expensive_searches: Mutex<usize>,
 	expensive_search_ready: Condvar,
+	#[cfg(feature = "test-panic")]
+	expensive_search_waiters: AtomicUsize,
 }
 
 enum RuntimeBudgetState {
@@ -555,6 +561,42 @@ pub fn test_fail_next_close(env: Env, handle: u32, quiesced: bool) -> boundary::
 	})?
 }
 
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailNextOpenCleanup")]
+pub fn test_fail_next_open_cleanup() {
+	FAIL_NEXT_OPEN_CLEANUP.store(true, Ordering::Release);
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testDelayNextExpensiveSearch")]
+pub fn test_delay_next_expensive_search(env: Env, handle: u32, milliseconds: u32) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		if milliseconds == 0 || milliseconds > 5_000 {
+			return Err(fulltext_napi_error(FulltextError::invalid(
+				"test search delay must be between 1 and 5000 milliseconds",
+			)));
+		}
+		runtime(&env, handle)?
+			.expensive_search_delay_milliseconds
+			.store(u64::from(milliseconds), Ordering::Release);
+		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testExpensiveSearchState")]
+pub fn test_expensive_search_state(env: Env, handle: u32) -> boundary::Result<Vec<u32>> {
+	boundary::run_stateless(|| {
+		let runtime = runtime(&env, handle)?;
+		Ok(vec![
+			u32::from(runtime.expensive_search_delay_milliseconds.load(Ordering::Acquire) != 0),
+			runtime.expensive_search_budget.as_ref().map_or(0, |budget| {
+				budget.expensive_search_waiters.load(Ordering::Acquire) as u32
+			}),
+		])
+	})?
+}
+
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeStatus")]
 pub fn native_status(env: Env, handle: u32) -> boundary::Result<Buffer> {
 	boundary::run_stateless(|| {
@@ -581,7 +623,7 @@ fn configure_runtime_budget(limits: RuntimeBudgetLimits) -> Result<()> {
 		)),
 		RuntimeBudgetState::OpenedWithoutBudget => Err(FulltextError::new(
 			"E_RESOURCE_LIMIT",
-			"the process-wide fulltext runtime budget must be configured before the first index opens",
+			"the process-wide fulltext runtime budget cannot be configured after an unbudgeted open or unproven teardown; restart the process",
 		)),
 	}
 }
@@ -621,6 +663,8 @@ impl RuntimeBudget {
 			queued_bytes: AtomicUsize::new(0),
 			expensive_searches: Mutex::new(0),
 			expensive_search_ready: Condvar::new(),
+			#[cfg(feature = "test-panic")]
+			expensive_search_waiters: AtomicUsize::new(0),
 		}
 	}
 
@@ -688,10 +732,14 @@ impl RuntimeBudget {
 			let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
 				return Err(search_timeout());
 			};
+			#[cfg(feature = "test-panic")]
+			self.expensive_search_waiters.fetch_add(1, Ordering::AcqRel);
 			let (next, timeout) = self
 				.expensive_search_ready
 				.wait_timeout(active, remaining)
 				.unwrap_or_else(|error| error.into_inner());
+			#[cfg(feature = "test-panic")]
+			self.expensive_search_waiters.fetch_sub(1, Ordering::AcqRel);
 			active = next;
 			if timeout.timed_out() && *active >= self.limits.max_expensive_searches {
 				return Err(search_timeout());
@@ -732,12 +780,12 @@ impl RuntimeAdmission {
 	}
 
 	fn retain_until_restart_in(mut self, state: &Mutex<RuntimeBudgetState>) {
-		if matches!(&self.kind, RuntimeAdmissionKind::Budgeted(_)) {
-			mem::forget(self);
-			return;
-		}
-		let RuntimeAdmissionKind::Unbudgeted { pending } = &mut self.kind else {
-			unreachable!();
+		let pending = match &mut self.kind {
+			RuntimeAdmissionKind::Budgeted(_) => {
+				mem::forget(self);
+				return;
+			}
+			RuntimeAdmissionKind::Unbudgeted { pending } => pending,
 		};
 		if !*pending {
 			return;
@@ -861,6 +909,8 @@ impl Runtime {
 			poison_before_admission: AtomicBool::new(false),
 			#[cfg(feature = "test-panic")]
 			close_fault: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
+			expensive_search_delay_milliseconds: AtomicU64::new(0),
 		});
 		let writer_runtime = runtime.clone();
 		let writer_engine = engine.clone();
@@ -1724,6 +1774,13 @@ fn execute_search_command(
 			} else {
 				None
 			};
+			#[cfg(feature = "test-panic")]
+			if _permit.is_some() {
+				let milliseconds = runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel);
+				if milliseconds > 0 {
+					thread::sleep(Duration::from_millis(milliseconds));
+				}
+			}
 			decode_search(&bytes).and_then(|request| {
 				engine
 					.search_with_deadline(&reader.searcher(), &request, deadline)
@@ -1733,6 +1790,13 @@ fn execute_search_command(
 		SearchOperation::Trace(bytes) => {
 			let deadline = operation_deadline(trace_budget(&bytes)?, queued.enqueued.elapsed())?;
 			let _permit = runtime.expensive_search_permit(deadline)?;
+			#[cfg(feature = "test-panic")]
+			if _permit.is_some() {
+				let milliseconds = runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel);
+				if milliseconds > 0 {
+					thread::sleep(Duration::from_millis(milliseconds));
+				}
+			}
 			decode_trace(&bytes).and_then(|request| {
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
@@ -2195,6 +2259,13 @@ fn open_runtime_with_directory(
 				reservation,
 			},
 		)?;
+		#[cfg(feature = "test-panic")]
+		if FAIL_NEXT_OPEN_CLEANUP.swap(false, Ordering::AcqRel) {
+			runtime.close_fault.store(2, Ordering::Release);
+			runtime.force_close();
+			let _ = runtime.wait_closed(CLEANUP_TIMEOUT);
+			return Err(FulltextError::new("E_CLOSED", "injected open cleanup failure"));
+		}
 		let mut registry = registry();
 		if registry.cancelled.remove(&handle) || !environment.callbacks.is_alive() {
 			drop(registry);

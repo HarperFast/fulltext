@@ -82,6 +82,57 @@ jobs:
       - name: Verify unwind profile
         run: cargo rustc --locked --release --features node-api -- --print cfg | grep 'panic="unwind"'
 
+  optimized-native:
+    name: Optimized native concurrency
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci --ignore-scripts
+      - run: npm run test:optimized-native
+
+  coverage:
+    name: Node and Rust coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci --ignore-scripts
+      - run: npm run build:test-native
+      - run: npm run build:typescript
+      - name: Measure Node facade coverage
+        env:
+          FULLTEXT_TEST_COVERAGE: '1'
+          NODE_V8_COVERAGE: coverage/node
+        run: node scripts/run-node-tests.mjs test
+      - name: Measure Rust coverage
+        run: cargo llvm-cov --locked --all-features --lcov --output-path coverage/rust.lcov
+      - name: Summarize Rust coverage
+        run: cargo llvm-cov report --summary-only
+      - name: Store coverage results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage/
+          if-no-files-found: error
+          retention-days: 30
+
   benchmark-smoke:
     name: Native benchmark smoke
     strategy:

@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-- Publish a binary-free `@harperfast/fulltext` facade at `0.1.2`.
+- Publish a binary-free `@harperfast/fulltext` facade.
 - Publish one exact-version optional package for each supported platform.
 - Load the platform package by default; repository tests explicitly prefer the local build.
 - Reject missing, unloadable, ABI-incompatible, capability-incompatible, or version-skewed addons
@@ -13,9 +13,9 @@
 ## Intent
 
 Publish `@harperfast/fulltext` as a reproducible native dependency that works without a Rust
-toolchain or install script on every supported platform. Harper must be able to pin one exact
-wrapper version and either load the matching native artifact or receive an actionable unsupported
-platform error before an index is opened.
+toolchain or install script on every supported platform. A consumer can pin one exact wrapper
+version and either load the matching native artifact or receive an actionable unsupported-platform
+error before an index is opened.
 
 ## Invariant
 
@@ -46,11 +46,7 @@ Use the established HNSW packaging model:
    consumer with lifecycle scripts disabled, validates `runtimeInfo()`, then runs an
    open/apply/commit/reload/search/close round trip through the public
    `@harperfast/fulltext/native` export.
-6. The first published version is `0.1.1`. The `0.1.0` GitHub release failed before npm
-   publication because its platform-package path was parsed as a GitHub shorthand instead of a
-   local directory. Version `0.1.1` successfully published the facade and three original platform
-   packages on 2026-09-24. Version `0.1.2` adds the Linux arm64 artifact.
-7. The publish workflow reports success or failure to Slack after the release pipeline settles.
+6. The publish workflow reports success or failure to Slack after the release pipeline settles.
    Success links the npm package and GitHub release; failure links the workflow run and observes
    failures from packaging, packed-consumer verification, or publication. Slack API rejection
    fails the notification job rather than producing a false green result.
@@ -70,7 +66,7 @@ installation.
 - Unsupported platform or libc: `E_NATIVE_ADDON_NOT_FOUND` names the computed platform triple and
   the expected optional package.
 - Missing optional package: the same error is raised before opening an index; npm installation of
-  Harper itself remains possible. A package that resolves but cannot be loaded is wrapped as
+  the JavaScript facade itself remains possible. A package that resolves but cannot be loaded is wrapped as
   `E_NATIVE_LOAD_FAILED` with its original error as the cause rather than leaking a raw `dlopen`
   error.
 - Wrong native ABI or capability set: existing loader validation rejects the artifact.
@@ -97,16 +93,16 @@ installation.
   release artifact for RocksDB dependencies and linkage.
 - Re-run the no-RocksDB dependency and native-linkage checks on release artifacts before publish;
   publish with npm provenance.
-- **untested:** after publishing, install `@harperfast/fulltext@0.1.2` into Harper and run the
-  derived-index lifecycle suite against the real package rather than an injected binding.
+- After publishing, install the exact release into a clean consumer and rerun the public lifecycle
+  round trip against the registry artifacts rather than an injected binding.
 
 ## Approaches considered
 
-### Different layer: bundle Fulltext binaries in Harper
+### Different layer: bundle Fulltext binaries in a host application
 
-Rejected because it makes Harper responsible for building and distributing a standalone wrapper,
-and standalone Node consumers would still have no supported package. The native artifact belongs
-to the wrapper version whose ABI it implements.
+Rejected because it makes every host responsible for building and distributing a standalone
+wrapper, while other Node consumers would still have no supported package. The native artifact
+belongs to the wrapper version whose ABI it implements.
 
 ### Deeper cause: publish one universal package containing every native binary
 
@@ -117,27 +113,14 @@ using that mechanism keeps one artifact per installation without an install scri
 ### Do less: publish the runner-local artifact or compile during installation
 
 Rejected because a single tarball built on one runner cannot serve the supported matrix. Compiling
-at installation would require Rust on Harper hosts and violate the package's existing no-lifecycle-
+at installation would require Rust on consumer hosts and violate the package's existing no-lifecycle-
 script installation contract.
 
 ### Chosen: exact-version platform optional packages
 
-This preserves the existing public entry point and native ABI validation while reusing Harper's
+This preserves the existing public entry point and native ABI validation while using the
 established native-package distribution model. It is the only option considered that supports the
 standalone wrapper, avoids install-time compilation, and does not download irrelevant binaries.
-
-## Open items
-
-- **untested:** run the release workflow and full benchmark on the Linux arm64 runner.
-- **untested:** publish the new Linux arm64 package with npm provenance and verify an identical
-  tarball retry.
-- **configured:** `HarperFast/fulltext` has access to the organization `SLACK_BOT_TOKEN` secret and
-  defines the repository `SLACK_CHANNEL_ID` secret. Secret values are intentionally unreadable.
-- **untested:** confirm both Slack notification paths against the configured channel.
-- After `0.1.2` is published, refresh `package-lock.json` so every platform package carries its
-  registry URL and integrity hash.
-- Publish `0.1.2` before updating Harper's exact optional dependency; the Harper integration test
-  must use the registry artifact rather than an injected binding.
 
 ## Sources
 

@@ -102,6 +102,7 @@ try {
 		{ name: 'prefix', text: 'waterproof trai', mode: 'prefix' },
 		{ name: 'fuzzy', text: 'waterprof', mode: 'fuzzy' },
 		{ name: 'fuzzy-prefix', text: 'waterproof tral', mode: 'fuzzy-prefix' },
+		{ name: 'unicode-all', text: 'cafe resume', mode: 'all' },
 		{ name: 'candidate-filter', text: 'waterproof', mode: 'any', candidateIds: ['product-0'] },
 	];
 	for (const query of queryMix) {
@@ -156,6 +157,8 @@ try {
 			indexingThreads: config.limits.indexingThreads,
 			searchThreads: config.limits.searchThreads,
 			writerMemoryBytes: config.limits.writerMemoryBytes,
+			unicode: true,
+			streamSafeStress: true,
 		},
 		indexing: {
 			packingMilliseconds,
@@ -214,6 +217,11 @@ function product(id) {
 		['Wireless Noise Cancelling Headphones', 'Portable audio product with long battery life', 'electronics'],
 		['Organic Cotton Blue Shirt', 'Comfortable everyday apparel in multiple sizes', 'clothing'],
 		['Stainless Steel Water Bottle', 'Insulated outdoor product for hiking and travel', 'outdoors'],
+		[
+			'Café Résumé Organizer',
+			`Müller’s crème brûlée guide ${'e\u0315'.repeat(31)} with ＦＵＬＬＷＩＤＴＨ text`,
+			'books',
+		],
 	];
 	const [title, description, category] = variants[id % variants.length];
 	return { id: `product-${id}`, fields: { title: `${title} ${id}`, description, category } };

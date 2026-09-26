@@ -2,7 +2,9 @@
 
 ## Scope and invariant
 
-This fixes the shared native runtime's writer admission race before broader concurrent Harper integration. It changes no public API signature, ABI, storage format, queue limits, or Harper protocol. Late writer requests now reject with `E_POISONED` instead of executing on a terminal generation. Native Tantivy files remain the delivery target.
+This fixes the shared native runtime's writer admission race. It changes no public API signature,
+ABI, storage format, or queue limit. Late writer requests now reject with `E_POISONED` instead of
+executing on a terminal generation. Native Tantivy files remain the delivery target.
 
 **Invariant:** once poison has drained the writer queue, a request that previously observed an open runtime cannot enter that queue. Close remains available to release the writer and cannot reopen a generation that has become poisoned.
 
@@ -41,4 +43,5 @@ The added successful-path work is one atomic state load under a mutex already ac
 - Existing dirty-close, worker teardown, publication failure, bounded-admission, and independent-index tests remain part of `npm test`. This does not claim complete coverage of every close/search-panic interleaving.
 - The full gates are `npm run format:check`, `npm run lint`, and `npm test` (Rust, Node integration, packed-consumer). Native-only compilation uses `cargo check --locked --no-default-features --features node-api`; `npm run benchmark:smoke` verifies benchmark execution, not a large-catalog latency target.
 
-Process-wide budgets, general shutdown-state redesign, panic cleanup, and Harper lifecycle wiring remain separate work under the existing execution and integration issues. This change does not complete the broader bounded-execution issue.
+Process-wide budgets, general shutdown-state redesign, and panic cleanup remain separate work under
+the existing execution issues. This change does not complete the broader bounded-execution issue.

@@ -2377,6 +2377,58 @@ mod tests {
 	}
 
 	#[test]
+	fn mapped_nfkc_matches_stream_safe_unicode_normalization() {
+		use unicode_normalization::UnicodeNormalization;
+
+		let ranges = [
+			(0x20, 0x7e),
+			(0xa0, 0x24f),
+			(0x300, 0x36f),
+			(0x590, 0x6ff),
+			(0x1100, 0x11ff),
+			(0x1e00, 0x1eff),
+			(0x2100, 0x214f),
+			(0x2460, 0x24ff),
+			(0xfb00, 0xfb4f),
+			(0xff00, 0xffef),
+			(0x1f300, 0x1f64f),
+		];
+		let mut random = 0x9e37_79b9_u32;
+		for _ in 0..4_096 {
+			random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+			let length = (random as usize % 48) + 1;
+			let mut source = String::new();
+			for _ in 0..length {
+				random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+				let (start, end) = ranges[random as usize % ranges.len()];
+				random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+				let character = char::from_u32(start + random % (end - start + 1)).unwrap();
+				source.push(character);
+			}
+			let mut mapped = MappedNfkc::new(&source);
+			let mut actual = String::new();
+			while let Some(character) = mapped.next() {
+				actual.push(character.character);
+				assert!(source.get(character.span.start..character.span.end).is_some());
+			}
+			assert_eq!(actual, source.stream_safe().nfkc().collect::<String>());
+		}
+
+		let composed = format!("\u{e9}{}", "\u{315}".repeat(MAX_NONSTARTERS + 1));
+		let decomposed = format!("e\u{301}{}", "\u{315}".repeat(MAX_NONSTARTERS + 1));
+		let mut tokenizer = NfkcTokenizer::default();
+		let tokens = |tokenizer: &mut NfkcTokenizer, value: &str| {
+			let mut stream = tokenizer.token_stream(value);
+			let mut tokens = Vec::new();
+			while stream.advance() {
+				tokens.push(stream.token().text.clone());
+			}
+			tokens
+		};
+		assert_eq!(tokens(&mut tokenizer, &composed), tokens(&mut tokenizer, &decomposed));
+	}
+
+	#[test]
 	fn prefix_length_is_checked_after_normalization() {
 		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
 		let query = "Ａ".repeat(14);
