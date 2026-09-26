@@ -36,7 +36,7 @@ try {
 	completed = true;
 } finally {
 	try {
-		await index?.close({ mode: 'rollback' }).catch((error) => {
+		await index?.close().catch((error) => {
 			if (completed) throw error;
 		});
 	} finally {
