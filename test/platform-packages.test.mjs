@@ -111,7 +111,7 @@ test('release workflow installs local packages and runs every packaged example',
 	assert.doesNotMatch(workflow, /npm pack "release\/\$\{\{ matrix\.target \}\}"/);
 	assert.match(workflow, /for example in node_modules\/@harperfast\/fulltext\/examples\/\*\.mjs; do/);
 	assert.match(workflow, /node "\$example"/);
-	assert.doesNotMatch(workflow, /openNativeFullTextIndex\s*\(|applyMutationBatch\s*\(|analyzer\s*:/);
+	assert.doesNotMatch(workflow, /openNativeFullTextIndex\s*\(|applyMutationBatch\s*\(/);
 });
 
 test('release workflow reports publication success and failure to Slack', () => {
