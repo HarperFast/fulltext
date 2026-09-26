@@ -180,9 +180,12 @@ same physical index without rebuilding it.
 `configureNativeFullTextRuntime()` optionally installs one immutable process budget before the first
 open attempt. Identical calls are idempotent; configuration after an unbudgeted open is rejected. It
 admits aggregate resident indexes, indexing/search threads,
-writer memory, configured queue capacity, and expensive searches with checked atomic counters.
-Exceeding a cap returns `E_RESOURCE_LIMIT`; it never evicts an active generation. Callers that omit
-it retain current per-index admission behavior.
+writer memory, configured queue capacity, and expensive searches with checked shared accounting.
+Each index reserves its writer queue and shared search-queue capacity, so process queue accounting
+charges twice the per-index `maxQueuedBytes`. Exceeding an open-time admission cap returns
+`E_RESOURCE_LIMIT`; it never evicts an active generation. Expensive searches wait on a condition
+variable off the JavaScript thread until process capacity is available. Callers that omit the
+governor retain current per-index admission behavior.
 
 The public search method accepts a small typed request and decodes a versioned native result buffer
 into bounded result objects. The N-API boundary receives one operation per batch or search;
@@ -290,11 +293,13 @@ invalid UTF-8 is rejected on the writer actor rather than the JavaScript thread.
 the fixed header and structural bounds only. `indexId` and `generation` have fixed encoded-length
 limits because they are persisted.
 
-The English analyzer is versioned by name and composed from `SimpleTokenizer`, possessive removal,
-Unicode NFKC normalization, `LowerCaser`, `AsciiFoldingFilter`, `RemoveLongFilter`, optional English
-`StopWordFilter`, and English `Stemmer`. Filters mutate token text without replacing the tokenizer's
-original byte offsets. Golden fixtures cover combining marks, full-width text, Latin diacritics,
-possessives, expansions, and adjacent emoji. The same analyzer tokenizes indexed and search text.
+The English analyzer is versioned by name and starts with an NFKC-aware tokenizer so decomposed
+words are normalized before token boundaries are selected. Already-normalized input is borrowed;
+only input requiring normalization allocates a normalized buffer and a mapping back to original
+byte spans. Possessive removal, `LowerCaser`, `AsciiFoldingFilter`, `RemoveLongFilter`, optional
+English `StopWordFilter`, and English `Stemmer` follow. Golden fixtures cover combining marks,
+full-width text, Latin diacritics, possessives, expansions, and adjacent emoji. The same analyzer
+tokenizes indexed and search text.
 The analyzer name and identity-sidecar version form the compatibility key; changing filter semantics
 requires bumping at least one of them.
 
@@ -304,9 +309,9 @@ sorted and fingerprinted in identity sidecar v3. A bounded token filter streams 
 the source position into both analyzed and surface fields; query text is not expanded. Tantivy counts
 the alternatives in BM25 field length, so enabling a rule can affect unrelated-term ranking for a
 document containing its source. Match tracing uses the same document-side expansion and maps every
-replacement to the source token span, with a 262,144-token-per-value ceiling after expansion. Version
-2 sidecars remain parseable for safe reset but mismatch v3 open/inspection so Harper can retire and
-rebuild them.
+replacement to the source token span. Crossing its 262,144-token-per-value ceiling marks the trace
+incomplete instead of failing the request. Version 2 sidecars remain parseable for safe reset but
+mismatch v3 open/inspection so Harper can retire and rebuild them.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`

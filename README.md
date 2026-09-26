@@ -53,7 +53,7 @@ const index = await openNativeFullTextIndex({
 		searchThreads: 4,
 		writerMemoryBytes: 60_000_000,
 		maxQueuedCommands: 128,
-		maxQueuedBytes: 64 * 1024 * 1024,
+		maxQueuedBytes: 16 * 1024 * 1024,
 		maxBatchBytes: 8 * 1024 * 1024,
 	},
 });
@@ -105,10 +105,12 @@ batch, without taking the latch.
 must be called before the first open attempt when one process may host many indexes; configuring
 after an unbudgeted open fails with `E_RESOURCE_LIMIT`. It bounds aggregate resident
 indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
-expensive searches. A conflicting second configuration or an open/search that would exceed the
-budget fails with `E_RESOURCE_LIMIT`; the wrapper never evicts a live generation. Closing an index
-releases its reservation. Callers that omit this function retain per-index limits and current
-standalone behavior.
+expensive searches. Aggregate queue accounting reserves each index's writer queue plus its shared
+search queues, or twice that index's `maxQueuedBytes`. A conflicting second configuration or an
+open that would exceed an admission cap fails with `E_RESOURCE_LIMIT`; the wrapper never evicts a
+live generation. Expensive searches wait off the JavaScript thread for process capacity, allowing
+the bounded search queues to apply backpressure. A completed close has released its reservation.
+Callers that omit this function retain per-index limits and current standalone behavior.
 
 Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
 as record-local rejection could remove many documents under the wrong schema. The option applies
@@ -201,10 +203,9 @@ const traced = await index.traceMatches(
 ```
 
 Tracing evaluates only the supplied current values; it does not expand the live index dictionary.
-Analysis is limited to 262,144 emitted tokens per value after synonym expansion and fails with
-`E_RESOURCE_LIMIT` beyond that bound.
-When its span or response ceiling is reached, `complete` is false and both later spans and later
-matching records may be omitted.
+Analysis is limited to 262,144 emitted tokens per value after synonym expansion. When that token
+ceiling, a span ceiling, or the response ceiling is reached, `complete` is false and later matches
+may be omitted.
 
 Search and tracing share a maximum 30-second queue-plus-execution budget. Harper passes its shorter
 remaining request budget through the second method argument; larger values are clamped to 30

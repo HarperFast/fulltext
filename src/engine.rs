@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -13,11 +14,12 @@ use tantivy::query::{
 };
 use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{
-	AsciiFoldingFilter, Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer,
-	Token, TokenFilter, TokenStream, Tokenizer,
+	AsciiFoldingFilter, Language, LowerCaser, RemoveLongFilter, Stemmer, StopWordFilter, TextAnalyzer, Token,
+	TokenFilter, TokenStream, Tokenizer,
 };
 use tantivy::{DocAddress, Index, IndexReader, IndexSettings, IndexWriter, Order, ReloadPolicy, Searcher, Term};
-use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::{is_nfkc, UnicodeNormalization};
 
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
@@ -589,12 +591,11 @@ impl Engine {
 		max_spans: usize,
 		deadline: Option<Instant>,
 	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool)> {
-		let analyzed = self.source_tokens(value, false, deadline)?;
+		let (analyzed, mut truncated) = self.source_tokens(value, false, deadline)?;
 		let utf16_offsets = utf16_offsets(value);
 		let mut spans = Vec::new();
 		let mut seen_spans = HashSet::new();
 		let mut found = HashSet::new();
-		let mut truncated = false;
 		match plan {
 			TracePlan::Any(terms) | TracePlan::All(terms) => {
 				for (index, token) in analyzed.iter().enumerate() {
@@ -666,7 +667,8 @@ impl Engine {
 				prefix,
 				fuzzy,
 			} => {
-				let surface = self.source_tokens(value, true, deadline)?;
+				let (surface, surface_truncated) = self.source_tokens(value, true, deadline)?;
+				truncated |= surface_truncated;
 				for (index, token) in analyzed.iter().enumerate() {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
@@ -705,7 +707,8 @@ impl Engine {
 				}
 			}
 			TracePlan::Fuzzy(terms) => {
-				let surface = self.source_tokens(value, true, deadline)?;
+				let (surface, surface_truncated) = self.source_tokens(value, true, deadline)?;
+				truncated |= surface_truncated;
 				let mut analyzed_by_position = HashMap::<usize, Vec<&str>>::new();
 				for token in &analyzed {
 					analyzed_by_position
@@ -748,7 +751,7 @@ impl Engine {
 		Ok((spans, found, truncated))
 	}
 
-	fn source_tokens(&self, text: &str, surface: bool, deadline: Option<Instant>) -> Result<Vec<SourceToken>> {
+	fn source_tokens(&self, text: &str, surface: bool, deadline: Option<Instant>) -> Result<(Vec<SourceToken>, bool)> {
 		let mut analyzer = if surface {
 			self.surface_index_analyzer.clone()
 		} else {
@@ -761,10 +764,7 @@ impl Engine {
 				check_deadline(deadline)?;
 			}
 			if tokens.len() == MAX_TRACE_TOKENS_PER_VALUE {
-				return Err(FulltextError::new(
-					"E_RESOURCE_LIMIT",
-					format!("trace analysis exceeds {MAX_TRACE_TOKENS_PER_VALUE} tokens for one value"),
-				));
+				return Ok((tokens, true));
 			}
 			let token = stream.token();
 			tokens.push(SourceToken {
@@ -774,7 +774,7 @@ impl Engine {
 				position: token.position,
 			});
 		}
-		Ok(tokens)
+		Ok((tokens, false))
 	}
 
 	fn selected_fields(&self, requested: &[String]) -> Result<Vec<&EngineField>> {
@@ -991,7 +991,7 @@ impl Engine {
 	}
 
 	fn final_surface_term<'a>(&self, text: &'a str) -> Result<(&'a str, Option<String>)> {
-		let mut tokenizer = SimpleTokenizer::default();
+		let mut tokenizer = NfkcTokenizer::default();
 		let mut raw_stream = tokenizer.token_stream(text);
 		let mut raw_final_length = 0;
 		while raw_stream.advance() {
@@ -1469,53 +1469,124 @@ fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Vec<Eng
 	Ok((builder.build(), id_field, fields))
 }
 
-#[derive(Clone)]
-struct NfkcFilter;
-
-impl TokenFilter for NfkcFilter {
-	type Tokenizer<T: Tokenizer> = NfkcFilterWrapper<T>;
-
-	fn transform<T: Tokenizer>(self, tokenizer: T) -> Self::Tokenizer<T> {
-		NfkcFilterWrapper { tokenizer }
-	}
+#[derive(Clone, Default)]
+struct NfkcTokenizer {
+	token: Token,
 }
 
-#[derive(Clone)]
-struct NfkcFilterWrapper<T> {
-	tokenizer: T,
+#[derive(Clone, Copy)]
+struct SourceSpan {
+	start: usize,
+	end: usize,
 }
 
-impl<T: Tokenizer> Tokenizer for NfkcFilterWrapper<T> {
-	type TokenStream<'a> = NfkcTokenStream<T::TokenStream<'a>>;
+struct NfkcTokenStream<'a> {
+	text: Cow<'a, str>,
+	source_spans: Option<Vec<SourceSpan>>,
+	byte_offset: usize,
+	character_offset: usize,
+	token: &'a mut Token,
+}
+
+impl Tokenizer for NfkcTokenizer {
+	type TokenStream<'a> = NfkcTokenStream<'a>;
 
 	fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+		self.token.reset();
+		let (text, source_spans) = normalize_for_tokenization(text);
 		NfkcTokenStream {
-			tail: self.tokenizer.token_stream(text),
+			text,
+			source_spans,
+			byte_offset: 0,
+			character_offset: 0,
+			token: &mut self.token,
 		}
 	}
 }
 
-struct NfkcTokenStream<T> {
-	tail: T,
+impl NfkcTokenStream<'_> {
+	fn next_character(&self) -> Option<char> {
+		self.text.get(self.byte_offset..)?.chars().next()
+	}
+
+	fn source_span(&self, character_offset: usize, byte_start: usize, byte_end: usize) -> SourceSpan {
+		self.source_spans
+			.as_ref()
+			.map(|spans| spans[character_offset])
+			.unwrap_or(SourceSpan {
+				start: byte_start,
+				end: byte_end,
+			})
+	}
+
+	fn consume_character(&mut self, character: char) -> SourceSpan {
+		let byte_start = self.byte_offset;
+		self.byte_offset += character.len_utf8();
+		let span = self.source_span(self.character_offset, byte_start, self.byte_offset);
+		self.character_offset += 1;
+		span
+	}
 }
 
-impl<T: TokenStream> TokenStream for NfkcTokenStream<T> {
+impl TokenStream for NfkcTokenStream<'_> {
 	fn advance(&mut self) -> bool {
-		if !self.tail.advance() {
-			return false;
+		self.token.text.clear();
+		self.token.position = self.token.position.wrapping_add(1);
+		while let Some(character) = self.next_character() {
+			let normalized_start = self.byte_offset;
+			let mut source_span = self.consume_character(character);
+			if !character.is_alphanumeric() {
+				continue;
+			}
+			while let Some(character) = self.next_character() {
+				if !character.is_alphanumeric() {
+					break;
+				}
+				source_span.end = self.consume_character(character).end;
+			}
+			self.token.offset_from = source_span.start;
+			self.token.offset_to = source_span.end;
+			self.token.text.push_str(&self.text[normalized_start..self.byte_offset]);
+			return true;
 		}
-		let normalized = self.tail.token().text.nfkc().collect::<String>();
-		self.tail.token_mut().text = normalized;
-		true
+		false
 	}
 
 	fn token(&self) -> &Token {
-		self.tail.token()
+		self.token
 	}
 
 	fn token_mut(&mut self) -> &mut Token {
-		self.tail.token_mut()
+		self.token
 	}
+}
+
+fn normalize_for_tokenization(text: &str) -> (Cow<'_, str>, Option<Vec<SourceSpan>>) {
+	if text.is_ascii() || is_nfkc(text) {
+		return (Cow::Borrowed(text), None);
+	}
+	let mut normalized = String::with_capacity(text.len());
+	let mut source_spans = Vec::with_capacity(text.chars().count());
+	let mut characters = text.char_indices().peekable();
+	while let Some((start, character)) = characters.next() {
+		let mut end = start + character.len_utf8();
+		let word = character.is_alphanumeric() || is_combining_mark(character);
+		if word {
+			while let Some(&(offset, next)) = characters.peek() {
+				if !next.is_alphanumeric() && !is_combining_mark(next) {
+					break;
+				}
+				characters.next();
+				end = offset + next.len_utf8();
+			}
+		}
+		let chunk = &text[start..end];
+		for normalized_character in chunk.nfkc() {
+			normalized.push(normalized_character);
+			source_spans.push(SourceSpan { start, end });
+		}
+	}
+	(Cow::Owned(normalized), Some(source_spans))
 }
 
 #[derive(Clone)]
@@ -1653,9 +1724,8 @@ impl<T: TokenStream> TokenStream for SynonymTokenStream<'_, T> {
 }
 
 fn build_analyzer(stop_words: bool, synonyms: Option<SynonymMap>) -> Result<TextAnalyzer> {
-	let mut builder = TextAnalyzer::builder(SimpleTokenizer::default())
+	let mut builder = TextAnalyzer::builder(NfkcTokenizer::default())
 		.filter_dynamic(EnglishPossessiveFilter)
-		.filter_dynamic(NfkcFilter)
 		.filter_dynamic(LowerCaser)
 		.filter_dynamic(AsciiFoldingFilter)
 		.filter_dynamic(RemoveLongFilter::limit(40));
@@ -1665,20 +1735,19 @@ fn build_analyzer(stop_words: bool, synonyms: Option<SynonymMap>) -> Result<Text
 		builder = builder.filter_dynamic(stop_filter);
 	}
 	builder = builder.filter_dynamic(Stemmer::new(Language::English));
-	if let Some(rules) = synonyms {
+	if let Some(rules) = synonyms.filter(|rules| !rules.is_empty()) {
 		builder = builder.filter_dynamic(SynonymFilter { rules });
 	}
 	Ok(builder.build())
 }
 
 fn build_surface_analyzer(synonyms: Option<SynonymMap>) -> TextAnalyzer {
-	let mut builder = TextAnalyzer::builder(SimpleTokenizer::default())
+	let mut builder = TextAnalyzer::builder(NfkcTokenizer::default())
 		.filter_dynamic(EnglishPossessiveFilter)
-		.filter_dynamic(NfkcFilter)
 		.filter_dynamic(LowerCaser)
 		.filter_dynamic(AsciiFoldingFilter)
 		.filter_dynamic(RemoveLongFilter::limit(40));
-	if let Some(rules) = synonyms {
+	if let Some(rules) = synonyms.filter(|rules| !rules.is_empty()) {
 		builder = builder.filter_dynamic(SynonymFilter { rules });
 	}
 	builder.build()
@@ -2050,16 +2119,23 @@ mod tests {
 	#[test]
 	fn english_analyzer_normalizes_unicode_and_possessives_with_source_offsets() {
 		let mut analyzer = build_analyzer(true, None).unwrap();
-		let source = "Müller's ＳＨＯＥＳ cafe\u{301} ß";
+		let source = "Müller's ＳＨＯＥＳ re\u{301}sume\u{301} ß";
 		let mut stream = analyzer.token_stream(source);
 		let mut tokens = Vec::new();
 		while stream.advance() {
 			tokens.push(stream.token().clone());
 		}
+		drop(stream);
 		assert_eq!(
 			tokens.iter().map(|token| token.text.as_str()).collect::<Vec<_>>(),
-			["muller", "shoe", "cafe", "ss"]
+			["muller", "shoe", "resum", "ss"]
 		);
+		let resume = &tokens[2];
+		assert_eq!(&source[resume.offset_from..resume.offset_to], "re\u{301}sume\u{301}");
+		let mut composed = analyzer.token_stream("résumé");
+		assert!(composed.advance());
+		assert_eq!(composed.token().text, "resum");
+		assert!(!composed.advance());
 		for token in tokens {
 			assert!(token.offset_from < token.offset_to);
 			assert!(source.get(token.offset_from..token.offset_to).is_some());
@@ -2068,6 +2144,15 @@ mod tests {
 			source_span(&utf16_offsets(source), source.len() + 1, source.len() + 2),
 			None
 		);
+	}
+
+	#[test]
+	fn prefix_length_is_checked_after_normalization() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let query = "Ａ".repeat(14);
+		let (completed, prefix) = engine.final_surface_term(&query).unwrap();
+		assert_eq!(completed, "");
+		assert_eq!(prefix.unwrap(), "a".repeat(14));
 	}
 
 	#[test]

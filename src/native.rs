@@ -85,7 +85,7 @@ struct Runtime {
 	search_execution_nanoseconds: AtomicU64,
 	search_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 	closed: Arc<CompletionSignal>,
-	admission: Option<RuntimeAdmission>,
+	reservation: Mutex<Option<RuntimeAdmission>>,
 	#[cfg(feature = "test-panic")]
 	publish_fault: AtomicU8,
 	#[cfg(feature = "test-panic")]
@@ -101,7 +101,8 @@ struct RuntimeBudget {
 	search_threads: AtomicUsize,
 	writer_memory_bytes: AtomicUsize,
 	queued_bytes: AtomicUsize,
-	expensive_searches: AtomicUsize,
+	expensive_searches: Mutex<usize>,
+	expensive_search_ready: Condvar,
 }
 
 enum RuntimeBudgetState {
@@ -140,7 +141,7 @@ struct RuntimeParts {
 	engine: Engine,
 	writer: Writer,
 	reader: IndexReader,
-	admission: Option<RuntimeAdmission>,
+	reservation: Option<RuntimeAdmission>,
 }
 
 struct CompletionSignal {
@@ -595,7 +596,8 @@ impl RuntimeBudget {
 			search_threads: AtomicUsize::new(0),
 			writer_memory_bytes: AtomicUsize::new(0),
 			queued_bytes: AtomicUsize::new(0),
-			expensive_searches: AtomicUsize::new(0),
+			expensive_searches: Mutex::new(0),
+			expensive_search_ready: Condvar::new(),
 		}
 	}
 
@@ -650,14 +652,16 @@ impl RuntimeBudget {
 		Ok(admission)
 	}
 
-	fn acquire_expensive(self: &Arc<Self>) -> Result<ExpensiveSearchPermit> {
-		reserve(
-			&self.expensive_searches,
-			1,
-			self.limits.max_expensive_searches,
-			"concurrent expensive searches",
-		)?;
-		Ok(ExpensiveSearchPermit { budget: self.clone() })
+	fn acquire_expensive(self: &Arc<Self>) -> ExpensiveSearchPermit {
+		let mut active = lock(&self.expensive_searches);
+		while *active >= self.limits.max_expensive_searches {
+			active = self
+				.expensive_search_ready
+				.wait(active)
+				.unwrap_or_else(|error| error.into_inner());
+		}
+		*active += 1;
+		ExpensiveSearchPermit { budget: self.clone() }
 	}
 }
 
@@ -675,7 +679,11 @@ impl Drop for RuntimeAdmission {
 
 impl Drop for ExpensiveSearchPermit {
 	fn drop(&mut self) {
-		release(&self.budget.expensive_searches, 1);
+		let mut active = lock(&self.budget.expensive_searches);
+		debug_assert!(*active > 0);
+		*active = active.saturating_sub(1);
+		drop(active);
+		self.budget.expensive_search_ready.notify_one();
 	}
 }
 
@@ -747,7 +755,7 @@ impl Runtime {
 			search_execution_nanoseconds: AtomicU64::new(0),
 			search_threads: Mutex::new(Vec::with_capacity(search_thread_count)),
 			closed: Arc::new(CompletionSignal::new()),
-			admission: parts.admission,
+			reservation: Mutex::new(parts.reservation),
 			#[cfg(feature = "test-panic")]
 			publish_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
@@ -807,11 +815,21 @@ impl Runtime {
 		}
 	}
 
-	fn expensive_search_permit(&self) -> Result<Option<ExpensiveSearchPermit>> {
-		self.admission
+	fn expensive_search_permit(&self) -> Option<ExpensiveSearchPermit> {
+		let budget = lock(&self.reservation)
 			.as_ref()
-			.map(|admission| admission.budget.acquire_expensive())
-			.transpose()
+			.map(|reservation| reservation.budget.clone());
+		budget.map(|budget| budget.acquire_expensive())
+	}
+
+	fn release_reservation(&self) {
+		drop(lock(&self.reservation).take());
+	}
+
+	fn retain_reservation_until_restart(&self) {
+		if let Some(reservation) = lock(&self.reservation).take() {
+			mem::forget(reservation);
+		}
 	}
 
 	fn enqueue_writer(&self, command: WriterCommand, bytes: usize) -> boundary::Result<()> {
@@ -1453,9 +1471,11 @@ fn finish_runtime(
 	runtime.writer_queue.close();
 	if outcome.quiesced {
 		runtime.state.store(STATE_CLOSED, Ordering::Release);
+		runtime.release_reservation();
 		release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
 	} else {
 		runtime.state.store(STATE_POISONED, Ordering::Release);
+		runtime.retain_reservation_until_restart();
 		release_runtime_handle(
 			runtime.handle,
 			&runtime.path,
@@ -1476,6 +1496,7 @@ fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
 	}
 	runtime.writer_queue.close();
 	runtime.state.store(STATE_POISONED, Ordering::Release);
+	runtime.retain_reservation_until_restart();
 	release_runtime_handle(
 		runtime.handle,
 		&runtime.path,
@@ -1582,16 +1603,12 @@ fn execute_search_command(
 	let started = Instant::now();
 	let SearchCommand { operation, completion } = queued.value;
 	let result = catch_unwind(AssertUnwindSafe(|| {
-		let _permit = if runtime.admission.is_some() {
-			let expensive = match &operation {
-				SearchOperation::Search(bytes) => search_mode(bytes)?.is_expensive(),
-				SearchOperation::Trace(_) => true,
-			};
-			if expensive {
-				runtime.expensive_search_permit()?
-			} else {
-				None
-			}
+		let expensive = match &operation {
+			SearchOperation::Search(bytes) => search_mode(bytes)?.is_expensive(),
+			SearchOperation::Trace(_) => true,
+		};
+		let _permit = if expensive {
+			runtime.expensive_search_permit()
 		} else {
 			None
 		};
@@ -2052,7 +2069,7 @@ fn open_runtime_with_directory(
 				))
 			}
 		}
-		let admission = admit_runtime(&config.limits)?;
+		let reservation = admit_runtime(&config.limits)?;
 		let engine = Engine::open(directory, &config)?;
 		let (writer, committed_payload) = engine.writer_with_payload(&config)?;
 		let reader = engine.reader_for_open()?;
@@ -2066,7 +2083,7 @@ fn open_runtime_with_directory(
 				engine,
 				writer,
 				reader,
-				admission,
+				reservation,
 			},
 		)?;
 		let mut registry = registry();
@@ -2466,19 +2483,44 @@ mod tests {
 			max_queued_bytes: 16,
 			max_batch_bytes: 16,
 		};
-		let admission = budget.admit(&limits).unwrap();
+		let reservation = budget.admit(&limits).unwrap();
 		assert_eq!(budget.admit(&limits).err().unwrap().code, "E_RESOURCE_LIMIT");
 		assert_eq!(budget.resident_indexes.load(Ordering::Acquire), 1);
-		let permit = budget.acquire_expensive().unwrap();
-		assert_eq!(budget.acquire_expensive().err().unwrap().code, "E_RESOURCE_LIMIT");
+		let permit = budget.acquire_expensive();
 		drop(permit);
-		drop(admission);
+		drop(reservation);
 		assert_eq!(budget.resident_indexes.load(Ordering::Acquire), 0);
 		assert_eq!(budget.indexing_threads.load(Ordering::Acquire), 0);
 		assert_eq!(budget.search_threads.load(Ordering::Acquire), 0);
 		assert_eq!(budget.writer_memory_bytes.load(Ordering::Acquire), 0);
 		assert_eq!(budget.queued_bytes.load(Ordering::Acquire), 0);
-		assert_eq!(budget.expensive_searches.load(Ordering::Acquire), 0);
+		assert_eq!(*lock(&budget.expensive_searches), 0);
+	}
+
+	#[test]
+	fn expensive_search_budget_applies_backpressure() {
+		let budget = Arc::new(RuntimeBudget::new(RuntimeBudgetLimits {
+			max_resident_indexes: 1,
+			max_indexing_threads: 1,
+			max_search_threads: 2,
+			max_writer_memory_bytes: 15_000_000,
+			max_queued_bytes: 32,
+			max_expensive_searches: 1,
+		}));
+		let first = budget.acquire_expensive();
+		let waiting_budget = budget.clone();
+		let (started_sender, started_receiver) = mpsc::channel();
+		let (acquired_sender, acquired_receiver) = mpsc::channel();
+		let waiting = thread::spawn(move || {
+			started_sender.send(()).unwrap();
+			let _permit = waiting_budget.acquire_expensive();
+			acquired_sender.send(()).unwrap();
+		});
+		started_receiver.recv().unwrap();
+		assert!(acquired_receiver.recv_timeout(Duration::from_millis(20)).is_err());
+		drop(first);
+		acquired_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+		waiting.join().unwrap();
 	}
 
 	#[test]
