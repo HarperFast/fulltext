@@ -105,14 +105,13 @@ test('release tarballs use unambiguous absolute paths for npm publish', (context
 	assert.deepStrictEqual(tarballsIn(path.relative(process.cwd(), temporaryDirectory)), [path.resolve(tarball)]);
 });
 
-test('release workflow marks staged platform packages as local npm inputs', () => {
+test('release workflow installs local packages and runs every packaged example', () => {
 	const workflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
 	assert.match(workflow, /npm pack "\.\/release\/\$\{\{ matrix\.target \}\}"/);
 	assert.doesNotMatch(workflow, /npm pack "release\/\$\{\{ matrix\.target \}\}"/);
-	assert.match(workflow, /openNativeFullTextIndex/);
-	assert.match(workflow, /applyMutationBatch/);
-	assert.match(workflow, /index\.search/);
-	assert.match(workflow, /index\.close/);
+	assert.match(workflow, /for example in node_modules\/@harperfast\/fulltext\/examples\/\*\.mjs; do/);
+	assert.match(workflow, /node "\$example"/);
+	assert.doesNotMatch(workflow, /openNativeFullTextIndex\s*\(|applyMutationBatch\s*\(/);
 });
 
 test('release workflow reports publication success and failure to Slack', () => {
