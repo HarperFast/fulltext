@@ -16,13 +16,14 @@ fuzzy-prefix queries, score-neutral candidate filtering, current-record match tr
 deterministic close. Harper's derived-index watermark and readiness policy remain outside the
 wrapper.
 
-It deliberately implements narrow prerequisites from issues #14 and #17 without closing either
-issue. From #14 it uses one versioned packed mutation request, one packed search result, stable error
-codes, and the lifecycle shape required by this backend. From #17 it uses one bounded dedicated
-writer actor and one bounded search executor per index so sustained work stays off JavaScript and
-libuv while search remains independent of write/commit latency. It does not implement the final
-process-wide governor, shared cross-index search pool, multi-environment handle registry,
-cancellation, or derived nonblocking admission.
+It implements the native portions of [the façade and lifecycle contract](https://github.com/HarperFast/fulltext/issues/14)
+and [bounded native execution](https://github.com/HarperFast/fulltext/issues/17). The facade uses
+versioned packed mutation and search frames, stable error codes, and explicit lifecycle operations.
+Each index has one bounded writer actor and a bounded search executor, while the optional process
+governor provides checked aggregate admission across indexes. Sustained work stays off JavaScript
+and libuv, and search remains independent of write and commit latency. Shared cross-index executors,
+multi-environment handles, cancellation of started Tantivy collectors, and Harper derived-index
+admission remain outside this contract.
 
 ## Invariant
 
@@ -240,8 +241,8 @@ well as indexing and commit. `reload()` first crosses the writer queue as a barr
 shared reader under a short coordination lock, and publishes the new searcher to subsequent
 requests. Tantivy remains free to use its
 configured indexing and merge workers behind the writer actor. Independent indexes and their
-searches may run concurrently. #17 later replaces the per-index search pools with the bounded
-process pool without changing engine behavior.
+searches may run concurrently. The process governor bounds their aggregate resources without
+replacing the per-index search pools with a shared scheduler.
 
 With two or more search threads, one worker consumes only the ordinary BM25 lane. Every other
 worker prioritizes phrase, prefix, fuzzy, and trace requests, then steals ordinary work when the
@@ -513,7 +514,7 @@ yields the reference implementation used by Harper's derived index.
 - Corpus-level query suggestions; bounded prefix search supplies text autocomplete.
 - Shared handles across multiple Node worker environments.
 - A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe
-  callback; this is part of the shared multi-environment runtime in issue #17.
+  callback as part of a future shared multi-environment runtime.
 - Fixed-host regression thresholds comparing standalone native, Harper without full text, and
   Harper using the native derived index.
 - Cancellation of an already-running Tantivy collector and cursor-based deep pagination.
