@@ -189,6 +189,9 @@ charges twice the per-index `maxQueuedBytes`. Exceeding an open-time admission c
 variable off the JavaScript thread until process capacity is available, the request deadline
 expires, or close interrupts the wait. Callers that omit the governor retain current per-index
 admission behavior.
+The deadline controls whether queued or completed work is accepted, not when its promise settles.
+When every eligible worker is already executing non-interruptible Tantivy work, an expired queued
+request is rejected when a worker next examines it.
 An unproven teardown quarantines the path and keeps its aggregate capacity charged until process
 restart; releasing an unverified reservation could oversubscribe threads or memory still held by
 native actors.
@@ -345,7 +348,8 @@ caller may catch that distinct code and choose a documented fallback. Fuzzy-pref
 remains a preview capability until the catalog-scale benchmark qualifies it. Request budgets cover
 queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing;
 Tantivy's collector itself cannot be interrupted, so an expired search result is discarded after
-the collector returns.
+the collector returns. If all eligible workers are executing, an expired queued request is rejected
+when a worker next examines it rather than at the exact wall-clock deadline.
 
 ## Failure and lifecycle behavior
 

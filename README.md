@@ -233,8 +233,11 @@ may be omitted.
 
 Search and tracing share a maximum 30-second queue-plus-execution budget. Applications can pass a
 shorter remaining request budget through the second method argument; larger values are clamped to
-30 seconds. Tantivy search itself is not interruptible, so a search that expires in flight is discarded
-after Tantivy returns. Match tracing checks its deadline while tokenizing and matching. With at
+30 seconds. The budget determines whether queued or completed work is accepted; it is not a
+callback timer. If every eligible worker is already executing non-interruptible work, an expired
+queued request is rejected when a worker next examines it. Tantivy search itself is not
+interruptible, so a search that expires in flight is discarded after Tantivy returns. Match tracing
+checks its deadline while tokenizing and matching. With at
 least two search threads, one worker is reserved for ordinary `any`/`all` BM25. The remaining
 workers prioritize phrase, prefix, fuzzy, and trace work, then steal ordinary work when that queue
 is idle. A one-thread configuration remains valid but cannot isolate query classes.
