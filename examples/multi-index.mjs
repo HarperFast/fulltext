@@ -30,10 +30,13 @@ const options = (name) => ({
 });
 let indexes = [];
 try {
-	indexes = await Promise.all([
+	const opened = await Promise.allSettled([
 		openNativeFullTextIndex(options('products')),
 		openNativeFullTextIndex(options('articles')),
 	]);
+	indexes = opened.filter((result) => result.status === 'fulfilled').map((result) => result.value);
+	const failure = opened.find((result) => result.status === 'rejected');
+	if (failure) throw failure.reason;
 	await Promise.all(
 		indexes.map(async (index, offset) => {
 			await index.applyMutationBatch({

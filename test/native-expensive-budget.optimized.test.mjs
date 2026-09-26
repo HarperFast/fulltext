@@ -9,7 +9,7 @@ import { encodeOpen } from '../dist/codec.js';
 import { invoke } from '../dist/invoke.js';
 import { loadAddon } from '../dist/load-addon.js';
 
-test('optimized native searches enforce expensive permits and wake waiters on close', async (context) => {
+test('optimized native searches preserve ordinary capacity and close queued expensive work', async (context) => {
 	const indexPath = mkdtempSync(path.join(tmpdir(), 'fulltext-optimized-permit-'));
 	context.after(() => rmSync(indexPath, { recursive: true, force: true }));
 	configureNativeFullTextRuntime({
@@ -40,7 +40,9 @@ test('optimized native searches enforce expensive permits and wake waiters on cl
 		},
 	};
 	const addon = loadAddon();
-	assert(addon.__testDelayNextExpensiveSearch && addon.__testExpensiveSearchState);
+	assert(
+		addon.__testDelayNextExpensiveSearch && addon.__testDelayNextOrdinarySearch && addon.__testExpensiveSearchState,
+	);
 	const opened = await invoke((callback) => addon.__nativeOpen(encodeOpen(options), callback));
 	const handle = opened.u32();
 	assert.strictEqual(opened.u8(), 0);
@@ -69,11 +71,28 @@ test('optimized native searches enforce expensive permits and wake waiters on cl
 		afterContention.metrics.searchQueueNanoseconds - beforeContention.metrics.searchQueueNanoseconds >= 5_000_000n,
 	);
 
+	addon.__testDelayNextOrdinarySearch(handle, 200);
+	const ordinaryBlocker = index.search({ text: 'trail' });
+	await waitFor(() => addon.__testExpensiveSearchState(handle)[2] === 0);
+	addon.__testDelayNextExpensiveSearch(handle, 150);
+	const expensiveHolder = index.search(
+		{ text: 'trail running', mode: 'phrase' },
+		{ remainingBudgetMilliseconds: 1_000 },
+	);
+	await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
+	const expensiveQueued = index.search(
+		{ text: 'trail running', mode: 'phrase' },
+		{ remainingBudgetMilliseconds: 1_000 },
+	);
+	await waitFor(() => index.status().searchQueuedCommands > 0n);
+	assert.strictEqual((await index.search({ text: 'waterproof' })).total, 1);
+	await Promise.all([ordinaryBlocker, expensiveHolder, expensiveQueued]);
+
 	addon.__testDelayNextExpensiveSearch(handle, 150);
 	const holding = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });
 	await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
 	const waiting = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });
-	await waitFor(() => addon.__testExpensiveSearchState(handle)[1] > 0);
+	await waitFor(() => index.status().searchQueuedCommands > 0n);
 	const closing = index.close();
 	await assert.rejects(waiting, (error) => error.code === 'E_CLOSED');
 	await holding;

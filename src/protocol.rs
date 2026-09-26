@@ -248,12 +248,6 @@ fn decode_engine_identity_config(cursor: &mut Cursor<'_>) -> Result<EngineIdenti
 	let mut synonyms = Vec::with_capacity(synonym_count);
 	for _ in 0..synonym_count {
 		let source = cursor.string_with_budget(&mut synonym_bytes_remaining, "encoded synonyms")?;
-		if synonym_bytes_remaining < 2 {
-			return Err(FulltextError::invalid(format!(
-				"encoded synonyms must not exceed {MAX_SYNONYM_BYTES} bytes"
-			)));
-		}
-		synonym_bytes_remaining -= 2;
 		let replacement_count = cursor.u16()? as usize;
 		if replacement_count == 0 || replacement_count > MAX_SYNONYM_REPLACEMENTS {
 			return Err(FulltextError::invalid(format!(
@@ -740,21 +734,13 @@ impl<'a> Cursor<'a> {
 	}
 
 	fn string_with_budget(&mut self, remaining: &mut usize, label: &str) -> Result<String> {
-		if *remaining < 4 {
-			return Err(FulltextError::invalid(format!(
-				"{label} must not exceed {MAX_SYNONYM_BYTES} bytes"
-			)));
-		}
 		let length = self.u32()? as usize;
-		let encoded_length = length
-			.checked_add(4)
-			.ok_or_else(|| FulltextError::invalid("packed string length overflow"))?;
-		if encoded_length > *remaining || length > MAX_STRING_BYTES {
+		if length > *remaining || length > MAX_STRING_BYTES {
 			return Err(FulltextError::invalid(format!(
 				"{label} must not exceed {MAX_SYNONYM_BYTES} bytes"
 			)));
 		}
-		*remaining -= encoded_length;
+		*remaining -= length;
 		let bytes = self.take(length)?;
 		String::from_utf8(bytes.to_vec()).map_err(|_| FulltextError::invalid("packed string is not valid UTF-8"))
 	}
@@ -849,6 +835,25 @@ mod tests {
 				.code,
 			"E_INVALID_ARGUMENT"
 		);
+	}
+
+	#[test]
+	fn accepts_exact_synonym_text_budget_without_charging_frame_bytes() {
+		let mut bytes = (MAX_SYNONYM_BYTES as u32).to_le_bytes().to_vec();
+		bytes.resize(4 + MAX_SYNONYM_BYTES, b'x');
+		let mut cursor = Cursor {
+			bytes: &bytes,
+			offset: 0,
+		};
+		let mut remaining = MAX_SYNONYM_BYTES;
+		assert_eq!(
+			cursor
+				.string_with_budget(&mut remaining, "encoded synonyms")
+				.unwrap()
+				.len(),
+			MAX_SYNONYM_BYTES
+		);
+		assert_eq!(remaining, 0);
 	}
 
 	#[test]

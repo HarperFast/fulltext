@@ -106,7 +106,8 @@ batch, without taking the latch.
 
 `configureNativeFullTextRuntime()` is optional and idempotent for an identical configuration. It
 must be called before the first successful open when one process may host many indexes; configuring
-while an open is pending or after an unbudgeted open fails with `E_RESOURCE_LIMIT`. A failed first
+while an open is pending fails with retryable `E_LOCK_BUSY`; configuration after an unbudgeted open
+fails with `E_RESOURCE_LIMIT`. A failed first
 open that proves its native resources were released does not prevent later configuration. An
 unproven pre-publication teardown blocks configuration until restart. The governor bounds aggregate
 resident indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
@@ -115,6 +116,10 @@ search queues, or twice that index's `maxQueuedBytes`. A conflicting second conf
 open that would exceed an admission cap fails with `E_RESOURCE_LIMIT`; the wrapper never evicts a
 live generation. Expensive searches wait off the JavaScript thread for process capacity, bounded
 by the request deadline and interrupted by close, allowing the search queues to apply backpressure.
+A flexible worker serves ordinary searches while the expensive-search budget is saturated. With a
+one-thread index, ordinary and expensive work share one FIFO, so a process-wide permit held by a
+different index can delay ordinary work queued behind an expensive request. Closing an index
+interrupts expensive requests that are waiting for a permit with `E_CLOSED`.
 A completed close has released its reservation.
 If teardown cannot prove native resources were released, the path is quarantined and its aggregate
 capacity remains reserved until process restart.

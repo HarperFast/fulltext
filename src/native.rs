@@ -97,6 +97,8 @@ struct Runtime {
 	close_fault: AtomicU8,
 	#[cfg(feature = "test-panic")]
 	expensive_search_delay_milliseconds: AtomicU64,
+	#[cfg(feature = "test-panic")]
+	ordinary_search_delay_milliseconds: AtomicU64,
 }
 
 struct RuntimeBudget {
@@ -108,6 +110,7 @@ struct RuntimeBudget {
 	queued_bytes: AtomicUsize,
 	expensive_searches: Mutex<usize>,
 	expensive_search_ready: Condvar,
+	expensive_search_wakes: Mutex<Vec<Weak<QueueWake>>>,
 	#[cfg(feature = "test-panic")]
 	expensive_search_waiters: AtomicUsize,
 }
@@ -584,6 +587,22 @@ pub fn test_delay_next_expensive_search(env: Env, handle: u32, milliseconds: u32
 }
 
 #[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testDelayNextOrdinarySearch")]
+pub fn test_delay_next_ordinary_search(env: Env, handle: u32, milliseconds: u32) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		if milliseconds == 0 || milliseconds > 5_000 {
+			return Err(fulltext_napi_error(FulltextError::invalid(
+				"test search delay must be between 1 and 5000 milliseconds",
+			)));
+		}
+		runtime(&env, handle)?
+			.ordinary_search_delay_milliseconds
+			.store(u64::from(milliseconds), Ordering::Release);
+		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
 #[napi(catch_unwind, skip_typescript, js_name = "__testExpensiveSearchState")]
 pub fn test_expensive_search_state(env: Env, handle: u32) -> boundary::Result<Vec<u32>> {
 	boundary::run_stateless(|| {
@@ -593,6 +612,7 @@ pub fn test_expensive_search_state(env: Env, handle: u32) -> boundary::Result<Ve
 			runtime.expensive_search_budget.as_ref().map_or(0, |budget| {
 				budget.expensive_search_waiters.load(Ordering::Acquire) as u32
 			}),
+			u32::from(runtime.ordinary_search_delay_milliseconds.load(Ordering::Acquire) != 0),
 		])
 	})?
 }
@@ -606,14 +626,18 @@ pub fn native_status(env: Env, handle: u32) -> boundary::Result<Buffer> {
 }
 
 fn configure_runtime_budget(limits: RuntimeBudgetLimits) -> Result<()> {
-	let mut state = lock(runtime_budget_state());
+	configure_runtime_budget_in(runtime_budget_state(), limits)
+}
+
+fn configure_runtime_budget_in(state: &Mutex<RuntimeBudgetState>, limits: RuntimeBudgetLimits) -> Result<()> {
+	let mut state = lock(state);
 	match &*state {
 		RuntimeBudgetState::Unconfigured { pending_opens: 0 } => {
 			*state = RuntimeBudgetState::Configured(Arc::new(RuntimeBudget::new(limits)));
 			Ok(())
 		}
 		RuntimeBudgetState::Unconfigured { .. } => Err(FulltextError::new(
-			"E_RESOURCE_LIMIT",
+			"E_LOCK_BUSY",
 			"the process-wide fulltext runtime budget cannot be configured while an index open is pending",
 		)),
 		RuntimeBudgetState::Configured(configured) if configured.limits == limits => Ok(()),
@@ -663,6 +687,7 @@ impl RuntimeBudget {
 			queued_bytes: AtomicUsize::new(0),
 			expensive_searches: Mutex::new(0),
 			expensive_search_ready: Condvar::new(),
+			expensive_search_wakes: Mutex::new(Vec::new()),
 			#[cfg(feature = "test-panic")]
 			expensive_search_waiters: AtomicUsize::new(0),
 		}
@@ -751,6 +776,39 @@ impl RuntimeBudget {
 		*active += 1;
 		Ok(ExpensiveSearchPermit { budget: self.clone() })
 	}
+
+	fn try_acquire_expensive(self: &Arc<Self>, runtime_state: &AtomicU8) -> Option<ExpensiveSearchPermit> {
+		if runtime_state.load(Ordering::Acquire) != STATE_OPEN {
+			return None;
+		}
+		let mut active = lock(&self.expensive_searches);
+		if *active >= self.limits.max_expensive_searches || runtime_state.load(Ordering::Acquire) != STATE_OPEN {
+			return None;
+		}
+		*active += 1;
+		Some(ExpensiveSearchPermit { budget: self.clone() })
+	}
+
+	fn register_expensive_wake(&self, wake: &Arc<QueueWake>) {
+		let mut wakes = lock(&self.expensive_search_wakes);
+		wakes.retain(|registered| registered.strong_count() > 0);
+		let weak = Arc::downgrade(wake);
+		if !wakes.iter().any(|registered| registered.ptr_eq(&weak)) {
+			wakes.push(weak);
+		}
+	}
+
+	fn notify_expensive_wakes(&self) {
+		let mut wakes = lock(&self.expensive_search_wakes);
+		wakes.retain(|registered| {
+			if let Some(wake) = registered.upgrade() {
+				wake.notify(true);
+				true
+			} else {
+				false
+			}
+		});
+	}
 }
 
 impl RuntimeAdmission {
@@ -825,10 +883,13 @@ impl Drop for BudgetReservation {
 
 impl Drop for ExpensiveSearchPermit {
 	fn drop(&mut self) {
-		let mut active = lock(&self.budget.expensive_searches);
-		debug_assert!(*active > 0);
-		*active = active.saturating_sub(1);
-		self.budget.expensive_search_ready.notify_all();
+		{
+			let mut active = lock(&self.budget.expensive_searches);
+			debug_assert!(*active > 0);
+			*active = active.saturating_sub(1);
+			self.budget.expensive_search_ready.notify_all();
+		}
+		self.budget.notify_expensive_wakes();
 	}
 }
 
@@ -911,7 +972,12 @@ impl Runtime {
 			close_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
 			expensive_search_delay_milliseconds: AtomicU64::new(0),
+			#[cfg(feature = "test-panic")]
+			ordinary_search_delay_milliseconds: AtomicU64::new(0),
 		});
+		if let (Some(budget), Some(wake)) = (&runtime.expensive_search_budget, &runtime.search_wake) {
+			budget.register_expensive_wake(wake);
+		}
 		let writer_runtime = runtime.clone();
 		let writer_engine = engine.clone();
 		let writer_reader = reader.clone();
@@ -973,6 +1039,12 @@ impl Runtime {
 		self.search_queue_nanoseconds
 			.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
 		permit.map(Some)
+	}
+
+	fn try_expensive_search_permit(&self) -> Option<ExpensiveSearchPermit> {
+		self.expensive_search_budget
+			.as_ref()
+			.and_then(|budget| budget.try_acquire_expensive(&self.state))
 	}
 
 	fn confirm_open(&self) {
@@ -1224,6 +1296,10 @@ impl<T> BoundedQueue<T> {
 
 	fn is_closed(&self) -> bool {
 		lock(&self.state).closed
+	}
+
+	fn has_items(&self) -> bool {
+		!lock(&self.state).items.is_empty()
 	}
 
 	fn take_front(&self, state: &mut QueueState<T>) -> Option<Queued<T>> {
@@ -1728,7 +1804,7 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 
 fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
 	while let Some(queued) = runtime.ordinary_search_queue.pop() {
-		if !execute_search_command(&runtime, &engine, &reader, queued) {
+		if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 			return;
 		}
 	}
@@ -1739,16 +1815,34 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 	let wake = runtime.search_wake.as_ref().unwrap();
 	loop {
 		let observed = wake.snapshot();
-		let queued = expensive.try_pop().or_else(|| runtime.ordinary_search_queue.try_pop());
-		if let Some(queued) = queued {
-			if !execute_search_command(&runtime, &engine, &reader, queued) {
+		let has_expensive = expensive.has_items();
+		let permit = has_expensive.then(|| runtime.try_expensive_search_permit()).flatten();
+		if has_expensive && (permit.is_some() || runtime.expensive_search_budget.is_none()) {
+			if let Some(queued) = expensive.try_pop() {
+				if !execute_search_command(&runtime, &engine, &reader, queued, permit) {
+					return;
+				}
+				continue;
+			}
+		}
+		drop(permit);
+		if let Some(queued) = runtime.ordinary_search_queue.try_pop() {
+			if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 				return;
 			}
 			continue;
 		}
+		if runtime.state.load(Ordering::Acquire) != STATE_OPEN {
+			if let Some(queued) = expensive.try_pop() {
+				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+					return;
+				}
+				continue;
+			}
+		}
 		if expensive.is_closed() {
 			while let Some(queued) = runtime.ordinary_search_queue.pop() {
-				if !execute_search_command(&runtime, &engine, &reader, queued) {
+				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
 					return;
 				}
 			}
@@ -1763,6 +1857,7 @@ fn execute_search_command(
 	engine: &Engine,
 	reader: &IndexReader,
 	queued: Queued<SearchCommand>,
+	preacquired_permit: Option<ExpensiveSearchPermit>,
 ) -> bool {
 	let queued_for = queued.enqueued.elapsed();
 	runtime
@@ -1772,15 +1867,23 @@ fn execute_search_command(
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
 		SearchOperation::Search(bytes) => {
 			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
-			let _permit = if search_mode(&bytes)?.is_expensive() {
-				runtime.expensive_search_permit(deadline)?
+			let expensive = search_mode(&bytes)?.is_expensive();
+			let _permit = if expensive {
+				match preacquired_permit {
+					Some(permit) => Some(permit),
+					None => runtime.expensive_search_permit(deadline)?,
+				}
 			} else {
 				None
 			};
 			let started = Instant::now();
 			#[cfg(feature = "test-panic")]
-			if _permit.is_some() {
-				let milliseconds = runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel);
+			{
+				let milliseconds = if expensive {
+					runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel)
+				} else {
+					runtime.ordinary_search_delay_milliseconds.swap(0, Ordering::AcqRel)
+				};
 				if milliseconds > 0 {
 					thread::sleep(Duration::from_millis(milliseconds));
 				}
@@ -1797,7 +1900,10 @@ fn execute_search_command(
 		}
 		SearchOperation::Trace(bytes) => {
 			let deadline = operation_deadline(trace_budget(&bytes)?, queued.enqueued.elapsed())?;
-			let _permit = runtime.expensive_search_permit(deadline)?;
+			let _permit = match preacquired_permit {
+				Some(permit) => Some(permit),
+				None => runtime.expensive_search_permit(deadline)?,
+			};
 			let started = Instant::now();
 			#[cfg(feature = "test-panic")]
 			if _permit.is_some() {
@@ -1957,6 +2063,17 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 		.ok_or_else(|| FulltextError::invalid("reset path must not be a filesystem root"))?;
 	let initial_identity = path_identity_from_metadata(&canonical, &metadata);
 	let (lifecycle_directory, lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
+	let public_metadata = match fs::symlink_metadata(path) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
+		Err(error) => return Err(storage_error(error)),
+	};
+	if is_link_like(&public_metadata) || !public_metadata.is_dir() {
+		return Err(FulltextError::new(
+			"E_LOCK_BUSY",
+			"the physical index path changed before reset acquired ownership",
+		));
+	}
 	let current_metadata = match fs::symlink_metadata(&canonical) {
 		Ok(metadata) => metadata,
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
@@ -2120,10 +2237,7 @@ fn validate_directory_root(metadata: fs::Metadata, label: &str) -> Result<()> {
 
 #[cfg(windows)]
 fn is_link_like(metadata: &fs::Metadata) -> bool {
-	use std::os::windows::fs::MetadataExt;
-
-	const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-	metadata.file_type().is_symlink() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+	metadata.file_type().is_symlink()
 }
 
 #[cfg(not(windows))]
@@ -2713,6 +2827,28 @@ mod tests {
 		}
 		.retain_until_restart_in(&state);
 		assert!(matches!(*lock(&state), RuntimeBudgetState::OpenedWithoutBudget));
+	}
+
+	#[test]
+	fn pending_open_reports_retryable_runtime_configuration_error() {
+		let state = Mutex::new(RuntimeBudgetState::Unconfigured { pending_opens: 1 });
+		let error = configure_runtime_budget_in(
+			&state,
+			RuntimeBudgetLimits {
+				max_resident_indexes: 1,
+				max_indexing_threads: 1,
+				max_search_threads: 1,
+				max_writer_memory_bytes: 15_000_000,
+				max_queued_bytes: 32,
+				max_expensive_searches: 1,
+			},
+		)
+		.unwrap_err();
+		assert_eq!(error.code, "E_LOCK_BUSY");
+		assert!(matches!(
+			*lock(&state),
+			RuntimeBudgetState::Unconfigured { pending_opens: 1 }
+		));
 	}
 
 	#[test]

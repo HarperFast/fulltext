@@ -177,8 +177,9 @@ because of its storage cost. Field weights are query-time boosts and may change 
 same physical index without rebuilding it.
 
 `configureNativeFullTextRuntime()` optionally installs one immutable process budget before the first
-successful open. Identical calls are idempotent; configuration while an open is pending or after an
-unbudgeted open is rejected. A failed first open releases its pending latch only after teardown
+successful open. Identical calls are idempotent; configuration while an open is pending returns
+retryable `E_LOCK_BUSY`, while configuration after an unbudgeted open returns `E_RESOURCE_LIMIT`.
+A failed first open releases its pending latch only after teardown
 proves native resources were released; an unproven teardown latches the process as opened without a
 budget until restart. The governor admits aggregate resident indexes, indexing/search threads,
 writer memory, configured queue capacity, and expensive searches with checked shared accounting.
@@ -247,7 +248,9 @@ With two or more search threads, one worker consumes only the ordinary BM25 lane
 worker prioritizes phrase, prefix, fuzzy, and trace requests, then steals ordinary work when the
 expensive lane is idle. This preserves ordinary-query capacity during expensive traffic without
 stranding half the pool during ordinary-only workloads. A one-thread configuration uses one shared
-lane and provides no query-class isolation.
+lane and provides no query-class isolation. In that configuration, a process-wide expensive permit
+held by another index can delay ordinary work behind an expensive request. Closing an index rejects
+an expensive request waiting for a permit with `E_CLOSED`.
 
 Both queues are bounded by command count and retained bytes. A JS-owned buffer is copied once into a
 Rust-owned `Vec<u8>` before admission; no native thread borrows memory owned by a Node environment.
