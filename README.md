@@ -104,8 +104,9 @@ batch, without taking the latch.
 `configureNativeFullTextRuntime()` is optional and idempotent for an identical configuration. It
 must be called before the first successful open when one process may host many indexes; configuring
 while an open is pending or after an unbudgeted open fails with `E_RESOURCE_LIMIT`. A failed first
-open does not prevent later configuration. It bounds aggregate resident
-indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
+open that proves its native resources were released does not prevent later configuration. An
+unproven pre-publication teardown blocks configuration until restart. The governor bounds aggregate
+resident indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
 expensive searches. Aggregate queue accounting reserves each index's writer queue plus its shared
 search queues, or twice that index's `maxQueuedBytes`. A conflicting second configuration or an
 open that would exceed an admission cap fails with `E_RESOURCE_LIMIT`; the wrapper never evicts a

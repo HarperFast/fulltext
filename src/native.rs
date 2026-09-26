@@ -726,6 +726,28 @@ impl RuntimeAdmission {
 		}
 		*pending = false;
 	}
+
+	fn retain_until_restart(self) {
+		self.retain_until_restart_in(runtime_budget_state());
+	}
+
+	fn retain_until_restart_in(mut self, state: &Mutex<RuntimeBudgetState>) {
+		if matches!(&self.kind, RuntimeAdmissionKind::Budgeted(_)) {
+			mem::forget(self);
+			return;
+		}
+		let RuntimeAdmissionKind::Unbudgeted { pending } = &mut self.kind else {
+			unreachable!();
+		};
+		if !*pending {
+			return;
+		}
+		let mut state = lock(state);
+		if matches!(&*state, RuntimeBudgetState::Unconfigured { .. }) {
+			*state = RuntimeBudgetState::OpenedWithoutBudget;
+		}
+		*pending = false;
+	}
 }
 
 impl Drop for RuntimeAdmission {
@@ -918,9 +940,7 @@ impl Runtime {
 
 	fn retain_reservation_until_restart(&self) {
 		if let Some(reservation) = lock(&self.reservation).take() {
-			if matches!(&reservation.kind, RuntimeAdmissionKind::Budgeted(_)) {
-				mem::forget(reservation);
-			}
+			reservation.retain_until_restart();
 		}
 	}
 
@@ -2588,6 +2608,16 @@ mod tests {
 		assert_eq!(budget.writer_memory_bytes.load(Ordering::Acquire), 0);
 		assert_eq!(budget.queued_bytes.load(Ordering::Acquire), 0);
 		assert_eq!(*lock(&budget.expensive_searches), 0);
+	}
+
+	#[test]
+	fn unproven_pending_open_blocks_later_runtime_configuration() {
+		let state = Mutex::new(RuntimeBudgetState::Unconfigured { pending_opens: 1 });
+		RuntimeAdmission {
+			kind: RuntimeAdmissionKind::Unbudgeted { pending: true },
+		}
+		.retain_until_restart_in(&state);
+		assert!(matches!(*lock(&state), RuntimeBudgetState::OpenedWithoutBudget));
 	}
 
 	#[test]

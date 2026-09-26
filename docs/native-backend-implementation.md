@@ -180,8 +180,9 @@ same physical index without rebuilding it.
 
 `configureNativeFullTextRuntime()` optionally installs one immutable process budget before the first
 successful open. Identical calls are idempotent; configuration while an open is pending or after an
-unbudgeted open is rejected, while a failed first open releases its pending latch. It
-admits aggregate resident indexes, indexing/search threads,
+unbudgeted open is rejected. A failed first open releases its pending latch only after teardown
+proves native resources were released; an unproven teardown latches the process as opened without a
+budget until restart. The governor admits aggregate resident indexes, indexing/search threads,
 writer memory, configured queue capacity, and expensive searches with checked shared accounting.
 Each index reserves its writer queue and shared search-queue capacity, so process queue accounting
 charges twice the per-index `maxQueuedBytes`. Exceeding an open-time admission cap returns
