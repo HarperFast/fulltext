@@ -875,8 +875,6 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 		config = packedOptions(options);
 		config.limits = { ...config.limits };
 		packed = encodeOpen(config);
-		const validation = decodeResponse(loadAddon().__nativeValidateOpen(packed));
-		validation.finish();
 	} catch (error) {
 		throw normalizeOptionsError(error);
 	}

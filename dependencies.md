@@ -34,6 +34,14 @@ for the full Cargo graph; they share the `dependencies` label used for Slack not
 per-dependency `version-update:` filters preserve that distinction and must not be replaced with a
 bare dependency-name ignore rule.
 
+### Updating Unicode semantics
+
+`unicode-normalization` data and Rust's `char` classification determine durable token output. Any
+change to `unicode-normalization` or the Rust toolchain floor requires reviewing normalization and
+token-boundary behavior. If indexed output can change, bump the public analyzer name or identity
+sidecar version so an existing index fails closed and is rebuilt. Run the differential Unicode
+normalization test and the Unicode-aware native benchmarks before merging the update.
+
 napi-rs generates an outer unwind boundary only for exports marked `catch_unwind`. Every
 fulltext function, method, and constructor uses that option to contain argument and result
 conversion panics. That outer boundary uses napi-rs error mapping; the inner boundary adds stable

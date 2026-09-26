@@ -521,6 +521,13 @@ test('validates native configuration without creating index storage', async (con
 		openNativeFullTextIndex({ ...config, fields: undefined }),
 		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
 	);
+	await assert.rejects(
+		openNativeFullTextIndex({
+			...options(indexPath),
+			synonyms: [{ source: 'television set', replacements: ['tv'] }],
+		}),
+		(error) => error.name === 'FulltextError' && error.code === 'E_INVALID_ARGUMENT',
+	);
 	assert.strictEqual(existsSync(indexPath), false);
 });
 
@@ -889,16 +896,13 @@ test('reset accepts an empty index directory', async (context) => {
 	assert.strictEqual((await resetNativeFullTextIndex({ path: lockOnlyPath, indexId: 'products' })).state, 'reset');
 });
 
-test('reset does not follow a symbolic-link path', async (context) => {
-	if (process.platform === 'win32') {
-		context.skip('creating directory symbolic links requires host privileges on Windows');
-		return;
-	}
+test('reset does not follow a symbolic-link or junction path', async (context) => {
 	const parent = temporaryIndex(context);
 	const target = path.join(parent, 'target');
 	const alias = path.join(parent, 'alias');
 	mkdirSync(target);
-	symlinkSync(target, alias, 'dir');
+	const directoryLinkType = process.platform === 'win32' ? 'junction' : 'dir';
+	symlinkSync(target, alias, directoryLinkType);
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: alias, indexId: 'products' }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
@@ -911,13 +915,13 @@ test('reset does not follow a symbolic-link path', async (context) => {
 	await index.close();
 	const lifecycleRoot = path.join(parent, '.fulltext-locks');
 	rmSync(lifecycleRoot, { recursive: true });
-	symlinkSync(target, lifecycleRoot, 'dir');
+	symlinkSync(target, lifecycleRoot, directoryLinkType);
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	unlinkSync(lifecycleRoot);
-	symlinkSync(target, path.join(parent, '.fulltext-retired'), 'dir');
+	symlinkSync(target, path.join(parent, '.fulltext-retired'), directoryLinkType);
 	await assert.rejects(
 		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',

@@ -965,10 +965,14 @@ impl Runtime {
 	}
 
 	fn expensive_search_permit(&self, deadline: Instant) -> Result<Option<ExpensiveSearchPermit>> {
-		self.expensive_search_budget
-			.as_ref()
-			.map(|budget| budget.acquire_expensive(deadline, &self.state))
-			.transpose()
+		let Some(budget) = &self.expensive_search_budget else {
+			return Ok(None);
+		};
+		let started = Instant::now();
+		let permit = budget.acquire_expensive(deadline, &self.state);
+		self.search_queue_nanoseconds
+			.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+		permit.map(Some)
 	}
 
 	fn confirm_open(&self) {
@@ -1764,7 +1768,6 @@ fn execute_search_command(
 	runtime
 		.search_queue_nanoseconds
 		.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
-	let started = Instant::now();
 	let SearchCommand { operation, completion } = queued.value;
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
 		SearchOperation::Search(bytes) => {
@@ -1774,6 +1777,7 @@ fn execute_search_command(
 			} else {
 				None
 			};
+			let started = Instant::now();
 			#[cfg(feature = "test-panic")]
 			if _permit.is_some() {
 				let milliseconds = runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel);
@@ -1781,15 +1785,20 @@ fn execute_search_command(
 					thread::sleep(Duration::from_millis(milliseconds));
 				}
 			}
-			decode_search(&bytes).and_then(|request| {
+			let result = decode_search(&bytes).and_then(|request| {
 				engine
 					.search_with_deadline(&reader.searcher(), &request, deadline)
 					.map(SearchOutcome::Search)
-			})
+			});
+			runtime
+				.search_execution_nanoseconds
+				.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+			result
 		}
 		SearchOperation::Trace(bytes) => {
 			let deadline = operation_deadline(trace_budget(&bytes)?, queued.enqueued.elapsed())?;
 			let _permit = runtime.expensive_search_permit(deadline)?;
+			let started = Instant::now();
 			#[cfg(feature = "test-panic")]
 			if _permit.is_some() {
 				let milliseconds = runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel);
@@ -1797,7 +1806,7 @@ fn execute_search_command(
 					thread::sleep(Duration::from_millis(milliseconds));
 				}
 			}
-			decode_trace(&bytes).and_then(|request| {
+			let result = decode_trace(&bytes).and_then(|request| {
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
 				}
@@ -1806,12 +1815,13 @@ fn execute_search_command(
 					return Err(search_timeout());
 				}
 				Ok(SearchOutcome::Trace(result))
-			})
+			});
+			runtime
+				.search_execution_nanoseconds
+				.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+			result
 		}
 	}));
-	runtime
-		.search_execution_nanoseconds
-		.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
 	match result {
 		Ok(Ok(SearchOutcome::Search(result))) => completion.success(search_body(result)),
 		Ok(Ok(SearchOutcome::Trace(result))) => completion.success(trace_body(result)),
@@ -1867,6 +1877,7 @@ fn open_on_thread_inner(handle: u32, bytes: Vec<u8>, completion: Completion, env
 
 fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>) -> Result<Option<String>> {
 	let open = decode_open(&bytes)?;
+	Engine::validate(&open.engine)?;
 	let canonical = create_and_canonicalize(Path::new(&open.path))?;
 	let (_lifecycle_directory, _lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
 	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
@@ -1930,7 +1941,7 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
 		Err(error) => return Err(storage_error(error)),
 	};
-	if metadata.file_type().is_symlink() {
+	if is_link_like(&metadata) {
 		return Err(FulltextError::invalid("reset path must not be a symbolic link"));
 	}
 	if !metadata.is_dir() {
@@ -1951,7 +1962,7 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ResetResult::Missing),
 		Err(error) => return Err(storage_error(error)),
 	};
-	if current_metadata.file_type().is_symlink() || !current_metadata.is_dir() {
+	if is_link_like(&current_metadata) || !current_metadata.is_dir() {
 		return Err(FulltextError::new(
 			"E_LOCK_BUSY",
 			"the physical index path changed before reset acquired ownership",
@@ -2016,7 +2027,7 @@ fn validate_reset_target(path: &Path, expected_index_id: &str) -> Result<()> {
 		let name = entry.file_name();
 		if name == IDENTITY_PATH {
 			let metadata = fs::symlink_metadata(entry.path()).map_err(storage_error)?;
-			if !metadata.is_file() || metadata.file_type().is_symlink() {
+			if !metadata.is_file() || is_link_like(&metadata) {
 				return Err(FulltextError::new(
 					"E_INDEX_CORRUPT",
 					"the persisted index identity is invalid",
@@ -2099,12 +2110,25 @@ fn ensure_directory_root(path: &Path, label: &str) -> Result<()> {
 }
 
 fn validate_directory_root(metadata: fs::Metadata, label: &str) -> Result<()> {
-	if metadata.file_type().is_symlink() || !metadata.is_dir() {
+	if is_link_like(&metadata) || !metadata.is_dir() {
 		return Err(FulltextError::invalid(format!(
 			"{label} must be a directory and must not be a symbolic link"
 		)));
 	}
 	Ok(())
+}
+
+#[cfg(windows)]
+fn is_link_like(metadata: &fs::Metadata) -> bool {
+	use std::os::windows::fs::MetadataExt;
+
+	const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+	metadata.file_type().is_symlink() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_like(metadata: &fs::Metadata) -> bool {
+	metadata.file_type().is_symlink()
 }
 
 fn acquire_lifecycle_lock(index_path: &Path) -> Result<(MmapDirectory, DirectoryLock)> {

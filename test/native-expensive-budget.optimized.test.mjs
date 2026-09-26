@@ -56,6 +56,7 @@ test('optimized native searches enforce expensive permits and wake waiters on cl
 	await index.reload();
 
 	addon.__testDelayNextExpensiveSearch(handle, 150);
+	const beforeContention = index.status();
 	const first = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });
 	await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
 	await assert.rejects(
@@ -63,6 +64,10 @@ test('optimized native searches enforce expensive permits and wake waiters on cl
 		(error) => error.code === 'E_TIMEOUT',
 	);
 	assert.strictEqual((await first).total, 1);
+	const afterContention = index.status();
+	assert(
+		afterContention.metrics.searchQueueNanoseconds - beforeContention.metrics.searchQueueNanoseconds >= 5_000_000n,
+	);
 
 	addon.__testDelayNextExpensiveSearch(handle, 150);
 	const holding = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });

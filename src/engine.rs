@@ -459,6 +459,8 @@ impl Engine {
 		let mut remaining_spans = MAX_TRACE_SPANS;
 		let mut response_bytes = 3usize;
 		let mut matched_records = Vec::new();
+		let mut analyzed_source_analyzer = self.index_analyzer.clone();
+		let mut surface_source_analyzer = self.surface_index_analyzer.clone();
 		for record in records {
 			check_deadline(deadline)?;
 			if candidates
@@ -485,8 +487,14 @@ impl Engine {
 				}
 				for (value_index, value) in source_values.iter().enumerate() {
 					check_deadline(deadline)?;
-					let (spans, terms, spans_truncated, analysis_truncated) =
-						self.trace_value(&plan, value, record_span_budget, deadline)?;
+					let (spans, terms, spans_truncated, analysis_truncated) = self.trace_value(
+						&plan,
+						value,
+						record_span_budget,
+						deadline,
+						&mut analyzed_source_analyzer,
+						&mut surface_source_analyzer,
+					)?;
 					record_truncated |= spans_truncated || analysis_truncated;
 					record_analysis_truncated |= analysis_truncated;
 					found.extend(terms);
@@ -600,8 +608,10 @@ impl Engine {
 		value: &str,
 		max_spans: usize,
 		deadline: Option<Instant>,
+		analyzed_source_analyzer: &mut TextAnalyzer,
+		surface_source_analyzer: &mut TextAnalyzer,
 	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool, bool)> {
-		let (analyzed, mut analysis_truncated) = self.source_tokens(value, false, deadline)?;
+		let (analyzed, mut analysis_truncated) = Self::source_tokens(analyzed_source_analyzer, value, deadline)?;
 		let utf16_offsets = utf16_offsets(value);
 		let mut spans = Vec::new();
 		let mut seen_spans = HashSet::new();
@@ -678,7 +688,7 @@ impl Engine {
 				prefix,
 				fuzzy,
 			} => {
-				let (surface, surface_truncated) = self.source_tokens(value, true, deadline)?;
+				let (surface, surface_truncated) = Self::source_tokens(surface_source_analyzer, value, deadline)?;
 				analysis_truncated |= surface_truncated;
 				for (index, token) in analyzed.iter().enumerate() {
 					if index % 256 == 0 {
@@ -718,7 +728,7 @@ impl Engine {
 				}
 			}
 			TracePlan::Fuzzy(terms) => {
-				let (surface, surface_truncated) = self.source_tokens(value, true, deadline)?;
+				let (surface, surface_truncated) = Self::source_tokens(surface_source_analyzer, value, deadline)?;
 				analysis_truncated |= surface_truncated;
 				let mut analyzed_by_position = HashMap::<usize, Vec<&str>>::new();
 				for token in &analyzed {
@@ -762,12 +772,11 @@ impl Engine {
 		Ok((spans, found, spans_truncated, analysis_truncated))
 	}
 
-	fn source_tokens(&self, text: &str, surface: bool, deadline: Option<Instant>) -> Result<(Vec<SourceToken>, bool)> {
-		let mut analyzer = if surface {
-			self.surface_index_analyzer.clone()
-		} else {
-			self.index_analyzer.clone()
-		};
+	fn source_tokens(
+		analyzer: &mut TextAnalyzer,
+		text: &str,
+		deadline: Option<Instant>,
+	) -> Result<(Vec<SourceToken>, bool)> {
 		let mut stream = analyzer.token_stream(text);
 		let mut tokens = Vec::new();
 		while stream.advance() {

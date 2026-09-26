@@ -219,7 +219,7 @@ function product(id) {
 		['Stainless Steel Water Bottle', 'Insulated outdoor product for hiking and travel', 'outdoors'],
 		[
 			'Café Résumé Organizer',
-			`Müller’s crème brûlée guide ${'e\u0315'.repeat(31)} with ＦＵＬＬＷＩＤＴＨ text`,
+			`Müller’s crème brûlée guide e${'\u0315'.repeat(31)} with ＦＵＬＬＷＩＤＴＨ text`,
 			'books',
 		],
 	];
