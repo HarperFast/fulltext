@@ -137,7 +137,7 @@ jobs:
         with:
           name: release-package-${{ matrix.target }}
           path: packages/native
-      - name: Install packed artifacts and run public example
+      - name: Install packed artifacts and run public examples
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -157,7 +157,9 @@ jobs:
           assert.deepStrictEqual(info.storageBackends, ['native']);
           console.log(info);
           NODE
-          node node_modules/@harperfast/fulltext/examples/basic.mjs
+          for example in node_modules/@harperfast/fulltext/examples/*.mjs; do
+            node "$example"
+          done
 
   publish:
     name: Publish npm packages

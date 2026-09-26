@@ -105,16 +105,13 @@ test('release tarballs use unambiguous absolute paths for npm publish', (context
 	assert.deepStrictEqual(tarballsIn(path.relative(process.cwd(), temporaryDirectory)), [path.resolve(tarball)]);
 });
 
-test('release workflow installs local packages and runs the packaged example', () => {
+test('release workflow installs local packages and runs every packaged example', () => {
 	const workflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
 	assert.match(workflow, /npm pack "\.\/release\/\$\{\{ matrix\.target \}\}"/);
 	assert.doesNotMatch(workflow, /npm pack "release\/\$\{\{ matrix\.target \}\}"/);
-	const packedConsumerStart = workflow.indexOf('\n  packed-consumer:');
-	const publishStart = workflow.indexOf('\n  publish:', packedConsumerStart);
-	assert(packedConsumerStart >= 0 && publishStart > packedConsumerStart);
-	const packedConsumer = workflow.slice(packedConsumerStart, publishStart);
-	assert.match(packedConsumer, /node node_modules\/@harperfast\/fulltext\/examples\/basic\.mjs/);
-	assert.doesNotMatch(packedConsumer, /openNativeFullTextIndex|applyMutationBatch|analyzer:/);
+	assert.match(workflow, /for example in node_modules\/@harperfast\/fulltext\/examples\/\*\.mjs; do/);
+	assert.match(workflow, /node "\$example"/);
+	assert.doesNotMatch(workflow, /openNativeFullTextIndex\s*\(|applyMutationBatch\s*\(|analyzer\s*:/);
 });
 
 test('release workflow reports publication success and failure to Slack', () => {

@@ -7,6 +7,7 @@ import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
 
 const root = await mkdtemp(path.join(tmpdir(), 'fulltext-basic-'));
 let index;
+let completed = false;
 try {
 	index = await openNativeFullTextIndex({
 		path: path.join(root, 'products'),
@@ -32,7 +33,13 @@ try {
 	assert.strictEqual(result.total, 1);
 	assert.strictEqual(result.hits[0]?.id, 'shoe-1');
 	console.log(result);
+	completed = true;
 } finally {
-	await index?.close({ mode: 'rollback' });
-	await rm(root, { recursive: true, force: true });
+	try {
+		await index?.close({ mode: 'rollback' }).catch((error) => {
+			if (completed) throw error;
+		});
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 }
