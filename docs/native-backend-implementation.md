@@ -324,13 +324,13 @@ requires bumping at least one of them.
 
 Synonym rules are bounded by count, replacement count, and encoded bytes in the native decoder.
 Each source and replacement must yield exactly one normalized and analyzed term. Canonical rules are
-sorted and fingerprinted in identity sidecar v3. A bounded token filter streams replacements once at
+sorted and fingerprinted in the identity sidecar. A bounded token filter streams replacements once at
 the source position into both analyzed and surface fields; query text is not expanded. Tantivy counts
 the alternatives in BM25 field length, so enabling a rule can affect unrelated-term ranking for a
 document containing its source. Match tracing uses the same document-side expansion and maps every
 replacement to the source token span. Crossing its 262,144-token-per-value ceiling marks the trace
-incomplete instead of failing the request. Version 2 sidecars remain parseable for safe reset but
-mismatch v3 open/inspection so the application can retire and rebuild them.
+incomplete instead of failing the request. Version 2 and 3 sidecars remain parseable for safe reset
+but mismatch v4 open/inspection so the application can retire and rebuild them.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`
