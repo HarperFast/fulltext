@@ -1260,12 +1260,13 @@ impl SnapshotReader {
 
 	fn reload_aligned(&self, engine: &Engine) -> Result<Option<String>> {
 		let mut staging = lock(&self.staging);
+		let reused = staging.is_some();
 		let mut candidate = match staging.take() {
 			Some(reader) => reader,
 			None => engine.reader_for_open()?,
 		};
 		for attempt in 0..3 {
-			if attempt > 0 {
+			if reused || attempt > 0 {
 				if let Err(error) = candidate.reload() {
 					*staging = Some(candidate);
 					return Err(FulltextError::native(error));
