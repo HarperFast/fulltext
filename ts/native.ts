@@ -194,6 +194,14 @@ export interface SearchRequest {
 	exactTotal?: boolean;
 }
 
+export interface TraceSearchRequest {
+	text: string;
+	mode?: SearchMode;
+	operator?: 'any' | 'all';
+	fields?: string[];
+	candidateIds?: string[];
+}
+
 export interface SearchResult {
 	total: number;
 	totalRelation: 'exact' | 'lower-bound';
@@ -502,8 +510,15 @@ export class NativeFullTextIndex {
 
 	async reload(): Promise<void> {
 		this.#assertLogicalMutationIdle();
+		const sequence = this.#publication.begin();
 		const cursor = await invoke((callback) => loadAddon().__nativeReload(this.#handle, callback));
+		const hasPayload = cursor.u8();
+		if (hasPayload !== 0 && hasPayload !== 1) {
+			throw new FulltextError('E_NATIVE_FAILURE', `Unknown committed payload status ${hasPayload}`);
+		}
+		const payload = hasPayload === 1 ? cursor.string() : undefined;
 		cursor.finish();
+		this.#publication.refresh(sequence, payload);
 	}
 
 	async search(request: SearchRequest, options: SearchExecutionOptions = {}): Promise<SearchResult> {
@@ -546,13 +561,11 @@ export class NativeFullTextIndex {
 	}
 
 	async traceMatches(
-		request: SearchRequest,
+		request: TraceSearchRequest,
 		records: TraceRecord[],
 		options: TraceMatchesOptions = {},
 	): Promise<TraceMatchesResult> {
-		if (request.query !== undefined || typeof request.text !== 'string') {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'traceMatches requires a text search request');
-		}
+		if (typeof request.text !== 'string') throw new FulltextError('E_INVALID_ARGUMENT', 'traceMatches requires text');
 		const text = request.text;
 		if (request.mode !== undefined && request.operator !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
@@ -756,7 +769,7 @@ export class NativeFullTextReader {
 	}
 
 	traceMatches(
-		request: SearchRequest,
+		request: TraceSearchRequest,
 		records: TraceRecord[],
 		options: TraceMatchesOptions = {},
 	): Promise<TraceMatchesResult> {

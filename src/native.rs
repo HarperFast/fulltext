@@ -22,8 +22,8 @@ use crate::engine::{
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
 	decode_batch, decode_inspect, decode_open, decode_reset, decode_runtime_budget, decode_search, decode_trace,
-	search_budget, search_mode, trace_budget, validate_batch_header, validate_search_header, validate_trace_header,
-	EngineConfig, RuntimeBudgetLimits, PROTOCOL_VERSION,
+	search_budget, search_is_expensive, trace_budget, validate_batch_header, validate_search_header,
+	validate_trace_header, EngineConfig, RuntimeBudgetLimits, PROTOCOL_VERSION,
 };
 
 const STATE_OPEN: u8 = 0;
@@ -465,8 +465,8 @@ pub fn native_search(
 		let runtime = runtime(&env, handle)?;
 		runtime.require_open().map_err(fulltext_napi_error)?;
 		validate_search_header(&packed_request).map_err(fulltext_napi_error)?;
-		let mode = search_mode(&packed_request).map_err(fulltext_napi_error)?;
-		let queue = runtime.search_queue(mode.is_expensive());
+		let expensive = search_is_expensive(&packed_request).map_err(fulltext_napi_error)?;
+		let queue = runtime.search_queue(expensive);
 		queue
 			.check_capacity(packed_request.len())
 			.map_err(fulltext_napi_error)?;
@@ -1678,9 +1678,16 @@ fn writer_loop_inner(runtime: Arc<Runtime>, mut writer: Option<Writer>, engine: 
 					),
 				),
 			},
-			WriterOperation::Reload => {
-				WriterOutcome::Continue(reader.reload().map(|()| Vec::new()).map_err(FulltextError::native))
-			}
+			WriterOperation::Reload => WriterOutcome::Continue(
+				reader
+					.reload()
+					.map_err(|_| FulltextError::new("E_RELOAD_FAILED", "native index reload failed; retry the reload"))
+					.and_then(|()| {
+						engine
+							.committed_payload()
+							.map(|payload| payload_body(payload.as_deref()))
+					}),
+			),
 			WriterOperation::Close { rollback } => {
 				let dirty = runtime.uncommitted_mutations.load(Ordering::Acquire) > 0;
 				if !rollback
@@ -2030,7 +2037,7 @@ fn execute_search_command(
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
 		SearchOperation::Search(bytes) => {
 			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
-			let expensive = search_mode(&bytes)?.is_expensive();
+			let expensive = search_is_expensive(&bytes)?;
 			let _permit = if expensive {
 				match preacquired_permit {
 					Some(permit) => Some(permit),
@@ -2162,7 +2169,16 @@ fn open_runtime(
 	let open = decode_open(&bytes)?;
 	Engine::validate(&open.engine)?;
 	let canonical = if read_only {
-		fs::canonicalize(Path::new(&open.path)).map_err(storage_error)?
+		match fs::canonicalize(Path::new(&open.path)) {
+			Ok(canonical) => canonical,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				return Err(FulltextError::new(
+					"E_INDEX_NOT_READY",
+					"native index is not ready for read-only open",
+				))
+			}
+			Err(error) => return Err(storage_error(error)),
+		}
 	} else {
 		create_and_canonicalize(Path::new(&open.path))?
 	};
@@ -2172,7 +2188,7 @@ fn open_runtime(
 			"native index is not ready for read-only open",
 		));
 	}
-	let (_lifecycle_directory, _lifecycle_lock) = acquire_lifecycle_lock_for_open(&canonical, read_only)?;
+	let (_lifecycle_directory, _lifecycle_lock) = acquire_lifecycle_lock_for_open(&canonical)?;
 	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
 	let path_identity = path_identity(&canonical)?;
 	open_runtime_with_directory(
@@ -2186,12 +2202,12 @@ fn open_runtime(
 	)
 }
 
-fn acquire_lifecycle_lock_for_open(path: &Path, wait: bool) -> Result<(MmapDirectory, DirectoryLock)> {
+fn acquire_lifecycle_lock_for_open(path: &Path) -> Result<(MmapDirectory, DirectoryLock)> {
 	let deadline = Instant::now() + Duration::from_secs(2);
 	loop {
 		match acquire_lifecycle_lock(path) {
 			Ok(lock) => return Ok(lock),
-			Err(error) if wait && error.code == "E_LOCK_BUSY" && Instant::now() < deadline => {
+			Err(error) if error.code == "E_LOCK_BUSY" && Instant::now() < deadline => {
 				thread::sleep(Duration::from_millis(5));
 			}
 			Err(error) => return Err(error),
@@ -2906,6 +2922,12 @@ fn u32_body(value: u32) -> Vec<u8> {
 
 fn open_body(handle: u32, payload: Option<&str>) -> Vec<u8> {
 	let mut bytes = u32_body(handle);
+	bytes.extend_from_slice(&payload_body(payload));
+	bytes
+}
+
+fn payload_body(payload: Option<&str>) -> Vec<u8> {
+	let mut bytes = Vec::new();
 	bytes.push(u8::from(payload.is_some()));
 	if let Some(payload) = payload {
 		push_string(&mut bytes, payload);

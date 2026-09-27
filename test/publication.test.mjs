@@ -37,3 +37,12 @@ test('a newer known success supersedes an older uncertain completion', () => {
 	state.fail(first);
 	assert.strictEqual(state.committedPayload, '');
 });
+
+test('reload refreshes the payload without letting an older callback move it backward', () => {
+	const state = new PublicationState('opened');
+	const older = state.begin();
+	const reload = state.begin();
+	state.refresh(reload, 'reloaded');
+	state.succeed(older, 'older');
+	assert.strictEqual(state.committedPayload, 'reloaded');
+});

@@ -76,6 +76,11 @@ struct EngineField {
 	weight: f32,
 }
 
+struct BuiltQuery {
+	query: Box<dyn Query>,
+	clauses: usize,
+}
+
 pub struct Writer {
 	inner: IndexWriter,
 	checkpoint_required: bool,
@@ -368,30 +373,50 @@ impl Engine {
 		let scored_docs = searcher
 			.search(
 				query.as_ref(),
-				&TopDocs::for_doc_range(0..window_end.saturating_add(1)).order_by((
-					(SortBySimilarityScore, Order::Desc),
-					(SortByString::for_field(ID_FIELD_NAME), Order::Asc),
-				)),
+				&TopDocs::with_limit(window_end.saturating_add(1)).order_by_score(),
 			)
 			.map_err(index_error)?;
 		check_deadline(deadline)?;
-		let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
-		let versions = search_hit_versions(searcher, &addresses)?;
-		let hits = scored_docs
-			.iter()
-			.zip(versions)
-			.skip(request.offset)
-			.take(request.limit)
-			.map(|(((score, id), _), version)| {
-				id.clone()
-					.map(|id| SearchHit {
-						id,
-						score: *score,
-						version,
-					})
-					.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID fast field value"))
-			})
-			.collect::<Result<Vec<_>>>()?;
+		let boundary_tie = scored_docs.len() > window_end && scored_docs[window_end - 1].0 == scored_docs[window_end].0;
+		let hits = if boundary_tie {
+			let scored_docs = searcher
+				.search(
+					query.as_ref(),
+					&TopDocs::for_doc_range(request.offset..window_end).order_by((
+						(SortBySimilarityScore, Order::Desc),
+						(SortByString::for_field(ID_FIELD_NAME), Order::Asc),
+					)),
+				)
+				.map_err(index_error)?;
+			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
+			let versions = search_hit_versions(searcher, &addresses)?;
+			scored_docs
+				.into_iter()
+				.zip(versions)
+				.map(|(((score, id), _), version)| {
+					id.map(|id| SearchHit { id, score, version })
+						.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID fast field value"))
+				})
+				.collect::<Result<Vec<_>>>()?
+		} else {
+			let metadata = search_hit_metadata(searcher, &scored_docs)?;
+			let mut ranked = scored_docs
+				.iter()
+				.zip(metadata)
+				.map(|((score, _), metadata)| SearchHit {
+					id: metadata.id,
+					score: *score,
+					version: metadata.version,
+				})
+				.collect::<Vec<_>>();
+			ranked.sort_by(|left, right| {
+				right
+					.score
+					.total_cmp(&left.score)
+					.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+			});
+			ranked.into_iter().skip(request.offset).take(request.limit).collect()
+		};
 		let (total, total_relation) = if request.exact_total {
 			check_deadline(deadline)?;
 			(
@@ -407,7 +432,7 @@ impl Engine {
 		let response_bytes = hits
 			.iter()
 			.try_fold(13usize, |bytes, hit| {
-				bytes.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, String::len))
+				bytes.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, |version| 4 + version.len()))
 			})
 			.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))?;
 		if response_bytes > MAX_SEARCH_RESPONSE_BYTES {
@@ -823,44 +848,54 @@ impl Engine {
 
 	fn query(&self, searcher: &Searcher, request: &SearchRequest) -> Result<Box<dyn Query>> {
 		let query = self.expression_query(searcher, &request.expression)?;
-		self.with_candidates(query, request.candidate_ids.as_deref())
+		self.with_candidates(query.query, request.candidate_ids.as_deref())
 	}
 
-	fn expression_query(&self, searcher: &Searcher, expression: &SearchExpression) -> Result<Box<dyn Query>> {
+	fn expression_query(&self, searcher: &Searcher, expression: &SearchExpression) -> Result<BuiltQuery> {
 		match expression {
 			SearchExpression::Clause(clause) => self.clause_query(searcher, clause),
-			SearchExpression::And(children) => Ok(Box::new(BooleanQuery::new(
-				children
-					.iter()
-					.map(|child| self.expression_query(searcher, child).map(|query| (Occur::Must, query)))
-					.collect::<Result<Vec<_>>>()?,
-			))),
-			SearchExpression::Or(children) => Ok(Box::new(BooleanQuery::new(
-				children
-					.iter()
-					.map(|child| {
-						self.expression_query(searcher, child)
-							.map(|query| (Occur::Should, query))
-					})
-					.collect::<Result<Vec<_>>>()?,
-			))),
-			SearchExpression::Not(child) => Ok(Box::new(BooleanQuery::new(vec![
-				(Occur::Must, Box::new(tantivy::query::AllQuery)),
-				(Occur::MustNot, self.expression_query(searcher, child)?),
-			]))),
+			SearchExpression::And(children) => self.boolean_query(searcher, children, Occur::Must),
+			SearchExpression::Or(children) => self.boolean_query(searcher, children, Occur::Should),
+			SearchExpression::Not(child) => {
+				let child = self.expression_query(searcher, child)?;
+				self.check_total_clause_count(child.clauses, 2)?;
+				Ok(BuiltQuery {
+					query: Box::new(BooleanQuery::new(vec![
+						(Occur::Must, Box::new(tantivy::query::AllQuery)),
+						(Occur::MustNot, child.query),
+					])),
+					clauses: child.clauses + 2,
+				})
+			}
 		}
 	}
 
-	fn clause_query(&self, searcher: &Searcher, clause: &SearchClause) -> Result<Box<dyn Query>> {
-		let fields = self.selected_fields(&clause.fields)?;
-		match clause.mode {
-			SearchMode::Any => self.term_query(&clause.text, &fields, Occur::Should),
-			SearchMode::All => self.term_query(&clause.text, &fields, Occur::Must),
-			SearchMode::Phrase => self.phrase_query(&clause.text, &fields),
-			SearchMode::Prefix => self.prefix_query(searcher, &clause.text, &fields, false),
-			SearchMode::Fuzzy => self.fuzzy_query(&clause.text, &fields),
-			SearchMode::FuzzyPrefix => self.prefix_query(searcher, &clause.text, &fields, true),
+	fn boolean_query(&self, searcher: &Searcher, children: &[SearchExpression], occur: Occur) -> Result<BuiltQuery> {
+		let mut clauses = children.len();
+		let mut queries = Vec::with_capacity(children.len());
+		for child in children {
+			let child = self.expression_query(searcher, child)?;
+			self.check_total_clause_count(clauses, child.clauses)?;
+			clauses += child.clauses;
+			queries.push((occur, child.query));
 		}
+		Ok(BuiltQuery {
+			query: Box::new(BooleanQuery::new(queries)),
+			clauses,
+		})
+	}
+
+	fn clause_query(&self, searcher: &Searcher, clause: &SearchClause) -> Result<BuiltQuery> {
+		let fields = self.selected_fields(&clause.fields)?;
+		let (query, clauses) = match clause.mode {
+			SearchMode::Any => self.term_query(&clause.text, &fields, Occur::Should)?,
+			SearchMode::All => self.term_query(&clause.text, &fields, Occur::Must)?,
+			SearchMode::Phrase => self.phrase_query(&clause.text, &fields)?,
+			SearchMode::Prefix => self.prefix_query(searcher, &clause.text, &fields, false)?,
+			SearchMode::Fuzzy => self.fuzzy_query(&clause.text, &fields)?,
+			SearchMode::FuzzyPrefix => self.prefix_query(searcher, &clause.text, &fields, true)?,
+		};
+		Ok(BuiltQuery { query, clauses })
 	}
 
 	fn analyze(&self, text: &str, surface: bool, deduplicate: bool) -> Result<Vec<String>> {
@@ -901,31 +936,35 @@ impl Engine {
 		Ok(terms)
 	}
 
-	fn term_query(&self, text: &str, fields: &[&EngineField], occur: Occur) -> Result<Box<dyn Query>> {
+	fn term_query(&self, text: &str, fields: &[&EngineField], occur: Occur) -> Result<(Box<dyn Query>, usize)> {
 		let terms = self.analyze(text, false, true)?;
 		if terms.is_empty() {
-			return Ok(Box::new(EmptyQuery));
+			return Ok((Box::new(EmptyQuery), 0));
 		}
 		self.check_clause_count(terms.len(), fields.len())?;
-		Ok(Box::new(BooleanQuery::new(
-			terms
-				.into_iter()
-				.map(|term| (occur, self.term_group(&term, fields)))
-				.collect(),
-		)))
+		let clauses = terms.len().saturating_mul(fields.len());
+		Ok((
+			Box::new(BooleanQuery::new(
+				terms
+					.into_iter()
+					.map(|term| (occur, self.term_group(&term, fields)))
+					.collect(),
+			)),
+			clauses,
+		))
 	}
 
-	fn phrase_query(&self, text: &str, fields: &[&EngineField]) -> Result<Box<dyn Query>> {
+	fn phrase_query(&self, text: &str, fields: &[&EngineField]) -> Result<(Box<dyn Query>, usize)> {
 		if !self.positions {
 			return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
 		}
 		let terms = self.analyze_positioned(text)?;
 		if terms.is_empty() {
-			return Ok(Box::new(EmptyQuery));
+			return Ok((Box::new(EmptyQuery), 0));
 		}
 		self.check_clause_count(1, fields.len())?;
 		if terms.len() == 1 {
-			return Ok(self.term_group(&terms[0].1, fields));
+			return Ok((self.term_group(&terms[0].1, fields), fields.len()));
 		}
 		let alternatives = fields
 			.iter()
@@ -940,10 +979,10 @@ impl Engine {
 				(Occur::Should, boosted(query, field.weight))
 			})
 			.collect();
-		Ok(Box::new(BooleanQuery::new(alternatives)))
+		Ok((Box::new(BooleanQuery::new(alternatives)), fields.len()))
 	}
 
-	fn fuzzy_query(&self, text: &str, fields: &[&EngineField]) -> Result<Box<dyn Query>> {
+	fn fuzzy_query(&self, text: &str, fields: &[&EngineField]) -> Result<(Box<dyn Query>, usize)> {
 		let surface = self.analyze(text, true, true)?;
 		let mut pairs = Vec::new();
 		for surface_term in surface {
@@ -953,7 +992,7 @@ impl Engine {
 			}
 		}
 		if pairs.is_empty() {
-			return Ok(Box::new(EmptyQuery));
+			return Ok((Box::new(EmptyQuery), 0));
 		}
 		let fuzzy_terms = pairs.iter().filter(|(_, term)| fuzzy_eligible(term)).count();
 		if fuzzy_terms > MAX_FUZZY_TERMS {
@@ -963,6 +1002,7 @@ impl Engine {
 		}
 		self.check_clause_count(pairs.len(), fields.len().saturating_mul(3))?;
 		let exact_bonus = fields.iter().map(|field| field.weight).fold(0.0f32, f32::max) * 0.25 + 1.0;
+		let clause_count = pairs.len().saturating_mul(fields.len().saturating_mul(3));
 		let clauses = pairs
 			.into_iter()
 			.map(|(analyzed, surface)| {
@@ -981,7 +1021,7 @@ impl Engine {
 				))
 			})
 			.collect::<Result<Vec<_>>>()?;
-		Ok(Box::new(BooleanQuery::new(clauses)))
+		Ok((Box::new(BooleanQuery::new(clauses)), clause_count))
 	}
 
 	fn prefix_query(
@@ -990,14 +1030,14 @@ impl Engine {
 		text: &str,
 		fields: &[&EngineField],
 		fuzzy: bool,
-	) -> Result<Box<dyn Query>> {
+	) -> Result<(Box<dyn Query>, usize)> {
 		self.require_surface_fields(fields)?;
 		if text.chars().last().is_some_and(char::is_whitespace) {
 			return self.term_query(text, fields, Occur::Must);
 		}
 		let (completed, surface_prefix) = self.final_surface_term(text)?;
 		let Some(surface_prefix) = surface_prefix else {
-			return Ok(Box::new(EmptyQuery));
+			return Ok((Box::new(EmptyQuery), 0));
 		};
 		let minimum = if fuzzy { 4 } else { 3 };
 		if surface_prefix.chars().count() < minimum {
@@ -1041,7 +1081,10 @@ impl Engine {
 			exact_prefix
 		};
 		clauses.push((Occur::Must, final_group));
-		Ok(Box::new(BooleanQuery::new(clauses)))
+		Ok((
+			Box::new(BooleanQuery::new(clauses)),
+			completed_clause_count + prefix_clause_count + fuzzy_clause_count,
+		))
 	}
 
 	fn final_surface_term(&self, text: &str) -> Result<(Vec<String>, Option<String>)> {
@@ -1205,6 +1248,15 @@ impl Engine {
 		}
 		Ok(())
 	}
+
+	fn check_total_clause_count(&self, clauses: usize, additional: usize) -> Result<()> {
+		if clauses.saturating_add(additional) > MAX_QUERY_CLAUSES {
+			return Err(FulltextError::invalid(format!(
+				"search query exceeds {MAX_QUERY_CLAUSES} clauses"
+			)));
+		}
+		Ok(())
+	}
 }
 
 fn check_deadline(deadline: Option<Instant>) -> Result<()> {
@@ -1257,6 +1309,82 @@ fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<
 		}
 	}
 	Ok(versions)
+}
+
+struct SearchHitMetadata {
+	id: String,
+	version: Option<String>,
+}
+
+fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Result<Vec<SearchHitMetadata>> {
+	let mut metadata = (0..scored_docs.len())
+		.map(|_| SearchHitMetadata {
+			id: String::new(),
+			version: None,
+		})
+		.collect::<Vec<_>>();
+	let mut hits_by_segment = HashMap::new();
+	for (index, (_, address)) in scored_docs.iter().enumerate() {
+		hits_by_segment
+			.entry(address.segment_ord)
+			.or_insert_with(Vec::new)
+			.push((index, address.doc_id));
+	}
+	for (segment_ord, segment_hits) in hits_by_segment {
+		let segment = &searcher.segment_readers()[segment_ord as usize];
+		let id_column = segment
+			.fast_fields()
+			.str(ID_FIELD_NAME)
+			.map_err(index_error)?
+			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no ID fast field"))?;
+		let version_column = segment
+			.fast_fields()
+			.str(VERSION_FIELD_NAME)
+			.map_err(index_error)?
+			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no version fast field"))?;
+		let mut id = Vec::new();
+		let mut version = Vec::new();
+		for (index, doc_id) in segment_hits {
+			let ordinal = id_column
+				.term_ords(doc_id)
+				.next()
+				.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"))?;
+			id.clear();
+			if !id_column
+				.dictionary()
+				.ord_to_term(ordinal, &mut id)
+				.map_err(storage_error)?
+			{
+				return Err(FulltextError::new(
+					"E_NATIVE_FAILURE",
+					"search hit ID ordinal is missing",
+				));
+			}
+			metadata[index].id = std::str::from_utf8(&id)
+				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?
+				.to_owned();
+			let Some(ordinal) = version_column.term_ords(doc_id).next() else {
+				continue;
+			};
+			version.clear();
+			if !version_column
+				.dictionary()
+				.ord_to_term(ordinal, &mut version)
+				.map_err(storage_error)?
+			{
+				return Err(FulltextError::new(
+					"E_NATIVE_FAILURE",
+					"search hit version ordinal is missing",
+				));
+			}
+			metadata[index].version = Some(
+				std::str::from_utf8(&version)
+					.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit version is not UTF-8"))?
+					.to_owned(),
+			);
+		}
+	}
+	Ok(metadata)
 }
 
 fn boosted(query: Box<dyn Query>, weight: f32) -> Box<dyn Query> {
@@ -2798,6 +2926,31 @@ mod tests {
 		assert!(search("waterproof", SearchMode::Any, Some(Vec::new())).hits.is_empty());
 		assert!(search("the", SearchMode::Any, None).hits.is_empty());
 		writer.close().unwrap();
+	}
+
+	#[test]
+	fn rejects_structured_queries_with_excessive_aggregate_expansion() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let reader = engine.reader().unwrap();
+		let expression = SearchExpression::And(
+			(0..129)
+				.map(|_| expression("shoe", SearchMode::Any, Vec::new()))
+				.collect(),
+		);
+		let error = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					expression,
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: false,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap_err();
+		assert_eq!(error.code, "E_INVALID_ARGUMENT");
 	}
 
 	#[test]

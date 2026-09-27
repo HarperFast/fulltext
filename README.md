@@ -282,8 +282,10 @@ await reader.close();
 
 Readers use Tantivy's manual reload policy. They do not watch or poll the filesystem; the caller
 coordinates publication and calls `reload()` only when a newer revision is available. Reset rejects
-while any writer or reader is live. A reader never creates missing storage and fails with
-`E_INDEX_NOT_READY` until a writer has created a complete index.
+while any writer or reader is live in the current process; separate processes must coordinate reset
+with their own reader lifecycle. A reader never creates missing storage and fails with
+`E_INDEX_NOT_READY` until a writer has created a complete index. A successful reload also refreshes
+the reader's `committedPayload`.
 
 ### Checkpointed publication
 
@@ -364,10 +366,11 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 7 and packed protocol 3. The loader rejects older addon binaries. Native
+This API uses native ABI 8 and packed protocol 4. The loader rejects older addon binaries. Native
 identity sidecar v3 fingerprints canonical synonyms and the completed `english@2` semantics. Older
 v2 indexes are identifiable for safe reset but cannot be reopened under the new meaning; rebuild
-them from the authoritative source.
+them from the authoritative source. Version 0.3.0 adds an internal source-version field, so indexes
+created by 0.2.x also require a rebuild.
 
 ## Diagnostics and errors
 

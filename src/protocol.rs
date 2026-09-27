@@ -364,13 +364,59 @@ fn packed_budget(bytes: &[u8], magic: [u8; 4], operation: &str) -> Result<u32> {
 	Ok(budget)
 }
 
-pub fn search_mode(bytes: &[u8]) -> Result<SearchMode> {
-	let request = decode_search(bytes)?;
-	Ok(if request.expression.is_expensive() {
-		SearchMode::Fuzzy
-	} else {
-		SearchMode::Any
-	})
+pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
+	let mut cursor = Cursor::new(bytes, *b"FTSQ")?;
+	let mut clause_count = 0usize;
+	let mut text_bytes = 0usize;
+	scan_search_expression(&mut cursor, 0, &mut clause_count, &mut text_bytes)
+}
+
+fn scan_search_expression(
+	cursor: &mut Cursor<'_>,
+	depth: usize,
+	clause_count: &mut usize,
+	text_bytes: &mut usize,
+) -> Result<bool> {
+	if depth > 8 {
+		return Err(FulltextError::invalid("search expression nesting exceeds 8 levels"));
+	}
+	match cursor.u8()? {
+		0 => {
+			*clause_count += 1;
+			if *clause_count > MAX_QUERY_CLAUSES {
+				return Err(FulltextError::invalid("search expression exceeds 256 clauses"));
+			}
+			let text = cursor.bytes()?;
+			*text_bytes = text_bytes.saturating_add(text.len());
+			if *text_bytes > MAX_QUERY_TEXT_BYTES {
+				return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
+			}
+			let expensive = decode_search_mode(cursor.u8()?)?.is_expensive();
+			let field_count = cursor.u16()? as usize;
+			if field_count > MAX_FIELDS || field_count > cursor.remaining() / 4 {
+				return Err(FulltextError::invalid("search field count exceeds its packed request"));
+			}
+			for _ in 0..field_count {
+				let _ = cursor.bytes()?;
+			}
+			Ok(expensive)
+		}
+		1 | 2 => {
+			let count = cursor.u16()? as usize;
+			if count == 0 || count > MAX_QUERY_CLAUSES {
+				return Err(FulltextError::invalid(
+					"boolean search expressions require 1 to 256 children",
+				));
+			}
+			let mut expensive = false;
+			for _ in 0..count {
+				expensive |= scan_search_expression(cursor, depth + 1, clause_count, text_bytes)?;
+			}
+			Ok(expensive)
+		}
+		3 => scan_search_expression(cursor, depth + 1, clause_count, text_bytes),
+		_ => Err(FulltextError::invalid("unknown search expression type")),
+	}
 }
 
 pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {

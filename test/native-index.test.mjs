@@ -137,6 +137,8 @@ test('opens concurrent readers, reloads publications, evaluates boolean queries,
 	});
 	await writer.publish('1');
 	const [first, second] = await Promise.all([openNativeFullTextReader(config), openNativeFullTextReader(config)]);
+	assert.strictEqual(first.committedPayload, '1');
+	assert.strictEqual(second.committedPayload, '1');
 	const request = {
 		query: {
 			operator: 'and',
@@ -154,11 +156,24 @@ test('opens concurrent readers, reloads publications, evaluates boolean queries,
 	await writer.publish('2');
 	assert.strictEqual((await second.search({ text: 'shoe', exactTotal: true })).total, 2);
 	await second.reload();
+	assert.strictEqual(first.committedPayload, '1');
+	assert.strictEqual(second.committedPayload, '2');
 	assert.deepStrictEqual(
 		(await second.search({ text: 'boot' })).hits.map(({ id, version }) => [id, version]),
 		[['one', '43']],
 	);
-	await Promise.all([first.close(), second.close(), writer.close()]);
+	await writer.close();
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_LOCK_BUSY',
+	);
+	await Promise.all([first.close(), second.close()]);
+});
+
+test('reports a missing read-only index as not ready', async (context) => {
+	const indexPath = temporaryIndex(context);
+	rmSync(indexPath, { recursive: true });
+	await assert.rejects(openNativeFullTextReader(options(indexPath)), (error) => error.code === 'E_INDEX_NOT_READY');
 });
 
 test('normalizes English text and persists bounded index-time synonyms', async (context) => {
