@@ -172,7 +172,8 @@ struct RuntimeParts {
 }
 
 struct SnapshotReader {
-	current: RwLock<IndexReader>,
+	active: RwLock<IndexReader>,
+	staging: Mutex<Option<IndexReader>>,
 }
 
 struct CompletionSignal {
@@ -1244,23 +1245,55 @@ impl Runtime {
 impl SnapshotReader {
 	fn new(reader: IndexReader) -> Self {
 		Self {
-			current: RwLock::new(reader),
+			active: RwLock::new(reader),
+			staging: Mutex::new(None),
 		}
 	}
 
 	fn searcher(&self) -> Searcher {
-		self.current
-			.read()
-			.unwrap_or_else(|error| error.into_inner())
-			.searcher()
+		self.active.read().unwrap_or_else(|error| error.into_inner()).searcher()
 	}
 
-	fn replace(&self, reader: IndexReader) {
-		*self.current.write().unwrap_or_else(|error| error.into_inner()) = reader;
+	fn reload_after_owned_publish(&self) -> tantivy::Result<()> {
+		self.active.read().unwrap_or_else(|error| error.into_inner()).reload()
 	}
 
-	fn reload(&self) -> tantivy::Result<()> {
-		self.current.read().unwrap_or_else(|error| error.into_inner()).reload()
+	fn reload_aligned(&self, engine: &Engine) -> Result<Option<String>> {
+		let mut staging = lock(&self.staging);
+		let mut candidate = match staging.take() {
+			Some(reader) => reader,
+			None => engine.reader_for_open()?,
+		};
+		for attempt in 0..3 {
+			if attempt > 0 {
+				if let Err(error) = candidate.reload() {
+					*staging = Some(candidate);
+					return Err(FulltextError::native(error));
+				}
+			}
+			match engine.committed_payload_for_searcher(&candidate.searcher()) {
+				Ok(payload) => {
+					let mut active = self.active.write().unwrap_or_else(|error| error.into_inner());
+					mem::swap(&mut *active, &mut candidate);
+					*staging = Some(candidate);
+					return Ok(payload);
+				}
+				Err(error) if error.code == "E_RELOAD_FAILED" => {
+					if attempt < 2 {
+						thread::sleep(Duration::from_millis(1 << attempt));
+					}
+				}
+				Err(error) => {
+					*staging = Some(candidate);
+					return Err(error);
+				}
+			}
+		}
+		*staging = Some(candidate);
+		Err(FulltextError::new(
+			"E_RELOAD_FAILED",
+			"native index changed repeatedly during reload; retry the reload",
+		))
 	}
 }
 
@@ -1697,7 +1730,7 @@ fn writer_loop_inner(
 				.and_then(|opstamp| {
 					#[cfg(feature = "test-panic")]
 					fail_publish_at(&runtime, 2)?;
-					reader.reload().map_err(FulltextError::native)?;
+					reader.reload_after_owned_publish().map_err(FulltextError::native)?;
 					Ok(opstamp)
 				}) {
 				Ok(opstamp) => {
@@ -2051,9 +2084,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 }
 
 fn reload_payload(reader: &SnapshotReader, engine: &Engine) -> Result<Option<String>> {
-	let (candidate, payload) = aligned_reader(engine)?;
-	reader.replace(candidate);
-	Ok(payload)
+	reader.reload_aligned(engine)
 }
 
 fn aligned_reader(engine: &Engine) -> Result<(IndexReader, Option<String>)> {
