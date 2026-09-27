@@ -256,9 +256,10 @@ callback timer. If every eligible worker is already executing non-interruptible 
 queued request is rejected when a worker next examines it. Tantivy search itself is not
 interruptible, so a search that expires in flight is discarded after Tantivy returns. Match tracing
 checks its deadline while tokenizing and matching. With at least two search threads, one worker is
-reserved for ordinary `any`/`all` BM25. The remaining
-workers prioritize phrase, prefix, fuzzy, and trace work, then steal ordinary work when that queue
-is idle. A one-thread configuration remains valid but cannot isolate query classes.
+reserved for ordinary bounded `any`/`all` BM25. The remaining workers prioritize phrase, prefix,
+fuzzy, unanchored-negation, exact-total, and trace work, then steal ordinary work when that queue is
+idle. A negation intersected with a positive ordinary clause stays in the ordinary lane. A
+one-thread configuration remains valid but cannot isolate query classes.
 
 ## Lifecycle and recovery
 

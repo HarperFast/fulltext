@@ -9,7 +9,7 @@ pub const MAX_SYNONYM_RULES: usize = 1_024;
 pub const MAX_SYNONYM_REPLACEMENTS: usize = 16;
 pub const MAX_SYNONYM_BYTES: usize = 1 << 20;
 const MUTATION_BATCH_HEADER_BYTES: usize = 14;
-const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 7;
+const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldConfig {
@@ -153,10 +153,23 @@ pub enum SearchExpression {
 
 impl SearchExpression {
 	pub fn is_expensive(&self) -> bool {
+		self.has_expensive_mode() || !self.has_positive_anchor()
+	}
+
+	fn has_expensive_mode(&self) -> bool {
 		match self {
 			Self::Clause(clause) => clause.mode.is_expensive(),
-			Self::And(children) | Self::Or(children) => children.iter().any(Self::is_expensive),
-			Self::Not(child) => child.is_expensive(),
+			Self::And(children) | Self::Or(children) => children.iter().any(Self::has_expensive_mode),
+			Self::Not(child) => child.has_expensive_mode(),
+		}
+	}
+
+	fn has_positive_anchor(&self) -> bool {
+		match self {
+			Self::Clause(_) => true,
+			Self::And(children) => children.iter().any(Self::has_positive_anchor),
+			Self::Or(children) => children.iter().all(Self::has_positive_anchor),
+			Self::Not(_) => false,
 		}
 	}
 }
@@ -368,7 +381,24 @@ pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
 	let mut cursor = Cursor::new(bytes, *b"FTSQ")?;
 	let mut clause_count = 0usize;
 	let mut text_bytes = 0usize;
-	scan_search_expression(&mut cursor, 0, &mut clause_count, &mut text_bytes)
+	let cost = scan_search_expression(&mut cursor, 0, &mut clause_count, &mut text_bytes)?;
+	let has_candidates = cursor.boolean()?;
+	let candidate_count = if has_candidates { cursor.u16()? as usize } else { 0 };
+	if candidate_count > MAX_CANDIDATE_IDS || candidate_count > cursor.remaining() / 4 {
+		return Err(FulltextError::invalid("candidate ID count exceeds its packed request"));
+	}
+	for _ in 0..candidate_count {
+		let _ = cursor.bytes()?;
+	}
+	let _ = cursor.u32()?;
+	let _ = cursor.u32()?;
+	let exact_total = cursor.boolean()?;
+	Ok(cost.has_expensive_mode || !cost.has_positive_anchor || exact_total)
+}
+
+struct SearchCost {
+	has_expensive_mode: bool,
+	has_positive_anchor: bool,
 }
 
 fn scan_search_expression(
@@ -376,7 +406,7 @@ fn scan_search_expression(
 	depth: usize,
 	clause_count: &mut usize,
 	text_bytes: &mut usize,
-) -> Result<bool> {
+) -> Result<SearchCost> {
 	if depth > 8 {
 		return Err(FulltextError::invalid("search expression nesting exceeds 8 levels"));
 	}
@@ -399,22 +429,41 @@ fn scan_search_expression(
 			for _ in 0..field_count {
 				let _ = cursor.bytes()?;
 			}
-			Ok(expensive)
+			Ok(SearchCost {
+				has_expensive_mode: expensive,
+				has_positive_anchor: true,
+			})
 		}
-		1 | 2 => {
+		kind @ (1 | 2) => {
 			let count = cursor.u16()? as usize;
 			if count == 0 || count > MAX_QUERY_CLAUSES {
 				return Err(FulltextError::invalid(
 					"boolean search expressions require 1 to 256 children",
 				));
 			}
-			let mut expensive = false;
+			let mut has_expensive_mode = false;
+			let mut has_positive_anchor = kind == 2;
 			for _ in 0..count {
-				expensive |= scan_search_expression(cursor, depth + 1, clause_count, text_bytes)?;
+				let child = scan_search_expression(cursor, depth + 1, clause_count, text_bytes)?;
+				has_expensive_mode |= child.has_expensive_mode;
+				if kind == 1 {
+					has_positive_anchor |= child.has_positive_anchor;
+				} else {
+					has_positive_anchor &= child.has_positive_anchor;
+				}
 			}
-			Ok(expensive)
+			Ok(SearchCost {
+				has_expensive_mode,
+				has_positive_anchor,
+			})
 		}
-		3 => scan_search_expression(cursor, depth + 1, clause_count, text_bytes),
+		3 => {
+			let child = scan_search_expression(cursor, depth + 1, clause_count, text_bytes)?;
+			Ok(SearchCost {
+				has_expensive_mode: child.has_expensive_mode,
+				has_positive_anchor: false,
+			})
+		}
 		_ => Err(FulltextError::invalid("unknown search expression type")),
 	}
 }
@@ -1049,6 +1098,34 @@ mod tests {
 		bytes.extend_from_slice(&1u32.to_le_bytes());
 		bytes.push(0xff);
 		assert_eq!(decode_search(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+	}
+
+	#[test]
+	fn classifies_negation_and_exact_totals_as_expensive() {
+		fn request(expression: &[u8], exact_total: bool) -> Vec<u8> {
+			let mut bytes = b"FTSQ\x04\x00".to_vec();
+			bytes.extend_from_slice(expression);
+			bytes.push(0); // no candidate IDs
+			bytes.extend_from_slice(&0u32.to_le_bytes());
+			bytes.extend_from_slice(&1u32.to_le_bytes());
+			bytes.push(u8::from(exact_total));
+			bytes.extend_from_slice(&100u32.to_le_bytes());
+			bytes
+		}
+		let leaf = [0, 1, 0, 0, 0, b'a', 0, 0, 0];
+		assert!(!search_is_expensive(&request(&leaf, false)).unwrap());
+		assert!(search_is_expensive(&request(&leaf, true)).unwrap());
+		let mut negated = vec![3];
+		negated.extend_from_slice(&leaf);
+		assert!(search_is_expensive(&request(&negated, false)).unwrap());
+		let mut anchored = vec![1, 2, 0];
+		anchored.extend_from_slice(&leaf);
+		anchored.extend_from_slice(&negated);
+		assert!(!search_is_expensive(&request(&anchored, false)).unwrap());
+		let mut unanchored_or = vec![2, 2, 0];
+		unanchored_or.extend_from_slice(&leaf);
+		unanchored_or.extend_from_slice(&negated);
+		assert!(search_is_expensive(&request(&unanchored_or, false)).unwrap());
 	}
 
 	#[test]

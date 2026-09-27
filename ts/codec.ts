@@ -9,7 +9,7 @@ export const maxRecordIdBytes = 4 << 10;
 export const maxRecordVersionBytes = 4 << 10;
 export const maxFields = 1_024;
 export const mutationBatchHeaderBytes = 14;
-export const minimumMutationBatchBytes = mutationBatchHeaderBytes + 7;
+export const minimumMutationBatchBytes = mutationBatchHeaderBytes + 8;
 const maxPendingWriterChunks = 1_024;
 const invalidSurrogate = /[\uD800-\uDFFF]/u;
 

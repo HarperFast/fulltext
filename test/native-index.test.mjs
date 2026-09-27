@@ -530,6 +530,19 @@ test('rejects a mutation frame limit that cannot hold one mutation', async (cont
 	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INVALID_ARGUMENT');
 });
 
+test('accepts the exact mutation-frame floor for a minimal upsert', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 22 };
+	const index = await openNativeFullTextIndex(config);
+	const result = await index.applyMutationBatch(
+		{ upserts: [{ id: 'a', fields: {} }], deletes: [] },
+		{ assumeDistinctIds: true, rejectedUpsert: 'delete' },
+	);
+	assert.strictEqual(result.processed, 1);
+	assert.deepStrictEqual(result.rejected, []);
+	await index.close({ mode: 'rollback' });
+});
+
 test('validates native configuration without creating index storage', async (context) => {
 	const indexPath = path.join(temporaryIndex(context), 'invalid');
 	const config = options(indexPath);

@@ -246,13 +246,14 @@ actor. Independent indexes and their
 searches may run concurrently. The process governor bounds their aggregate resources without
 replacing the per-index search pools with a shared scheduler.
 
-With two or more search threads, one worker consumes only the ordinary BM25 lane. Every other
-worker prioritizes phrase, prefix, fuzzy, and trace requests, then steals ordinary work when the
-expensive lane is idle. This preserves ordinary-query capacity during expensive traffic without
-stranding half the pool during ordinary-only workloads. A one-thread configuration uses one shared
-lane and provides no query-class isolation. In that configuration, a process-wide expensive permit
-held by another index can delay ordinary work behind an expensive request. Closing an index rejects
-an expensive request waiting for a permit with `E_CLOSED`.
+With two or more search threads, one worker consumes only the ordinary bounded BM25 lane. Every
+other worker prioritizes phrase, prefix, fuzzy, unanchored-negation, exact-total, and trace requests,
+then steals ordinary work when the expensive lane is idle. A negation intersected with a positive
+ordinary clause stays in the ordinary lane. This preserves ordinary-query capacity during expensive
+traffic without stranding half the pool during ordinary-only workloads. A one-thread configuration
+uses one shared lane and provides no query-class isolation. In that configuration, a process-wide
+expensive permit held by another index can delay ordinary work behind an expensive request. Closing
+an index rejects an expensive request waiting for a permit with `E_CLOSED`.
 
 Both queues are bounded by command count and retained bytes. A JS-owned buffer is copied once into a
 Rust-owned `Vec<u8>` before admission; no native thread borrows memory owned by a Node environment.
@@ -261,8 +262,8 @@ writer arena, indexing-thread, and search-thread values are printed in every ben
 
 The registry rejects a second writer for the same canonical path and admits bounded read-only
 handles alongside the writer. A reset requires both the writer and every reader to be closed.
-Readers reserve search threads and queue bytes from the process budget but do not reserve indexing
-threads or writer memory. Publication coordination belongs to the caller: a reader calls
+Readers reserve a resident-index slot, search threads, and queue bytes from the process budget but
+do not reserve indexing threads or writer memory. Publication coordination belongs to the caller: a reader calls
 `reload()` only after learning that the writer published a newer revision.
 
 Inspection is outside the handle registry and writer actor. It opens Tantivy's
