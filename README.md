@@ -200,6 +200,9 @@ const result = await index.search({
 });
 ```
 
+Negation filters do not add to BM25 scores. A query made only of negation matches assigns every
+surviving hit a score of zero and orders ties by UTF-8 ID.
+
 `total` is bounded by default so Tantivy can retain block-max WAND pruning. Set `exactTotal: true`
 only when an exact match count is worth a second full-match traversal. Ranking is score descending,
 then UTF-8 ID ascending, including ties that cross segment or page boundaries.

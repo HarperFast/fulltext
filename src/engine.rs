@@ -2970,6 +2970,27 @@ mod tests {
 			excluded.hits.iter().map(|hit| (&hit.id, hit.score)).collect::<Vec<_>>(),
 			baseline.hits.iter().map(|hit| (&hit.id, hit.score)).collect::<Vec<_>>()
 		);
+		let only_negated = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					expression: SearchExpression::Not(Box::new(expression("wireless", SearchMode::Any, Vec::new()))),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert_eq!(
+			only_negated
+				.hits
+				.iter()
+				.map(|hit| (hit.id.as_str(), hit.score))
+				.collect::<Vec<_>>(),
+			vec![("one", 0.0), ("two", 0.0)]
+		);
 		assert!(search("waterproof", SearchMode::Any, Some(Vec::new())).hits.is_empty());
 		assert!(search("the", SearchMode::Any, None).hits.is_empty());
 		writer.close().unwrap();

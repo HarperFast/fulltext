@@ -94,14 +94,20 @@ test('a failed reader reload retains its aligned snapshot and checkpoint', async
 	});
 	await writer.apply(batch('two', 'updated catalog'));
 	await writer.publish('two');
-	addon.__testFailNextReloadAlignment(handle);
-	await assert.rejects(reader.reload(), hasCode('E_RELOAD_FAILED'));
-	assert.strictEqual(reader.committedPayload, 'one');
-	assert.strictEqual((await reader.search({ text: 'original', exactTotal: true })).total, 1);
-	assert.strictEqual((await reader.search({ text: 'updated', exactTotal: true })).total, 0);
+	addon.__testFailReloadAlignment(handle, 1);
 	await reader.reload();
 	assert.strictEqual(reader.committedPayload, 'two');
 	assert.strictEqual((await reader.search({ text: 'updated', exactTotal: true })).total, 1);
+	await writer.apply(batch('three', 'third catalog'));
+	await writer.publish('three');
+	addon.__testFailReloadAlignment(handle, 3);
+	await assert.rejects(reader.reload(), hasCode('E_RELOAD_FAILED'));
+	assert.strictEqual(reader.committedPayload, 'two');
+	assert.strictEqual((await reader.search({ text: 'original', exactTotal: true })).total, 1);
+	assert.strictEqual((await reader.search({ text: 'third', exactTotal: true })).total, 0);
+	await reader.reload();
+	assert.strictEqual(reader.committedPayload, 'three');
+	assert.strictEqual((await reader.search({ text: 'third', exactTotal: true })).total, 1);
 });
 
 test('checks a queued commit after earlier publication and retains staged work on rejection', async (context) => {

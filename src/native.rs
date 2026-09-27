@@ -31,6 +31,8 @@ const STATE_CLOSING: u8 = 1;
 const STATE_CLOSED: u8 = 2;
 const STATE_POISONED: u8 = 3;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const RELOAD_ALIGNMENT_ATTEMPTS: u8 = 3;
+const RELOAD_FAILED_CODE: &str = "E_RELOAD_FAILED";
 
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -174,8 +176,8 @@ struct RuntimeParts {
 }
 
 struct SnapshotReader {
-	active: RwLock<IndexReader>,
-	staging: Mutex<Option<IndexReader>>,
+	active: RwLock<Searcher>,
+	staging: Mutex<IndexReader>,
 }
 
 struct CompletionSignal {
@@ -602,12 +604,17 @@ pub fn test_fail_next_publish(env: Env, handle: u32, after_commit: bool) -> boun
 }
 
 #[cfg(feature = "test-panic")]
-#[napi(catch_unwind, skip_typescript, js_name = "__testFailNextReloadAlignment")]
-pub fn test_fail_next_reload_alignment(env: Env, handle: u32) -> boundary::Result<()> {
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailReloadAlignment")]
+pub fn test_fail_reload_alignment(env: Env, handle: u32, failures: u8) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
+		if failures == 0 || failures > RELOAD_ALIGNMENT_ATTEMPTS {
+			return Err(fulltext_napi_error(FulltextError::invalid(
+				"test reload failures exceed the retry budget",
+			)));
+		}
 		runtime(&env, handle)?
 			.reload_alignment_faults
-			.store(3, Ordering::Release);
+			.store(failures, Ordering::Release);
 		Ok(())
 	})?
 }
@@ -1259,36 +1266,31 @@ impl Runtime {
 
 impl SnapshotReader {
 	fn new(reader: IndexReader) -> Self {
+		let searcher = reader.searcher();
 		Self {
-			active: RwLock::new(reader),
-			staging: Mutex::new(None),
+			active: RwLock::new(searcher),
+			staging: Mutex::new(reader),
 		}
 	}
 
 	fn searcher(&self) -> Searcher {
-		self.active.read().unwrap_or_else(|error| error.into_inner()).searcher()
+		self.active.read().unwrap_or_else(|error| error.into_inner()).clone()
 	}
 
 	fn reload_after_owned_publish(&self) -> tantivy::Result<()> {
-		self.active.read().unwrap_or_else(|error| error.into_inner()).reload()
+		let staging = lock(&self.staging);
+		staging.reload()?;
+		self.replace(staging.searcher());
+		Ok(())
 	}
 
 	fn reload_aligned(&self, engine: &Engine, runtime: &Runtime) -> Result<Option<String>> {
 		#[cfg(not(feature = "test-panic"))]
 		let _ = runtime;
-		let mut staging = lock(&self.staging);
-		let reused = staging.is_some();
-		let mut candidate = match staging.take() {
-			Some(reader) => reader,
-			None => engine.reader_for_open()?,
-		};
-		for attempt in 0..3 {
-			if reused || attempt > 0 {
-				if let Err(error) = candidate.reload() {
-					*staging = Some(candidate);
-					return Err(FulltextError::native(error));
-				}
-			}
+		let staging = lock(&self.staging);
+		for attempt in 0..RELOAD_ALIGNMENT_ATTEMPTS {
+			staging.reload().map_err(FulltextError::native)?;
+			let candidate = staging.searcher();
 			#[cfg(feature = "test-panic")]
 			let aligned = if runtime
 				.reload_alignment_faults
@@ -1298,37 +1300,39 @@ impl SnapshotReader {
 				.is_ok()
 			{
 				Err(FulltextError::new(
-					"E_RELOAD_FAILED",
+					RELOAD_FAILED_CODE,
 					"injected reload alignment failure",
 				))
 			} else {
-				engine.committed_payload_for_searcher(&candidate.searcher())
+				engine.committed_payload_for_searcher(&candidate)
 			};
 			#[cfg(not(feature = "test-panic"))]
-			let aligned = engine.committed_payload_for_searcher(&candidate.searcher());
+			let aligned = engine.committed_payload_for_searcher(&candidate);
 			match aligned {
 				Ok(payload) => {
-					let mut active = self.active.write().unwrap_or_else(|error| error.into_inner());
-					mem::swap(&mut *active, &mut candidate);
-					*staging = Some(candidate);
+					self.replace(candidate);
 					return Ok(payload);
 				}
-				Err(error) if error.code == "E_RELOAD_FAILED" => {
-					if attempt < 2 {
+				Err(error) if error.code == RELOAD_FAILED_CODE => {
+					if attempt + 1 < RELOAD_ALIGNMENT_ATTEMPTS {
 						thread::sleep(Duration::from_millis(1 << attempt));
 					}
 				}
-				Err(error) => {
-					*staging = Some(candidate);
-					return Err(error);
-				}
+				Err(error) => return Err(error),
 			}
 		}
-		*staging = Some(candidate);
 		Err(FulltextError::new(
-			"E_RELOAD_FAILED",
+			RELOAD_FAILED_CODE,
 			"native index changed repeatedly during reload; retry the reload",
 		))
+	}
+
+	fn replace(&self, searcher: Searcher) {
+		let previous = {
+			let mut active = self.active.write().unwrap_or_else(|error| error.into_inner());
+			mem::replace(&mut *active, searcher)
+		};
+		drop(previous);
 	}
 }
 
