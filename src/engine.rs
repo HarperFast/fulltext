@@ -1337,11 +1337,7 @@ fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -
 			.str(ID_FIELD_NAME)
 			.map_err(index_error)?
 			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no ID fast field"))?;
-		let version_column = segment
-			.fast_fields()
-			.str(VERSION_FIELD_NAME)
-			.map_err(index_error)?
-			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no version fast field"))?;
+		let version_column = segment.fast_fields().str(VERSION_FIELD_NAME).map_err(index_error)?;
 		let mut id = Vec::new();
 		let mut version = Vec::new();
 		for (index, doc_id) in segment_hits {
@@ -1363,6 +1359,9 @@ fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -
 			metadata[index].id = std::str::from_utf8(&id)
 				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?
 				.to_owned();
+			let Some(version_column) = &version_column else {
+				continue;
+			};
 			let Some(ordinal) = version_column.term_ords(doc_id).next() else {
 				continue;
 			};

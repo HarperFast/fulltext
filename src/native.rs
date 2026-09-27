@@ -1681,7 +1681,9 @@ fn writer_loop_inner(runtime: Arc<Runtime>, mut writer: Option<Writer>, engine: 
 			WriterOperation::Reload => WriterOutcome::Continue(
 				reader
 					.reload()
-					.map_err(|_| FulltextError::new("E_RELOAD_FAILED", "native index reload failed; retry the reload"))
+					.map_err(|error| {
+						FulltextError::new("E_RELOAD_FAILED", format!("native index reload failed: {error}"))
+					})
 					.and_then(|()| {
 						engine
 							.committed_payload()
