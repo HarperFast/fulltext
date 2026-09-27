@@ -238,9 +238,9 @@ writer actor ─► shared engine ─► MmapDirectory
 
 The native addon owns these threads and queues; no sustained operation runs on the JavaScript event
 loop or libuv pool. The writer actor is the sole owner of `IndexWriter`, making mutation, commit,
-rollback, and shutdown ordering explicit. A small configurable search pool shares the
-active immutable `Searcher`, so searches overlap each
-other as well as indexing and commit. `reload()` first crosses the writer queue as a barrier. It
+rollback, and shutdown ordering explicit. A small configurable search pool shares the active
+immutable `Searcher`, so searches overlap each other as well as indexing and commit. `reload()`
+first crosses the writer queue as a barrier. It
 reloads a reusable staging reader, validates that reader against the persisted checkpoint, then
 swaps its `Searcher` into the active slot. A failed validation leaves the prior aligned snapshot
 active and returns retryable `E_RELOAD_FAILED`. Publication by the owning writer already knows the

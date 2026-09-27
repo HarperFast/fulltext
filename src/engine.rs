@@ -2983,6 +2983,7 @@ mod tests {
 				},
 			)
 			.unwrap();
+		assert_eq!(only_negated.total, 2);
 		assert_eq!(
 			only_negated
 				.hits
