@@ -151,29 +151,6 @@ pub enum SearchExpression {
 	Not(Box<SearchExpression>),
 }
 
-impl SearchExpression {
-	pub fn is_expensive(&self) -> bool {
-		self.has_expensive_mode() || !self.has_positive_anchor()
-	}
-
-	fn has_expensive_mode(&self) -> bool {
-		match self {
-			Self::Clause(clause) => clause.mode.is_expensive(),
-			Self::And(children) | Self::Or(children) => children.iter().any(Self::has_expensive_mode),
-			Self::Not(child) => child.has_expensive_mode(),
-		}
-	}
-
-	fn has_positive_anchor(&self) -> bool {
-		match self {
-			Self::Clause(_) => true,
-			Self::And(children) => children.iter().any(Self::has_positive_anchor),
-			Self::Or(children) => children.iter().all(Self::has_positive_anchor),
-			Self::Not(_) => false,
-		}
-	}
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchRequest {
 	pub expression: SearchExpression,
@@ -1105,7 +1082,7 @@ mod tests {
 		fn request(expression: &[u8], exact_total: bool) -> Vec<u8> {
 			let mut bytes = b"FTSQ\x04\x00".to_vec();
 			bytes.extend_from_slice(expression);
-			bytes.push(0); // no candidate IDs
+			bytes.push(0);
 			bytes.extend_from_slice(&0u32.to_le_bytes());
 			bytes.extend_from_slice(&1u32.to_le_bytes());
 			bytes.push(u8::from(exact_total));

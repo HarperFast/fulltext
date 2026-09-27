@@ -185,8 +185,9 @@ A failed first open releases its pending latch only after teardown proves native
 released; an unproven teardown latches the process as opened without a budget until restart. The
 governor admits aggregate resident indexes, indexing/search threads,
 writer memory, configured queue capacity, and expensive searches with checked shared accounting.
-Each index reserves its writer queue and shared search-queue capacity, so process queue accounting
-charges twice the per-index `maxQueuedBytes`. Exceeding an open-time admission cap returns
+Each writer reserves its writer queue and shared search-queue capacity, so process queue accounting
+charges twice the per-index `maxQueuedBytes`; each read-only handle reserves one search-queue share.
+Exceeding an open-time admission cap returns
 `E_RESOURCE_LIMIT`; it never evicts an active generation. Expensive searches wait on a condition
 variable off the JavaScript thread until process capacity is available, the request deadline
 expires, or close interrupts the wait. Callers that omit the governor retain per-index admission.

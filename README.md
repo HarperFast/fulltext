@@ -265,7 +265,8 @@ one-thread configuration remains valid but cannot isolate query classes.
 
 `close()` rejects uncommitted data by default. Use `close({ mode: 'rollback' })` to discard it
 explicitly. `commit()` publishes mutations, and `reload()` makes the latest commit visible to this
-handle's searches.
+handle's searches. A reload that cannot align Tantivy's snapshot with its checkpoint after three
+immediate attempts returns `E_RELOAD_FAILED`; callers can retry because the reader remains open.
 
 ### Read-only handles
 
@@ -368,10 +369,9 @@ lock directory. The parent must permit creating this directory, and `.fulltext-l
 writable while indices are opened or reset; failures name the lock-directory path.
 
 This API uses native ABI 8 and packed protocol 4. The loader rejects older addon binaries. Native
-identity sidecar v3 fingerprints canonical synonyms and the completed `english@2` semantics. Older
-v2 indexes are identifiable for safe reset but cannot be reopened under the new meaning; rebuild
-them from the authoritative source. Version 0.3.0 adds an internal source-version field, so indexes
-created by 0.2.x also require a rebuild.
+identity sidecar v4 fingerprints the internal source-version field in addition to canonical
+synonyms and the completed `english@2` semantics. Older v2 and v3 indexes remain identifiable for
+safe reset but cannot be reopened under the new schema; rebuild them from the authoritative source.
 
 ## Diagnostics and errors
 

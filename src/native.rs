@@ -2193,11 +2193,9 @@ fn open_runtime(
 	} else {
 		create_and_canonicalize(Path::new(&open.path))?
 	};
-	if read_only && (!canonical.join(IDENTITY_PATH).is_file() || !canonical.join("meta.json").is_file()) {
-		return Err(FulltextError::new(
-			"E_INDEX_NOT_READY",
-			"native index is not ready for read-only open",
-		));
+	if read_only {
+		require_reader_file(&canonical.join(IDENTITY_PATH))?;
+		require_reader_file(&canonical.join("meta.json"))?;
 	}
 	let (_lifecycle_directory, _lifecycle_lock) = acquire_lifecycle_lock_for_open(&canonical)?;
 	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
@@ -2211,6 +2209,21 @@ fn open_runtime(
 		environment,
 		read_only,
 	)
+}
+
+fn require_reader_file(path: &Path) -> Result<()> {
+	match fs::symlink_metadata(path) {
+		Ok(metadata) if metadata.is_file() && !is_link_like(&metadata) => Ok(()),
+		Ok(_) => Err(FulltextError::new(
+			"E_INDEX_CORRUPT",
+			"native index metadata is not a regular file",
+		)),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(FulltextError::new(
+			"E_INDEX_NOT_READY",
+			"native index is not ready for read-only open",
+		)),
+		Err(error) => Err(storage_error(error)),
+	}
 }
 
 fn acquire_lifecycle_lock_for_open(path: &Path) -> Result<(MmapDirectory, DirectoryLock)> {

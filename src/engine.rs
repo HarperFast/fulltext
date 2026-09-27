@@ -1297,11 +1297,9 @@ fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<
 	let mut versions = vec![None; addresses.len()];
 	for (segment_ord, segment_hits) in hits_by_segment {
 		let segment = &searcher.segment_readers()[segment_ord as usize];
-		let column = segment
-			.fast_fields()
-			.str(VERSION_FIELD_NAME)
-			.map_err(index_error)?
-			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no version fast field"))?;
+		let Some(column) = segment.fast_fields().str(VERSION_FIELD_NAME).map_err(index_error)? else {
+			continue;
+		};
 		let mut value = Vec::new();
 		for (index, doc_id) in segment_hits {
 			let Some(ordinal) = column.term_ords(doc_id).next() else {
@@ -2198,7 +2196,7 @@ fn canonical_synonym_term(analyzer: &mut TextAnalyzer, text: &str, label: &str) 
 }
 
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
-	let mut bytes = b"HTFI\x03\x00".to_vec();
+	let mut bytes = b"HTFI\x04\x00".to_vec();
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
 	push_string(&mut bytes, &config.analyzer);
@@ -2224,7 +2222,7 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 
 pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	let version = bytes.get(4..6)?;
-	if bytes.get(..4)? != b"HTFI" || !matches!(version, b"\x01\x00" | b"\x02\x00" | b"\x03\x00") {
+	if bytes.get(..4)? != b"HTFI" || !matches!(version, b"\x01\x00" | b"\x02\x00" | b"\x03\x00" | b"\x04\x00") {
 		return None;
 	}
 	let mut offset = 6;
@@ -2239,7 +2237,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 		return None;
 	}
 	offset += 3;
-	if version == b"\x03\x00" {
+	if matches!(version, b"\x03\x00" | b"\x04\x00") {
 		let synonym_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
 		for _ in 0..synonym_count {
@@ -2813,24 +2811,30 @@ mod tests {
 	}
 
 	#[test]
-	fn persisted_index_id_accepts_v2_sidecars_for_reset_only() {
+	fn persisted_index_id_accepts_legacy_sidecars_for_reset_only() {
 		let config = config();
-		let mut identity = b"HTFI\x02\x00".to_vec();
-		push_string(&mut identity, &config.identity.index_id);
-		push_string(&mut identity, &config.identity.generation);
-		push_string(&mut identity, &config.identity.analyzer);
-		identity.extend_from_slice(&[1, 1, 0]);
-		identity.extend_from_slice(&(config.identity.fields.len() as u16).to_le_bytes());
-		for field in &config.identity.fields {
-			push_string(&mut identity, &field.name);
+		for version in [b"\x02\x00".as_slice(), b"\x03\x00".as_slice()] {
+			let mut identity = b"HTFI".to_vec();
+			identity.extend_from_slice(version);
+			push_string(&mut identity, &config.identity.index_id);
+			push_string(&mut identity, &config.identity.generation);
+			push_string(&mut identity, &config.identity.analyzer);
+			identity.extend_from_slice(&[1, 1, 0]);
+			if version == b"\x03\x00" {
+				identity.extend_from_slice(&0u16.to_le_bytes());
+			}
+			identity.extend_from_slice(&(config.identity.fields.len() as u16).to_le_bytes());
+			for field in &config.identity.fields {
+				push_string(&mut identity, &field.name);
+			}
+			assert_eq!(persisted_index_id(&identity), Some("products"));
+			let directory = RamDirectory::create();
+			directory.atomic_write(Path::new(IDENTITY_PATH), &identity).unwrap();
+			assert_eq!(
+				Engine::inspect(directory, &config.identity).unwrap_err().code,
+				"E_IDENTITY_MISMATCH"
+			);
 		}
-		assert_eq!(persisted_index_id(&identity), Some("products"));
-		let directory = RamDirectory::create();
-		directory.atomic_write(Path::new(IDENTITY_PATH), &identity).unwrap();
-		assert_eq!(
-			Engine::inspect(directory, &config.identity).unwrap_err().code,
-			"E_IDENTITY_MISMATCH"
-		);
 	}
 
 	#[test]
