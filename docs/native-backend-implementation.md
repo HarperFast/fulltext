@@ -151,6 +151,8 @@ The exported flow is:
    The application validates the opaque payload against its own replay-cursor contract.
 2. `openNativeFullTextIndex(options)` creates the directory when absent, canonicalizes it, reserves
    the canonical path, and asynchronously creates or reopens Tantivy state.
+   `openNativeFullTextReader(options)` opens existing state without acquiring a writer and may be
+   called multiple times for the same path. Each reader uses manual reload and never polls files.
 3. `index.encodeMutationBatches(batch)` validates one logical batch against the opened schema and
    greedily creates versioned packed requests within the opened byte limits. Invalid individual
    mutations are reported by operation and per-operation array index; they are never dropped.
@@ -183,8 +185,9 @@ A failed first open releases its pending latch only after teardown proves native
 released; an unproven teardown latches the process as opened without a budget until restart. The
 governor admits aggregate resident indexes, indexing/search threads,
 writer memory, configured queue capacity, and expensive searches with checked shared accounting.
-Each index reserves its writer queue and shared search-queue capacity, so process queue accounting
-charges twice the per-index `maxQueuedBytes`. Exceeding an open-time admission cap returns
+Each writer reserves its writer queue and shared search-queue capacity, so process queue accounting
+charges twice the per-index `maxQueuedBytes`; each read-only handle reserves one search-queue share.
+Exceeding an open-time admission cap returns
 `E_RESOURCE_LIMIT`; it never evicts an active generation. Expensive searches wait on a condition
 variable off the JavaScript thread until process capacity is available, the request deadline
 expires, or close interrupts the wait. Callers that omit the governor retain per-index admission.
@@ -235,32 +238,37 @@ writer actor ─► shared engine ─► MmapDirectory
 
 The native addon owns these threads and queues; no sustained operation runs on the JavaScript event
 loop or libuv pool. The writer actor is the sole owner of `IndexWriter`, making mutation, commit,
-rollback, and shutdown ordering explicit. A small configurable search pool shares the
-`IndexReader`; each request captures its immutable `Searcher`, so searches overlap each other as
-well as indexing and commit. `reload()` first crosses the writer queue as a barrier, reloads the
-shared reader under a short coordination lock, and publishes the new searcher to subsequent
-requests. Tantivy remains free to use its configured indexing and merge workers behind the writer
-actor. Independent indexes and their
+rollback, and shutdown ordering explicit. A small configurable search pool shares the active
+immutable `Searcher`, so searches overlap each other as well as indexing and commit. `reload()`
+first crosses the writer queue as a barrier. It
+reloads a reusable staging reader, validates that reader against the persisted checkpoint, then
+swaps its `Searcher` into the active slot. A failed validation leaves the prior aligned snapshot
+active and returns retryable `E_RELOAD_FAILED`. Publication by the owning writer already knows the
+checkpoint it committed, so that path reloads the staging reader and replaces the active searcher
+without the external-reader alignment check. Tantivy remains free to use its configured indexing
+and merge workers behind the writer actor. Independent indexes and their
 searches may run concurrently. The process governor bounds their aggregate resources without
 replacing the per-index search pools with a shared scheduler.
 
-With two or more search threads, one worker consumes only the ordinary BM25 lane. Every other
-worker prioritizes phrase, prefix, fuzzy, and trace requests, then steals ordinary work when the
-expensive lane is idle. This preserves ordinary-query capacity during expensive traffic without
-stranding half the pool during ordinary-only workloads. A one-thread configuration uses one shared
-lane and provides no query-class isolation. In that configuration, a process-wide expensive permit
-held by another index can delay ordinary work behind an expensive request. Closing an index rejects
-an expensive request waiting for a permit with `E_CLOSED`.
+With two or more search threads, one worker consumes only the ordinary bounded BM25 lane. Every
+other worker prioritizes phrase, prefix, fuzzy, unanchored-negation, exact-total, and trace requests,
+then steals ordinary work when the expensive lane is idle. A negation intersected with a positive
+ordinary clause stays in the ordinary lane. This preserves ordinary-query capacity during expensive
+traffic without stranding half the pool during ordinary-only workloads. A one-thread configuration
+uses one shared lane and provides no query-class isolation. In that configuration, a process-wide
+expensive permit held by another index can delay ordinary work behind an expensive request. Closing
+an index rejects an expensive request waiting for a permit with `E_CLOSED`.
 
 Both queues are bounded by command count and retained bytes. A JS-owned buffer is copied once into a
 Rust-owned `Vec<u8>` before admission; no native thread borrows memory owned by a Node environment.
 Queue wait and engine execution time are reported separately in status/benchmark output. Effective
 writer arena, indexing-thread, and search-thread values are printed in every benchmark record.
 
-The registry rejects a second live open of the same canonical path. This is narrower than the
-eventual shared multi-environment registry, but it preserves the one-writer invariant without
-pretending two JavaScript handles have coordinated close ownership. Reference-counted shared
-handles can replace rejection later without changing the index contract.
+The registry rejects a second writer for the same canonical path and admits bounded read-only
+handles alongside the writer. A reset requires both the writer and every reader to be closed.
+Readers reserve a resident-index slot, search threads, and queue bytes from the process budget but
+do not reserve indexing threads or writer memory. Publication coordination belongs to the caller: a reader calls
+`reload()` only after learning that the writer published a newer revision.
 
 Inspection is outside the handle registry and writer actor. It opens Tantivy's
 managed directory read-only long enough to validate the persisted schema and read the current
@@ -319,13 +327,13 @@ requires bumping at least one of them.
 
 Synonym rules are bounded by count, replacement count, and encoded bytes in the native decoder.
 Each source and replacement must yield exactly one normalized and analyzed term. Canonical rules are
-sorted and fingerprinted in identity sidecar v3. A bounded token filter streams replacements once at
+sorted and fingerprinted in the identity sidecar. A bounded token filter streams replacements once at
 the source position into both analyzed and surface fields; query text is not expanded. Tantivy counts
 the alternatives in BM25 field length, so enabling a rule can affect unrelated-term ranking for a
 document containing its source. Match tracing uses the same document-side expansion and maps every
 replacement to the source token span. Crossing its 262,144-token-per-value ceiling marks the trace
-incomplete instead of failing the request. Version 2 sidecars remain parseable for safe reset but
-mismatch v3 open/inspection so the application can retire and rebuild them.
+incomplete instead of failing the request. Version 2 and 3 sidecars remain parseable for safe reset
+but mismatch v4 open/inspection so the application can retire and rebuild them.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`
@@ -445,10 +453,10 @@ controls repeated passes, and requested index counts are capped at 10,000 total 
 ## Verification
 
 - Rust unit tests: schema equality, analyzer behavior, batch decode bounds, upsert/delete ordering,
-  query construction, close state, duplicate path rejection, and queue saturation.
+  query construction, close state, duplicate writer rejection, and queue saturation.
 - Node tests through `@harperfast/fulltext/native`: create, apply, commit, reload, BM25 ranking,
-  reopen, read-only inspection while a writer is held, mutation validation, schema mismatch, close
-  modes, and event-loop responsiveness.
+  reopen, concurrent read-only handles, manual publication refresh, Boolean queries, hit versions,
+  mutation validation, schema mismatch, close modes, and event-loop responsiveness.
 - Process tests: kill the indexer immediately after a successful commit and verify the committed
   corpus after reopen; kill before commit and verify it is absent. A worker-thread test verifies
   promises settle only into their originating Node environment.

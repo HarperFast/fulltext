@@ -51,7 +51,7 @@ const index = await openNativeFullTextIndex({
 
 try {
 	await index.applyMutationBatch({
-		upserts: [{ id: 'shoe-1', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
+		upserts: [{ id: 'shoe-1', version: '42', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
 	});
 	await index.commit();
 	await index.reload();
@@ -111,8 +111,9 @@ fails with `E_RESOURCE_LIMIT`. A failed first open that proves its native resour
 does not prevent later configuration. An
 unproven pre-publication teardown blocks configuration until restart. The governor bounds aggregate
 resident indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
-expensive searches. Aggregate queue accounting reserves each index's writer queue plus its shared
-search queues, or twice that index's `maxQueuedBytes`. A conflicting second configuration or an
+expensive searches. Each writer reserves twice its `maxQueuedBytes` for the writer and shared search
+queues; each read-only handle reserves it once for search. Every writer or reader also consumes one
+resident-index slot and its configured search-thread count. A conflicting second configuration or an
 open that would exceed an admission cap fails with `E_RESOURCE_LIMIT`; the library never evicts a
 live generation. Expensive searches wait off the JavaScript thread for process capacity, bounded
 by the request deadline and interrupted by close, allowing the search queues to apply backpressure.
@@ -180,6 +181,27 @@ truncating the term set and returning incomplete rankings. `fuzzy-prefix` is a p
 until catalog-scale benchmark qualification is complete.
 
 Record IDs are limited to 4,096 UTF-8 bytes, keeping deterministic tie-page sorting memory bounded.
+An upsert may include an opaque `version` string of up to 4,096 UTF-8 bytes. The version is returned
+with its search hit, allowing a derived-index consumer to discard a hit when the authoritative
+record has moved past the indexed version.
+
+Use `query` for Boolean expressions within one index. Expressions may nest to eight levels and are
+bounded by the same request, term, and clause limits as simple searches:
+
+```js
+const result = await index.search({
+	query: {
+		operator: 'and',
+		clauses: [
+			{ text: 'waterproof trail', mode: 'all', fields: ['title'] },
+			{ operator: 'not', clause: { text: 'used' } },
+		],
+	},
+});
+```
+
+Negation filters do not add to BM25 scores. A query made only of negation matches assigns every
+surviving hit a score of zero and orders ties by UTF-8 ID.
 
 `total` is bounded by default so Tantivy can retain block-max WAND pruning. Set `exactTotal: true`
 only when an exact match count is worth a second full-match traversal. Ranking is score descending,
@@ -238,15 +260,40 @@ callback timer. If every eligible worker is already executing non-interruptible 
 queued request is rejected when a worker next examines it. Tantivy search itself is not
 interruptible, so a search that expires in flight is discarded after Tantivy returns. Match tracing
 checks its deadline while tokenizing and matching. With at least two search threads, one worker is
-reserved for ordinary `any`/`all` BM25. The remaining
-workers prioritize phrase, prefix, fuzzy, and trace work, then steal ordinary work when that queue
-is idle. A one-thread configuration remains valid but cannot isolate query classes.
+reserved for ordinary bounded `any`/`all` BM25. The remaining workers prioritize phrase, prefix,
+fuzzy, unanchored-negation, exact-total, and trace work, then steal ordinary work when that queue is
+idle. A negation intersected with a positive ordinary clause stays in the ordinary lane. A
+one-thread configuration remains valid but cannot isolate query classes.
 
 ## Lifecycle and recovery
 
 `close()` rejects uncommitted data by default. Use `close({ mode: 'rollback' })` to discard it
 explicitly. `commit()` publishes mutations, and `reload()` makes the latest commit visible to this
-handle's searches.
+handle's searches. A reload that cannot align Tantivy's snapshot with its checkpoint after three
+bounded attempts returns `E_RELOAD_FAILED`; callers can retry because the reader remains open.
+The failed attempt leaves the reader on its previous aligned snapshot and checkpoint.
+
+### Read-only handles
+
+One process may open one writer and multiple readers for the same physical index. Readers share the
+same physical files, but each has an independently bounded search runtime and never reserves
+Tantivy's writer lock:
+
+```js
+import { openNativeFullTextReader } from '@harperfast/fulltext/native';
+
+const reader = await openNativeFullTextReader(options);
+await reader.reload(); // call after the writer publishes a newer checkpoint
+const result = await reader.search({ text: 'trail shoe' });
+await reader.close();
+```
+
+Readers use Tantivy's manual reload policy. They do not watch or poll the filesystem; the caller
+coordinates publication and calls `reload()` only when a newer revision is available. Reset rejects
+while any writer or reader is live in the current process; separate processes must coordinate reset
+with their own reader lifecycle. A reader never creates missing storage and fails with
+`E_INDEX_NOT_READY` until a writer has created a complete index. A successful reload also refreshes
+the reader's `committedPayload`.
 
 ### Checkpointed publication
 
@@ -322,15 +369,17 @@ to reclaim.
 
 An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.
+An open that cannot capture one checkpoint-aligned Tantivy snapshot returns `E_RELOAD_FAILED`; retry
+the open.
 Lifecycle lock files are stored in the index parent's `.fulltext-locks` directory so reset can keep
 the handoff lock while renaming the native directory on Windows. The library does not remove this
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 7 and packed protocol 3. The loader rejects older addon binaries. Native
-identity sidecar v3 fingerprints canonical synonyms and the completed `english@2` semantics. Older
-v2 indexes are identifiable for safe reset but cannot be reopened under the new meaning; rebuild
-them from the authoritative source.
+This API uses native ABI 8 and packed protocol 4. The loader rejects older addon binaries. Native
+identity sidecar v4 fingerprints the internal source-version field in addition to canonical
+synonyms and the completed `english@2` semantics. Older v2 and v3 indexes remain identifiable for
+safe reset but cannot be reopened under the new schema; rebuild them from the authoritative source.
 
 ## Diagnostics and errors
 

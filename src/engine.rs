@@ -22,12 +22,13 @@ use unicode_normalization::is_nfkc;
 
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	validate_record_id, EngineConfig, EngineIdentityConfig, MutationBatch, SearchMode, SearchRequest, SynonymRule,
-	TraceRecord, MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES,
-	MAX_TRACE_SPANS,
+	validate_record_id, EngineConfig, EngineIdentityConfig, MutationBatch, SearchClause, SearchExpression, SearchMode,
+	SearchRequest, SynonymRule, TraceRecord, MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES,
+	MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES, MAX_TRACE_SPANS,
 };
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
+const VERSION_FIELD_NAME: &str = "__fulltext_version";
 pub(crate) const IDENTITY_PATH: &str = ".harper-fulltext-identity";
 const META_PATH: &str = "meta.json";
 const ANALYZER_NAME: &str = "english@2";
@@ -50,6 +51,7 @@ struct CanonicalIdentity {
 pub struct Engine {
 	index: Index,
 	id_field: Field,
+	version_field: Field,
 	fields: Vec<EngineField>,
 	field_lookup: HashMap<String, usize>,
 	analyzer: TextAnalyzer,
@@ -74,10 +76,16 @@ struct EngineField {
 	weight: f32,
 }
 
+struct BuiltQuery {
+	query: Box<dyn Query>,
+	clauses: usize,
+}
+
 pub struct Writer {
 	inner: IndexWriter,
 	checkpoint_required: bool,
 	id_field: Field,
+	version_field: Field,
 	fields: Vec<EngineField>,
 	field_lookup: HashMap<String, usize>,
 }
@@ -92,6 +100,7 @@ pub(crate) struct PreparedBatch {
 pub struct SearchHit {
 	pub id: String,
 	pub score: f32,
+	pub version: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +183,7 @@ impl Engine {
 
 	pub fn inspect<D: Directory + Clone>(directory: D, config: &EngineIdentityConfig) -> Result<InspectionResult> {
 		let identity = canonical_identity(config)?.config;
-		let (expected_schema, _, _) = build_schema(&identity)?;
+		let (expected_schema, _, _, _) = build_schema(&identity)?;
 		let expected_identity = identity_bytes(&identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
 		let meta_exists = directory.exists(Path::new(META_PATH)).map_err(storage_error)?;
@@ -215,7 +224,7 @@ impl Engine {
 		let canonical = canonical_identity(&config.identity)?;
 		let identity = canonical.config;
 		let analyzer = canonical.analyzer;
-		let (schema, id_field, fields) = build_schema(&identity)?;
+		let (schema, id_field, version_field, fields) = build_schema(&identity)?;
 		let expected_identity = identity_bytes(&identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
 		let meta_exists = directory.exists(Path::new(META_PATH)).map_err(storage_error)?;
@@ -266,6 +275,7 @@ impl Engine {
 		Ok(Self {
 			index,
 			id_field,
+			version_field,
 			fields,
 			field_lookup,
 			analyzer,
@@ -301,6 +311,7 @@ impl Engine {
 				inner,
 				checkpoint_required: payload.is_some(),
 				id_field: self.id_field,
+				version_field: self.version_field,
 				fields: self.fields.clone(),
 				field_lookup: self.field_lookup.clone(),
 			},
@@ -326,6 +337,22 @@ impl Engine {
 
 	pub fn committed_payload(&self) -> Result<Option<String>> {
 		validated_committed_payload(&self.index)
+	}
+
+	pub fn committed_payload_for_searcher(&self, searcher: &Searcher) -> Result<Option<String>> {
+		let metas = self.index.load_metas().map_err(recovery_index_error)?;
+		let segments = metas
+			.segments
+			.iter()
+			.map(|segment| (segment.id(), segment.delete_opstamp()))
+			.collect::<std::collections::BTreeMap<_, _>>();
+		if searcher.generation().segments() != &segments {
+			return Err(FulltextError::new(
+				"E_RELOAD_FAILED",
+				"native index changed during reload; retry the reload",
+			));
+		}
+		validated_payload(metas.payload)
 	}
 
 	pub fn search(&self, searcher: &Searcher, request: &SearchRequest) -> Result<SearchResult> {
@@ -356,8 +383,7 @@ impl Engine {
 			}
 		}
 		check_deadline(deadline)?;
-		let selected = self.selected_fields(&request.fields)?;
-		let query = self.query(searcher, request, &selected)?;
+		let query = self.query(searcher, request)?;
 		check_deadline(deadline)?;
 		let window_end = request.offset + request.limit;
 		let scored_docs = searcher
@@ -369,25 +395,35 @@ impl Engine {
 		check_deadline(deadline)?;
 		let boundary_tie = scored_docs.len() > window_end && scored_docs[window_end - 1].0 == scored_docs[window_end].0;
 		let hits = if boundary_tie {
-			let collector = TopDocs::for_doc_range(request.offset..window_end).order_by((
-				(SortBySimilarityScore, Order::Desc),
-				(SortByString::for_field(ID_FIELD_NAME), Order::Asc),
-			));
-			searcher
-				.search(query.as_ref(), &collector)
-				.map_err(index_error)?
+			let scored_docs = searcher
+				.search(
+					query.as_ref(),
+					&TopDocs::for_doc_range(request.offset..window_end).order_by((
+						(SortBySimilarityScore, Order::Desc),
+						(SortByString::for_field(ID_FIELD_NAME), Order::Asc),
+					)),
+				)
+				.map_err(index_error)?;
+			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
+			let versions = search_hit_versions(searcher, &addresses)?;
+			scored_docs
 				.into_iter()
-				.map(|((score, id), _)| {
-					id.map(|id| SearchHit { id, score })
+				.zip(versions)
+				.map(|(((score, id), _), version)| {
+					id.map(|id| SearchHit { id, score, version })
 						.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID fast field value"))
 				})
 				.collect::<Result<Vec<_>>>()?
 		} else {
-			let ids = search_hit_ids(searcher, &scored_docs)?;
+			let metadata = search_hit_metadata(searcher, &scored_docs)?;
 			let mut ranked = scored_docs
 				.iter()
-				.zip(ids)
-				.map(|((score, _), id)| SearchHit { id, score: *score })
+				.zip(metadata)
+				.map(|((score, _), metadata)| SearchHit {
+					id: metadata.id,
+					score: *score,
+					version: metadata.version,
+				})
 				.collect::<Vec<_>>();
 			ranked.sort_by(|left, right| {
 				right
@@ -411,7 +447,9 @@ impl Engine {
 		check_deadline(deadline)?;
 		let response_bytes = hits
 			.iter()
-			.try_fold(13usize, |bytes, hit| bytes.checked_add(8 + hit.id.len()))
+			.try_fold(13usize, |bytes, hit| {
+				bytes.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, |version| 4 + version.len()))
+			})
 			.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))?;
 		if response_bytes > MAX_SEARCH_RESPONSE_BYTES {
 			return Err(FulltextError::new(
@@ -441,7 +479,15 @@ impl Engine {
 		for record in records {
 			validate_record_id(&record.id)?;
 		}
-		let selected = self.selected_fields(&request.fields)?;
+		let clause = match &request.expression {
+			SearchExpression::Clause(clause) => clause,
+			_ => {
+				return Err(FulltextError::invalid(
+					"traceMatches does not support boolean expressions",
+				))
+			}
+		};
+		let selected = self.selected_fields(&clause.fields)?;
 		self.require_surface_fields(&selected)?;
 		let selected_names = selected.iter().map(|field| field.name.as_str()).collect::<HashSet<_>>();
 		let candidates = request
@@ -454,7 +500,7 @@ impl Engine {
 				records: Vec::new(),
 			});
 		}
-		let plan = self.trace_plan(request)?;
+		let plan = self.trace_plan(clause)?;
 		let mut complete = true;
 		let mut remaining_spans = MAX_TRACE_SPANS;
 		let mut response_bytes = 3usize;
@@ -552,7 +598,7 @@ impl Engine {
 		})
 	}
 
-	fn trace_plan(&self, request: &SearchRequest) -> Result<TracePlan> {
+	fn trace_plan(&self, request: &SearchClause) -> Result<TracePlan> {
 		match request.mode {
 			SearchMode::Any => Ok(TracePlan::Any(self.analyze(&request.text, false, true)?)),
 			SearchMode::All => Ok(TracePlan::All(self.analyze(&request.text, false, true)?)),
@@ -816,16 +862,59 @@ impl Engine {
 		Ok(fields)
 	}
 
-	fn query(&self, searcher: &Searcher, request: &SearchRequest, fields: &[&EngineField]) -> Result<Box<dyn Query>> {
-		let query = match request.mode {
-			SearchMode::Any => self.term_query(&request.text, fields, Occur::Should)?,
-			SearchMode::All => self.term_query(&request.text, fields, Occur::Must)?,
-			SearchMode::Phrase => self.phrase_query(&request.text, fields)?,
-			SearchMode::Prefix => self.prefix_query(searcher, &request.text, fields, false)?,
-			SearchMode::Fuzzy => self.fuzzy_query(&request.text, fields)?,
-			SearchMode::FuzzyPrefix => self.prefix_query(searcher, &request.text, fields, true)?,
+	fn query(&self, searcher: &Searcher, request: &SearchRequest) -> Result<Box<dyn Query>> {
+		let query = self.expression_query(searcher, &request.expression)?;
+		self.with_candidates(query.query, request.candidate_ids.as_deref())
+	}
+
+	fn expression_query(&self, searcher: &Searcher, expression: &SearchExpression) -> Result<BuiltQuery> {
+		match expression {
+			SearchExpression::Clause(clause) => self.clause_query(searcher, clause),
+			SearchExpression::And(children) => self.boolean_query(searcher, children, Occur::Must),
+			SearchExpression::Or(children) => self.boolean_query(searcher, children, Occur::Should),
+			SearchExpression::Not(child) => {
+				let child = self.expression_query(searcher, child)?;
+				self.check_total_clause_count(child.clauses, 2)?;
+				Ok(BuiltQuery {
+					query: Box::new(ConstScoreQuery::new(
+						Box::new(BooleanQuery::new(vec![
+							(Occur::Must, Box::new(tantivy::query::AllQuery)),
+							(Occur::MustNot, child.query),
+						])),
+						0.0,
+					)),
+					clauses: child.clauses + 2,
+				})
+			}
+		}
+	}
+
+	fn boolean_query(&self, searcher: &Searcher, children: &[SearchExpression], occur: Occur) -> Result<BuiltQuery> {
+		let mut clauses = children.len();
+		let mut queries = Vec::with_capacity(children.len());
+		for child in children {
+			let child = self.expression_query(searcher, child)?;
+			self.check_total_clause_count(clauses, child.clauses)?;
+			clauses += child.clauses;
+			queries.push((occur, child.query));
+		}
+		Ok(BuiltQuery {
+			query: Box::new(BooleanQuery::new(queries)),
+			clauses,
+		})
+	}
+
+	fn clause_query(&self, searcher: &Searcher, clause: &SearchClause) -> Result<BuiltQuery> {
+		let fields = self.selected_fields(&clause.fields)?;
+		let (query, clauses) = match clause.mode {
+			SearchMode::Any => self.term_query(&clause.text, &fields, Occur::Should)?,
+			SearchMode::All => self.term_query(&clause.text, &fields, Occur::Must)?,
+			SearchMode::Phrase => self.phrase_query(&clause.text, &fields)?,
+			SearchMode::Prefix => self.prefix_query(searcher, &clause.text, &fields, false)?,
+			SearchMode::Fuzzy => self.fuzzy_query(&clause.text, &fields)?,
+			SearchMode::FuzzyPrefix => self.prefix_query(searcher, &clause.text, &fields, true)?,
 		};
-		self.with_candidates(query, request.candidate_ids.as_deref())
+		Ok(BuiltQuery { query, clauses })
 	}
 
 	fn analyze(&self, text: &str, surface: bool, deduplicate: bool) -> Result<Vec<String>> {
@@ -866,31 +955,35 @@ impl Engine {
 		Ok(terms)
 	}
 
-	fn term_query(&self, text: &str, fields: &[&EngineField], occur: Occur) -> Result<Box<dyn Query>> {
+	fn term_query(&self, text: &str, fields: &[&EngineField], occur: Occur) -> Result<(Box<dyn Query>, usize)> {
 		let terms = self.analyze(text, false, true)?;
 		if terms.is_empty() {
-			return Ok(Box::new(EmptyQuery));
+			return Ok((Box::new(EmptyQuery), 0));
 		}
 		self.check_clause_count(terms.len(), fields.len())?;
-		Ok(Box::new(BooleanQuery::new(
-			terms
-				.into_iter()
-				.map(|term| (occur, self.term_group(&term, fields)))
-				.collect(),
-		)))
+		let clauses = terms.len().saturating_mul(fields.len());
+		Ok((
+			Box::new(BooleanQuery::new(
+				terms
+					.into_iter()
+					.map(|term| (occur, self.term_group(&term, fields)))
+					.collect(),
+			)),
+			clauses,
+		))
 	}
 
-	fn phrase_query(&self, text: &str, fields: &[&EngineField]) -> Result<Box<dyn Query>> {
+	fn phrase_query(&self, text: &str, fields: &[&EngineField]) -> Result<(Box<dyn Query>, usize)> {
 		if !self.positions {
 			return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
 		}
 		let terms = self.analyze_positioned(text)?;
 		if terms.is_empty() {
-			return Ok(Box::new(EmptyQuery));
+			return Ok((Box::new(EmptyQuery), 0));
 		}
 		self.check_clause_count(1, fields.len())?;
 		if terms.len() == 1 {
-			return Ok(self.term_group(&terms[0].1, fields));
+			return Ok((self.term_group(&terms[0].1, fields), fields.len()));
 		}
 		let alternatives = fields
 			.iter()
@@ -905,10 +998,10 @@ impl Engine {
 				(Occur::Should, boosted(query, field.weight))
 			})
 			.collect();
-		Ok(Box::new(BooleanQuery::new(alternatives)))
+		Ok((Box::new(BooleanQuery::new(alternatives)), fields.len()))
 	}
 
-	fn fuzzy_query(&self, text: &str, fields: &[&EngineField]) -> Result<Box<dyn Query>> {
+	fn fuzzy_query(&self, text: &str, fields: &[&EngineField]) -> Result<(Box<dyn Query>, usize)> {
 		let surface = self.analyze(text, true, true)?;
 		let mut pairs = Vec::new();
 		for surface_term in surface {
@@ -918,7 +1011,7 @@ impl Engine {
 			}
 		}
 		if pairs.is_empty() {
-			return Ok(Box::new(EmptyQuery));
+			return Ok((Box::new(EmptyQuery), 0));
 		}
 		let fuzzy_terms = pairs.iter().filter(|(_, term)| fuzzy_eligible(term)).count();
 		if fuzzy_terms > MAX_FUZZY_TERMS {
@@ -928,6 +1021,7 @@ impl Engine {
 		}
 		self.check_clause_count(pairs.len(), fields.len().saturating_mul(3))?;
 		let exact_bonus = fields.iter().map(|field| field.weight).fold(0.0f32, f32::max) * 0.25 + 1.0;
+		let clause_count = pairs.len().saturating_mul(fields.len().saturating_mul(3));
 		let clauses = pairs
 			.into_iter()
 			.map(|(analyzed, surface)| {
@@ -946,7 +1040,7 @@ impl Engine {
 				))
 			})
 			.collect::<Result<Vec<_>>>()?;
-		Ok(Box::new(BooleanQuery::new(clauses)))
+		Ok((Box::new(BooleanQuery::new(clauses)), clause_count))
 	}
 
 	fn prefix_query(
@@ -955,14 +1049,14 @@ impl Engine {
 		text: &str,
 		fields: &[&EngineField],
 		fuzzy: bool,
-	) -> Result<Box<dyn Query>> {
+	) -> Result<(Box<dyn Query>, usize)> {
 		self.require_surface_fields(fields)?;
 		if text.chars().last().is_some_and(char::is_whitespace) {
 			return self.term_query(text, fields, Occur::Must);
 		}
 		let (completed, surface_prefix) = self.final_surface_term(text)?;
 		let Some(surface_prefix) = surface_prefix else {
-			return Ok(Box::new(EmptyQuery));
+			return Ok((Box::new(EmptyQuery), 0));
 		};
 		let minimum = if fuzzy { 4 } else { 3 };
 		if surface_prefix.chars().count() < minimum {
@@ -1006,7 +1100,10 @@ impl Engine {
 			exact_prefix
 		};
 		clauses.push((Occur::Must, final_group));
-		Ok(Box::new(BooleanQuery::new(clauses)))
+		Ok((
+			Box::new(BooleanQuery::new(clauses)),
+			completed_clause_count + prefix_clause_count + fuzzy_clause_count,
+		))
 	}
 
 	fn final_surface_term(&self, text: &str) -> Result<(Vec<String>, Option<String>)> {
@@ -1170,6 +1267,15 @@ impl Engine {
 		}
 		Ok(())
 	}
+
+	fn check_total_clause_count(&self, clauses: usize, additional: usize) -> Result<()> {
+		if clauses.saturating_add(additional) > MAX_QUERY_CLAUSES {
+			return Err(FulltextError::invalid(format!(
+				"search query exceeds {MAX_QUERY_CLAUSES} clauses"
+			)));
+		}
+		Ok(())
+	}
 }
 
 fn check_deadline(deadline: Option<Instant>) -> Result<()> {
@@ -1183,7 +1289,57 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
 	}
 }
 
-fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Result<Vec<String>> {
+fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<Vec<Option<String>>> {
+	let mut hits_by_segment = HashMap::new();
+	for (index, address) in addresses.iter().enumerate() {
+		hits_by_segment
+			.entry(address.segment_ord)
+			.or_insert_with(Vec::new)
+			.push((index, address.doc_id));
+	}
+	let mut versions = vec![None; addresses.len()];
+	for (segment_ord, segment_hits) in hits_by_segment {
+		let segment = &searcher.segment_readers()[segment_ord as usize];
+		let Some(column) = segment.fast_fields().str(VERSION_FIELD_NAME).map_err(index_error)? else {
+			continue;
+		};
+		let mut value = Vec::new();
+		for (index, doc_id) in segment_hits {
+			let Some(ordinal) = column.term_ords(doc_id).next() else {
+				continue;
+			};
+			value.clear();
+			if !column
+				.dictionary()
+				.ord_to_term(ordinal, &mut value)
+				.map_err(storage_error)?
+			{
+				return Err(FulltextError::new(
+					"E_NATIVE_FAILURE",
+					"search hit version ordinal is missing",
+				));
+			}
+			let version = std::str::from_utf8(&value)
+				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit version is not UTF-8"))?
+				.to_owned();
+			versions[index] = Some(version);
+		}
+	}
+	Ok(versions)
+}
+
+struct SearchHitMetadata {
+	id: String,
+	version: Option<String>,
+}
+
+fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Result<Vec<SearchHitMetadata>> {
+	let mut metadata = (0..scored_docs.len())
+		.map(|_| SearchHitMetadata {
+			id: String::new(),
+			version: None,
+		})
+		.collect::<Vec<_>>();
 	let mut hits_by_segment = HashMap::new();
 	for (index, (_, address)) in scored_docs.iter().enumerate() {
 		hits_by_segment
@@ -1191,22 +1347,23 @@ fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Res
 			.or_insert_with(Vec::new)
 			.push((index, address.doc_id));
 	}
-	let mut ids = vec![String::new(); scored_docs.len()];
 	for (segment_ord, segment_hits) in hits_by_segment {
 		let segment = &searcher.segment_readers()[segment_ord as usize];
-		let column = segment
+		let id_column = segment
 			.fast_fields()
 			.str(ID_FIELD_NAME)
 			.map_err(index_error)?
 			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no ID fast field"))?;
+		let version_column = segment.fast_fields().str(VERSION_FIELD_NAME).map_err(index_error)?;
 		let mut id = Vec::new();
+		let mut version = Vec::new();
 		for (index, doc_id) in segment_hits {
-			let ordinal = column
+			let ordinal = id_column
 				.term_ords(doc_id)
 				.next()
 				.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"))?;
 			id.clear();
-			if !column
+			if !id_column
 				.dictionary()
 				.ord_to_term(ordinal, &mut id)
 				.map_err(storage_error)?
@@ -1216,13 +1373,34 @@ fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Res
 					"search hit ID ordinal is missing",
 				));
 			}
-			let id = std::str::from_utf8(&id)
+			metadata[index].id = std::str::from_utf8(&id)
 				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?
 				.to_owned();
-			ids[index] = id;
+			let Some(version_column) = &version_column else {
+				continue;
+			};
+			let Some(ordinal) = version_column.term_ords(doc_id).next() else {
+				continue;
+			};
+			version.clear();
+			if !version_column
+				.dictionary()
+				.ord_to_term(ordinal, &mut version)
+				.map_err(storage_error)?
+			{
+				return Err(FulltextError::new(
+					"E_NATIVE_FAILURE",
+					"search hit version ordinal is missing",
+				));
+			}
+			metadata[index].version = Some(
+				std::str::from_utf8(&version)
+					.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit version is not UTF-8"))?
+					.to_owned(),
+			);
 		}
 	}
-	Ok(ids)
+	Ok(metadata)
 }
 
 fn boosted(query: Box<dyn Query>, weight: f32) -> Box<dyn Query> {
@@ -1378,6 +1556,9 @@ impl Writer {
 			let mut seen = HashSet::with_capacity(upsert.fields.len());
 			let mut document = TantivyDocument::default();
 			document.add_text(self.id_field, &upsert.id);
+			if let Some(version) = &upsert.version {
+				document.add_text(self.version_field, version);
+			}
 			for (name, values) in upsert.fields {
 				if !seen.insert(name.clone()) {
 					return Err(FulltextError::invalid(format!("duplicate mutation field {name}")));
@@ -1448,7 +1629,7 @@ impl Writer {
 	}
 }
 
-fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Vec<EngineField>)> {
+fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Field, Vec<EngineField>)> {
 	let mut builder = Schema::builder();
 	let id_indexing = TextFieldIndexing::default()
 		.set_tokenizer("raw")
@@ -1456,6 +1637,7 @@ fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Vec<Eng
 		.set_fieldnorms(false);
 	let id_options = TextOptions::default().set_indexing_options(id_indexing).set_fast(None);
 	let id_field = builder.add_text_field(ID_FIELD_NAME, id_options);
+	let version_field = builder.add_text_field(VERSION_FIELD_NAME, TextOptions::default().set_fast(None));
 	let record = if config.positions {
 		IndexRecordOption::WithFreqsAndPositions
 	} else {
@@ -1487,7 +1669,7 @@ fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Vec<Eng
 			weight: field.weight,
 		});
 	}
-	Ok((builder.build(), id_field, fields))
+	Ok((builder.build(), id_field, version_field, fields))
 }
 
 #[derive(Clone, Default)]
@@ -2017,7 +2199,7 @@ fn canonical_synonym_term(analyzer: &mut TextAnalyzer, text: &str, label: &str) 
 }
 
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
-	let mut bytes = b"HTFI\x03\x00".to_vec();
+	let mut bytes = b"HTFI\x04\x00".to_vec();
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
 	push_string(&mut bytes, &config.analyzer);
@@ -2043,7 +2225,7 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 
 pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	let version = bytes.get(4..6)?;
-	if bytes.get(..4)? != b"HTFI" || !matches!(version, b"\x01\x00" | b"\x02\x00" | b"\x03\x00") {
+	if bytes.get(..4)? != b"HTFI" || !matches!(version, b"\x01\x00" | b"\x02\x00" | b"\x03\x00" | b"\x04\x00") {
 		return None;
 	}
 	let mut offset = 6;
@@ -2058,7 +2240,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 		return None;
 	}
 	offset += 3;
-	if version == b"\x03\x00" {
+	if matches!(version, b"\x03\x00" | b"\x04\x00") {
 		let synonym_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
 		for _ in 0..synonym_count {
@@ -2110,7 +2292,7 @@ fn index_error(error: tantivy::TantivyError) -> FulltextError {
 	}
 }
 
-fn recovery_index_error(error: tantivy::TantivyError) -> FulltextError {
+pub(crate) fn recovery_index_error(error: tantivy::TantivyError) -> FulltextError {
 	match error {
 		tantivy::TantivyError::DataCorruption(_) => FulltextError::new("E_INDEX_CORRUPT", error.to_string()),
 		tantivy::TantivyError::IncompatibleIndex(_)
@@ -2142,6 +2324,10 @@ fn recovery_index_error(error: tantivy::TantivyError) -> FulltextError {
 
 fn validated_committed_payload(index: &Index) -> Result<Option<String>> {
 	let payload = index.load_metas().map_err(recovery_index_error)?.payload;
+	validated_payload(payload)
+}
+
+fn validated_payload(payload: Option<String>) -> Result<Option<String>> {
 	if payload
 		.as_ref()
 		.is_some_and(|payload| payload.len() > MAX_COMMIT_PAYLOAD_BYTES)
@@ -2259,15 +2445,25 @@ mod tests {
 		}
 	}
 
+	fn expression(text: &str, mode: SearchMode, fields: Vec<String>) -> SearchExpression {
+		SearchExpression::Clause(SearchClause {
+			text: text.to_owned(),
+			mode,
+			fields,
+		})
+	}
+
 	fn batch() -> MutationBatch {
 		MutationBatch {
 			upserts: vec![
 				crate::protocol::Upsert {
 					id: "one".to_owned(),
+					version: None,
 					fields: vec![("title".to_owned(), vec!["Running Shoes".to_owned()])],
 				},
 				crate::protocol::Upsert {
 					id: "two".to_owned(),
+					version: None,
 					fields: vec![("description".to_owned(), vec!["shoe rack".to_owned()])],
 				},
 			],
@@ -2461,9 +2657,7 @@ mod tests {
 		let trace = engine
 			.trace_matches(
 				&SearchRequest {
-					text: "needle".to_owned(),
-					mode: SearchMode::Any,
-					fields: vec!["description".to_owned()],
+					expression: expression("needle", SearchMode::Any, vec!["description".to_owned()]),
 					candidate_ids: None,
 					offset: 0,
 					limit: 10,
@@ -2497,10 +2691,12 @@ mod tests {
 				upserts: vec![
 					crate::protocol::Upsert {
 						id: "one".to_owned(),
+						version: None,
 						fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
 					},
 					crate::protocol::Upsert {
 						id: "two".to_owned(),
+						version: None,
 						fields: vec![("title".to_owned(), vec!["monitor stand".to_owned()])],
 					},
 				],
@@ -2514,9 +2710,7 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
-						text: text.to_owned(),
-						mode: SearchMode::Any,
-						fields: Vec::new(),
+						expression: expression(text, SearchMode::Any, Vec::new()),
 						candidate_ids: None,
 						offset: 0,
 						limit: 10,
@@ -2530,9 +2724,7 @@ mod tests {
 		let trace = engine
 			.trace_matches(
 				&SearchRequest {
-					text: "television".to_owned(),
-					mode: SearchMode::Any,
-					fields: Vec::new(),
+					expression: expression("television", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					offset: 0,
 					limit: 10,
@@ -2551,9 +2743,7 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
-					text: "stand".to_owned(),
-					mode: SearchMode::Any,
-					fields: Vec::new(),
+					expression: expression("stand", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					offset: 0,
 					limit: 10,
@@ -2577,10 +2767,12 @@ mod tests {
 				upserts: vec![
 					crate::protocol::Upsert {
 						id: "one".to_owned(),
+						version: None,
 						fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
 					},
 					crate::protocol::Upsert {
 						id: "two".to_owned(),
+						version: None,
 						fields: vec![("title".to_owned(), vec!["monitor stand".to_owned()])],
 					},
 				],
@@ -2593,9 +2785,7 @@ mod tests {
 			.search(
 				&baseline_reader.searcher(),
 				&SearchRequest {
-					text: "stand".to_owned(),
-					mode: SearchMode::Any,
-					fields: Vec::new(),
+					expression: expression("stand", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					offset: 0,
 					limit: 10,
@@ -2624,24 +2814,30 @@ mod tests {
 	}
 
 	#[test]
-	fn persisted_index_id_accepts_v2_sidecars_for_reset_only() {
+	fn persisted_index_id_accepts_legacy_sidecars_for_reset_only() {
 		let config = config();
-		let mut identity = b"HTFI\x02\x00".to_vec();
-		push_string(&mut identity, &config.identity.index_id);
-		push_string(&mut identity, &config.identity.generation);
-		push_string(&mut identity, &config.identity.analyzer);
-		identity.extend_from_slice(&[1, 1, 0]);
-		identity.extend_from_slice(&(config.identity.fields.len() as u16).to_le_bytes());
-		for field in &config.identity.fields {
-			push_string(&mut identity, &field.name);
+		for version in [b"\x02\x00".as_slice(), b"\x03\x00".as_slice()] {
+			let mut identity = b"HTFI".to_vec();
+			identity.extend_from_slice(version);
+			push_string(&mut identity, &config.identity.index_id);
+			push_string(&mut identity, &config.identity.generation);
+			push_string(&mut identity, &config.identity.analyzer);
+			identity.extend_from_slice(&[1, 1, 0]);
+			if version == b"\x03\x00" {
+				identity.extend_from_slice(&0u16.to_le_bytes());
+			}
+			identity.extend_from_slice(&(config.identity.fields.len() as u16).to_le_bytes());
+			for field in &config.identity.fields {
+				push_string(&mut identity, &field.name);
+			}
+			assert_eq!(persisted_index_id(&identity), Some("products"));
+			let directory = RamDirectory::create();
+			directory.atomic_write(Path::new(IDENTITY_PATH), &identity).unwrap();
+			assert_eq!(
+				Engine::inspect(directory, &config.identity).unwrap_err().code,
+				"E_IDENTITY_MISMATCH"
+			);
 		}
-		assert_eq!(persisted_index_id(&identity), Some("products"));
-		let directory = RamDirectory::create();
-		directory.atomic_write(Path::new(IDENTITY_PATH), &identity).unwrap();
-		assert_eq!(
-			Engine::inspect(directory, &config.identity).unwrap_err().code,
-			"E_IDENTITY_MISMATCH"
-		);
 	}
 
 	#[test]
@@ -2665,9 +2861,7 @@ mod tests {
 		let reader = engine.reader().unwrap();
 		reader.reload().unwrap();
 		let mut request = SearchRequest {
-			text: "shoes".to_owned(),
-			mode: SearchMode::Any,
-			fields: Vec::new(),
+			expression: expression("shoes", SearchMode::Any, Vec::new()),
 			candidate_ids: None,
 			offset: 0,
 			limit: 10,
@@ -2708,14 +2902,17 @@ mod tests {
 				upserts: vec![
 					crate::protocol::Upsert {
 						id: "one".to_owned(),
+						version: None,
 						fields: vec![("title".to_owned(), vec!["Waterproof Trail Running Shoes".to_owned()])],
 					},
 					crate::protocol::Upsert {
 						id: "two".to_owned(),
+						version: None,
 						fields: vec![("title".to_owned(), vec!["Waterproof Road Shoes".to_owned()])],
 					},
 					crate::protocol::Upsert {
 						id: "three".to_owned(),
+						version: None,
 						fields: vec![("title".to_owned(), vec!["Wireless Headphones".to_owned()])],
 					},
 				],
@@ -2730,9 +2927,7 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
-						text: text.to_owned(),
-						mode,
-						fields: Vec::new(),
+						expression: expression(text, mode, Vec::new()),
 						candidate_ids: candidates.map(|ids| ids.into_iter().map(str::to_owned).collect()),
 						offset: 0,
 						limit: 10,
@@ -2754,9 +2949,77 @@ mod tests {
 			search("waterproof", SearchMode::Any, Some(vec!["two"])).hits[0].id,
 			"two"
 		);
+		let baseline = search("waterproof", SearchMode::Any, None);
+		let excluded = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					expression: SearchExpression::And(vec![
+						expression("waterproof", SearchMode::Any, Vec::new()),
+						SearchExpression::Not(Box::new(expression("wireless", SearchMode::Any, Vec::new()))),
+					]),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert_eq!(
+			excluded.hits.iter().map(|hit| (&hit.id, hit.score)).collect::<Vec<_>>(),
+			baseline.hits.iter().map(|hit| (&hit.id, hit.score)).collect::<Vec<_>>()
+		);
+		let only_negated = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					expression: SearchExpression::Not(Box::new(expression("wireless", SearchMode::Any, Vec::new()))),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert_eq!(only_negated.total, 2);
+		assert_eq!(
+			only_negated
+				.hits
+				.iter()
+				.map(|hit| (hit.id.as_str(), hit.score))
+				.collect::<Vec<_>>(),
+			vec![("one", 0.0), ("two", 0.0)]
+		);
 		assert!(search("waterproof", SearchMode::Any, Some(Vec::new())).hits.is_empty());
 		assert!(search("the", SearchMode::Any, None).hits.is_empty());
 		writer.close().unwrap();
+	}
+
+	#[test]
+	fn rejects_structured_queries_with_excessive_aggregate_expansion() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let reader = engine.reader().unwrap();
+		let expression = SearchExpression::And(
+			(0..129)
+				.map(|_| expression("shoe", SearchMode::Any, Vec::new()))
+				.collect(),
+		);
+		let error = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					expression,
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: false,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap_err();
+		assert_eq!(error.code, "E_INVALID_ARGUMENT");
 	}
 
 	#[test]
@@ -2773,6 +3036,7 @@ mod tests {
 				.apply(MutationBatch {
 					upserts: vec![crate::protocol::Upsert {
 						id: id.to_owned(),
+						version: None,
 						fields: vec![("title".to_owned(), vec!["identical catalog text".to_owned()])],
 					}],
 					deletes: Vec::new(),
@@ -2786,9 +3050,7 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
-						text: "identical".to_owned(),
-						mode: SearchMode::Any,
-						fields: Vec::new(),
+						expression: expression("identical", SearchMode::Any, Vec::new()),
 						candidate_ids: None,
 						offset,
 						limit: 1,
@@ -2809,9 +3071,7 @@ mod tests {
 			.search(
 				&reopened.reader().unwrap().searcher(),
 				&SearchRequest {
-					text: "identical".to_owned(),
-					mode: SearchMode::Any,
-					fields: Vec::new(),
+					expression: expression("identical", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					offset: 0,
 					limit: 2,
@@ -2838,6 +3098,7 @@ mod tests {
 				upserts: (0..=MAX_PREFIX_EXPANSIONS)
 					.map(|id| crate::protocol::Upsert {
 						id: id.to_string(),
+						version: None,
 						fields: vec![("title".to_owned(), vec![format!("catalog{id:03}")])],
 					})
 					.collect(),
@@ -2850,9 +3111,7 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
-					text: "cat".to_owned(),
-					mode: SearchMode::Prefix,
-					fields: Vec::new(),
+					expression: expression("cat", SearchMode::Prefix, Vec::new()),
 					candidate_ids: None,
 					offset: 0,
 					limit: 10,
@@ -2992,6 +3251,33 @@ mod tests {
 	}
 
 	#[test]
+	fn committed_payload_requires_the_same_searcher_snapshot() {
+		let directory = RamDirectory::create();
+		let config = config();
+		let reader_engine = Engine::open(directory.clone(), &config).unwrap();
+		let reader = reader_engine.reader().unwrap();
+		let writer_engine = Engine::open(directory, &config).unwrap();
+		let mut writer = writer_engine.writer(&config).unwrap();
+		writer.apply(batch()).unwrap();
+		writer.commit_with_payload(Some("cursor-v1")).unwrap();
+		assert_eq!(
+			reader_engine
+				.committed_payload_for_searcher(&reader.searcher())
+				.unwrap_err()
+				.code,
+			"E_RELOAD_FAILED"
+		);
+		reader.reload().unwrap();
+		assert_eq!(
+			reader_engine
+				.committed_payload_for_searcher(&reader.searcher())
+				.unwrap()
+				.as_deref(),
+			Some("cursor-v1")
+		);
+	}
+
+	#[test]
 	fn failed_checkpoint_commit_keeps_the_guard_conservative() {
 		let directory = AmbiguousAtomicWriteDirectory::new();
 		let config = config();
@@ -3018,6 +3304,7 @@ mod tests {
 			.apply(MutationBatch {
 				upserts: vec![crate::protocol::Upsert {
 					id: "three".to_owned(),
+					version: None,
 					fields: vec![("title".to_owned(), vec!["Hiking Boots".to_owned()])],
 				}],
 				deletes: Vec::new(),
@@ -3049,7 +3336,7 @@ mod tests {
 	fn rejects_meta_without_an_identity_sidecar() {
 		let directory = RamDirectory::create();
 		let config = config();
-		let (schema, _, _) = build_schema(&config.identity).unwrap();
+		let (schema, _, _, _) = build_schema(&config.identity).unwrap();
 		Index::create(directory.clone(), schema, IndexSettings::default()).unwrap();
 		let error = match Engine::open(directory, &config) {
 			Ok(_) => panic!("meta without an identity sidecar was accepted"),

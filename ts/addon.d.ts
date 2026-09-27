@@ -21,6 +21,7 @@ export interface RuntimeLimits {
   maxCandidateIds: number
   maxCandidateBytes: number
   maxRecordIdBytes: number
+  maxRecordVersionBytes: number
   maxPrefixExpansions: number
   maxFuzzyTerms: number
   maxSearchWindow: number

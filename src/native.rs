@@ -4,7 +4,7 @@ use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +13,7 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Status};
 use napi_derive::napi;
 use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory, INDEX_WRITER_LOCK, META_LOCK};
-use tantivy::IndexReader;
+use tantivy::{IndexReader, Searcher};
 
 use crate::boundary;
 use crate::engine::{
@@ -22,8 +22,8 @@ use crate::engine::{
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
 	decode_batch, decode_inspect, decode_open, decode_reset, decode_runtime_budget, decode_search, decode_trace,
-	search_budget, search_mode, trace_budget, validate_batch_header, validate_search_header, validate_trace_header,
-	EngineConfig, RuntimeBudgetLimits, PROTOCOL_VERSION,
+	search_budget, search_is_expensive, trace_budget, validate_batch_header, validate_search_header,
+	validate_trace_header, EngineConfig, RuntimeBudgetLimits, PROTOCOL_VERSION,
 };
 
 const STATE_OPEN: u8 = 0;
@@ -31,6 +31,8 @@ const STATE_CLOSING: u8 = 1;
 const STATE_CLOSED: u8 = 2;
 const STATE_POISONED: u8 = 3;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const RELOAD_ALIGNMENT_ATTEMPTS: u8 = 3;
+const RELOAD_FAILED_CODE: &str = "E_RELOAD_FAILED";
 
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -48,6 +50,7 @@ type CompletionThreadsafeFunction = ThreadsafeFunction<Buffer, (), Buffer, Statu
 struct Registry {
 	handles: HashMap<u32, Arc<Runtime>>,
 	paths: HashMap<PathIdentity, PathReservation>,
+	reader_paths: HashMap<PathIdentity, HashSet<u32>>,
 	unproven_paths: HashSet<PathBuf>,
 	opening: HashSet<u32>,
 	cancelled: HashSet<u32>,
@@ -73,6 +76,7 @@ struct Runtime {
 	path: PathBuf,
 	path_identity: PathIdentity,
 	config: EngineConfig,
+	read_only: bool,
 	writer_queue: Arc<BoundedQueue<WriterCommand>>,
 	ordinary_search_queue: Arc<BoundedQueue<SearchCommand>>,
 	expensive_search_queue: Option<Arc<BoundedQueue<SearchCommand>>>,
@@ -91,6 +95,8 @@ struct Runtime {
 	expensive_search_budget: Option<Arc<RuntimeBudget>>,
 	#[cfg(feature = "test-panic")]
 	publish_fault: AtomicU8,
+	#[cfg(feature = "test-panic")]
+	reload_alignment_faults: AtomicU8,
 	#[cfg(feature = "test-panic")]
 	poison_before_admission: AtomicBool,
 	#[cfg(feature = "test-panic")]
@@ -163,9 +169,15 @@ struct RuntimeParts {
 	path_identity: PathIdentity,
 	config: EngineConfig,
 	engine: Engine,
-	writer: Writer,
+	writer: Option<Writer>,
 	reader: IndexReader,
+	read_only: bool,
 	reservation: RuntimeAdmission,
+}
+
+struct SnapshotReader {
+	active: RwLock<Searcher>,
+	staging: Mutex<IndexReader>,
 }
 
 struct CompletionSignal {
@@ -256,7 +268,7 @@ struct SearchCommand {
 }
 
 enum SearchOperation {
-	Search(Vec<u8>),
+	Search { bytes: Vec<u8>, expensive: bool },
 	Trace(Vec<u8>),
 }
 
@@ -273,6 +285,20 @@ pub fn native_configure_runtime(packed_limits: Buffer) -> boundary::Result<Buffe
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeOpen")]
 pub fn native_open(env: Env, packed_config: Buffer, callback: CompletionCallback<'_>) -> boundary::Result<()> {
+	native_open_mode(env, packed_config, callback, false)
+}
+
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeOpenReader")]
+pub fn native_open_reader(env: Env, packed_config: Buffer, callback: CompletionCallback<'_>) -> boundary::Result<()> {
+	native_open_mode(env, packed_config, callback, true)
+}
+
+fn native_open_mode(
+	env: Env,
+	packed_config: Buffer,
+	callback: CompletionCallback<'_>,
+	read_only: bool,
+) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let environment = environment_state(&env)?;
 		let opening_done = Arc::new(CompletionSignal::new());
@@ -285,8 +311,16 @@ pub fn native_open(env: Env, packed_config: Buffer, callback: CompletionCallback
 		let thread_environment = environment.clone();
 		if let Err(error) = thread::Builder::new()
 			.name(format!("fulltext-open-{handle}"))
-			.spawn(move || open_on_thread(handle, bytes, completion, thread_opening_done, thread_environment))
-		{
+			.spawn(move || {
+				open_on_thread(
+					handle,
+					bytes,
+					completion,
+					thread_opening_done,
+					thread_environment,
+					read_only,
+				)
+			}) {
 			registry().opening.remove(&handle);
 			environment.release(handle);
 			opening_done.signal();
@@ -352,6 +386,7 @@ pub fn native_apply(
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
+		runtime.require_writable().map_err(fulltext_napi_error)?;
 		validate_batch_header(&packed_batch, runtime.config.limits.max_batch_bytes).map_err(fulltext_napi_error)?;
 		runtime
 			.writer_queue
@@ -373,6 +408,7 @@ pub fn native_apply(
 pub fn native_commit(env: Env, handle: u32, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
+		runtime.require_writable().map_err(fulltext_napi_error)?;
 		let completion = completion(callback, &runtime.environment)?;
 		runtime.enqueue_writer(
 			WriterCommand {
@@ -399,6 +435,7 @@ pub fn native_publish(
 			))));
 		}
 		let runtime = runtime(&env, handle)?;
+		runtime.require_writable().map_err(fulltext_napi_error)?;
 		let completion = completion(callback, &runtime.environment)?;
 		let bytes = payload.len();
 		runtime.enqueue_writer(
@@ -437,8 +474,8 @@ pub fn native_search(
 		let runtime = runtime(&env, handle)?;
 		runtime.require_open().map_err(fulltext_napi_error)?;
 		validate_search_header(&packed_request).map_err(fulltext_napi_error)?;
-		let mode = search_mode(&packed_request).map_err(fulltext_napi_error)?;
-		let queue = runtime.search_queue(mode.is_expensive());
+		let expensive = search_is_expensive(&packed_request).map_err(fulltext_napi_error)?;
+		let queue = runtime.search_queue(expensive);
 		queue
 			.check_capacity(packed_request.len())
 			.map_err(fulltext_napi_error)?;
@@ -447,7 +484,10 @@ pub fn native_search(
 		queue
 			.try_push(
 				SearchCommand {
-					operation: SearchOperation::Search(request),
+					operation: SearchOperation::Search {
+						bytes: request,
+						expensive,
+					},
 					completion,
 				},
 				packed_request.len(),
@@ -564,6 +604,22 @@ pub fn test_fail_next_publish(env: Env, handle: u32, after_commit: bool) -> boun
 }
 
 #[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailReloadAlignment")]
+pub fn test_fail_reload_alignment(env: Env, handle: u32, failures: u8) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		if failures == 0 || failures > RELOAD_ALIGNMENT_ATTEMPTS {
+			return Err(fulltext_napi_error(FulltextError::invalid(
+				"test reload failures exceed the retry budget",
+			)));
+		}
+		runtime(&env, handle)?
+			.reload_alignment_faults
+			.store(failures, Ordering::Release);
+		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
 #[napi(catch_unwind, skip_typescript, js_name = "__testFailNextClose")]
 pub fn test_fail_next_close(env: Env, handle: u32, quiesced: bool) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
@@ -666,7 +722,7 @@ fn runtime_budget_state() -> &'static Mutex<RuntimeBudgetState> {
 	RUNTIME_BUDGET.get_or_init(|| Mutex::new(RuntimeBudgetState::Unconfigured { pending_opens: 0 }))
 }
 
-fn admit_runtime(limits: &crate::protocol::Limits) -> Result<RuntimeAdmission> {
+fn admit_runtime(limits: &crate::protocol::Limits, read_only: bool) -> Result<RuntimeAdmission> {
 	let mut state = lock(runtime_budget_state());
 	match &mut *state {
 		RuntimeBudgetState::Unconfigured { pending_opens } => {
@@ -677,7 +733,7 @@ fn admit_runtime(limits: &crate::protocol::Limits) -> Result<RuntimeAdmission> {
 				kind: RuntimeAdmissionKind::Unbudgeted { pending: true },
 			})
 		}
-		RuntimeBudgetState::Configured(budget) => budget.admit(limits).map(|reservation| RuntimeAdmission {
+		RuntimeBudgetState::Configured(budget) => budget.admit(limits, read_only).map(|reservation| RuntimeAdmission {
 			kind: RuntimeAdmissionKind::Budgeted(reservation),
 		}),
 		RuntimeBudgetState::OpenedWithoutBudget => Ok(RuntimeAdmission {
@@ -703,7 +759,7 @@ impl RuntimeBudget {
 		}
 	}
 
-	fn admit(self: &Arc<Self>, limits: &crate::protocol::Limits) -> Result<BudgetReservation> {
+	fn admit(self: &Arc<Self>, limits: &crate::protocol::Limits, read_only: bool) -> Result<BudgetReservation> {
 		let mut admission = BudgetReservation {
 			budget: self.clone(),
 			resident: false,
@@ -719,13 +775,15 @@ impl RuntimeBudget {
 			"resident indexes",
 		)?;
 		admission.resident = true;
-		reserve(
-			&self.indexing_threads,
-			limits.indexing_threads,
-			self.limits.max_indexing_threads,
-			"indexing threads",
-		)?;
-		admission.indexing_threads = limits.indexing_threads;
+		if !read_only {
+			reserve(
+				&self.indexing_threads,
+				limits.indexing_threads,
+				self.limits.max_indexing_threads,
+				"indexing threads",
+			)?;
+			admission.indexing_threads = limits.indexing_threads;
+		}
 		reserve(
 			&self.search_threads,
 			limits.search_threads,
@@ -733,16 +791,18 @@ impl RuntimeBudget {
 			"search threads",
 		)?;
 		admission.search_threads = limits.search_threads;
-		reserve(
-			&self.writer_memory_bytes,
-			limits.writer_memory_bytes,
-			self.limits.max_writer_memory_bytes,
-			"writer memory",
-		)?;
-		admission.writer_memory_bytes = limits.writer_memory_bytes;
+		if !read_only {
+			reserve(
+				&self.writer_memory_bytes,
+				limits.writer_memory_bytes,
+				self.limits.max_writer_memory_bytes,
+				"writer memory",
+			)?;
+			admission.writer_memory_bytes = limits.writer_memory_bytes;
+		}
 		let queued_bytes = limits
 			.max_queued_bytes
-			.checked_mul(2)
+			.checked_mul(if read_only { 1 } else { 2 })
 			.ok_or_else(|| FulltextError::new("E_RESOURCE_LIMIT", "configured queue capacity overflows"))?;
 		reserve(
 			&self.queued_bytes,
@@ -942,9 +1002,10 @@ fn release(counter: &AtomicUsize, amount: usize) {
 impl Runtime {
 	fn start(handle: u32, environment: Arc<EnvironmentState>, parts: RuntimeParts) -> Result<Arc<Self>> {
 		let search_thread_count = parts.config.limits.search_threads;
+		let read_only = parts.read_only;
 		let expensive_search_budget = parts.reservation.budget();
 		let engine = Arc::new(parts.engine);
-		let reader = Arc::new(parts.reader);
+		let reader = Arc::new(SnapshotReader::new(parts.reader));
 		let writer_queue = Arc::new(BoundedQueue::new(
 			parts.config.limits.max_queued_commands,
 			parts.config.limits.max_queued_bytes,
@@ -975,6 +1036,7 @@ impl Runtime {
 			path: parts.path,
 			path_identity: parts.path_identity,
 			config: parts.config,
+			read_only,
 			writer_queue,
 			ordinary_search_queue,
 			expensive_search_queue,
@@ -993,6 +1055,8 @@ impl Runtime {
 			expensive_search_budget,
 			#[cfg(feature = "test-panic")]
 			publish_fault: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
+			reload_alignment_faults: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
 			poison_before_admission: AtomicBool::new(false),
 			#[cfg(feature = "test-panic")]
@@ -1041,6 +1105,15 @@ impl Runtime {
 			STATE_OPEN => Ok(()),
 			STATE_POISONED => Err(FulltextError::new("E_POISONED", "index is poisoned")),
 			_ => Err(FulltextError::new("E_CLOSED", "index is closing or closed")),
+		}
+	}
+
+	fn require_writable(&self) -> Result<()> {
+		self.require_open()?;
+		if self.read_only {
+			Err(FulltextError::new("E_READ_ONLY", "index handle is read-only"))
+		} else {
+			Ok(())
 		}
 	}
 
@@ -1188,6 +1261,78 @@ impl Runtime {
 
 	fn wait_closed(&self, timeout: Duration) -> bool {
 		self.closed.wait(timeout)
+	}
+}
+
+impl SnapshotReader {
+	fn new(reader: IndexReader) -> Self {
+		let searcher = reader.searcher();
+		Self {
+			active: RwLock::new(searcher),
+			staging: Mutex::new(reader),
+		}
+	}
+
+	fn searcher(&self) -> Searcher {
+		self.active.read().unwrap_or_else(|error| error.into_inner()).clone()
+	}
+
+	fn reload_after_owned_publish(&self) -> tantivy::Result<()> {
+		let staging = lock(&self.staging);
+		staging.reload()?;
+		self.replace(staging.searcher());
+		Ok(())
+	}
+
+	fn reload_aligned(&self, engine: &Engine, runtime: &Runtime) -> Result<Option<String>> {
+		#[cfg(not(feature = "test-panic"))]
+		let _ = runtime;
+		let staging = lock(&self.staging);
+		for attempt in 0..RELOAD_ALIGNMENT_ATTEMPTS {
+			staging.reload().map_err(FulltextError::native)?;
+			let candidate = staging.searcher();
+			#[cfg(feature = "test-panic")]
+			let aligned = if runtime
+				.reload_alignment_faults
+				.fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+					remaining.checked_sub(1)
+				})
+				.is_ok()
+			{
+				Err(FulltextError::new(
+					RELOAD_FAILED_CODE,
+					"injected reload alignment failure",
+				))
+			} else {
+				engine.committed_payload_for_searcher(&candidate)
+			};
+			#[cfg(not(feature = "test-panic"))]
+			let aligned = engine.committed_payload_for_searcher(&candidate);
+			match aligned {
+				Ok(payload) => {
+					self.replace(candidate);
+					return Ok(payload);
+				}
+				Err(error) if error.code == RELOAD_FAILED_CODE => {
+					if attempt + 1 < RELOAD_ALIGNMENT_ATTEMPTS {
+						thread::sleep(Duration::from_millis(1 << attempt));
+					}
+				}
+				Err(error) => return Err(error),
+			}
+		}
+		Err(FulltextError::new(
+			RELOAD_FAILED_CODE,
+			"native index changed repeatedly during reload; retry the reload",
+		))
+	}
+
+	fn replace(&self, searcher: Searcher) {
+		let previous = {
+			let mut active = self.active.write().unwrap_or_else(|error| error.into_inner());
+			mem::replace(&mut *active, searcher)
+		};
+		drop(previous);
 	}
 }
 
@@ -1467,7 +1612,7 @@ impl BoundedQueue<SearchCommand> {
 		for _ in 0..queued_count {
 			let queued = state.items.pop_front().unwrap();
 			let milliseconds = match &queued.value.operation {
-				SearchOperation::Search(bytes) => search_budget(bytes),
+				SearchOperation::Search { bytes, .. } => search_budget(bytes),
 				SearchOperation::Trace(bytes) => trace_budget(bytes),
 			}
 			.unwrap_or(0);
@@ -1563,14 +1708,18 @@ impl WriterCommand {
 	}
 }
 
-fn writer_loop(runtime: Arc<Runtime>, writer: Writer, engine: Arc<Engine>, reader: Arc<IndexReader>) {
+fn writer_loop(runtime: Arc<Runtime>, writer: Option<Writer>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
 	let closed = runtime.closed.clone();
 	writer_loop_inner(runtime, writer, engine, reader);
 	closed.signal();
 }
 
-fn writer_loop_inner(runtime: Arc<Runtime>, writer: Writer, engine: Arc<Engine>, reader: Arc<IndexReader>) {
-	let mut writer = Some(writer);
+fn writer_loop_inner(
+	runtime: Arc<Runtime>,
+	mut writer: Option<Writer>,
+	engine: Arc<Engine>,
+	reader: Arc<SnapshotReader>,
+) {
 	while let Some(queued) = runtime.writer_queue.pop() {
 		runtime
 			.writer_queue_nanoseconds
@@ -1620,7 +1769,7 @@ fn writer_loop_inner(runtime: Arc<Runtime>, writer: Writer, engine: Arc<Engine>,
 				.and_then(|opstamp| {
 					#[cfg(feature = "test-panic")]
 					fail_publish_at(&runtime, 2)?;
-					reader.reload().map_err(FulltextError::native)?;
+					reader.reload_after_owned_publish().map_err(FulltextError::native)?;
 					Ok(opstamp)
 				}) {
 				Ok(opstamp) => {
@@ -1636,9 +1785,9 @@ fn writer_loop_inner(runtime: Arc<Runtime>, writer: Writer, engine: Arc<Engine>,
 					),
 				),
 			},
-			WriterOperation::Reload => {
-				WriterOutcome::Continue(reader.reload().map(|()| Vec::new()).map_err(FulltextError::native))
-			}
+			WriterOperation::Reload => WriterOutcome::Continue(
+				reload_payload(&reader, &engine, &runtime).map(|payload| payload_body(payload.as_deref())),
+			),
 			WriterOperation::Close { rollback } => {
 				let dirty = runtime.uncommitted_mutations.load(Ordering::Acquire) > 0;
 				if !rollback
@@ -1724,6 +1873,12 @@ fn writer_loop_inner(runtime: Arc<Runtime>, writer: Writer, engine: Arc<Engine>,
 
 fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool) -> WriterCloseOutcome {
 	let Some(mut writer) = writer.take() else {
+		if _runtime.read_only {
+			return WriterCloseOutcome {
+				quiesced: true,
+				error: None,
+			};
+		}
 		return WriterCloseOutcome {
 			quiesced: false,
 			error: Some(FulltextError::new("E_POISONED", "writer is unavailable")),
@@ -1761,7 +1916,7 @@ fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool)
 fn finish_runtime(
 	runtime: &Arc<Runtime>,
 	engine: Arc<Engine>,
-	reader: Arc<IndexReader>,
+	reader: Arc<SnapshotReader>,
 	mut outcome: WriterCloseOutcome,
 ) -> WriterCloseOutcome {
 	runtime.ordinary_search_queue.shutdown_after_drain();
@@ -1876,7 +2031,7 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 		.ok_or_else(|| FulltextError::new("E_POISONED", "writer is unavailable"))
 }
 
-fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
+fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
 	while let Some(queued) = runtime.ordinary_search_queue.pop() {
 		#[cfg(feature = "test-panic")]
 		{
@@ -1891,7 +2046,7 @@ fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 	}
 }
 
-fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
+fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
 	let expensive = runtime.expensive_search_queue.as_ref().unwrap();
 	let wake = runtime.search_wake.as_ref().unwrap();
 	loop {
@@ -1967,10 +2122,33 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 	}
 }
 
+fn reload_payload(reader: &SnapshotReader, engine: &Engine, runtime: &Runtime) -> Result<Option<String>> {
+	reader.reload_aligned(engine, runtime)
+}
+
+fn aligned_reader(engine: &Engine) -> Result<(IndexReader, Option<String>)> {
+	for attempt in 0..3 {
+		let candidate = engine.reader_for_open()?;
+		match engine.committed_payload_for_searcher(&candidate.searcher()) {
+			Ok(payload) => return Ok((candidate, payload)),
+			Err(error) if error.code == "E_RELOAD_FAILED" => {
+				if attempt < 2 {
+					thread::sleep(Duration::from_millis(1 << attempt));
+				}
+			}
+			Err(error) => return Err(error),
+		}
+	}
+	Err(FulltextError::new(
+		"E_RELOAD_FAILED",
+		"native index changed repeatedly during reload; retry the reload",
+	))
+}
+
 fn execute_search_command(
 	runtime: &Runtime,
 	engine: &Engine,
-	reader: &IndexReader,
+	reader: &SnapshotReader,
 	queued: Queued<SearchCommand>,
 	preacquired_permit: Option<ExpensiveSearchPermit>,
 ) -> bool {
@@ -1980,9 +2158,8 @@ fn execute_search_command(
 		.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
 	let SearchCommand { operation, completion } = queued.value;
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
-		SearchOperation::Search(bytes) => {
+		SearchOperation::Search { bytes, expensive } => {
 			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
-			let expensive = search_mode(&bytes)?.is_expensive();
 			let _permit = if expensive {
 				match preacquired_permit {
 					Some(permit) => Some(permit),
@@ -2077,13 +2254,22 @@ fn open_on_thread(
 	completion: Completion,
 	opening_done: Arc<CompletionSignal>,
 	environment: Arc<EnvironmentState>,
+	read_only: bool,
 ) {
-	open_on_thread_inner(handle, bytes, completion, environment);
+	open_on_thread_inner(handle, bytes, completion, environment, read_only);
 	opening_done.signal();
 }
 
-fn open_on_thread_inner(handle: u32, bytes: Vec<u8>, completion: Completion, environment: Arc<EnvironmentState>) {
-	let result = catch_unwind(AssertUnwindSafe(|| open_runtime(handle, bytes, environment.clone())));
+fn open_on_thread_inner(
+	handle: u32,
+	bytes: Vec<u8>,
+	completion: Completion,
+	environment: Arc<EnvironmentState>,
+	read_only: bool,
+) {
+	let result = catch_unwind(AssertUnwindSafe(|| {
+		open_runtime(handle, bytes, environment.clone(), read_only)
+	}));
 	let opened = matches!(result, Ok(Ok(_)));
 	match result {
 		Ok(Ok(payload)) => completion.success(open_body(handle, payload.as_deref())),
@@ -2096,14 +2282,72 @@ fn open_on_thread_inner(handle: u32, bytes: Vec<u8>, completion: Completion, env
 	}
 }
 
-fn open_runtime(handle: u32, bytes: Vec<u8>, environment: Arc<EnvironmentState>) -> Result<Option<String>> {
+fn open_runtime(
+	handle: u32,
+	bytes: Vec<u8>,
+	environment: Arc<EnvironmentState>,
+	read_only: bool,
+) -> Result<Option<String>> {
 	let open = decode_open(&bytes)?;
 	Engine::validate(&open.engine)?;
-	let canonical = create_and_canonicalize(Path::new(&open.path))?;
-	let (_lifecycle_directory, _lifecycle_lock) = acquire_lifecycle_lock(&canonical)?;
+	let canonical = if read_only {
+		match fs::canonicalize(Path::new(&open.path)) {
+			Ok(canonical) => canonical,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				return Err(FulltextError::new(
+					"E_INDEX_NOT_READY",
+					"native index is not ready for read-only open",
+				))
+			}
+			Err(error) => return Err(storage_error(error)),
+		}
+	} else {
+		create_and_canonicalize(Path::new(&open.path))?
+	};
+	if read_only {
+		require_reader_file(&canonical.join(IDENTITY_PATH))?;
+		require_reader_file(&canonical.join("meta.json"))?;
+	}
+	let (_lifecycle_directory, _lifecycle_lock) = acquire_lifecycle_lock_for_open(&canonical)?;
 	let directory = MmapDirectory::open(&canonical).map_err(storage_error)?;
 	let path_identity = path_identity(&canonical)?;
-	open_runtime_with_directory(handle, canonical, path_identity, open.engine, directory, environment)
+	open_runtime_with_directory(
+		handle,
+		canonical,
+		path_identity,
+		open.engine,
+		directory,
+		environment,
+		read_only,
+	)
+}
+
+fn require_reader_file(path: &Path) -> Result<()> {
+	match fs::symlink_metadata(path) {
+		Ok(metadata) if metadata.is_file() && !is_link_like(&metadata) => Ok(()),
+		Ok(_) => Err(FulltextError::new(
+			"E_INDEX_CORRUPT",
+			"native index metadata is not a regular file",
+		)),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(FulltextError::new(
+			"E_INDEX_NOT_READY",
+			"native index is not ready for read-only open",
+		)),
+		Err(error) => Err(storage_error(error)),
+	}
+}
+
+fn acquire_lifecycle_lock_for_open(path: &Path) -> Result<(MmapDirectory, DirectoryLock)> {
+	let deadline = Instant::now() + Duration::from_secs(2);
+	loop {
+		match acquire_lifecycle_lock(path) {
+			Ok(lock) => return Ok(lock),
+			Err(error) if error.code == "E_LOCK_BUSY" && Instant::now() < deadline => {
+				thread::sleep(Duration::from_millis(5));
+			}
+			Err(error) => return Err(error),
+		}
+	}
 }
 
 fn inspect_runtime(bytes: &[u8]) -> Result<InspectionResult> {
@@ -2217,7 +2461,12 @@ fn reset_runtime(operation: u32, bytes: &[u8], environment: &EnvironmentState) -
 				"this native index was not proven quiescent; restart is required",
 			)));
 		}
-		if registry.paths.contains_key(&physical_identity) {
+		if registry.paths.contains_key(&physical_identity)
+			|| registry
+				.reader_paths
+				.get(&physical_identity)
+				.is_some_and(|readers| !readers.is_empty())
+		{
 			return Err(FulltextError::new("E_LOCK_BUSY", "the physical index is still active"));
 		}
 		registry
@@ -2451,6 +2700,7 @@ fn open_runtime_with_directory(
 	config: EngineConfig,
 	directory: MmapDirectory,
 	environment: Arc<EnvironmentState>,
+	read_only: bool,
 ) -> Result<Option<String>> {
 	{
 		let mut registry = registry();
@@ -2468,16 +2718,30 @@ fn open_runtime_with_directory(
 			)));
 		}
 		if let Some(reservation) = registry.paths.get(&physical_identity) {
-			return Err(match reservation {
+			match reservation {
+				PathReservation::Open(_) if read_only => {}
 				PathReservation::Open(_) => {
-					FulltextError::new("E_DUPLICATE_OPEN", "the physical index is already open")
+					return Err(FulltextError::new(
+						"E_DUPLICATE_OPEN",
+						"the physical index is already open",
+					))
 				}
-				PathReservation::Reset(_) => FulltextError::new("E_LOCK_BUSY", "the physical index is being reset"),
-			});
+				PathReservation::Reset(_) => {
+					return Err(FulltextError::new("E_LOCK_BUSY", "the physical index is being reset"))
+				}
+			}
 		}
-		registry
-			.paths
-			.insert(physical_identity.clone(), PathReservation::Open(handle));
+		if read_only {
+			registry
+				.reader_paths
+				.entry(physical_identity.clone())
+				.or_default()
+				.insert(handle);
+		} else {
+			registry
+				.paths
+				.insert(physical_identity.clone(), PathReservation::Open(handle));
+		}
 	}
 	let result = (|| {
 		match path_identity(&canonical) {
@@ -2489,10 +2753,16 @@ fn open_runtime_with_directory(
 				))
 			}
 		}
-		let reservation = admit_runtime(&config.limits)?;
+		let reservation = admit_runtime(&config.limits, read_only)?;
 		let engine = Engine::open(directory, &config)?;
-		let (writer, committed_payload) = engine.writer_with_payload(&config)?;
-		let reader = engine.reader_for_open()?;
+		let (writer, writer_payload) = if read_only {
+			(None, None)
+		} else {
+			let (writer, payload) = engine.writer_with_payload(&config)?;
+			(Some(writer), payload)
+		};
+		let (reader, reader_payload) = aligned_reader(&engine)?;
+		let committed_payload = if read_only { reader_payload } else { writer_payload };
 		let runtime = Runtime::start(
 			handle,
 			environment.clone(),
@@ -2503,6 +2773,7 @@ fn open_runtime_with_directory(
 				engine,
 				writer,
 				reader,
+				read_only,
 				reservation,
 			},
 		)?;
@@ -2669,6 +2940,12 @@ impl CleanupWait {
 fn release_runtime(handle: u32, path_identity: &PathIdentity, environment: &EnvironmentState) {
 	let mut registry = registry();
 	registry.handles.remove(&handle);
+	if let Some(readers) = registry.reader_paths.get_mut(path_identity) {
+		readers.remove(&handle);
+		if readers.is_empty() {
+			registry.reader_paths.remove(path_identity);
+		}
+	}
 	if registry.paths.get(path_identity) == Some(&PathReservation::Open(handle)) {
 		registry.paths.remove(path_identity);
 	}
@@ -2679,6 +2956,12 @@ fn release_runtime(handle: u32, path_identity: &PathIdentity, environment: &Envi
 fn release_runtime_handle(handle: u32, path: &Path, path_identity: &PathIdentity, environment: &EnvironmentState) {
 	let mut registry = registry();
 	registry.handles.remove(&handle);
+	if let Some(readers) = registry.reader_paths.get_mut(path_identity) {
+		readers.remove(&handle);
+		if readers.is_empty() {
+			registry.reader_paths.remove(path_identity);
+		}
+	}
 	if registry.paths.get(path_identity) == Some(&PathReservation::Open(handle)) {
 		registry.paths.remove(path_identity);
 	}
@@ -2775,6 +3058,12 @@ fn u32_body(value: u32) -> Vec<u8> {
 
 fn open_body(handle: u32, payload: Option<&str>) -> Vec<u8> {
 	let mut bytes = u32_body(handle);
+	bytes.extend_from_slice(&payload_body(payload));
+	bytes
+}
+
+fn payload_body(payload: Option<&str>) -> Vec<u8> {
+	let mut bytes = Vec::new();
 	bytes.push(u8::from(payload.is_some()));
 	if let Some(payload) = payload {
 		push_string(&mut bytes, payload);
@@ -2820,6 +3109,10 @@ fn search_body(result: SearchResult) -> Vec<u8> {
 	for hit in result.hits {
 		bytes.extend_from_slice(&hit.score.to_le_bytes());
 		push_string(&mut bytes, &hit.id);
+		bytes.push(hit.version.is_some() as u8);
+		if let Some(version) = hit.version {
+			push_string(&mut bytes, &version);
+		}
 	}
 	bytes
 }
@@ -2911,8 +3204,8 @@ mod tests {
 			max_queued_bytes: 16,
 			max_batch_bytes: 16,
 		};
-		let reservation = budget.admit(&limits).unwrap();
-		assert_eq!(budget.admit(&limits).err().unwrap().code, "E_RESOURCE_LIMIT");
+		let reservation = budget.admit(&limits, false).unwrap();
+		assert_eq!(budget.admit(&limits, false).err().unwrap().code, "E_RESOURCE_LIMIT");
 		assert_eq!(budget.resident_indexes.load(Ordering::Acquire), 1);
 		let state = AtomicU8::new(STATE_OPEN);
 		let permit = budget

@@ -72,6 +72,44 @@ test('publishes visible mutations and opaque checkpoints, reopens, and replays b
 	assert.strictEqual((await index.search({ text: 'updated', exactTotal: true })).total, 0);
 });
 
+test('a failed reader reload retains its aligned snapshot and checkpoint', async (context) => {
+	const options = config();
+	const writer = await openNativeFullTextIndex(options);
+	const addon = loadAddon();
+	await writer.apply(batch('one', 'original catalog'));
+	await writer.publish('one');
+	const opened = await invoke((callback) => addon.__nativeOpenReader(encodeOpen(options), callback));
+	const handle = opened.u32();
+	assert.strictEqual(opened.u8(), 1);
+	const reader = new NativeFullTextIndex({
+		handle,
+		committedPayload: opened.string(),
+		maxBatchBytes: options.limits.maxBatchBytes,
+		fieldNames: options.fields.map((field) => field.name),
+	});
+	opened.finish();
+	context.after(async () => {
+		await Promise.allSettled([reader.close({ mode: 'rollback' }), writer.close({ mode: 'rollback' })]);
+		rmSync(options.path, { recursive: true, force: true });
+	});
+	await writer.apply(batch('two', 'updated catalog'));
+	await writer.publish('two');
+	addon.__testFailReloadAlignment(handle, 1);
+	await reader.reload();
+	assert.strictEqual(reader.committedPayload, 'two');
+	assert.strictEqual((await reader.search({ text: 'updated', exactTotal: true })).total, 1);
+	await writer.apply(batch('three', 'third catalog'));
+	await writer.publish('three');
+	addon.__testFailReloadAlignment(handle, 3);
+	await assert.rejects(reader.reload(), hasCode('E_RELOAD_FAILED'));
+	assert.strictEqual(reader.committedPayload, 'two');
+	assert.strictEqual((await reader.search({ text: 'original', exactTotal: true })).total, 1);
+	assert.strictEqual((await reader.search({ text: 'third', exactTotal: true })).total, 0);
+	await reader.reload();
+	assert.strictEqual(reader.committedPayload, 'three');
+	assert.strictEqual((await reader.search({ text: 'third', exactTotal: true })).total, 1);
+});
+
 test('checks a queued commit after earlier publication and retains staged work on rejection', async (context) => {
 	const options = config();
 	let index = await openNativeFullTextIndex(options);

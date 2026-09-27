@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "test-panic")]
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const NATIVE_ABI_VERSION: u32 = 7;
+pub const NATIVE_ABI_VERSION: u32 = 8;
 pub const TANTIVY_VERSION: &str = "0.26.1";
 
 #[cfg(feature = "node-api")]
@@ -36,6 +36,7 @@ pub struct RuntimeLimits {
 	pub max_candidate_ids: u32,
 	pub max_candidate_bytes: u32,
 	pub max_record_id_bytes: u32,
+	pub max_record_version_bytes: u32,
 	pub max_prefix_expansions: u32,
 	pub max_fuzzy_terms: u32,
 	pub max_search_window: u32,
@@ -70,7 +71,7 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 		package_version: env!("CARGO_PKG_VERSION").to_owned(),
 		tantivy_version: TANTIVY_VERSION.to_owned(),
 		native_abi_version: NATIVE_ABI_VERSION,
-		query_api_version: 1,
+		query_api_version: 2,
 		query_class_isolation_minimum_search_threads: 2,
 		storage_backends: vec!["native".to_owned()],
 		limits: RuntimeLimits {
@@ -81,6 +82,7 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 			max_candidate_ids: protocol::MAX_CANDIDATE_IDS as u32,
 			max_candidate_bytes: protocol::MAX_CANDIDATE_BYTES as u32,
 			max_record_id_bytes: protocol::MAX_RECORD_ID_BYTES as u32,
+			max_record_version_bytes: protocol::MAX_RECORD_VERSION_BYTES as u32,
 			max_prefix_expansions: protocol::MAX_PREFIX_EXPANSIONS as u32,
 			max_fuzzy_terms: protocol::MAX_FUZZY_TERMS as u32,
 			max_search_window: protocol::MAX_SEARCH_WINDOW as u32,

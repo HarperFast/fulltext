@@ -23,6 +23,7 @@ import {
 	encodeMutationBatch,
 	inspectNativeFullTextIndex,
 	openNativeFullTextIndex,
+	openNativeFullTextReader,
 	reclaimRetiredNativeFullTextIndexes,
 	resetNativeFullTextIndex,
 	validateNativeFullTextIndexOptions,
@@ -122,6 +123,57 @@ test('runs the public create, mutate, BM25 search, close, and reopen route', asy
 	);
 	assert(afterDelete.hits[0].score > 0);
 	await index.close();
+});
+
+test('opens concurrent readers, reloads publications, evaluates boolean queries, and returns source versions', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const writer = await openNativeFullTextIndex(config);
+	await writer.applyMutationBatch({
+		upserts: [
+			{ id: 'one', version: '41', fields: { title: 'red trail shoe', description: 'waterproof' } },
+			{ id: 'two', version: '42', fields: { title: 'blue road shoe', description: 'lightweight' } },
+		],
+	});
+	await writer.publish('1');
+	const [first, second] = await Promise.all([openNativeFullTextReader(config), openNativeFullTextReader(config)]);
+	assert.strictEqual(first.committedPayload, '1');
+	assert.strictEqual(second.committedPayload, '1');
+	const request = {
+		query: {
+			operator: 'and',
+			clauses: [{ text: 'shoe' }, { operator: 'not', clause: { text: 'blue' } }],
+		},
+		exactTotal: true,
+	};
+	const initial = await first.search(request);
+	assert.strictEqual(initial.total, 1);
+	assert.deepStrictEqual(
+		initial.hits.map(({ id, version }) => [id, version]),
+		[['one', '41']],
+	);
+	await writer.applyMutationBatch({ upserts: [{ id: 'one', version: '43', fields: { title: 'green boot' } }] });
+	await writer.publish('2');
+	assert.strictEqual((await second.search({ text: 'shoe', exactTotal: true })).total, 2);
+	await second.reload();
+	assert.strictEqual(first.committedPayload, '1');
+	assert.strictEqual(second.committedPayload, '2');
+	assert.deepStrictEqual(
+		(await second.search({ text: 'boot' })).hits.map(({ id, version }) => [id, version]),
+		[['one', '43']],
+	);
+	await writer.close();
+	await assert.rejects(
+		resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId }),
+		(error) => error.code === 'E_LOCK_BUSY',
+	);
+	await Promise.all([first.close(), second.close()]);
+});
+
+test('reports a missing read-only index as not ready', async (context) => {
+	const indexPath = temporaryIndex(context);
+	rmSync(indexPath, { recursive: true });
+	await assert.rejects(openNativeFullTextReader(options(indexPath)), (error) => error.code === 'E_INDEX_NOT_READY');
 });
 
 test('normalizes English text and persists bounded index-time synonyms', async (context) => {
@@ -476,6 +528,19 @@ test('rejects a mutation frame limit that cannot hold one mutation', async (cont
 	const config = options(temporaryIndex(context));
 	config.limits = { ...config.limits, maxBatchBytes: 20 };
 	await assert.rejects(openNativeFullTextIndex(config), (error) => error.code === 'E_INVALID_ARGUMENT');
+});
+
+test('accepts the exact mutation-frame floor for a minimal upsert', async (context) => {
+	const config = options(temporaryIndex(context));
+	config.limits = { ...config.limits, maxBatchBytes: 22 };
+	const index = await openNativeFullTextIndex(config);
+	const result = await index.applyMutationBatch(
+		{ upserts: [{ id: 'a', fields: {} }], deletes: [] },
+		{ assumeDistinctIds: true, rejectedUpsert: 'delete' },
+	);
+	assert.strictEqual(result.processed, 1);
+	assert.deepStrictEqual(result.rejected, []);
+	await index.close({ mode: 'rollback' });
 });
 
 test('validates native configuration without creating index storage', async (context) => {

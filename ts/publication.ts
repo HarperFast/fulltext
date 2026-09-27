@@ -31,4 +31,11 @@ export class PublicationState {
 	fail(sequence: bigint): void {
 		if (sequence > this.#uncertainSequence) this.#uncertainSequence = sequence;
 	}
+
+	refresh(sequence: bigint, payload?: string): void {
+		if (sequence > this.#publishedSequence) {
+			this.#publishedSequence = sequence;
+			this.#payload = payload;
+		}
+	}
 }

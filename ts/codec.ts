@@ -1,14 +1,15 @@
 import { FulltextError, type FulltextErrorCode } from './errors.js';
 
-const protocolVersion = 3;
+const protocolVersion = 4;
 const maxStringBytes = 1 << 20;
 const maxSynonymRules = 1_024;
 const maxSynonymReplacements = 16;
 const maxSynonymBytes = 1 << 20;
 export const maxRecordIdBytes = 4 << 10;
+export const maxRecordVersionBytes = 4 << 10;
 export const maxFields = 1_024;
 export const mutationBatchHeaderBytes = 14;
-export const minimumMutationBatchBytes = mutationBatchHeaderBytes + 7;
+export const minimumMutationBatchBytes = mutationBatchHeaderBytes + 8;
 const maxPendingWriterChunks = 1_024;
 const invalidSurrogate = /[\uD800-\uDFFF]/u;
 
@@ -62,7 +63,7 @@ export interface PackedRuntimeBudgetLimits {
 }
 
 export interface PackedMutationBatch {
-	upserts: Array<{ id: string; fields: Record<string, string | string[]> }>;
+	upserts: Array<{ id: string; version?: string; fields: Record<string, string | string[]> }>;
 	deletes: string[];
 }
 
@@ -294,6 +295,14 @@ function encodeUpsertRecord(
 	}
 	const writer = new ByteWriter(maxBytes, 'E_BATCH_TOO_LARGE');
 	writer.encodedString(id);
+	if (upsert.version !== undefined && typeof upsert.version !== 'string') {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'upsert version must be a string');
+	}
+	if (upsert.version !== undefined && Buffer.byteLength(upsert.version) > maxRecordVersionBytes) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'upsert version exceeds 4096 UTF-8 bytes');
+	}
+	writer.boolean(upsert.version !== undefined);
+	if (upsert.version !== undefined) writer.string(upsert.version);
 	writer.u16(names.length, 'upsert field count');
 	for (const name of names) {
 		writer.string(name);
@@ -315,10 +324,19 @@ function deleteFrameIdCapacity(maxBytes: number): number {
 	return maxBytes - mutationBatchHeaderBytes - 4;
 }
 
-export interface PackedSearchRequest {
+export interface PackedSearchClause {
 	text: string;
 	mode: 'any' | 'all' | 'phrase' | 'prefix' | 'fuzzy' | 'fuzzy-prefix';
 	fields: string[];
+}
+
+export type PackedSearchExpression =
+	| PackedSearchClause
+	| { operator: 'and' | 'or'; clauses: PackedSearchExpression[] }
+	| { operator: 'not'; clause: PackedSearchExpression };
+
+export interface PackedSearchRequest {
+	expression: PackedSearchExpression;
 	candidateIds?: string[];
 	offset: number;
 	limit: number;
@@ -328,7 +346,7 @@ export interface PackedSearchRequest {
 
 export interface PackedTraceRequest {
 	text: string;
-	mode: PackedSearchRequest['mode'];
+	mode: PackedSearchClause['mode'];
 	fields: string[];
 	candidateIds?: string[];
 	records: Array<{ id: string; fields: Array<{ name: string; values: string[] }> }>;
@@ -439,6 +457,11 @@ export function encodeBatch(batch: PackedMutationBatch, maxBytes: number): Buffe
 	writer.u32(batch.deletes.length, 'deletes.length');
 	for (const upsert of batch.upserts) {
 		writer.string(upsert.id);
+		if (upsert.version !== undefined && typeof upsert.version !== 'string') {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'upsert version must be a string');
+		}
+		writer.boolean(upsert.version !== undefined);
+		if (upsert.version !== undefined) writer.string(upsert.version);
 		const fields = Object.entries(upsert.fields);
 		writer.u16(fields.length, 'upsert field count');
 		for (const [name, value] of fields) {
@@ -582,12 +605,7 @@ export function encodeSearch(request: PackedSearchRequest): Buffer {
 	validateCandidateIds(request.candidateIds);
 	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
 	writer.header('FTSQ');
-	writer.string(request.text);
-	writer.u8(['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'].indexOf(request.mode), 'mode');
-	writer.u16(request.fields.length, 'fields.length');
-	for (const field of request.fields) {
-		writer.string(field);
-	}
+	encodeSearchExpression(writer, request.expression, 0);
 	writer.boolean(request.candidateIds !== undefined);
 	if (request.candidateIds !== undefined) {
 		writer.u16(request.candidateIds.length, 'candidateIds.length');
@@ -600,6 +618,26 @@ export function encodeSearch(request: PackedSearchRequest): Buffer {
 	writer.boolean(request.exactTotal);
 	writer.u32(request.budgetMilliseconds, 'budgetMilliseconds');
 	return writer.finish();
+}
+
+function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpression, depth: number): void {
+	if (depth > 8) throw new FulltextError('E_INVALID_ARGUMENT', 'search expression nesting exceeds 8 levels');
+	if ('text' in expression) {
+		writer.u8(0, 'expression type');
+		writer.string(expression.text);
+		writer.u8(['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'].indexOf(expression.mode), 'mode');
+		writer.u16(expression.fields.length, 'fields.length');
+		for (const field of expression.fields) writer.string(field);
+		return;
+	}
+	if (expression.operator === 'not') {
+		writer.u8(3, 'expression type');
+		encodeSearchExpression(writer, expression.clause, depth + 1);
+		return;
+	}
+	writer.u8(expression.operator === 'and' ? 1 : 2, 'expression type');
+	writer.u16(expression.clauses.length, 'clauses.length');
+	for (const clause of expression.clauses) encodeSearchExpression(writer, clause, depth + 1);
 }
 
 export function encodeTrace(request: PackedTraceRequest): Buffer {
