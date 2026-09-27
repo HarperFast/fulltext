@@ -23,6 +23,7 @@ import {
 	encodeMutationBatch,
 	inspectNativeFullTextIndex,
 	openNativeFullTextIndex,
+	openNativeFullTextReader,
 	reclaimRetiredNativeFullTextIndexes,
 	resetNativeFullTextIndex,
 	validateNativeFullTextIndexOptions,
@@ -122,6 +123,42 @@ test('runs the public create, mutate, BM25 search, close, and reopen route', asy
 	);
 	assert(afterDelete.hits[0].score > 0);
 	await index.close();
+});
+
+test('opens concurrent readers, reloads publications, evaluates boolean queries, and returns source versions', async (context) => {
+	const indexPath = temporaryIndex(context);
+	const config = options(indexPath);
+	const writer = await openNativeFullTextIndex(config);
+	await writer.applyMutationBatch({
+		upserts: [
+			{ id: 'one', version: '41', fields: { title: 'red trail shoe', description: 'waterproof' } },
+			{ id: 'two', version: '42', fields: { title: 'blue road shoe', description: 'lightweight' } },
+		],
+	});
+	await writer.publish('1');
+	const [first, second] = await Promise.all([openNativeFullTextReader(config), openNativeFullTextReader(config)]);
+	const request = {
+		query: {
+			operator: 'and',
+			clauses: [{ text: 'shoe' }, { operator: 'not', clause: { text: 'blue' } }],
+		},
+		exactTotal: true,
+	};
+	const initial = await first.search(request);
+	assert.strictEqual(initial.total, 1);
+	assert.deepStrictEqual(
+		initial.hits.map(({ id, version }) => [id, version]),
+		[['one', '41']],
+	);
+	await writer.applyMutationBatch({ upserts: [{ id: 'one', version: '43', fields: { title: 'green boot' } }] });
+	await writer.publish('2');
+	assert.strictEqual((await second.search({ text: 'shoe', exactTotal: true })).total, 2);
+	await second.reload();
+	assert.deepStrictEqual(
+		(await second.search({ text: 'boot' })).hits.map(({ id, version }) => [id, version]),
+		[['one', '43']],
+	);
+	await Promise.all([first.close(), second.close(), writer.close()]);
 });
 
 test('normalizes English text and persists bounded index-time synonyms', async (context) => {

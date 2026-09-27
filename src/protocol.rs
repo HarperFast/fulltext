@@ -1,8 +1,9 @@
 use crate::error::{FulltextError, Result};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 const MAX_STRING_BYTES: usize = 1 << 20;
 pub const MAX_RECORD_ID_BYTES: usize = 4 << 10;
+pub const MAX_RECORD_VERSION_BYTES: usize = 4 << 10;
 const MAX_FIELDS: usize = 1_024;
 pub const MAX_SYNONYM_RULES: usize = 1_024;
 pub const MAX_SYNONYM_REPLACEMENTS: usize = 16;
@@ -81,6 +82,7 @@ pub struct NativeResetConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upsert {
 	pub id: String,
+	pub version: Option<String>,
 	pub fields: Vec<(String, Vec<String>)>,
 }
 
@@ -135,10 +137,33 @@ impl SearchMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SearchRequest {
+pub struct SearchClause {
 	pub text: String,
 	pub mode: SearchMode,
 	pub fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchExpression {
+	Clause(SearchClause),
+	And(Vec<SearchExpression>),
+	Or(Vec<SearchExpression>),
+	Not(Box<SearchExpression>),
+}
+
+impl SearchExpression {
+	pub fn is_expensive(&self) -> bool {
+		match self {
+			Self::Clause(clause) => clause.mode.is_expensive(),
+			Self::And(children) | Self::Or(children) => children.iter().any(Self::is_expensive),
+			Self::Not(child) => child.is_expensive(),
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchRequest {
+	pub expression: SearchExpression,
 	pub candidate_ids: Option<Vec<String>>,
 	pub offset: usize,
 	pub limit: usize,
@@ -340,14 +365,12 @@ fn packed_budget(bytes: &[u8], magic: [u8; 4], operation: &str) -> Result<u32> {
 }
 
 pub fn search_mode(bytes: &[u8]) -> Result<SearchMode> {
-	validate_search_header(bytes)?;
-	let mut cursor = Cursor::new(bytes, *b"FTSQ")?;
-	let query_length = cursor.u32()? as usize;
-	if query_length > MAX_QUERY_TEXT_BYTES {
-		return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
-	}
-	cursor.take(query_length)?;
-	decode_search_mode(cursor.u8()?)
+	let request = decode_search(bytes)?;
+	Ok(if request.expression.is_expensive() {
+		SearchMode::Fuzzy
+	} else {
+		SearchMode::Any
+	})
 }
 
 pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
@@ -368,6 +391,17 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 	let mut upserts = Vec::with_capacity(upsert_count);
 	for _ in 0..upsert_count {
 		let id = cursor.record_id()?;
+		let version = if cursor.boolean()? {
+			let version = cursor.string()?;
+			if version.len() > MAX_RECORD_VERSION_BYTES {
+				return Err(FulltextError::invalid(
+					"record versions must not exceed 4096 UTF-8 bytes",
+				));
+			}
+			Some(version)
+		} else {
+			None
+		};
 		let field_count = cursor.u16()? as usize;
 		if field_count > MAX_FIELDS {
 			return Err(FulltextError::invalid("upsert field count exceeds 1024"));
@@ -390,7 +424,7 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 			}
 			fields.push((name, values));
 		}
-		upserts.push(Upsert { id, fields });
+		upserts.push(Upsert { id, version, fields });
 	}
 	if delete_count > cursor.remaining() / 4 {
 		return Err(FulltextError::invalid("delete count exceeds the packed batch length"));
@@ -405,19 +439,9 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 
 pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	let mut cursor = Cursor::new(bytes, *b"FTSQ")?;
-	let text = cursor.string()?;
-	if text.len() > MAX_QUERY_TEXT_BYTES {
-		return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
-	}
-	let mode = decode_search_mode(cursor.u8()?)?;
-	let field_count = cursor.u16()? as usize;
-	if field_count > MAX_FIELDS {
-		return Err(FulltextError::invalid("search field count exceeds 1024"));
-	}
-	let mut fields = Vec::with_capacity(field_count);
-	for _ in 0..field_count {
-		fields.push(cursor.string()?);
-	}
+	let mut clause_count = 0usize;
+	let mut text_bytes = 0usize;
+	let expression = decode_search_expression(&mut cursor, 0, &mut clause_count, &mut text_bytes)?;
 	let has_candidates = cursor.boolean()?;
 	let candidate_count = if has_candidates { cursor.u16()? as usize } else { 0 };
 	if candidate_count > MAX_CANDIDATE_IDS {
@@ -453,22 +477,86 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	if limit == 0 || offset.saturating_add(limit) > MAX_SEARCH_WINDOW {
 		return Err(FulltextError::invalid("search window must be between 1 and 10000"));
 	}
-	if matches!(mode, SearchMode::Prefix | SearchMode::FuzzyPrefix) && (offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS)
-	{
+	if contains_prefix(&expression) && (offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS) {
 		return Err(FulltextError::invalid(
 			"prefix search requires offset zero and a limit no greater than 100",
 		));
 	}
 	Ok(SearchRequest {
-		text,
-		mode,
-		fields,
+		expression,
 		candidate_ids: has_candidates.then_some(candidate_ids),
 		offset,
 		limit,
 		exact_total,
 		budget_milliseconds,
 	})
+}
+
+fn decode_search_expression(
+	cursor: &mut Cursor<'_>,
+	depth: usize,
+	clause_count: &mut usize,
+	text_bytes: &mut usize,
+) -> Result<SearchExpression> {
+	if depth > 8 {
+		return Err(FulltextError::invalid("search expression nesting exceeds 8 levels"));
+	}
+	let kind = cursor.u8()?;
+	match kind {
+		0 => {
+			*clause_count += 1;
+			if *clause_count > MAX_QUERY_CLAUSES {
+				return Err(FulltextError::invalid("search expression exceeds 256 clauses"));
+			}
+			let text = cursor.string()?;
+			*text_bytes = text_bytes.saturating_add(text.len());
+			if *text_bytes > MAX_QUERY_TEXT_BYTES {
+				return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
+			}
+			let mode = decode_search_mode(cursor.u8()?)?;
+			let field_count = cursor.u16()? as usize;
+			if field_count > MAX_FIELDS {
+				return Err(FulltextError::invalid("search field count exceeds 1024"));
+			}
+			let mut fields = Vec::with_capacity(field_count);
+			for _ in 0..field_count {
+				fields.push(cursor.string()?);
+			}
+			Ok(SearchExpression::Clause(SearchClause { text, mode, fields }))
+		}
+		1 | 2 => {
+			let count = cursor.u16()? as usize;
+			if count == 0 || count > MAX_QUERY_CLAUSES {
+				return Err(FulltextError::invalid(
+					"boolean search expressions require 1 to 256 children",
+				));
+			}
+			let mut children = Vec::with_capacity(count);
+			for _ in 0..count {
+				children.push(decode_search_expression(cursor, depth + 1, clause_count, text_bytes)?);
+			}
+			Ok(if kind == 1 {
+				SearchExpression::And(children)
+			} else {
+				SearchExpression::Or(children)
+			})
+		}
+		3 => Ok(SearchExpression::Not(Box::new(decode_search_expression(
+			cursor,
+			depth + 1,
+			clause_count,
+			text_bytes,
+		)?))),
+		_ => Err(FulltextError::invalid("unknown search expression type")),
+	}
+}
+
+fn contains_prefix(expression: &SearchExpression) -> bool {
+	match expression {
+		SearchExpression::Clause(clause) => matches!(clause.mode, SearchMode::Prefix | SearchMode::FuzzyPrefix),
+		SearchExpression::And(children) | SearchExpression::Or(children) => children.iter().any(contains_prefix),
+		SearchExpression::Not(child) => contains_prefix(child),
+	}
 }
 
 pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
@@ -549,9 +637,7 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 	}
 	Ok(TraceRequest {
 		search: SearchRequest {
-			text,
-			mode,
-			fields,
+			expression: SearchExpression::Clause(SearchClause { text, mode, fields }),
 			candidate_ids: has_candidates.then_some(candidate_ids),
 			offset: 0,
 			limit: record_count,
@@ -770,7 +856,7 @@ mod tests {
 
 	#[test]
 	fn reset_frame_contains_only_path_and_logical_index_id() {
-		let mut bytes = b"FTRX\x03\x00".to_vec();
+		let mut bytes = b"FTRX\x04\x00".to_vec();
 		for value in ["/tmp/index", "products"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -791,7 +877,7 @@ mod tests {
 
 	#[test]
 	fn inspection_frame_is_distinct_and_rejects_trailing_limits() {
-		let mut bytes = b"FTIP\x03\x00".to_vec();
+		let mut bytes = b"FTIP\x04\x00".to_vec();
 		for value in ["/tmp/index", "products", "one", "english@2"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -814,7 +900,7 @@ mod tests {
 
 	#[test]
 	fn rejects_counts_before_allocating() {
-		let mut bytes = b"FTMB\x03\x00".to_vec();
+		let mut bytes = b"FTMB\x04\x00".to_vec();
 		bytes.extend_from_slice(&u32::MAX.to_le_bytes());
 		bytes.extend_from_slice(&0u32.to_le_bytes());
 		assert_eq!(decode_batch(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
@@ -858,7 +944,7 @@ mod tests {
 
 	#[test]
 	fn distinguishes_batch_size_from_invalid_encoding() {
-		let bytes = b"FTMB\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+		let bytes = b"FTMB\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 		assert_eq!(
 			validate_batch_header(bytes, bytes.len() - 1).unwrap_err().code,
 			"E_BATCH_TOO_LARGE"
@@ -921,14 +1007,14 @@ mod tests {
 
 	#[test]
 	fn rejects_nested_counts_before_allocating() {
-		let mut fields = b"FTMB\x03\x00".to_vec();
+		let mut fields = b"FTMB\x04\x00".to_vec();
 		fields.extend_from_slice(&1u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&u16::MAX.to_le_bytes());
 		assert_eq!(decode_batch(&fields).unwrap_err().code, "E_INVALID_ARGUMENT");
 
-		let mut values = b"FTMB\x03\x00".to_vec();
+		let mut values = b"FTMB\x04\x00".to_vec();
 		values.extend_from_slice(&1u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());

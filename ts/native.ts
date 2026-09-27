@@ -27,10 +27,10 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	queryApiVersion: 1;
+	queryApiVersion: 2;
 	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
-	mutationBatchApiVersion: 3;
+	mutationBatchApiVersion: 4;
 	storageBackends: ReadonlyArray<'native'>;
 	limits: {
 		maxCommitPayloadBytes: number;
@@ -40,6 +40,7 @@ export interface RuntimeInfo {
 		maxCandidateIds: number;
 		maxCandidateBytes: number;
 		maxRecordIdBytes: number;
+		maxRecordVersionBytes: number;
 		maxPrefixExpansions: number;
 		maxFuzzyTerms: number;
 		maxSearchWindow: number;
@@ -118,7 +119,7 @@ export type NativeFullTextIndexResetResult = { state: 'missing' } | { state: 're
 export type NativeFullTextReclaimResult = { removed: number; failed: number };
 
 export interface FullTextMutationBatch {
-	upserts?: Array<{ id: string; fields: Record<string, string | string[]> }>;
+	upserts?: Array<{ id: string; version?: string; fields: Record<string, string | string[]> }>;
 	deletes?: string[];
 }
 
@@ -169,8 +170,21 @@ export type SearchMode =
 	/** Preview until catalog-scale performance qualification is complete. */
 	| 'fuzzy-prefix';
 
-export interface SearchRequest {
+export interface SearchClause {
 	text: string;
+	mode?: SearchMode;
+	operator?: 'any' | 'all';
+	fields?: string[];
+}
+
+export type SearchExpression =
+	| SearchClause
+	| { operator: 'and' | 'or'; clauses: SearchExpression[] }
+	| { operator: 'not'; clause: SearchExpression };
+
+export interface SearchRequest {
+	text?: string;
+	query?: SearchExpression;
 	mode?: SearchMode;
 	operator?: 'any' | 'all';
 	fields?: string[];
@@ -183,7 +197,7 @@ export interface SearchRequest {
 export interface SearchResult {
 	total: number;
 	totalRelation: 'exact' | 'lower-bound';
-	hits: Array<{ id: string; score: number }>;
+	hits: Array<{ id: string; score: number; version?: string }>;
 }
 
 export interface SearchExecutionOptions {
@@ -493,6 +507,7 @@ export class NativeFullTextIndex {
 	}
 
 	async search(request: SearchRequest, options: SearchExecutionOptions = {}): Promise<SearchResult> {
+		const expression = normalizeSearchExpression(request);
 		if (request.mode !== undefined && request.operator !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 		}
@@ -500,9 +515,7 @@ export class NativeFullTextIndex {
 			loadAddon().__nativeSearch(
 				this.#handle,
 				encodeSearch({
-					text: request.text,
-					mode: request.mode ?? request.operator ?? 'any',
-					fields: request.fields ?? [],
+					expression,
 					candidateIds: request.candidateIds,
 					offset: request.offset ?? 0,
 					limit: request.limit ?? 20,
@@ -515,7 +528,12 @@ export class NativeFullTextIndex {
 		const total = safeNumber(cursor.u64(), 'search total');
 		const relation = cursor.u8();
 		const hitCount = cursor.u32();
-		const hits = Array.from({ length: hitCount }, () => ({ score: cursor.f32(), id: cursor.string() }));
+		const hits = Array.from({ length: hitCount }, () => {
+			const score = cursor.f32();
+			const id = cursor.string();
+			const version = cursor.u8() === 1 ? cursor.string() : undefined;
+			return { score, id, ...(version === undefined ? {} : { version }) };
+		});
 		cursor.finish();
 		if (relation !== 0 && relation !== 1) {
 			throw new FulltextError('E_NATIVE_FAILURE', `Unknown total relation ${relation}`);
@@ -532,6 +550,10 @@ export class NativeFullTextIndex {
 		records: TraceRecord[],
 		options: TraceMatchesOptions = {},
 	): Promise<TraceMatchesResult> {
+		if (request.query !== undefined || typeof request.text !== 'string') {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'traceMatches requires a text search request');
+		}
+		const text = request.text;
 		if (request.mode !== undefined && request.operator !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 		}
@@ -577,7 +599,7 @@ export class NativeFullTextIndex {
 			loadAddon().__nativeTraceMatches(
 				this.#handle,
 				encodeTrace({
-					text: request.text,
+					text,
 					mode: request.mode ?? request.operator ?? 'any',
 					fields: request.fields ?? [],
 					candidateIds: request.candidateIds,
@@ -711,6 +733,42 @@ export class NativeFullTextIndex {
 		if (this.#closed || this.#closePromise) {
 			throw new FulltextError('E_CLOSED', 'index is closing or closed');
 		}
+	}
+}
+
+export class NativeFullTextReader {
+	readonly #inner: NativeFullTextIndex;
+
+	constructor(inner: NativeFullTextIndex) {
+		this.#inner = inner;
+	}
+
+	get committedPayload(): string | undefined {
+		return this.#inner.committedPayload;
+	}
+
+	reload(): Promise<void> {
+		return this.#inner.reload();
+	}
+
+	search(request: SearchRequest, options: SearchExecutionOptions = {}): Promise<SearchResult> {
+		return this.#inner.search(request, options);
+	}
+
+	traceMatches(
+		request: SearchRequest,
+		records: TraceRecord[],
+		options: TraceMatchesOptions = {},
+	): Promise<TraceMatchesResult> {
+		return this.#inner.traceMatches(request, records, options);
+	}
+
+	status(): FullTextStatus {
+		return this.#inner.status();
+	}
+
+	close(): Promise<CloseResult> {
+		return this.#inner.close();
 	}
 }
 
@@ -899,6 +957,39 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 	}
 }
 
+export async function openNativeFullTextReader(options: NativeFullTextIndexOptions): Promise<NativeFullTextReader> {
+	let config: ReturnType<typeof packedOptions>;
+	let packed: Buffer;
+	try {
+		config = packedOptions(options);
+		config.limits = { ...config.limits };
+		packed = encodeOpen(config);
+	} catch (error) {
+		throw normalizeOptionsError(error);
+	}
+	const cursor = await invoke((callback) => loadAddon().__nativeOpenReader(packed, callback));
+	const handle = cursor.u32();
+	try {
+		const hasPayload = cursor.u8();
+		if (hasPayload !== 0 && hasPayload !== 1) {
+			throw new FulltextError('E_NATIVE_FAILURE', `Unknown committed payload status ${hasPayload}`);
+		}
+		const payload = hasPayload === 1 ? cursor.string() : undefined;
+		cursor.finish();
+		return new NativeFullTextReader(
+			new NativeFullTextIndex({
+				handle,
+				committedPayload: payload,
+				maxBatchBytes: config.limits.maxBatchBytes,
+				fieldNames: config.fields.map((field) => field.name),
+			}),
+		);
+	} catch (error) {
+		await invoke((callback) => loadAddon().__nativeClose(handle, true, callback)).catch(() => undefined);
+		throw error;
+	}
+}
+
 function packedOpenOptions(options: NativeFullTextIndexOptions): Buffer {
 	const config = packedOptions(options);
 	config.limits = { ...config.limits };
@@ -940,10 +1031,10 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			queryApiVersion: info.queryApiVersion as 1,
+			queryApiVersion: info.queryApiVersion as 2,
 			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
-			mutationBatchApiVersion: 3,
+			mutationBatchApiVersion: 4,
 			storageBackends: ['native'],
 			limits: { ...info.limits },
 		};
@@ -954,6 +1045,61 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 
 function asBuffer(value: Uint8Array): Buffer {
 	return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+}
+
+function normalizeSearchExpression(request: SearchRequest): import('./codec.js').PackedSearchExpression {
+	if (!request || typeof request !== 'object' || Array.isArray(request)) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'search request must be an object');
+	}
+	if (request.query !== undefined) {
+		if (
+			request.text !== undefined ||
+			request.mode !== undefined ||
+			request.operator !== undefined ||
+			request.fields !== undefined
+		) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'query cannot be combined with text, mode, operator, or fields');
+		}
+		return normalizeExpression(request.query, 0);
+	}
+	if (typeof request.text !== 'string') {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'search request requires text or query');
+	}
+	return {
+		text: request.text,
+		mode: request.mode ?? request.operator ?? 'any',
+		fields: request.fields ?? [],
+	};
+}
+
+function normalizeExpression(expression: SearchExpression, depth: number): import('./codec.js').PackedSearchExpression {
+	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > 8) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search expression');
+	}
+	if ('text' in expression) {
+		if (typeof expression.text !== 'string' || (expression.mode !== undefined && expression.operator !== undefined)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search clause');
+		}
+		return {
+			text: expression.text,
+			mode: expression.mode ?? expression.operator ?? 'any',
+			fields: expression.fields ?? [],
+		};
+	}
+	if (expression.operator === 'not') {
+		return { operator: 'not', clause: normalizeExpression(expression.clause, depth + 1) };
+	}
+	if (
+		(expression.operator !== 'and' && expression.operator !== 'or') ||
+		!Array.isArray(expression.clauses) ||
+		expression.clauses.length === 0
+	) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'boolean search expressions require at least one clause');
+	}
+	return {
+		operator: expression.operator,
+		clauses: expression.clauses.map((clause) => normalizeExpression(clause, depth + 1)),
+	};
 }
 
 function snapshotMutationBatch(batch: FullTextMutationBatch): Required<FullTextMutationBatch> {
@@ -969,7 +1115,9 @@ function snapshotMutationBatch(batch: FullTextMutationBatch): Required<FullTextM
 	return {
 		upserts:
 			batch.upserts?.map((upsert) =>
-				upsert && typeof upsert === 'object' ? { id: upsert.id, fields: upsert.fields } : upsert,
+				upsert && typeof upsert === 'object'
+					? { id: upsert.id, version: upsert.version, fields: upsert.fields }
+					: upsert,
 			) ?? [],
 		deletes: batch.deletes?.slice() ?? [],
 	};

@@ -51,7 +51,7 @@ const index = await openNativeFullTextIndex({
 
 try {
 	await index.applyMutationBatch({
-		upserts: [{ id: 'shoe-1', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
+		upserts: [{ id: 'shoe-1', version: '42', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
 	});
 	await index.commit();
 	await index.reload();
@@ -180,6 +180,24 @@ truncating the term set and returning incomplete rankings. `fuzzy-prefix` is a p
 until catalog-scale benchmark qualification is complete.
 
 Record IDs are limited to 4,096 UTF-8 bytes, keeping deterministic tie-page sorting memory bounded.
+An upsert may include an opaque `version` string of up to 4,096 UTF-8 bytes. The version is returned
+with its search hit, allowing a derived-index consumer to discard a hit when the authoritative
+record has moved past the indexed version.
+
+Use `query` for Boolean expressions within one index. Expressions may nest to eight levels and are
+bounded by the same request, term, and clause limits as simple searches:
+
+```js
+const result = await index.search({
+	query: {
+		operator: 'and',
+		clauses: [
+			{ text: 'waterproof trail', mode: 'all', fields: ['title'] },
+			{ operator: 'not', clause: { text: 'used' } },
+		],
+	},
+});
+```
 
 `total` is bounded by default so Tantivy can retain block-max WAND pruning. Set `exactTotal: true`
 only when an exact match count is worth a second full-match traversal. Ranking is score descending,
@@ -247,6 +265,25 @@ is idle. A one-thread configuration remains valid but cannot isolate query class
 `close()` rejects uncommitted data by default. Use `close({ mode: 'rollback' })` to discard it
 explicitly. `commit()` publishes mutations, and `reload()` makes the latest commit visible to this
 handle's searches.
+
+### Read-only handles
+
+One process may open one writer and multiple readers for the same physical index. Readers share the
+same bounded search runtime but never reserve Tantivy's writer lock:
+
+```js
+import { openNativeFullTextReader } from '@harperfast/fulltext/native';
+
+const reader = await openNativeFullTextReader(options);
+await reader.reload(); // call after the writer publishes a newer checkpoint
+const result = await reader.search({ text: 'trail shoe' });
+await reader.close();
+```
+
+Readers use Tantivy's manual reload policy. They do not watch or poll the filesystem; the caller
+coordinates publication and calls `reload()` only when a newer revision is available. Reset rejects
+while any writer or reader is live. A reader never creates missing storage and fails with
+`E_INDEX_NOT_READY` until a writer has created a complete index.
 
 ### Checkpointed publication
 

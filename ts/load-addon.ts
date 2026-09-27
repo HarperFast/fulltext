@@ -19,6 +19,7 @@ interface NativeRuntimeInfo {
 		maxCandidateIds: number;
 		maxCandidateBytes: number;
 		maxRecordIdBytes: number;
+		maxRecordVersionBytes: number;
 		maxPrefixExpansions: number;
 		maxFuzzyTerms: number;
 		maxSearchWindow: number;
@@ -42,6 +43,7 @@ interface NativeAddonApi {
 	__nativeInspect(config: Buffer): Buffer;
 	__nativeReset(config: Buffer, callback: NativeCallback): void;
 	__nativeOpen(config: Buffer, callback: NativeCallback): void;
+	__nativeOpenReader(config: Buffer, callback: NativeCallback): void;
 	__nativeApply(handle: number, batch: Buffer, callback: NativeCallback): void;
 	__nativeCommit(handle: number, callback: NativeCallback): void;
 	__nativePublish(handle: number, payload: string, callback: NativeCallback): void;
@@ -65,7 +67,7 @@ interface NativeAddonApi {
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 7;
+const expectedNativeAbiVersion = 8;
 const packageManifest = require('../package.json') as { name: string; version: string };
 let loadedAddon: NativeAddonApi | undefined;
 let runtimeUsesGlibc: boolean | undefined;
@@ -195,7 +197,7 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 			`Fulltext native ABI ${info.nativeAbiVersion} from ${artifactPath} does not match ${expectedNativeAbiVersion}`,
 		);
 	}
-	if (info.queryApiVersion !== 1) {
+	if (info.queryApiVersion !== 2) {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',
 			`Fulltext query API ${info.queryApiVersion} from ${artifactPath} is not supported`,
@@ -223,6 +225,12 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',
 			`Fulltext native artifact ${artifactPath} does not provide index reset`,
+		);
+	}
+	if (typeof addon.__nativeOpenReader !== 'function') {
+		throw new FulltextError(
+			'E_NATIVE_CAPABILITY_MISMATCH',
+			`Fulltext native artifact ${artifactPath} does not provide read-only index handles`,
 		);
 	}
 	if (info.storageBackends.length !== 1 || info.storageBackends[0] !== 'native') {

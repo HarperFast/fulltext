@@ -151,6 +151,8 @@ The exported flow is:
    The application validates the opaque payload against its own replay-cursor contract.
 2. `openNativeFullTextIndex(options)` creates the directory when absent, canonicalizes it, reserves
    the canonical path, and asynchronously creates or reopens Tantivy state.
+   `openNativeFullTextReader(options)` opens existing state without acquiring a writer and may be
+   called multiple times for the same path. Each reader uses manual reload and never polls files.
 3. `index.encodeMutationBatches(batch)` validates one logical batch against the opened schema and
    greedily creates versioned packed requests within the opened byte limits. Invalid individual
    mutations are reported by operation and per-operation array index; they are never dropped.
@@ -257,10 +259,11 @@ Rust-owned `Vec<u8>` before admission; no native thread borrows memory owned by 
 Queue wait and engine execution time are reported separately in status/benchmark output. Effective
 writer arena, indexing-thread, and search-thread values are printed in every benchmark record.
 
-The registry rejects a second live open of the same canonical path. This is narrower than the
-eventual shared multi-environment registry, but it preserves the one-writer invariant without
-pretending two JavaScript handles have coordinated close ownership. Reference-counted shared
-handles can replace rejection later without changing the index contract.
+The registry rejects a second writer for the same canonical path and admits bounded read-only
+handles alongside the writer. A reset requires both the writer and every reader to be closed.
+Readers reserve search threads and queue bytes from the process budget but do not reserve indexing
+threads or writer memory. Publication coordination belongs to the caller: a reader calls
+`reload()` only after learning that the writer published a newer revision.
 
 Inspection is outside the handle registry and writer actor. It opens Tantivy's
 managed directory read-only long enough to validate the persisted schema and read the current
@@ -445,10 +448,10 @@ controls repeated passes, and requested index counts are capped at 10,000 total 
 ## Verification
 
 - Rust unit tests: schema equality, analyzer behavior, batch decode bounds, upsert/delete ordering,
-  query construction, close state, duplicate path rejection, and queue saturation.
+  query construction, close state, duplicate writer rejection, and queue saturation.
 - Node tests through `@harperfast/fulltext/native`: create, apply, commit, reload, BM25 ranking,
-  reopen, read-only inspection while a writer is held, mutation validation, schema mismatch, close
-  modes, and event-loop responsiveness.
+  reopen, concurrent read-only handles, manual publication refresh, Boolean queries, hit versions,
+  mutation validation, schema mismatch, close modes, and event-loop responsiveness.
 - Process tests: kill the indexer immediately after a successful commit and verify the committed
   corpus after reopen; kill before commit and verify it is absent. A worker-thread test verifies
   promises settle only into their originating Node environment.
