@@ -111,8 +111,9 @@ fails with `E_RESOURCE_LIMIT`. A failed first open that proves its native resour
 does not prevent later configuration. An
 unproven pre-publication teardown blocks configuration until restart. The governor bounds aggregate
 resident indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
-expensive searches. Aggregate queue accounting reserves each index's writer queue plus its shared
-search queues, or twice that index's `maxQueuedBytes`. A conflicting second configuration or an
+expensive searches. Each writer reserves twice its `maxQueuedBytes` for the writer and shared search
+queues; each read-only handle reserves it once for search. Every writer or reader also consumes one
+resident-index slot and its configured search-thread count. A conflicting second configuration or an
 open that would exceed an admission cap fails with `E_RESOURCE_LIMIT`; the library never evicts a
 live generation. Expensive searches wait off the JavaScript thread for process capacity, bounded
 by the request deadline and interrupted by close, allowing the search queues to apply backpressure.
@@ -266,12 +267,14 @@ one-thread configuration remains valid but cannot isolate query classes.
 `close()` rejects uncommitted data by default. Use `close({ mode: 'rollback' })` to discard it
 explicitly. `commit()` publishes mutations, and `reload()` makes the latest commit visible to this
 handle's searches. A reload that cannot align Tantivy's snapshot with its checkpoint after three
-immediate attempts returns `E_RELOAD_FAILED`; callers can retry because the reader remains open.
+bounded attempts returns `E_RELOAD_FAILED`; callers can retry because the reader remains open.
+The failed attempt leaves the reader on its previous aligned snapshot and checkpoint.
 
 ### Read-only handles
 
 One process may open one writer and multiple readers for the same physical index. Readers share the
-same bounded search runtime but never reserve Tantivy's writer lock:
+same physical files, but each has an independently bounded search runtime and never reserves
+Tantivy's writer lock:
 
 ```js
 import { openNativeFullTextReader } from '@harperfast/fulltext/native';

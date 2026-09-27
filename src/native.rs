@@ -4,7 +4,7 @@ use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,12 +13,11 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Status};
 use napi_derive::napi;
 use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory, INDEX_WRITER_LOCK, META_LOCK};
-use tantivy::IndexReader;
+use tantivy::{IndexReader, Searcher};
 
 use crate::boundary;
 use crate::engine::{
-	persisted_index_id, recovery_index_error, Engine, InspectionResult, SearchResult, TotalRelation, TraceResult,
-	Writer, IDENTITY_PATH,
+	persisted_index_id, Engine, InspectionResult, SearchResult, TotalRelation, TraceResult, Writer, IDENTITY_PATH,
 };
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
@@ -170,6 +169,10 @@ struct RuntimeParts {
 	reader: IndexReader,
 	read_only: bool,
 	reservation: RuntimeAdmission,
+}
+
+struct SnapshotReader {
+	current: RwLock<IndexReader>,
 }
 
 struct CompletionSignal {
@@ -981,7 +984,7 @@ impl Runtime {
 		let read_only = parts.read_only;
 		let expensive_search_budget = parts.reservation.budget();
 		let engine = Arc::new(parts.engine);
-		let reader = Arc::new(parts.reader);
+		let reader = Arc::new(SnapshotReader::new(parts.reader));
 		let writer_queue = Arc::new(BoundedQueue::new(
 			parts.config.limits.max_queued_commands,
 			parts.config.limits.max_queued_bytes,
@@ -1235,6 +1238,29 @@ impl Runtime {
 
 	fn wait_closed(&self, timeout: Duration) -> bool {
 		self.closed.wait(timeout)
+	}
+}
+
+impl SnapshotReader {
+	fn new(reader: IndexReader) -> Self {
+		Self {
+			current: RwLock::new(reader),
+		}
+	}
+
+	fn searcher(&self) -> Searcher {
+		self.current
+			.read()
+			.unwrap_or_else(|error| error.into_inner())
+			.searcher()
+	}
+
+	fn replace(&self, reader: IndexReader) {
+		*self.current.write().unwrap_or_else(|error| error.into_inner()) = reader;
+	}
+
+	fn reload(&self) -> tantivy::Result<()> {
+		self.current.read().unwrap_or_else(|error| error.into_inner()).reload()
 	}
 }
 
@@ -1610,13 +1636,18 @@ impl WriterCommand {
 	}
 }
 
-fn writer_loop(runtime: Arc<Runtime>, writer: Option<Writer>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
+fn writer_loop(runtime: Arc<Runtime>, writer: Option<Writer>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
 	let closed = runtime.closed.clone();
 	writer_loop_inner(runtime, writer, engine, reader);
 	closed.signal();
 }
 
-fn writer_loop_inner(runtime: Arc<Runtime>, mut writer: Option<Writer>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
+fn writer_loop_inner(
+	runtime: Arc<Runtime>,
+	mut writer: Option<Writer>,
+	engine: Arc<Engine>,
+	reader: Arc<SnapshotReader>,
+) {
 	while let Some(queued) = runtime.writer_queue.pop() {
 		runtime
 			.writer_queue_nanoseconds
@@ -1813,7 +1844,7 @@ fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool)
 fn finish_runtime(
 	runtime: &Arc<Runtime>,
 	engine: Arc<Engine>,
-	reader: Arc<IndexReader>,
+	reader: Arc<SnapshotReader>,
 	mut outcome: WriterCloseOutcome,
 ) -> WriterCloseOutcome {
 	runtime.ordinary_search_queue.shutdown_after_drain();
@@ -1928,7 +1959,7 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 		.ok_or_else(|| FulltextError::new("E_POISONED", "writer is unavailable"))
 }
 
-fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
+fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
 	while let Some(queued) = runtime.ordinary_search_queue.pop() {
 		#[cfg(feature = "test-panic")]
 		{
@@ -1943,7 +1974,7 @@ fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 	}
 }
 
-fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<IndexReader>) {
+fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
 	let expensive = runtime.expensive_search_queue.as_ref().unwrap();
 	let wake = runtime.search_wake.as_ref().unwrap();
 	loop {
@@ -2019,12 +2050,22 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 	}
 }
 
-fn reload_payload(reader: &IndexReader, engine: &Engine) -> Result<Option<String>> {
-	for _ in 0..3 {
-		reader.reload().map_err(recovery_index_error)?;
-		match engine.committed_payload_for_searcher(&reader.searcher()) {
-			Ok(payload) => return Ok(payload),
-			Err(error) if error.code == "E_RELOAD_FAILED" => continue,
+fn reload_payload(reader: &SnapshotReader, engine: &Engine) -> Result<Option<String>> {
+	let (candidate, payload) = aligned_reader(engine)?;
+	reader.replace(candidate);
+	Ok(payload)
+}
+
+fn aligned_reader(engine: &Engine) -> Result<(IndexReader, Option<String>)> {
+	for attempt in 0..3 {
+		let candidate = engine.reader_for_open()?;
+		match engine.committed_payload_for_searcher(&candidate.searcher()) {
+			Ok(payload) => return Ok((candidate, payload)),
+			Err(error) if error.code == "E_RELOAD_FAILED" => {
+				if attempt < 2 {
+					thread::sleep(Duration::from_millis(1 << attempt));
+				}
+			}
 			Err(error) => return Err(error),
 		}
 	}
@@ -2037,7 +2078,7 @@ fn reload_payload(reader: &IndexReader, engine: &Engine) -> Result<Option<String
 fn execute_search_command(
 	runtime: &Runtime,
 	engine: &Engine,
-	reader: &IndexReader,
+	reader: &SnapshotReader,
 	queued: Queued<SearchCommand>,
 	preacquired_permit: Option<ExpensiveSearchPermit>,
 ) -> bool {
@@ -2644,13 +2685,14 @@ fn open_runtime_with_directory(
 		}
 		let reservation = admit_runtime(&config.limits, read_only)?;
 		let engine = Engine::open(directory, &config)?;
-		let (writer, committed_payload) = if read_only {
-			(None, engine.committed_payload()?)
+		let (writer, writer_payload) = if read_only {
+			(None, None)
 		} else {
 			let (writer, payload) = engine.writer_with_payload(&config)?;
 			(Some(writer), payload)
 		};
-		let reader = engine.reader_for_open()?;
+		let (reader, reader_payload) = aligned_reader(&engine)?;
+		let committed_payload = if read_only { reader_payload } else { writer_payload };
 		let runtime = Runtime::start(
 			handle,
 			environment.clone(),
