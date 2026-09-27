@@ -366,6 +366,8 @@ to reclaim.
 
 An established duplicate open returns `E_DUPLICATE_OPEN`. An open racing another open or reset can
 return `E_LOCK_BUSY` while the shared lifecycle lock is held; callers may retry that acquisition.
+An open that cannot capture one checkpoint-aligned Tantivy snapshot returns `E_RELOAD_FAILED`; retry
+the open.
 Lifecycle lock files are stored in the index parent's `.fulltext-locks` directory so reset can keep
 the handoff lock while renaming the native directory on Windows. The library does not remove this
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain

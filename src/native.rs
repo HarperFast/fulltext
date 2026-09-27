@@ -94,6 +94,8 @@ struct Runtime {
 	#[cfg(feature = "test-panic")]
 	publish_fault: AtomicU8,
 	#[cfg(feature = "test-panic")]
+	reload_alignment_faults: AtomicU8,
+	#[cfg(feature = "test-panic")]
 	poison_before_admission: AtomicBool,
 	#[cfg(feature = "test-panic")]
 	close_fault: AtomicU8,
@@ -600,6 +602,17 @@ pub fn test_fail_next_publish(env: Env, handle: u32, after_commit: bool) -> boun
 }
 
 #[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailNextReloadAlignment")]
+pub fn test_fail_next_reload_alignment(env: Env, handle: u32) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		runtime(&env, handle)?
+			.reload_alignment_faults
+			.store(3, Ordering::Release);
+		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
 #[napi(catch_unwind, skip_typescript, js_name = "__testFailNextClose")]
 pub fn test_fail_next_close(env: Env, handle: u32, quiesced: bool) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
@@ -1036,6 +1049,8 @@ impl Runtime {
 			#[cfg(feature = "test-panic")]
 			publish_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
+			reload_alignment_faults: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
 			poison_before_admission: AtomicBool::new(false),
 			#[cfg(feature = "test-panic")]
 			close_fault: AtomicU8::new(0),
@@ -1258,7 +1273,9 @@ impl SnapshotReader {
 		self.active.read().unwrap_or_else(|error| error.into_inner()).reload()
 	}
 
-	fn reload_aligned(&self, engine: &Engine) -> Result<Option<String>> {
+	fn reload_aligned(&self, engine: &Engine, runtime: &Runtime) -> Result<Option<String>> {
+		#[cfg(not(feature = "test-panic"))]
+		let _ = runtime;
 		let mut staging = lock(&self.staging);
 		let reused = staging.is_some();
 		let mut candidate = match staging.take() {
@@ -1272,7 +1289,24 @@ impl SnapshotReader {
 					return Err(FulltextError::native(error));
 				}
 			}
-			match engine.committed_payload_for_searcher(&candidate.searcher()) {
+			#[cfg(feature = "test-panic")]
+			let aligned = if runtime
+				.reload_alignment_faults
+				.fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+					remaining.checked_sub(1)
+				})
+				.is_ok()
+			{
+				Err(FulltextError::new(
+					"E_RELOAD_FAILED",
+					"injected reload alignment failure",
+				))
+			} else {
+				engine.committed_payload_for_searcher(&candidate.searcher())
+			};
+			#[cfg(not(feature = "test-panic"))]
+			let aligned = engine.committed_payload_for_searcher(&candidate.searcher());
+			match aligned {
 				Ok(payload) => {
 					let mut active = self.active.write().unwrap_or_else(|error| error.into_inner());
 					mem::swap(&mut *active, &mut candidate);
@@ -1748,7 +1782,7 @@ fn writer_loop_inner(
 				),
 			},
 			WriterOperation::Reload => WriterOutcome::Continue(
-				reload_payload(&reader, &engine).map(|payload| payload_body(payload.as_deref())),
+				reload_payload(&reader, &engine, &runtime).map(|payload| payload_body(payload.as_deref())),
 			),
 			WriterOperation::Close { rollback } => {
 				let dirty = runtime.uncommitted_mutations.load(Ordering::Acquire) > 0;
@@ -2084,8 +2118,8 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 	}
 }
 
-fn reload_payload(reader: &SnapshotReader, engine: &Engine) -> Result<Option<String>> {
-	reader.reload_aligned(engine)
+fn reload_payload(reader: &SnapshotReader, engine: &Engine, runtime: &Runtime) -> Result<Option<String>> {
+	reader.reload_aligned(engine, runtime)
 }
 
 fn aligned_reader(engine: &Engine) -> Result<(IndexReader, Option<String>)> {

@@ -239,10 +239,12 @@ writer actor ─► shared engine ─► MmapDirectory
 The native addon owns these threads and queues; no sustained operation runs on the JavaScript event
 loop or libuv pool. The writer actor is the sole owner of `IndexWriter`, making mutation, commit,
 rollback, and shutdown ordering explicit. A small configurable search pool shares the
-`IndexReader`; each request captures its immutable `Searcher`, so searches overlap each other as
-well as indexing and commit. `reload()` first crosses the writer queue as a barrier, reloads the
-shared reader under a short coordination lock, and publishes the new searcher to subsequent
-requests. Tantivy remains free to use its configured indexing and merge workers behind the writer
+active `IndexReader`; each request captures its immutable `Searcher`, so searches overlap each
+other as well as indexing and commit. `reload()` first crosses the writer queue as a barrier. It
+reloads a reusable staging reader, validates that reader against the persisted checkpoint, then
+swaps it into the active slot. A failed validation leaves the prior aligned snapshot active and
+returns retryable `E_RELOAD_FAILED`. Tantivy remains free to use its configured indexing and merge
+workers behind the writer
 actor. Independent indexes and their
 searches may run concurrently. The process governor bounds their aggregate resources without
 replacing the per-index search pools with a shared scheduler.

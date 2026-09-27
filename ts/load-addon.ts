@@ -58,6 +58,7 @@ interface NativeAddonApi {
 	__testPoisonNativeHandle?(handle: number): void;
 	__testPoisonBeforeNextAdmission?(handle: number): void;
 	__testFailNextPublish?(handle: number, afterCommit: boolean): void;
+	__testFailNextReloadAlignment?(handle: number): void;
 	__testFailNextClose?(handle: number, quiesced: boolean): void;
 	__testFailNextOpenCleanup?(): void;
 	__testDelayNextExpensiveSearch?(handle: number, milliseconds: number): void;

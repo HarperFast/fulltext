@@ -876,10 +876,13 @@ impl Engine {
 				let child = self.expression_query(searcher, child)?;
 				self.check_total_clause_count(child.clauses, 2)?;
 				Ok(BuiltQuery {
-					query: Box::new(BooleanQuery::new(vec![
-						(Occur::Must, Box::new(tantivy::query::AllQuery)),
-						(Occur::MustNot, child.query),
-					])),
+					query: Box::new(ConstScoreQuery::new(
+						Box::new(BooleanQuery::new(vec![
+							(Occur::Must, Box::new(tantivy::query::AllQuery)),
+							(Occur::MustNot, child.query),
+						])),
+						0.0,
+					)),
 					clauses: child.clauses + 2,
 				})
 			}
@@ -2945,6 +2948,27 @@ mod tests {
 		assert_eq!(
 			search("waterproof", SearchMode::Any, Some(vec!["two"])).hits[0].id,
 			"two"
+		);
+		let baseline = search("waterproof", SearchMode::Any, None);
+		let excluded = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					expression: SearchExpression::And(vec![
+						expression("waterproof", SearchMode::Any, Vec::new()),
+						SearchExpression::Not(Box::new(expression("wireless", SearchMode::Any, Vec::new()))),
+					]),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert_eq!(
+			excluded.hits.iter().map(|hit| (&hit.id, hit.score)).collect::<Vec<_>>(),
+			baseline.hits.iter().map(|hit| (&hit.id, hit.score)).collect::<Vec<_>>()
 		);
 		assert!(search("waterproof", SearchMode::Any, Some(Vec::new())).hits.is_empty());
 		assert!(search("the", SearchMode::Any, None).hits.is_empty());
