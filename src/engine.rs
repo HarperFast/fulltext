@@ -339,6 +339,22 @@ impl Engine {
 		validated_committed_payload(&self.index)
 	}
 
+	pub fn committed_payload_for_searcher(&self, searcher: &Searcher) -> Result<Option<String>> {
+		let metas = self.index.load_metas().map_err(recovery_index_error)?;
+		let segments = metas
+			.segments
+			.iter()
+			.map(|segment| (segment.id(), segment.delete_opstamp()))
+			.collect::<std::collections::BTreeMap<_, _>>();
+		if searcher.generation().segments() != &segments {
+			return Err(FulltextError::new(
+				"E_RELOAD_FAILED",
+				"native index changed during reload; retry the reload",
+			));
+		}
+		validated_payload(metas.payload)
+	}
+
 	pub fn search(&self, searcher: &Searcher, request: &SearchRequest) -> Result<SearchResult> {
 		self.search_inner(searcher, request, None)
 	}
@@ -2275,7 +2291,7 @@ fn index_error(error: tantivy::TantivyError) -> FulltextError {
 	}
 }
 
-fn recovery_index_error(error: tantivy::TantivyError) -> FulltextError {
+pub(crate) fn recovery_index_error(error: tantivy::TantivyError) -> FulltextError {
 	match error {
 		tantivy::TantivyError::DataCorruption(_) => FulltextError::new("E_INDEX_CORRUPT", error.to_string()),
 		tantivy::TantivyError::IncompatibleIndex(_)
@@ -2307,6 +2323,10 @@ fn recovery_index_error(error: tantivy::TantivyError) -> FulltextError {
 
 fn validated_committed_payload(index: &Index) -> Result<Option<String>> {
 	let payload = index.load_metas().map_err(recovery_index_error)?.payload;
+	validated_payload(payload)
+}
+
+fn validated_payload(payload: Option<String>) -> Result<Option<String>> {
 	if payload
 		.as_ref()
 		.is_some_and(|payload| payload.len() > MAX_COMMIT_PAYLOAD_BYTES)
@@ -3178,6 +3198,33 @@ mod tests {
 		let (mut writer, payload) = old_view.writer_with_payload(&config).unwrap();
 		assert_eq!(payload.as_deref(), Some("published-by-other-owner"));
 		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
+	}
+
+	#[test]
+	fn committed_payload_requires_the_same_searcher_snapshot() {
+		let directory = RamDirectory::create();
+		let config = config();
+		let reader_engine = Engine::open(directory.clone(), &config).unwrap();
+		let reader = reader_engine.reader().unwrap();
+		let writer_engine = Engine::open(directory, &config).unwrap();
+		let mut writer = writer_engine.writer(&config).unwrap();
+		writer.apply(batch()).unwrap();
+		writer.commit_with_payload(Some("cursor-v1")).unwrap();
+		assert_eq!(
+			reader_engine
+				.committed_payload_for_searcher(&reader.searcher())
+				.unwrap_err()
+				.code,
+			"E_RELOAD_FAILED"
+		);
+		reader.reload().unwrap();
+		assert_eq!(
+			reader_engine
+				.committed_payload_for_searcher(&reader.searcher())
+				.unwrap()
+				.as_deref(),
+			Some("cursor-v1")
+		);
 	}
 
 	#[test]

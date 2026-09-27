@@ -17,7 +17,8 @@ use tantivy::IndexReader;
 
 use crate::boundary;
 use crate::engine::{
-	persisted_index_id, Engine, InspectionResult, SearchResult, TotalRelation, TraceResult, Writer, IDENTITY_PATH,
+	persisted_index_id, recovery_index_error, Engine, InspectionResult, SearchResult, TotalRelation, TraceResult,
+	Writer, IDENTITY_PATH,
 };
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
@@ -259,7 +260,7 @@ struct SearchCommand {
 }
 
 enum SearchOperation {
-	Search(Vec<u8>),
+	Search { bytes: Vec<u8>, expensive: bool },
 	Trace(Vec<u8>),
 }
 
@@ -475,7 +476,10 @@ pub fn native_search(
 		queue
 			.try_push(
 				SearchCommand {
-					operation: SearchOperation::Search(request),
+					operation: SearchOperation::Search {
+						bytes: request,
+						expensive,
+					},
 					completion,
 				},
 				packed_request.len(),
@@ -1510,7 +1514,7 @@ impl BoundedQueue<SearchCommand> {
 		for _ in 0..queued_count {
 			let queued = state.items.pop_front().unwrap();
 			let milliseconds = match &queued.value.operation {
-				SearchOperation::Search(bytes) => search_budget(bytes),
+				SearchOperation::Search { bytes, .. } => search_budget(bytes),
 				SearchOperation::Trace(bytes) => trace_budget(bytes),
 			}
 			.unwrap_or(0);
@@ -1679,16 +1683,7 @@ fn writer_loop_inner(runtime: Arc<Runtime>, mut writer: Option<Writer>, engine: 
 				),
 			},
 			WriterOperation::Reload => WriterOutcome::Continue(
-				reader
-					.reload()
-					.map_err(|error| {
-						FulltextError::new("E_RELOAD_FAILED", format!("native index reload failed: {error}"))
-					})
-					.and_then(|()| {
-						engine
-							.committed_payload()
-							.map(|payload| payload_body(payload.as_deref()))
-					}),
+				reload_payload(&reader, &engine).map(|payload| payload_body(payload.as_deref())),
 			),
 			WriterOperation::Close { rollback } => {
 				let dirty = runtime.uncommitted_mutations.load(Ordering::Acquire) > 0;
@@ -2024,6 +2019,21 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 	}
 }
 
+fn reload_payload(reader: &IndexReader, engine: &Engine) -> Result<Option<String>> {
+	for _ in 0..3 {
+		reader.reload().map_err(recovery_index_error)?;
+		match engine.committed_payload_for_searcher(&reader.searcher()) {
+			Ok(payload) => return Ok(payload),
+			Err(error) if error.code == "E_RELOAD_FAILED" => continue,
+			Err(error) => return Err(error),
+		}
+	}
+	Err(FulltextError::new(
+		"E_RELOAD_FAILED",
+		"native index changed repeatedly during reload; retry the reload",
+	))
+}
+
 fn execute_search_command(
 	runtime: &Runtime,
 	engine: &Engine,
@@ -2037,9 +2047,8 @@ fn execute_search_command(
 		.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
 	let SearchCommand { operation, completion } = queued.value;
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
-		SearchOperation::Search(bytes) => {
+		SearchOperation::Search { bytes, expensive } => {
 			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
-			let expensive = search_is_expensive(&bytes)?;
 			let _permit = if expensive {
 				match preacquired_permit {
 					Some(permit) => Some(permit),
