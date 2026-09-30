@@ -3397,6 +3397,51 @@ mod tests {
 			.collect::<BTreeSet<_>>()
 			.into_iter()
 			.collect::<Vec<_>>();
+		let bounded = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
+					candidate_ids: None,
+					offset: 0,
+					limit: 3,
+					exact_total: false,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert_eq!(bounded.total, 3);
+		assert_eq!(bounded.total_relation, TotalRelation::LowerBound);
+		let exact = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
+					candidate_ids: None,
+					offset: 0,
+					limit: 3,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert_eq!(exact.total, expected_ids.len() as u64);
+		assert_eq!(exact.total_relation, TotalRelation::Exact);
+		let exact_boundary_tie = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					expression: expression("identical", SearchMode::Any, Vec::new()),
+					candidate_ids: None,
+					offset: 0,
+					limit: 3,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert_eq!(exact_boundary_tie.total, expected_ids.len() as u64);
+		assert_eq!(exact_boundary_tie.total_relation, TotalRelation::Exact);
 		let full_page = page(0, expected_ids.len());
 		let paged_hits = (0..expected_ids.len())
 			.flat_map(|offset| page(offset, 1))

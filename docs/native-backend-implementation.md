@@ -40,17 +40,17 @@ the consuming application. The Node package contributes canonical path handling 
 - The directory harness exercises Tantivy create, write, commit, query, and reopen behavior against
   `MmapDirectory`.
   `verify: src/directory_harness.rs`
-- Tantivy 0.26.1 is pinned and compiled into the addon. Its `Index::open` wraps a supplied directory
+- Tantivy 0.26.2 is pinned and compiled into the addon. Its `Index::open` wraps a supplied directory
   in `ManagedDirectory`, while `Index::writer_with_num_threads` acquires the writer lock and divides
   the supplied memory budget across the requested indexing threads.
-  `verify: Cargo.toml:20-25; tantivy 0.26.1 src/index/index.rs:509-590`
+  `verify: Cargo.toml:20-25; tantivy 0.26.2 src/index/index.rs:509-590`
 - `MmapDirectory::open` requires an existing directory, canonicalizes it, and owns its mmap cache,
   watcher, filesystem access, and lock behavior.
-  `verify: tantivy 0.26.1 src/directory/mmap_directory/mod.rs:166-175,232-295`
+  `verify: tantivy 0.26.2 src/directory/mmap_directory/mod.rs:166-175,232-295`
 - The reader uses `ReloadPolicy::Manual`, which does not call `Directory::watch`; Tantivy's mmap
   watcher starts its polling thread only when `watch()` is called. The native backend therefore
   does not add a metadata-watcher thread per open index.
-  `verify: src/engine.rs:148-154; tantivy 0.26.1 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
+  `verify: src/engine.rs:148-154; tantivy 0.26.2 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
 - napi-rs `AsyncTask` executes on the shared libuv pool, so it is not the execution primitive for
   sustained indexing or search.
   `verify: napi 3.13.0 src/bindgen_runtime/js_values/task.rs:18-43; src/async_work.rs:181-195`
@@ -340,7 +340,7 @@ analyzed term is searched across the selected fields, applying configured field 
 scores documents matching at least one term; `all` requires every analyzed term to match at least
 one selected field. Tantivy's normal scorer supplies BM25. The default result reports a bounded
 lower total (`offset + returned hits`, with `totalRelation: 'lower-bound'` when the page is full) and
-runs `TopDocs::order_by_score()` alone. In pinned Tantivy 0.26.1 that collector invokes
+runs `TopDocs::order_by_score()` alone. In pinned Tantivy 0.26.2 that collector invokes
 `Weight::for_each_pruning`, and Boolean term unions select the block-WAND implementation. Exact
 total is explicit per query, runs a separate `Count`, and is benchmarked separately at the same
 concurrency because it must visit all matches. The initial schema resolves hit IDs through that fast
@@ -384,7 +384,7 @@ ordinary live-operation classification rather than triggering an automatic rebui
 Missing storage returns `missing` without creating the requested directory. A read-only integration
 test snapshots file names, bytes, sizes, and modification times before and after inspection.
 
-Successful `commit()` delegates to Tantivy 0.26.1's ordinary commit path and resolves only after it
+Successful `commit()` delegates to Tantivy 0.26.2's ordinary commit path and resolves only after it
 returns. The process-kill test verifies publication and process-crash recovery. A test directory
 that reports an error after applying an atomic metadata write verifies conservative checkpoint
 handling after an ambiguous commit. Checkpointed publication is implemented separately in
