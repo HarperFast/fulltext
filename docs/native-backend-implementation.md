@@ -345,10 +345,11 @@ runs `TopDocs::order_by_score()` alone. In pinned Tantivy 0.26.1 that collector 
 total is explicit per query, runs a separate `Count`, and is benchmarked separately at the same
 concurrency because it must visit all matches. The initial schema resolves hit IDs through that fast
 field once per result segment, avoiding stored-document decompression on every result. The ID is not
-duplicated in Tantivy's document store. Candidate-free top-level `any` queries use one stable
-score-then-raw-ID collector so every page shares one scoring topology. Other query shapes keep the
-score-only fast path and use that collector only when equal scores cross a page boundary. The
-collector resolves winning ID ordinals with one ordered dictionary traversal per segment.
+duplicated in Tantivy's document store. Candidate-free top-level `any` queries with multiple scoring
+clauses use one stable score-then-raw-ID collector so every page shares one scoring topology.
+Single-clause `any` and other query shapes keep the score-only fast path and use that collector only
+when equal scores cross a page boundary. The collector resolves winning ID ordinals with one ordered
+dictionary traversal per segment.
 
 Phrase queries preserve analyzer positions, including gaps left by removed stop words, and match
 tracing uses the same positional rule. Prefix expansion is capped; exceeding the cap returns

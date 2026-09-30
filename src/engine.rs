@@ -166,7 +166,7 @@ impl SegmentCollector for StableScoreTieSegmentCollector {
 }
 
 impl Collector for StableScoreTieCollector {
-	type Fruit = Result<Vec<StableScoreTieHit>>;
+	type Fruit = Result<(usize, Vec<StableScoreTieHit>)>;
 	type Child = StableScoreTieSegmentCollector;
 
 	fn for_segment(&self, segment_ord: u32, segment: &SegmentReader) -> tantivy::Result<Self::Child> {
@@ -201,12 +201,16 @@ impl Collector for StableScoreTieCollector {
 				top_docs.push((sort_key, address), address);
 			}
 		}
-		Ok(Ok(top_docs
-			.into_sorted_vec()
-			.into_iter()
-			.skip(self.doc_range.start)
-			.map(|hit| (hit.sort_key.0, hit.doc))
-			.collect()))
+		let top_docs = top_docs.into_sorted_vec();
+		let retained = top_docs.len();
+		Ok(Ok((
+			retained,
+			top_docs
+				.into_iter()
+				.skip(self.doc_range.start)
+				.map(|hit| (hit.sort_key.0, hit.doc))
+				.collect(),
+		)))
 	}
 }
 
@@ -516,16 +520,16 @@ impl Engine {
 		check_deadline(deadline)?;
 		let window_end = request.offset + request.limit;
 		let stable_any = request.candidate_ids.is_none()
+			&& query.clauses > 1
 			&& matches!(&request.expression, SearchExpression::Clause(clause) if clause.mode == SearchMode::Any);
 		let (hits, bounded_total, bounded_total_relation) = if stable_any {
-			let mut scored_docs = searcher
+			let (retained, mut scored_docs) = searcher
 				.search(
-					query.as_ref(),
+					query.query.as_ref(),
 					&StableScoreTieCollector::new(request.offset..window_end.saturating_add(1)),
 				)
 				.map_err(index_error)??;
 			check_deadline(deadline)?;
-			let has_more = scored_docs.len() > request.limit;
 			scored_docs.truncate(request.limit);
 			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
 			let versions = search_hit_versions(searcher, &addresses)?;
@@ -534,8 +538,8 @@ impl Engine {
 				.zip(versions)
 				.map(|(((score, id), _), version)| SearchHit { id, score, version })
 				.collect::<Vec<_>>();
-			let (total, relation) = if !has_more && (!hits.is_empty() || request.offset == 0) {
-				((request.offset + hits.len()) as u64, TotalRelation::Exact)
+			let (total, relation) = if retained < window_end.saturating_add(1) {
+				(retained as u64, TotalRelation::Exact)
 			} else {
 				(window_end as u64, TotalRelation::LowerBound)
 			};
@@ -543,7 +547,7 @@ impl Engine {
 		} else {
 			let scored_docs = searcher
 				.search(
-					query.as_ref(),
+					query.query.as_ref(),
 					&TopDocs::with_limit(window_end.saturating_add(1)).order_by_score(),
 				)
 				.map_err(index_error)?;
@@ -551,9 +555,9 @@ impl Engine {
 			let boundary_tie =
 				scored_docs.len() > window_end && scored_docs[window_end - 1].0 == scored_docs[window_end].0;
 			let hits = if boundary_tie {
-				let scored_docs = searcher
+				let (_, scored_docs) = searcher
 					.search(
-						query.as_ref(),
+						query.query.as_ref(),
 						&StableScoreTieCollector::new(request.offset..window_end),
 					)
 					.map_err(index_error)??;
@@ -593,7 +597,7 @@ impl Engine {
 		let (total, total_relation) = if request.exact_total {
 			check_deadline(deadline)?;
 			(
-				searcher.search(query.as_ref(), &Count).map_err(index_error)? as u64,
+				searcher.search(query.query.as_ref(), &Count).map_err(index_error)? as u64,
 				TotalRelation::Exact,
 			)
 		} else {
@@ -1017,9 +1021,12 @@ impl Engine {
 		Ok(fields)
 	}
 
-	fn query(&self, searcher: &Searcher, request: &SearchRequest) -> Result<Box<dyn Query>> {
+	fn query(&self, searcher: &Searcher, request: &SearchRequest) -> Result<BuiltQuery> {
 		let query = self.expression_query(searcher, &request.expression)?;
-		self.with_candidates(query.query, request.candidate_ids.as_deref())
+		Ok(BuiltQuery {
+			query: self.with_candidates(query.query, request.candidate_ids.as_deref())?,
+			clauses: query.clauses,
+		})
 	}
 
 	fn expression_query(&self, searcher: &Searcher, expression: &SearchExpression) -> Result<BuiltQuery> {
@@ -3415,6 +3422,22 @@ mod tests {
 				.as_deref(),
 			Some("latest")
 		);
+		let past_end = engine
+			.search(
+				&reader.searcher(),
+				&SearchRequest {
+					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
+					candidate_ids: None,
+					offset: 20,
+					limit: 5,
+					exact_total: false,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert!(past_end.hits.is_empty());
+		assert_eq!(past_end.total, expected_ids.len() as u64);
+		assert_eq!(past_end.total_relation, TotalRelation::Exact);
 		writer.close().unwrap();
 		let reopened = Engine::open(directory, &config).unwrap();
 		let result = reopened
