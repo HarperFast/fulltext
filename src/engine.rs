@@ -122,35 +122,17 @@ impl SegmentCollector for StableScoreTieSegmentCollector {
 			return Err(FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"));
 		}
 		let top_docs = self.top_docs.into_vec();
-		let mut ordinals = top_docs
+		let ordinals = top_docs
 			.iter()
 			.enumerate()
 			.map(|(index, hit)| (hit.sort_key.1, index))
 			.collect::<Vec<_>>();
-		ordinals.sort_unstable();
-		let mut ids = vec![None; top_docs.len()];
-		let mut next_ordinal = 0;
-		let found_all = self
-			.id_column
-			.dictionary()
-			.sorted_ords_to_term_cb(ordinals.iter().map(|(ordinal, _)| *ordinal), |id| {
-				let Some((_, result_index)) = ordinals.get(next_ordinal) else {
-					return Err(std::io::Error::new(
-						std::io::ErrorKind::InvalidData,
-						"ID dictionary returned too many terms",
-					));
-				};
-				next_ordinal += 1;
-				ids[*result_index] = Some(id.to_vec());
-				Ok(())
-			})
-			.map_err(storage_error)?;
-		if !found_all || next_ordinal != ordinals.len() {
-			return Err(FulltextError::new(
-				"E_NATIVE_FAILURE",
-				"search hit ID ordinal is missing",
-			));
-		}
+		let ids = resolve_string_ordinals(
+			&self.id_column,
+			ordinals,
+			top_docs.len(),
+			"search hit ID ordinal is missing",
+		)?;
 		top_docs
 			.into_iter()
 			.zip(ids)
@@ -1478,26 +1460,27 @@ fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<
 		let Some(column) = segment.fast_fields().str(VERSION_FIELD_NAME).map_err(index_error)? else {
 			continue;
 		};
-		let mut value = Vec::new();
-		for (index, doc_id) in segment_hits {
-			let Some(ordinal) = column.term_ords(doc_id).next() else {
+		let ordinals = segment_hits
+			.iter()
+			.enumerate()
+			.filter_map(|(result_index, (_, doc_id))| {
+				column.term_ords(*doc_id).next().map(|ordinal| (ordinal, result_index))
+			})
+			.collect();
+		let values = resolve_string_ordinals(
+			&column,
+			ordinals,
+			segment_hits.len(),
+			"search hit version ordinal is missing",
+		)?;
+		for ((index, _), value) in segment_hits.into_iter().zip(values) {
+			let Some(value) = value else {
 				continue;
 			};
-			value.clear();
-			if !column
-				.dictionary()
-				.ord_to_term(ordinal, &mut value)
-				.map_err(storage_error)?
-			{
-				return Err(FulltextError::new(
-					"E_NATIVE_FAILURE",
-					"search hit version ordinal is missing",
-				));
-			}
-			let version = std::str::from_utf8(&value)
-				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit version is not UTF-8"))?
-				.to_owned();
-			versions[index] = Some(version);
+			versions[index] = Some(
+				String::from_utf8(value)
+					.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit version is not UTF-8"))?,
+			);
 		}
 	}
 	Ok(versions)
@@ -1530,52 +1513,86 @@ fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -
 			.map_err(index_error)?
 			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no ID fast field"))?;
 		let version_column = segment.fast_fields().str(VERSION_FIELD_NAME).map_err(index_error)?;
-		let mut id = Vec::new();
-		let mut version = Vec::new();
-		for (index, doc_id) in segment_hits {
-			let ordinal = id_column
-				.term_ords(doc_id)
-				.next()
-				.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"))?;
-			id.clear();
-			if !id_column
-				.dictionary()
-				.ord_to_term(ordinal, &mut id)
-				.map_err(storage_error)?
-			{
-				return Err(FulltextError::new(
-					"E_NATIVE_FAILURE",
-					"search hit ID ordinal is missing",
-				));
+		let id_ordinals = segment_hits
+			.iter()
+			.enumerate()
+			.map(|(result_index, (_, doc_id))| {
+				let ordinal = id_column
+					.term_ords(*doc_id)
+					.next()
+					.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"))?;
+				Ok((ordinal, result_index))
+			})
+			.collect::<Result<Vec<_>>>()?;
+		let ids = resolve_string_ordinals(
+			&id_column,
+			id_ordinals,
+			segment_hits.len(),
+			"search hit ID ordinal is missing",
+		)?;
+		for ((index, _), id) in segment_hits.iter().zip(ids) {
+			let id = id.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit ID ordinal is missing"))?;
+			metadata[*index].id = String::from_utf8(id)
+				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?;
+		}
+		if let Some(version_column) = version_column {
+			let ordinals = segment_hits
+				.iter()
+				.enumerate()
+				.filter_map(|(result_index, (_, doc_id))| {
+					version_column
+						.term_ords(*doc_id)
+						.next()
+						.map(|ordinal| (ordinal, result_index))
+				})
+				.collect();
+			let versions = resolve_string_ordinals(
+				&version_column,
+				ordinals,
+				segment_hits.len(),
+				"search hit version ordinal is missing",
+			)?;
+			for ((index, _), version) in segment_hits.into_iter().zip(versions) {
+				let Some(version) = version else {
+					continue;
+				};
+				metadata[index].version = Some(
+					String::from_utf8(version)
+						.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit version is not UTF-8"))?,
+				);
 			}
-			metadata[index].id = std::str::from_utf8(&id)
-				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?
-				.to_owned();
-			let Some(version_column) = &version_column else {
-				continue;
-			};
-			let Some(ordinal) = version_column.term_ords(doc_id).next() else {
-				continue;
-			};
-			version.clear();
-			if !version_column
-				.dictionary()
-				.ord_to_term(ordinal, &mut version)
-				.map_err(storage_error)?
-			{
-				return Err(FulltextError::new(
-					"E_NATIVE_FAILURE",
-					"search hit version ordinal is missing",
-				));
-			}
-			metadata[index].version = Some(
-				std::str::from_utf8(&version)
-					.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit version is not UTF-8"))?
-					.to_owned(),
-			);
 		}
 	}
 	Ok(metadata)
+}
+
+fn resolve_string_ordinals(
+	column: &StrColumn,
+	mut ordinals: Vec<(u64, usize)>,
+	value_count: usize,
+	missing_message: &'static str,
+) -> Result<Vec<Option<Vec<u8>>>> {
+	ordinals.sort_unstable();
+	let mut values = vec![None; value_count];
+	let mut next_ordinal = 0;
+	let found_all = column
+		.dictionary()
+		.sorted_ords_to_term_cb(ordinals.iter().map(|(ordinal, _)| *ordinal), |value| {
+			let Some((_, result_index)) = ordinals.get(next_ordinal) else {
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"string dictionary returned too many terms",
+				));
+			};
+			next_ordinal += 1;
+			values[*result_index] = Some(value.to_vec());
+			Ok(())
+		})
+		.map_err(storage_error)?;
+	if !found_all || next_ordinal != ordinals.len() {
+		return Err(FulltextError::new("E_NATIVE_FAILURE", missing_message));
+	}
+	Ok(values)
 }
 
 fn boosted(query: Box<dyn Query>, weight: f32) -> Box<dyn Query> {
@@ -3510,6 +3527,49 @@ mod tests {
 			result.hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
 			expected_ids[..3].to_vec()
 		);
+	}
+
+	#[test]
+	fn resolves_hit_metadata_in_document_order_with_duplicate_and_missing_versions() {
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: [("one", Some("shared")), ("two", None), ("three", Some("shared"))]
+					.into_iter()
+					.map(|(id, version)| crate::protocol::Upsert {
+						id: id.to_owned(),
+						version: version.map(str::to_owned),
+						fields: vec![("title".to_owned(), vec!["catalog".to_owned()])],
+					})
+					.collect(),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let scored_docs = [2, 0, 1]
+			.into_iter()
+			.map(|doc_id| (1.0, DocAddress::new(0, doc_id)))
+			.collect::<Vec<_>>();
+		let metadata = search_hit_metadata(&searcher, &scored_docs).unwrap();
+		assert_eq!(
+			metadata
+				.iter()
+				.map(|value| (value.id.as_str(), value.version.as_deref()))
+				.collect::<Vec<_>>(),
+			vec![("three", Some("shared")), ("one", Some("shared")), ("two", None)]
+		);
+		assert_eq!(
+			search_hit_versions(
+				&searcher,
+				&scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>()
+			)
+			.unwrap(),
+			vec![Some("shared".to_owned()), Some("shared".to_owned()), None]
+		);
+		writer.close().unwrap();
 	}
 
 	#[test]
