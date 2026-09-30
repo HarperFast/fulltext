@@ -50,7 +50,7 @@ the consuming application. The Node package contributes canonical path handling 
 - The reader uses `ReloadPolicy::Manual`, which does not call `Directory::watch`; Tantivy's mmap
   watcher starts its polling thread only when `watch()` is called. The native backend therefore
   does not add a metadata-watcher thread per open index.
-  `verify: src/engine.rs:148-154; tantivy 0.26.2 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
+  `verify: src/engine.rs:458; tantivy 0.26.2 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
 - napi-rs `AsyncTask` executes on the shared libuv pool, so it is not the execution primitive for
   sustained indexing or search.
   `verify: napi 3.13.0 src/bindgen_runtime/js_values/task.rs:18-43; src/async_work.rs:181-195`
@@ -362,6 +362,8 @@ collector reads the ID fast field for each match because raw UTF-8 ID order is t
 It resolves winning ID ordinals with one ordered dictionary traversal per segment. Flattening the
 `any` scorer can change the least-significant bits of a returned `f32` score because floating-point
 addition is not associative; ranking and pagination use the flattened topology consistently.
+The ID fast field is an index invariant. If any matched document lacks an ID ordinal, the query
+fails with `E_NATIVE_FAILURE` rather than returning an incomplete or incorrectly paginated result.
 
 The initial schema resolves hit IDs through a fast field, avoiding stored-document decompression on
 every result. The ID is not duplicated in Tantivy's document store.
