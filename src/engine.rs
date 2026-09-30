@@ -179,7 +179,6 @@ impl Collector for StableScoreTieCollector {
 				Err(error) => return Ok(Err(error)),
 			};
 			for (sort_key, address) in segment_hits {
-				// DocAddress makes each merge key unique, so push order cannot break ties.
 				top_docs.push((sort_key, address), address);
 			}
 		}

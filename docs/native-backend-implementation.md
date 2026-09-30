@@ -338,18 +338,24 @@ but mismatch v4 open/inspection so the application can retire and rebuild them.
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`
 scores documents matching at least one term; `all` requires every analyzed term to match at least
-one selected field. Tantivy's normal scorer supplies BM25. The default result reports a bounded
-lower total (`offset + returned hits`, with `totalRelation: 'lower-bound'` when the page is full) and
-runs `TopDocs::order_by_score()` alone. In pinned Tantivy 0.26.2 that collector invokes
-`Weight::for_each_pruning`, and Boolean term unions select the block-WAND implementation. Exact
-total is explicit per query, runs a separate `Count`, and is benchmarked separately at the same
-concurrency because it must visit all matches. The initial schema resolves hit IDs through that fast
-field once per result segment, avoiding stored-document decompression on every result. The ID is not
-duplicated in Tantivy's document store. Candidate-free top-level `any` queries with multiple scoring
-clauses use one stable score-then-raw-ID collector so every page shares one scoring topology.
-Single-clause `any` and other query shapes keep the score-only fast path and use that collector only
-when equal scores cross a page boundary. The collector resolves winning ID ordinals with one ordered
-dictionary traversal per segment.
+one selected field. Tantivy's normal scorer supplies BM25. A bounded result reports the exact match
+count when the collector exhausts the matches before filling `offset + limit + 1`; otherwise it
+reports `offset + limit` with `totalRelation: 'lower-bound'`. Exact total is explicit per query,
+runs a separate `Count`, and is benchmarked separately at the same concurrency because it must visit
+all matches.
+
+Single-clause `any`, `all`, phrase, prefix, fuzzy, and candidate-filtered searches use
+`TopDocs::order_by_score()`. In pinned Tantivy 0.26.2 that collector invokes
+`Weight::for_each_pruning`, and Boolean term unions can select the block-WAND implementation.
+Candidate-free top-level `any` queries with multiple scoring clauses instead enumerate matches with
+one stable score-then-raw-ID collector so every page shares one scoring topology. Its per-segment
+collector reads the ID fast field for each match because raw UTF-8 ID order is the secondary key.
+It resolves winning ID ordinals with one ordered dictionary traversal per segment. Flattening the
+`any` scorer can change the least-significant bits of a returned `f32` score because floating-point
+addition is not associative; ranking and pagination use the flattened topology consistently.
+
+The initial schema resolves hit IDs through a fast field, avoiding stored-document decompression on
+every result. The ID is not duplicated in Tantivy's document store.
 
 Phrase queries preserve analyzer positions, including gaps left by removed stop words, and match
 tracing uses the same positional rule. Prefix expansion is capped; exceeding the cap returns
