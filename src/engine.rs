@@ -1085,6 +1085,19 @@ impl Engine {
 		}
 		self.check_clause_count(terms.len(), fields.len())?;
 		let clauses = terms.len().saturating_mul(fields.len());
+		if occur == Occur::Should {
+			let mut alternatives = Vec::with_capacity(clauses);
+			for term in terms {
+				for field in fields {
+					let query: Box<dyn Query> = Box::new(TermQuery::new(
+						Term::from_field_text(field.field, &term),
+						IndexRecordOption::WithFreqs,
+					));
+					alternatives.push((Occur::Should, boosted(query, field.weight)));
+				}
+			}
+			return Ok((Box::new(BooleanQuery::new(alternatives)), clauses));
+		}
 		Ok((
 			Box::new(BooleanQuery::new(
 				terms
@@ -2612,6 +2625,135 @@ mod tests {
 	}
 
 	#[test]
+	fn any_terms_flatten_across_fields_without_changing_matches_or_scores() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let fields = engine.fields.iter().collect::<Vec<_>>();
+		let (flat_query, clauses) = engine.term_query("waterproof trail", &fields, Occur::Should).unwrap();
+		assert_eq!(clauses, 4);
+		assert_eq!(format!("{flat_query:?}").matches("BooleanQuery").count(), 1);
+		let (grouped_query, _) = engine.term_query("waterproof trail", &fields, Occur::Must).unwrap();
+		assert_eq!(format!("{grouped_query:?}").matches("BooleanQuery").count(), 3);
+
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![
+					crate::protocol::Upsert {
+						id: "both".to_owned(),
+						version: None,
+						fields: vec![
+							("title".to_owned(), vec!["Waterproof shell".to_owned()]),
+							("description".to_owned(), vec!["Trail pack".to_owned()]),
+						],
+					},
+					crate::protocol::Upsert {
+						id: "title-only".to_owned(),
+						version: None,
+						fields: vec![("title".to_owned(), vec!["Waterproof jacket".to_owned()])],
+					},
+					crate::protocol::Upsert {
+						id: "description-only".to_owned(),
+						version: None,
+						fields: vec![("description".to_owned(), vec!["Trail guide".to_owned()])],
+					},
+				],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let reader = engine.reader().unwrap();
+		let searcher = reader.searcher();
+		let current = engine
+			.search(
+				&searcher,
+				&SearchRequest {
+					expression: expression("waterproof trail", SearchMode::Any, Vec::new()),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		let legacy_query = BooleanQuery::new(
+			engine
+				.analyze("waterproof trail", false, true)
+				.unwrap()
+				.into_iter()
+				.map(|term| (Occur::Should, engine.term_group(&term, &fields)))
+				.collect(),
+		);
+		let legacy_docs = searcher
+			.search(&legacy_query, &TopDocs::with_limit(10).order_by_score())
+			.unwrap();
+		let mut legacy = legacy_docs
+			.iter()
+			.zip(search_hit_metadata(&searcher, &legacy_docs).unwrap())
+			.map(|((score, _), metadata)| (metadata.id, *score))
+			.collect::<Vec<_>>();
+		legacy.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+		assert_eq!(
+			current.hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+			legacy.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>()
+		);
+		for (current, (_, legacy_score)) in current.hits.iter().zip(legacy) {
+			assert!((current.score - legacy_score).abs() <= f32::EPSILON * current.score.abs().max(1.0));
+		}
+		let all = engine
+			.search(
+				&searcher,
+				&SearchRequest {
+					expression: expression("waterproof trail", SearchMode::All, Vec::new()),
+					candidate_ids: None,
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert_eq!(
+			all.hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+			vec!["both"]
+		);
+		let completed_prefix = engine
+			.search(
+				&searcher,
+				&SearchRequest {
+					expression: expression("waterproof trail ", SearchMode::Prefix, Vec::new()),
+					candidate_ids: Some(vec!["both".to_owned()]),
+					offset: 0,
+					limit: 10,
+					exact_total: true,
+					budget_milliseconds: 30_000,
+				},
+			)
+			.unwrap();
+		assert_eq!(completed_prefix.hits[0].id, "both");
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn any_terms_respect_the_clause_limit() {
+		let mut config = config();
+		config.identity.fields = (0..=MAX_QUERY_CLAUSES)
+			.map(|index| FieldConfig {
+				name: format!("field_{index}"),
+				weight: 1.0,
+			})
+			.collect();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let fields = engine.fields.iter().collect::<Vec<_>>();
+		assert_eq!(
+			engine.term_query("shoe", &fields, Occur::Should).unwrap_err().code,
+			"E_INVALID_ARGUMENT"
+		);
+	}
+
+	#[test]
 	fn edit_distance_helpers_handle_unicode_and_transposition_without_allocation() {
 		assert!(within_one_edit("shoe", "shoe"));
 		assert!(within_one_edit("shoe", "shoo"));
@@ -3200,7 +3342,7 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
-						expression: expression("identical", SearchMode::Any, Vec::new()),
+						expression: expression("identical catalog", SearchMode::Any, Vec::new()),
 						candidate_ids: None,
 						offset,
 						limit,
@@ -3240,7 +3382,7 @@ mod tests {
 			.search(
 				&reopened.reader().unwrap().searcher(),
 				&SearchRequest {
-					expression: expression("identical", SearchMode::Any, Vec::new()),
+					expression: expression("identical catalog", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					offset: 0,
 					limit: expected_ids.len(),
