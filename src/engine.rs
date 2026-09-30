@@ -3358,12 +3358,20 @@ mod tests {
 			.collect::<BTreeSet<_>>()
 			.into_iter()
 			.collect::<Vec<_>>();
+		let full_page = page(0, expected_ids.len());
 		let paged_hits = (0..expected_ids.len())
-			.step_by(3)
-			.flat_map(|offset| page(offset, 3))
+			.flat_map(|offset| page(offset, 1))
 			.collect::<Vec<_>>();
 		assert_eq!(
 			paged_hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+			full_page.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>()
+		);
+		assert_eq!(
+			paged_hits.iter().map(|hit| hit.score.to_bits()).collect::<Vec<_>>(),
+			full_page.iter().map(|hit| hit.score.to_bits()).collect::<Vec<_>>()
+		);
+		assert_eq!(
+			full_page.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
 			expected_ids
 		);
 		assert_eq!(
@@ -3384,7 +3392,7 @@ mod tests {
 					expression: expression("identical catalog", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					offset: 0,
-					limit: expected_ids.len(),
+					limit: 3,
 					exact_total: false,
 					budget_milliseconds: 30_000,
 				},
@@ -3392,7 +3400,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(
 			result.hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
-			expected_ids
+			expected_ids[..3].to_vec()
 		);
 	}
 
