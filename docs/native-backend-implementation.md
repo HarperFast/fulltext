@@ -486,9 +486,11 @@ fixed-host qualification work. This slice establishes the standalone native base
 CI runs correctness tests and an explicit small benchmark-smoke command that performs ranking,
 commit, close, and reopen assertions before validating nonzero measurements. Shared runners enforce
 no timing threshold. Performance thresholds require controlled hardware and release-over-release
-history. Smoke JSON is retained as a GitHub Actions artifact. A published release also attaches its
-JSON benchmark record to the GitHub release so results remain comparable after Actions artifacts
-expire.
+history. Smoke JSON is retained as a GitHub Actions artifact. After a GitHub release is published, a
+separate workflow runs the native and multi-index profiles on Linux x64 and Linux arm64, retains the
+results as 90-day Actions artifacts, and attaches all four JSON records to the release. This
+post-publish workflow preserves comparison history; it does not gate npm publication or calculate a
+baseline delta.
 
 The inspection benchmark creates one committed native seed, clones it to configurable index counts,
 and compares synchronous inspection with full writer-backed reopen. It reports first-pass and warm

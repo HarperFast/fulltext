@@ -463,15 +463,15 @@ the library's native path, not source projection, authorization, or record retri
 an application.
 
 `--revision` labels a result and `--output` writes the same JSON record printed to stdout. Pull
-requests keep smoke records as GitHub Actions artifacts for 30 days. The release benchmark keeps
-90-day Actions artifacts and attaches `benchmark-native.json` for Linux x64 and
-`benchmark-native-linux-arm64-gnu.json` for Linux arm64 to the GitHub release, providing a permanent
-per-architecture release-over-release history. The workflow records results but does not currently
-calculate a baseline delta or fail a build on timing. Shared-runner numbers are evidence that the
-workload still runs, not a latency gate. Compare performance only with the same benchmark format,
-workload, architecture, and controlled hardware. Record observed numbers in the pull request or
-release notes; keep this README focused on the reproducible method rather than environment-specific
-targets.
+requests keep smoke records as GitHub Actions artifacts for 30 days. After a GitHub release is
+published, the release benchmark keeps 90-day Actions artifacts and attaches native and multi-index
+JSON results for Linux x64 and Linux arm64 to that release. These assets provide a permanent
+per-architecture release-over-release history, but the post-publish workflow does not gate npm
+publication, calculate a baseline delta, or fail a build on timing. Shared-runner numbers are
+evidence that the workload still runs, not a latency gate. Compare performance only with the same
+benchmark format, workload, architecture, and controlled hardware. Record observed numbers in the
+pull request or release notes; keep this README focused on the reproducible method rather than
+environment-specific targets.
 
 The inspection benchmark compares synchronous read-only inspection with full writer reopen across
 multiple index counts. It reports equivalent first-pass and warm p50/p95/p99/max latency,
