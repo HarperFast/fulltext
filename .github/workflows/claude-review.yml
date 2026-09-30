@@ -1,0 +1,62 @@
+name: Claude PR Review
+
+# Thin caller of the commit-pinned reusable workflow in HarperFast/ai-review-prompts.
+# Set CLAUDE_ALWAYS_ON=true for trusted-author automatic reviews; otherwise apply
+# the claude-review label to opt in.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+
+jobs:
+  review:
+    if: ${{ (github.event.action == 'labeled' && github.event.label.name == 'claude-review') || (github.event.action != 'labeled' && vars.CLAUDE_ALWAYS_ON == 'true') || (github.event.action == 'ready_for_review' && contains(github.event.pull_request.labels.*.name, 'claude-review')) }}
+    uses: HarperFast/ai-review-prompts/.github/workflows/_claude-review.yml@af81872e56dd63da1160adb5eae82d359a456dde # main 2026-09-01
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    with:
+      ai-review-prompts-ref: af81872e56dd63da1160adb5eae82d359a456dde
+      review-layers: |
+        universal
+        repo-type/native-addon
+      repo-specific-checks: |
+        ## Repo-specific checks (@harperfast/fulltext)
+
+        This is a Rust/Tantivy N-API addon with a hand-written TypeScript facade.
+        The repo-type/native-addon layer carries the common native-addon checks.
+        On top of it:
+
+        - **Use the repository's real gates.** `npm run check` covers Prettier,
+          TypeScript, Clippy, Rust tests, Node tests, examples, and package checks.
+          Dependency changes must preserve locked builds, `cargo deny check`,
+          `npm audit --audit-level=high`, and panic containment.
+        - **Keep generated declarations private.** Binding changes regenerate and
+          commit `ts/addon.d.ts`; consumers use only the hand-written public facade.
+        - **Test source modules directly.** New source modules need direct tests;
+          exercise changed behavior through the public Node boundary where practical.
+        - **Keep sustained native work off JavaScript.** Search, indexing, commit,
+          and request-path storage stay off the Node event loop. Check actor ownership,
+          teardown, bounded queues, resource budgets, and one writer per index. The
+          documented one-time addon load, process-budget configuration, and bounded
+          lifecycle inspection are allowed synchronous exceptions.
+        - **Tantivy owns the search engine.** Flag duplicated scoring, postings,
+          query execution, collection, merge, or storage behavior unless a wrapper
+          contract requires it and measured evidence justifies the specialization.
+        - **Native filesystem storage only.** RocksDB and Harper-specific projection,
+          replication, readiness, and authorization do not belong in this package.
+        - **Preserve search and durability contracts.** Check stable score-then-ID
+          pagination, exact and bounded totals, checkpoints, reopen/reset behavior,
+          schema compatibility, and fail-closed index invariants.
+        - **Preserve release packaging.** Versions stay in lockstep across Cargo,
+          the root package, and platform packages. Linux x64/ARM64, macOS ARM64,
+          and Windows x64 clean-consumer tests remain covered. Do not add install
+          scripts or build-from-source fallback.
+        - **Qualify performance claims.** Compare the same workload, architecture,
+          build mode, and controlled hardware. Shared-runner timing is not a gate.
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      AI_REVIEW_LOG_TOKEN: ${{ secrets.AI_REVIEW_LOG_TOKEN }}
+      HARPERFAST_AI_CLIENT_ID: ${{ secrets.HARPERFAST_AI_CLIENT_ID }}
+      HARPERFAST_AI_APP_PRIVATE_KEY: ${{ secrets.HARPERFAST_AI_APP_PRIVATE_KEY }}
