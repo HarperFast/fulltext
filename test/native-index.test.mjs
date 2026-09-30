@@ -125,6 +125,27 @@ test('runs the public create, mutate, BM25 search, close, and reopen route', asy
 	await index.close();
 });
 
+test('keeps bounded and exact totals consistent across successive publications', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	for (let batch = 0; batch < 3; batch++) {
+		await index.applyMutationBatch({
+			upserts: Array.from({ length: 4 }, (_, offset) => ({
+				id: `catalog-${batch}-${offset}`,
+				fields: { title: 'identical catalog product' },
+			})),
+		});
+		await index.publish(`batch-${batch}`);
+	}
+	const bounded = await index.search({ text: 'identical catalog', mode: 'any', limit: 3 });
+	assert.strictEqual(bounded.total, 3);
+	assert.strictEqual(bounded.totalRelation, 'lower-bound');
+	const exact = await index.search({ text: 'identical catalog', mode: 'any', limit: 3, exactTotal: true });
+	assert.strictEqual(exact.total, 12);
+	assert.strictEqual(exact.totalRelation, 'exact');
+	assert.deepStrictEqual(exact.hits, bounded.hits);
+	await index.close();
+});
+
 test('opens concurrent readers, reloads publications, evaluates boolean queries, and returns source versions', async (context) => {
 	const indexPath = temporaryIndex(context);
 	const config = options(indexPath);

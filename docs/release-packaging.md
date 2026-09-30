@@ -95,6 +95,10 @@ installation.
   publish with npm provenance.
 - After publishing, install the exact release into a clean consumer and rerun the public lifecycle
   round trip against the registry artifacts rather than an injected binding.
+- After the GitHub release is published, run the native and multi-index benchmark profiles on Linux
+  x64 and Linux arm64. Retain the JSON as 90-day Actions artifacts and attach all four records to the
+  release for manual release-over-release comparison. This post-publish workflow records evidence;
+  it does not gate npm publication, calculate a baseline delta, or enforce shared-runner timing.
 - After the platform packages are available in the registry, refresh `package-lock.json` and verify
   that each platform entry records its registry URL and integrity hash.
 

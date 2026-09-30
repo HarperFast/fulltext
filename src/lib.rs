@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub const NATIVE_ABI_VERSION: u32 = 8;
-pub const TANTIVY_VERSION: &str = "0.26.1";
+pub const TANTIVY_VERSION: &str = "0.26.2";
 
 #[cfg(feature = "node-api")]
 #[napi(object)]

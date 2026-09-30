@@ -40,20 +40,47 @@ the consuming application. The Node package contributes canonical path handling 
 - The directory harness exercises Tantivy create, write, commit, query, and reopen behavior against
   `MmapDirectory`.
   `verify: src/directory_harness.rs`
-- Tantivy 0.26.1 is pinned and compiled into the addon. Its `Index::open` wraps a supplied directory
+- Tantivy 0.26.2 is pinned and compiled into the addon. Its `Index::open` wraps a supplied directory
   in `ManagedDirectory`, while `Index::writer_with_num_threads` acquires the writer lock and divides
   the supplied memory budget across the requested indexing threads.
-  `verify: Cargo.toml:20-25; tantivy 0.26.1 src/index/index.rs:509-590`
+  `verify: Cargo.toml:20-25; tantivy 0.26.2 src/index/index.rs:509-590`
 - `MmapDirectory::open` requires an existing directory, canonicalizes it, and owns its mmap cache,
   watcher, filesystem access, and lock behavior.
-  `verify: tantivy 0.26.1 src/directory/mmap_directory/mod.rs:166-175,232-295`
+  `verify: tantivy 0.26.2 src/directory/mmap_directory/mod.rs:166-175,232-295`
 - The reader uses `ReloadPolicy::Manual`, which does not call `Directory::watch`; Tantivy's mmap
   watcher starts its polling thread only when `watch()` is called. The native backend therefore
   does not add a metadata-watcher thread per open index.
-  `verify: src/engine.rs:148-154; tantivy 0.26.1 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
+  `verify: src/engine.rs:458; tantivy 0.26.2 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
 - napi-rs `AsyncTask` executes on the shared libuv pool, so it is not the execution primitive for
   sustained indexing or search.
   `verify: napi 3.13.0 src/bindgen_runtime/js_values/task.rs:18-43; src/async_work.rs:181-195`
+
+## Tantivy ownership boundary
+
+The wrapper composes Tantivy primitives instead of implementing a second search engine.
+
+| Capability                                                                      | Owner                                                                                                 | Wrapper responsibility                                                                                                                                                                                                           |
+| ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tantivy index files, memory maps, locks, segments, and metadata                 | Tantivy `MmapDirectory` and `Index`                                                                   | Canonicalize the caller's path, atomically maintain the wrapper identity sidecar, coordinate reset, and map failures to stable public errors.                                                                                    |
+| Writing, deletion, commits, merges, and merge threads                           | Tantivy `IndexWriter` and `LogMergePolicy`                                                            | Serialize one writer actor per index, publish the opaque checkpoint in Tantivy's commit payload, and set only the configured deleted-document threshold.                                                                         |
+| Postings, BM25, Boolean execution, phrases, fuzzy terms, and block-WAND pruning | Tantivy query and scorer types                                                                        | Translate the bounded typed request into native query objects; do not expose query-string syntax.                                                                                                                                |
+| Result collection                                                               | Tantivy scorers, `TopDocs`, `Count`, `TopNComputer`, and columnar fast fields                         | Own the stable score-then-ID collector, its cross-segment merge, batched winning-ordinal resolution, and exact match count.                                                                                                      |
+| Prefix autocomplete                                                             | Tantivy term dictionaries, `TermQuery`, and `FuzzyTermQuery`                                          | Bound dictionary expansion and implement completed-terms-plus-final-prefix semantics. Tantivy's `PhrasePrefixQuery` requires positional adjacency and cannot run on the frequency-only surface field.                            |
+| Analysis                                                                        | Tantivy `TextAnalyzer` and built-in lowercase, ASCII-folding, length, stop-word, and stemming filters | Supply the versioned streaming NFKC tokenizer, English possessive handling, bounded index-time synonyms, and source-span tracking.                                                                                               |
+| Highlighting and snippets                                                       | Wrapper                                                                                               | Match caller-supplied current values and return UTF-16 spans without storing source text or emitting HTML. Tantivy's snippet helper does not implement Fulltext's synonym, fuzzy/prefix, source-span, and completeness contract. |
+| Node concurrency and admission                                                  | Wrapper                                                                                               | Keep sustained native work off JavaScript, bound queues and process resources, isolate expensive queries, and settle every admitted promise during close.                                                                        |
+
+The custom stable collector is intentionally narrow, but it is wrapper-owned collection code. It
+reuses Tantivy's scorer, `TopNComputer`, segment readers, and string fast-field ordinals; it does not
+calculate relevance or read postings itself. Tantivy can compose score and string sort keys, but its
+0.26.2 `SortByString` converts each retained ordinal with an individual dictionary lookup and notes
+the repeated-decompression cost in its source. A direct comparison against that native composite
+collector on the deterministic 100,000-document benchmark kept the wrapper path only after it was
+consistently faster on the affected multi-term `any` query. The wrapper resolves retained ordinals
+in one ordered traversal per segment and also carries the fail-closed missing-ID invariant and match
+count. Re-run that comparison when Tantivy's string sorting or this collector changes; remove the
+wrapper collector if the native path reaches parity. Prefix expansion is likewise policy around
+Tantivy's dictionary and query objects, not a replacement postings implementation.
 
 ## Public slice
 
@@ -174,9 +201,10 @@ index-format change, not a silent reinterpretation. `generation` is an opaque ca
 for this physical index generation; it is persisted in the engine fingerprint and must match on
 reopen. It is not a Tantivy opstamp or an application transaction-log position.
 `surfaceTerms` creates a separately indexed, unstemmed companion term field for prefix,
-fuzzy-prefix, and current-record match tracing; it never stores source values. It defaults off
-because of its storage cost. Field weights are query-time boosts and may change when reopening the
-same physical index without rebuilding it.
+fuzzy-prefix, and current-record match tracing; it never stores source values or token positions.
+Surface fields retain term frequencies for BM25 while primary fields follow `positions`. It defaults
+off because of its storage cost. Field weights are query-time boosts and may change when reopening
+the same physical index without rebuilding it.
 
 `configureNativeFullTextRuntime()` optionally installs one immutable process budget before the first
 successful open. Identical calls are idempotent; configuration while an open is pending returns
@@ -246,8 +274,10 @@ swaps its `Searcher` into the active slot. A failed validation leaves the prior 
 active and returns retryable `E_RELOAD_FAILED`. Publication by the owning writer already knows the
 checkpoint it committed, so that path reloads the staging reader and replaces the active searcher
 without the external-reader alignment check. Tantivy remains free to use its configured indexing
-and merge workers behind the writer actor. Independent indexes and their
-searches may run concurrently. The process governor bounds their aggregate resources without
+and merge workers behind the writer actor. The writer uses Tantivy's log merge policy with its
+deleted-document threshold set to 50%, preventing replacement-heavy indexes from retaining a
+segment once more than half its documents are dead. Independent indexes and their searches may run
+concurrently. The process governor bounds their aggregate resources without
 replacing the per-index search pools with a shared scheduler.
 
 With two or more search threads, one worker consumes only the ordinary bounded BM25 lane. Every
@@ -291,6 +321,10 @@ change durable semantics, and Tantivy performs its own index-format compatibilit
 compares both the generated Tantivy schema and this fingerprint before creating a writer. The
 immutable sidecar is separate from Tantivy's per-commit payload, which remains available for
 standalone checkpoints and derived watermarks.
+
+Schema changes fail closed even when the logical identity is unchanged. Indexes made by versions
+that stored positions in surface fields report `E_SCHEMA_MISMATCH` and must be rebuilt; they are
+never opened under the smaller frequency-only surface schema.
 
 Unknown mutation fields, missing IDs, duplicate schema field names, unknown search fields, oversized
 batches, and excessive result windows fail before search/index work. Blank and stop-word-only
@@ -338,14 +372,28 @@ but mismatch v4 open/inspection so the application can retire and rebuild them.
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`
 scores documents matching at least one term; `all` requires every analyzed term to match at least
-one selected field. Tantivy's normal scorer supplies BM25. The default result reports a bounded
-lower total (`offset + returned hits`, with `totalRelation: 'lower-bound'` when the page is full) and
-runs `TopDocs::order_by_score()` alone. In pinned Tantivy 0.26.1 that collector invokes
-`Weight::for_each_pruning`, and Boolean term unions select the block-WAND implementation. Exact
-total is explicit per query, runs a separate `Count`, and is benchmarked separately at the same
-concurrency because it must visit all matches. The initial schema resolves hit IDs through that fast
-field once per result segment, avoiding stored-document decompression on every result. The ID is not
-duplicated in Tantivy's document store.
+one selected field. Tantivy's normal scorer supplies BM25. A bounded result reports the exact match
+count when the collector exhausts the matches before filling `offset + limit + 1`; otherwise it
+reports `offset + limit` with `totalRelation: 'lower-bound'`. Exact total is explicit per query and
+is benchmarked separately at the same concurrency because it may need to visit all matches. TopDocs
+paths run a separate `Count` only when the bounded pass does not exhaust the result set. The stable
+multi-clause `any` collector already enumerates and counts every match, so that path reuses its count
+instead of executing the query twice.
+
+Single-clause `any`, `all`, phrase, prefix, fuzzy, and candidate-filtered searches use
+`TopDocs::order_by_score()`. In pinned Tantivy 0.26.2 that collector invokes
+`Weight::for_each_pruning`, and Boolean term unions can select the block-WAND implementation.
+Candidate-free top-level `any` queries with multiple scoring clauses instead enumerate matches with
+one stable score-then-raw-ID collector so every page shares one scoring topology. Its per-segment
+collector reads the ID fast field for each match because raw UTF-8 ID order is the secondary key.
+It resolves winning ID ordinals with one ordered dictionary traversal per segment. Flattening the
+`any` scorer can change the least-significant bits of a returned `f32` score because floating-point
+addition is not associative; ranking and pagination use the flattened topology consistently.
+The ID fast field is an index invariant. If any matched document lacks an ID ordinal, the query
+fails with `E_NATIVE_FAILURE` rather than returning an incomplete or incorrectly paginated result.
+
+The initial schema resolves hit IDs through a fast field, avoiding stored-document decompression on
+every result. The ID is not duplicated in Tantivy's document store.
 
 Phrase queries preserve analyzer positions, including gaps left by removed stop words, and match
 tracing uses the same positional rule. Prefix expansion is capped; exceeding the cap returns
@@ -380,7 +428,7 @@ ordinary live-operation classification rather than triggering an automatic rebui
 Missing storage returns `missing` without creating the requested directory. A read-only integration
 test snapshots file names, bytes, sizes, and modification times before and after inspection.
 
-Successful `commit()` delegates to Tantivy 0.26.1's ordinary commit path and resolves only after it
+Successful `commit()` delegates to Tantivy 0.26.2's ordinary commit path and resolves only after it
 returns. The process-kill test verifies publication and process-crash recovery. A test directory
 that reports an error after applying an atomic metadata write verifies conservative checkpoint
 handling after an ambiguous commit. Checkpointed publication is implemented separately in
@@ -438,9 +486,11 @@ fixed-host qualification work. This slice establishes the standalone native base
 CI runs correctness tests and an explicit small benchmark-smoke command that performs ranking,
 commit, close, and reopen assertions before validating nonzero measurements. Shared runners enforce
 no timing threshold. Performance thresholds require controlled hardware and release-over-release
-history. Smoke JSON is retained as a GitHub Actions artifact. A published release also attaches its
-JSON benchmark record to the GitHub release so results remain comparable after Actions artifacts
-expire.
+history. Smoke JSON is retained as a GitHub Actions artifact. After a GitHub release is published, a
+separate workflow runs the native and multi-index profiles on Linux x64 and Linux arm64, retains the
+results as 90-day Actions artifacts, and attaches all four JSON records to the release. This
+post-publish workflow preserves comparison history; it does not gate npm publication or calculate a
+baseline delta.
 
 The inspection benchmark creates one committed native seed, clones it to configurable index counts,
 and compares synchronous inspection with full writer-backed reopen. It reports first-pass and warm

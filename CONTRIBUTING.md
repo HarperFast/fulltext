@@ -23,6 +23,15 @@ Rust tests exercise the engine and directory contract without Node.js. Node test
 load it through the public `./native` entry point, verify panic containment, and install the output
 of `npm pack` into a temporary consumer project.
 
+## Automated review
+
+Maintainers can apply the `claude-review` or `gemini-review` label to run the corresponding
+AI-assisted pull-request review. The workflows use the shared, commit-pinned HarperFast review
+prompts and default to opt-in. Remove and reapply a review label after a new push to request another
+review. Maintainers can deliberately enable trusted-author automatic reviews with the
+`CLAUDE_ALWAYS_ON` or `GEMINI_ALWAYS_ON` repository variable. Fork and Dependabot pull requests
+cannot run these reviews because GitHub withholds the required provider secrets for those events.
+
 ## Design constraints
 
 - Keep search, indexing, scheduling, and lifecycle behavior independent from any host application.

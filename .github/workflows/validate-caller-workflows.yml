@@ -1,0 +1,18 @@
+name: Validate caller workflows
+
+# Reject shadow jobs and mutable refs in the Claude and Gemini reusable callers.
+# Keep this job required on main. It runs unconditionally so required checks never
+# remain pending on PRs that do not change workflow files.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    uses: HarperFast/ai-review-prompts/.github/workflows/_validate-caller-workflows.yml@af81872e56dd63da1160adb5eae82d359a456dde # main 2026-09-01
+    permissions:
+      contents: read
+    with:
+      ai-review-prompts-ref: af81872e56dd63da1160adb5eae82d359a456dde
