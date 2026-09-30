@@ -64,18 +64,22 @@ The wrapper composes Tantivy primitives instead of implementing a second search 
 | Tantivy index files, memory maps, locks, segments, and metadata                 | Tantivy `MmapDirectory` and `Index`                                                                   | Canonicalize the caller's path, atomically maintain the wrapper identity sidecar, coordinate reset, and map failures to stable public errors.                                                                                    |
 | Writing, deletion, commits, merges, and merge threads                           | Tantivy `IndexWriter` and `LogMergePolicy`                                                            | Serialize one writer actor per index, publish the opaque checkpoint in Tantivy's commit payload, and set only the configured deleted-document threshold.                                                                         |
 | Postings, BM25, Boolean execution, phrases, fuzzy terms, and block-WAND pruning | Tantivy query and scorer types                                                                        | Translate the bounded typed request into native query objects; do not expose query-string syntax.                                                                                                                                |
-| Result collection                                                               | Tantivy `TopDocs`, `Count`, `TopNComputer`, and columnar fast fields                                  | Add raw UTF-8 ID as the stable secondary key, batch winning ordinal resolution, and reuse a collected exact count.                                                                                                               |
+| Result collection                                                               | Tantivy scorers, `TopDocs`, `Count`, `TopNComputer`, and columnar fast fields                         | Own the stable score-then-ID collector, its cross-segment merge, batched winning-ordinal resolution, and exact match count.                                                                                                      |
 | Prefix autocomplete                                                             | Tantivy term dictionaries, `TermQuery`, and `FuzzyTermQuery`                                          | Bound dictionary expansion and implement completed-terms-plus-final-prefix semantics. Tantivy's `PhrasePrefixQuery` requires positional adjacency and cannot run on the frequency-only surface field.                            |
 | Analysis                                                                        | Tantivy `TextAnalyzer` and built-in lowercase, ASCII-folding, length, stop-word, and stemming filters | Supply the versioned streaming NFKC tokenizer, English possessive handling, bounded index-time synonyms, and source-span tracking.                                                                                               |
 | Highlighting and snippets                                                       | Wrapper                                                                                               | Match caller-supplied current values and return UTF-16 spans without storing source text or emitting HTML. Tantivy's snippet helper does not implement Fulltext's synonym, fuzzy/prefix, source-span, and completeness contract. |
 | Node concurrency and admission                                                  | Wrapper                                                                                               | Keep sustained native work off JavaScript, bound queues and process resources, isolate expensive queries, and settle every admitted promise during close.                                                                        |
 
-The custom stable collector is intentionally narrow. It reuses Tantivy's scorer, `TopNComputer`,
-segment readers, and string fast-field ordinals; it does not calculate relevance. Tantivy can
-compose score and string sort keys, but its 0.26.2 `SortByString` converts each retained ordinal with
-an individual dictionary lookup and notes the repeated-decompression cost in its source. The
-wrapper resolves retained ordinals in one ordered traversal per segment and also carries the
-fail-closed missing-ID invariant and match count. Prefix expansion is likewise policy around
+The custom stable collector is intentionally narrow, but it is wrapper-owned collection code. It
+reuses Tantivy's scorer, `TopNComputer`, segment readers, and string fast-field ordinals; it does not
+calculate relevance or read postings itself. Tantivy can compose score and string sort keys, but its
+0.26.2 `SortByString` converts each retained ordinal with an individual dictionary lookup and notes
+the repeated-decompression cost in its source. A direct comparison against that native composite
+collector on the deterministic 100,000-document benchmark kept the wrapper path only after it was
+consistently faster on the affected multi-term `any` query. The wrapper resolves retained ordinals
+in one ordered traversal per segment and also carries the fail-closed missing-ID invariant and match
+count. Re-run that comparison when Tantivy's string sorting or this collector changes; remove the
+wrapper collector if the native path reaches parity. Prefix expansion is likewise policy around
 Tantivy's dictionary and query objects, not a replacement postings implementation.
 
 ## Public slice
