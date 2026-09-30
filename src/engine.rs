@@ -3431,7 +3431,7 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
-					expression: expression("identical", SearchMode::Any, Vec::new()),
+					expression: expression("identical", SearchMode::Any, vec!["title".to_owned()]),
 					candidate_ids: None,
 					offset: 0,
 					limit: 3,
@@ -3442,6 +3442,14 @@ mod tests {
 			.unwrap();
 		assert_eq!(exact_boundary_tie.total, expected_ids.len() as u64);
 		assert_eq!(exact_boundary_tie.total_relation, TotalRelation::Exact);
+		assert_eq!(
+			exact_boundary_tie
+				.hits
+				.iter()
+				.map(|hit| hit.id.as_str())
+				.collect::<Vec<_>>(),
+			expected_ids[..3]
+		);
 		let full_page = page(0, expected_ids.len());
 		let paged_hits = (0..expected_ids.len())
 			.flat_map(|offset| page(offset, 1))
