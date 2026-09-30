@@ -174,9 +174,10 @@ index-format change, not a silent reinterpretation. `generation` is an opaque ca
 for this physical index generation; it is persisted in the engine fingerprint and must match on
 reopen. It is not a Tantivy opstamp or an application transaction-log position.
 `surfaceTerms` creates a separately indexed, unstemmed companion term field for prefix,
-fuzzy-prefix, and current-record match tracing; it never stores source values. It defaults off
-because of its storage cost. Field weights are query-time boosts and may change when reopening the
-same physical index without rebuilding it.
+fuzzy-prefix, and current-record match tracing; it never stores source values or token positions.
+Surface fields retain term frequencies for BM25 while primary fields follow `positions`. It defaults
+off because of its storage cost. Field weights are query-time boosts and may change when reopening
+the same physical index without rebuilding it.
 
 `configureNativeFullTextRuntime()` optionally installs one immutable process budget before the first
 successful open. Identical calls are idempotent; configuration while an open is pending returns
@@ -246,8 +247,10 @@ swaps its `Searcher` into the active slot. A failed validation leaves the prior 
 active and returns retryable `E_RELOAD_FAILED`. Publication by the owning writer already knows the
 checkpoint it committed, so that path reloads the staging reader and replaces the active searcher
 without the external-reader alignment check. Tantivy remains free to use its configured indexing
-and merge workers behind the writer actor. Independent indexes and their
-searches may run concurrently. The process governor bounds their aggregate resources without
+and merge workers behind the writer actor. The writer uses Tantivy's log merge policy with its
+deleted-document threshold set to 50%, preventing replacement-heavy indexes from retaining a
+segment once more than half its documents are dead. Independent indexes and their searches may run
+concurrently. The process governor bounds their aggregate resources without
 replacing the per-index search pools with a shared scheduler.
 
 With two or more search threads, one worker consumes only the ordinary bounded BM25 lane. Every
@@ -291,6 +294,10 @@ change durable semantics, and Tantivy performs its own index-format compatibilit
 compares both the generated Tantivy schema and this fingerprint before creating a writer. The
 immutable sidecar is separate from Tantivy's per-commit payload, which remains available for
 standalone checkpoints and derived watermarks.
+
+Schema changes fail closed even when the logical identity is unchanged. Indexes made by versions
+that stored positions in surface fields report `E_SCHEMA_MISMATCH` and must be rebuilt; they are
+never opened under the smaller frequency-only surface schema.
 
 Unknown mutation fields, missing IDs, duplicate schema field names, unknown search fields, oversized
 batches, and excessive result windows fail before search/index work. Blank and stop-word-only
@@ -340,9 +347,11 @@ analyzed term is searched across the selected fields, applying configured field 
 scores documents matching at least one term; `all` requires every analyzed term to match at least
 one selected field. Tantivy's normal scorer supplies BM25. A bounded result reports the exact match
 count when the collector exhausts the matches before filling `offset + limit + 1`; otherwise it
-reports `offset + limit` with `totalRelation: 'lower-bound'`. Exact total is explicit per query,
-runs a separate `Count`, and is benchmarked separately at the same concurrency because it must visit
-all matches.
+reports `offset + limit` with `totalRelation: 'lower-bound'`. Exact total is explicit per query and
+is benchmarked separately at the same concurrency because it may need to visit all matches. TopDocs
+paths run a separate `Count` only when the bounded pass does not exhaust the result set. The stable
+multi-clause `any` collector already enumerates and counts every match, so that path reuses its count
+instead of executing the query twice.
 
 Single-clause `any`, `all`, phrase, prefix, fuzzy, and candidate-filtered searches use
 `TopDocs::order_by_score()`. In pinned Tantivy 0.26.2 that collector invokes

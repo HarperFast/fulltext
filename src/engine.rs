@@ -42,6 +42,7 @@ pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_TRACE_TOKENS_PER_VALUE: usize = 262_144;
 const MAX_TOKEN_CHARACTERS: usize = 40;
 const MAX_NONSTARTERS: usize = 30;
+const DELETE_MERGE_RATIO: f32 = 0.5;
 const COMBINING_GRAPHEME_JOINER: char = '\u{034f}';
 type SynonymMap = Arc<HashMap<String, Vec<String>>>;
 
@@ -102,13 +103,15 @@ struct StableScoreTieSegmentCollector {
 	top_docs: TopNComputer<(Score, u64), DocId, (NaturalComparator, ReverseComparator)>,
 	id_column: StrColumn,
 	segment_ord: u32,
+	match_count: u64,
 	missing_id: bool,
 }
 
 impl SegmentCollector for StableScoreTieSegmentCollector {
-	type Fruit = Result<Vec<StableScoreTieHit>>;
+	type Fruit = Result<(u64, Vec<StableScoreTieHit>)>;
 
 	fn collect(&mut self, doc: DocId, score: Score) {
+		self.match_count += 1;
 		let Some(id_ord) = self.id_column.ords().first(doc) else {
 			self.missing_id = true;
 			return;
@@ -133,7 +136,7 @@ impl SegmentCollector for StableScoreTieSegmentCollector {
 			top_docs.len(),
 			"search hit ID ordinal is missing",
 		)?;
-		top_docs
+		let hits = top_docs
 			.into_iter()
 			.zip(ids)
 			.map(|(hit, id)| {
@@ -143,12 +146,13 @@ impl SegmentCollector for StableScoreTieSegmentCollector {
 					.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?;
 				Ok(((hit.sort_key.0, id), DocAddress::new(self.segment_ord, hit.doc)))
 			})
-			.collect()
+			.collect::<Result<Vec<_>>>()?;
+		Ok((self.match_count, hits))
 	}
 }
 
 impl Collector for StableScoreTieCollector {
-	type Fruit = Result<(usize, Vec<StableScoreTieHit>)>;
+	type Fruit = Result<(usize, u64, Vec<StableScoreTieHit>)>;
 	type Child = StableScoreTieSegmentCollector;
 
 	fn for_segment(&self, segment_ord: u32, segment: &SegmentReader) -> tantivy::Result<Self::Child> {
@@ -160,6 +164,7 @@ impl Collector for StableScoreTieCollector {
 			top_docs: TopNComputer::new_with_comparator(self.doc_range.end, (NaturalComparator, ReverseComparator)),
 			id_column,
 			segment_ord,
+			match_count: 0,
 			missing_id: false,
 		})
 	}
@@ -168,16 +173,18 @@ impl Collector for StableScoreTieCollector {
 		true
 	}
 
-	fn merge_fruits(&self, segment_fruits: Vec<Result<Vec<StableScoreTieHit>>>) -> tantivy::Result<Self::Fruit> {
+	fn merge_fruits(&self, segment_fruits: Vec<Result<(u64, Vec<StableScoreTieHit>)>>) -> tantivy::Result<Self::Fruit> {
 		let mut top_docs = TopNComputer::new_with_comparator(
 			self.doc_range.end,
 			((NaturalComparator, ReverseComparator), ReverseComparator),
 		);
+		let mut match_count = 0u64;
 		for segment_hits in segment_fruits {
-			let segment_hits = match segment_hits {
+			let (segment_match_count, segment_hits) = match segment_hits {
 				Ok(segment_hits) => segment_hits,
 				Err(error) => return Ok(Err(error)),
 			};
+			match_count += segment_match_count;
 			for (sort_key, address) in segment_hits {
 				top_docs.push((sort_key, address), address);
 			}
@@ -186,6 +193,7 @@ impl Collector for StableScoreTieCollector {
 		let retained = top_docs.len();
 		Ok(Ok((
 			retained,
+			match_count,
 			top_docs
 				.into_iter()
 				.skip(self.doc_range.start)
@@ -418,6 +426,9 @@ impl Engine {
 			.index
 			.writer_with_num_threads(config.limits.indexing_threads, config.limits.writer_memory_bytes)
 			.map_err(map_error)?;
+		let mut merge_policy = tantivy::merge_policy::LogMergePolicy::default();
+		merge_policy.set_del_docs_ratio_before_merge(DELETE_MERGE_RATIO);
+		inner.set_merge_policy(Box::new(merge_policy));
 		// A competing process can publish until we acquire the writer lock.
 		let payload = self.committed_payload()?;
 		Ok((
@@ -503,8 +514,8 @@ impl Engine {
 		let stable_any = request.candidate_ids.is_none()
 			&& query.clauses > 1
 			&& matches!(&request.expression, SearchExpression::Clause(clause) if clause.mode == SearchMode::Any);
-		let (hits, bounded_total, bounded_total_relation) = if stable_any {
-			let (retained, mut scored_docs) = searcher
+		let (hits, bounded_total, bounded_total_relation, collected_total) = if stable_any {
+			let (retained, match_count, mut scored_docs) = searcher
 				.search(
 					query.query.as_ref(),
 					&StableScoreTieCollector::new(request.offset..window_end.saturating_add(1)),
@@ -524,7 +535,7 @@ impl Engine {
 			} else {
 				(window_end as u64, TotalRelation::LowerBound)
 			};
-			(hits, total, relation)
+			(hits, total, relation, Some(match_count))
 		} else {
 			let scored_docs = searcher
 				.search(
@@ -535,8 +546,8 @@ impl Engine {
 			check_deadline(deadline)?;
 			let boundary_tie =
 				scored_docs.len() > window_end && scored_docs[window_end - 1].0 == scored_docs[window_end].0;
-			let hits = if boundary_tie {
-				let (_, scored_docs) = searcher
+			let (hits, collected_total) = if boundary_tie {
+				let (_, match_count, scored_docs) = searcher
 					.search(
 						query.query.as_ref(),
 						&StableScoreTieCollector::new(request.offset..window_end),
@@ -544,11 +555,12 @@ impl Engine {
 					.map_err(index_error)??;
 				let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
 				let versions = search_hit_versions(searcher, &addresses)?;
-				scored_docs
+				let hits = scored_docs
 					.into_iter()
 					.zip(versions)
 					.map(|(((score, id), _), version)| SearchHit { id, score, version })
-					.collect::<Vec<_>>()
+					.collect::<Vec<_>>();
+				(hits, Some(match_count))
 			} else {
 				let metadata = search_hit_metadata(searcher, &scored_docs)?;
 				let mut ranked = scored_docs
@@ -566,21 +578,33 @@ impl Engine {
 						.total_cmp(&left.score)
 						.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
 				});
-				ranked.into_iter().skip(request.offset).take(request.limit).collect()
+				(
+					ranked.into_iter().skip(request.offset).take(request.limit).collect(),
+					None,
+				)
 			};
 			let (total, relation) = if scored_docs.len() <= window_end {
 				(scored_docs.len() as u64, TotalRelation::Exact)
 			} else {
 				(window_end as u64, TotalRelation::LowerBound)
 			};
-			(hits, total, relation)
+			(hits, total, relation, collected_total)
 		};
 		let (total, total_relation) = if request.exact_total {
-			check_deadline(deadline)?;
-			(
-				searcher.search(query.query.as_ref(), &Count).map_err(index_error)? as u64,
-				TotalRelation::Exact,
-			)
+			match collected_total {
+				Some(total) => {
+					check_deadline(deadline)?;
+					(total, TotalRelation::Exact)
+				}
+				None if bounded_total_relation == TotalRelation::Exact => (bounded_total, TotalRelation::Exact),
+				None => {
+					check_deadline(deadline)?;
+					(
+						searcher.search(query.query.as_ref(), &Count).map_err(index_error)? as u64,
+						TotalRelation::Exact,
+					)
+				}
+			}
 		} else {
 			(bounded_total, bounded_total_relation)
 		};
@@ -1821,6 +1845,13 @@ impl Writer {
 }
 
 fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Field, Vec<EngineField>)> {
+	build_schema_with_surface_record(config, IndexRecordOption::WithFreqs)
+}
+
+fn build_schema_with_surface_record(
+	config: &EngineIdentityConfig,
+	surface_record: IndexRecordOption,
+) -> Result<(Schema, Field, Field, Vec<EngineField>)> {
 	let mut builder = Schema::builder();
 	let id_indexing = TextFieldIndexing::default()
 		.set_tokenizer("raw")
@@ -1845,7 +1876,7 @@ fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Field, 
 			let surface_name = format!("__fulltext_surface_{}", fields.len());
 			let surface_indexing = TextFieldIndexing::default()
 				.set_tokenizer(SURFACE_ANALYZER_NAME)
-				.set_index_option(record);
+				.set_index_option(surface_record);
 			Some(builder.add_text_field(
 				&surface_name,
 				TextOptions::default().set_indexing_options(surface_indexing),
@@ -2660,6 +2691,48 @@ mod tests {
 			],
 			deletes: Vec::new(),
 		}
+	}
+
+	#[test]
+	fn surface_fields_do_not_store_positions() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let (schema, _, _, fields) = build_schema(&config.identity).unwrap();
+		for field in fields {
+			assert_eq!(
+				schema.get_field_entry(field.field).field_type().index_record_option(),
+				Some(IndexRecordOption::WithFreqsAndPositions)
+			);
+			assert_eq!(
+				schema
+					.get_field_entry(field.surface_field.unwrap())
+					.field_type()
+					.index_record_option(),
+				Some(IndexRecordOption::WithFreqs)
+			);
+		}
+	}
+
+	#[test]
+	fn positioned_surface_schema_requires_rebuild() {
+		let directory = RamDirectory::create();
+		let mut config = config();
+		config.identity.surface_terms = true;
+		directory
+			.atomic_write(Path::new(IDENTITY_PATH), &identity_bytes(&config.identity))
+			.unwrap();
+		let (positioned_schema, _, _, _) =
+			build_schema_with_surface_record(&config.identity, IndexRecordOption::WithFreqsAndPositions).unwrap();
+		Index::create(directory.clone(), positioned_schema, IndexSettings::default()).unwrap();
+		assert_eq!(
+			Engine::inspect(directory.clone(), &config.identity).unwrap_err().code,
+			"E_SCHEMA_MISMATCH"
+		);
+		let error = match Engine::open(directory, &config) {
+			Ok(_) => panic!("positioned surface schema was accepted"),
+			Err(error) => error,
+		};
+		assert_eq!(error.code, "E_SCHEMA_MISMATCH");
 	}
 
 	#[test]
@@ -3804,6 +3877,50 @@ mod tests {
 
 		let reopened = Engine::open(directory, &config).unwrap();
 		assert_eq!(reopened.committed_payload().unwrap().as_deref(), Some("cursor-v1:43"));
+	}
+
+	#[test]
+	fn delete_aware_merges_preserve_live_documents_and_checkpoint() {
+		let directory = RamDirectory::create();
+		let config = config();
+		let engine = Engine::open(directory.clone(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		let upserts = |range: Range<usize>, version: &str| {
+			range
+				.map(|id| crate::protocol::Upsert {
+					id: format!("product-{id}"),
+					version: Some(version.to_owned()),
+					fields: vec![("title".to_owned(), vec![format!("Trail shoe {id}")])],
+				})
+				.collect()
+		};
+		writer
+			.apply(MutationBatch {
+				upserts: upserts(0..100, "one"),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit_with_payload(Some("cursor:100")).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: upserts(0..51, "two"),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit_with_payload(Some("cursor:151")).unwrap();
+		writer.close().unwrap();
+
+		let meta = engine.index.load_metas().unwrap();
+		assert_eq!(meta.segments.iter().map(|segment| segment.num_docs()).sum::<u32>(), 100);
+		assert_eq!(
+			meta.segments
+				.iter()
+				.map(|segment| segment.num_deleted_docs())
+				.sum::<u32>(),
+			0
+		);
+		let reopened = Engine::open(directory, &config).unwrap();
+		assert_eq!(reopened.committed_payload().unwrap().as_deref(), Some("cursor:151"));
 	}
 
 	#[test]
