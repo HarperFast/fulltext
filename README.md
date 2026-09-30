@@ -203,15 +203,26 @@ const result = await index.search({
 Negation filters do not add to BM25 scores. A query made only of negation matches assigns every
 surviving hit a score of zero and orders ties by UTF-8 ID.
 
-`total` is bounded by default so Tantivy can retain block-max WAND pruning. Set `exactTotal: true`
-only when an exact match count is worth a second full-match traversal. Ranking is score descending,
-then UTF-8 ID ascending, including ties that cross segment or page boundaries.
+`total` is bounded by default so Tantivy can retain block-max WAND pruning where the query shape
+supports it. Set `exactTotal: true` only when an exact match count is required. A separate count
+pass runs only when the result was not exhausted and the selected collector did not already visit
+and count every match. Ranking is score descending, then UTF-8 ID ascending, including ties that
+cross segment or page boundaries.
+
+Candidate-free, top-level `any` searches with more than one scoring clause use the same stable
+score-and-ID collector path for every page. Clause count is analyzed terms multiplied by selected
+fields, so one term searched across two fields takes this path. This prevents segment merges and
+different page boundaries from changing tie order, but it visits every match and checks the request
+deadline after collection. Other bounded query shapes start with Tantivy's score-pruned `TopDocs`
+path; a score tie at the requested page boundary falls back to the stable all-match collector.
 
 `positions` defaults on and is required for phrase search. `surfaceTerms` defaults off and creates
 an internal unstemmed companion term field used by prefix, fuzzy-prefix, and match tracing. It does
-not store source values. Both settings are persisted and must match when the index is reopened.
-Enable `surfaceTerms` only on indexes that need those operations. Field weights are query-time
-boosts and may change on reopen without rebuilding the index.
+not store source values or positions; it retains term frequencies for scoring. Both settings are
+persisted and must match when the index is reopened. Indexes created before this change with both
+`surfaceTerms: true` and `positions: true` fail to open with `E_SCHEMA_MISMATCH` and must be rebuilt
+from their authoritative source. Enable `surfaceTerms` only on indexes that need those operations.
+Field weights are query-time boosts and may change on reopen without rebuilding the index.
 
 `english@2` applies Unicode NFKC normalization, lowercase and Latin-to-ASCII folding, English
 possessive removal, optional English stop words, and English stemming. Token offsets continue to
@@ -455,9 +466,12 @@ an application.
 requests keep smoke records as GitHub Actions artifacts for 30 days. The release benchmark keeps
 90-day Actions artifacts and attaches `benchmark-native.json` for Linux x64 and
 `benchmark-native-linux-arm64-gnu.json` for Linux arm64 to the GitHub release, providing a permanent
-per-architecture release-over-release history. Shared-runner numbers are evidence that the workload
-still runs, not a latency gate; compare performance only on equivalent controlled hardware and the
-same architecture.
+per-architecture release-over-release history. The workflow records results but does not currently
+calculate a baseline delta or fail a build on timing. Shared-runner numbers are evidence that the
+workload still runs, not a latency gate. Compare performance only with the same benchmark format,
+workload, architecture, and controlled hardware. Record observed numbers in the pull request or
+release notes; keep this README focused on the reproducible method rather than environment-specific
+targets.
 
 The inspection benchmark compares synchronous read-only inspection with full writer reopen across
 multiple index counts. It reports equivalent first-pass and warm p50/p95/p99/max latency,
