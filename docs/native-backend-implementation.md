@@ -346,8 +346,8 @@ total is explicit per query, runs a separate `Count`, and is benchmarked separat
 concurrency because it must visit all matches. The initial schema resolves hit IDs through that fast
 field once per result segment, avoiding stored-document decompression on every result. The ID is not
 duplicated in Tantivy's document store. When equal scores cross a page boundary, a bounded fallback
-orders the page by raw ID and resolves the winning ID ordinals with one ordered dictionary traversal
-per segment.
+orders the page by score, then raw ID, and resolves the winning ID ordinals with one ordered
+dictionary traversal per segment.
 
 Phrase queries preserve analyzer positions, including gaps left by removed stop words, and match
 tracing uses the same positional rule. Prefix expansion is capped; exceeding the cap returns

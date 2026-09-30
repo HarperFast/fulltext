@@ -3353,12 +3353,11 @@ mod tests {
 				.unwrap()
 				.hits
 		};
-		let mut expected_ids = inserted_ids
+		let expected_ids = inserted_ids
 			.into_iter()
 			.collect::<BTreeSet<_>>()
 			.into_iter()
 			.collect::<Vec<_>>();
-		expected_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 		let paged_hits = (0..expected_ids.len())
 			.step_by(3)
 			.flat_map(|offset| page(offset, 3))
