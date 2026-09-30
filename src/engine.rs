@@ -515,46 +515,80 @@ impl Engine {
 		let query = self.query(searcher, request)?;
 		check_deadline(deadline)?;
 		let window_end = request.offset + request.limit;
-		let scored_docs = searcher
-			.search(
-				query.as_ref(),
-				&TopDocs::with_limit(window_end.saturating_add(1)).order_by_score(),
-			)
-			.map_err(index_error)?;
-		check_deadline(deadline)?;
-		let boundary_tie = scored_docs.len() > window_end && scored_docs[window_end - 1].0 == scored_docs[window_end].0;
-		let hits = if boundary_tie {
-			let scored_docs = searcher
+		let stable_any = request.candidate_ids.is_none()
+			&& matches!(&request.expression, SearchExpression::Clause(clause) if clause.mode == SearchMode::Any);
+		let (hits, bounded_total, bounded_total_relation) = if stable_any {
+			let mut scored_docs = searcher
 				.search(
 					query.as_ref(),
-					&StableScoreTieCollector::new(request.offset..window_end),
+					&StableScoreTieCollector::new(request.offset..window_end.saturating_add(1)),
 				)
 				.map_err(index_error)??;
+			check_deadline(deadline)?;
+			let has_more = scored_docs.len() > request.limit;
+			scored_docs.truncate(request.limit);
 			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
 			let versions = search_hit_versions(searcher, &addresses)?;
-			scored_docs
+			let hits = scored_docs
 				.into_iter()
 				.zip(versions)
 				.map(|(((score, id), _), version)| SearchHit { id, score, version })
-				.collect::<Vec<_>>()
-		} else {
-			let metadata = search_hit_metadata(searcher, &scored_docs)?;
-			let mut ranked = scored_docs
-				.iter()
-				.zip(metadata)
-				.map(|((score, _), metadata)| SearchHit {
-					id: metadata.id,
-					score: *score,
-					version: metadata.version,
-				})
 				.collect::<Vec<_>>();
-			ranked.sort_by(|left, right| {
-				right
-					.score
-					.total_cmp(&left.score)
-					.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
-			});
-			ranked.into_iter().skip(request.offset).take(request.limit).collect()
+			let (total, relation) = if !has_more && (!hits.is_empty() || request.offset == 0) {
+				((request.offset + hits.len()) as u64, TotalRelation::Exact)
+			} else {
+				(window_end as u64, TotalRelation::LowerBound)
+			};
+			(hits, total, relation)
+		} else {
+			let scored_docs = searcher
+				.search(
+					query.as_ref(),
+					&TopDocs::with_limit(window_end.saturating_add(1)).order_by_score(),
+				)
+				.map_err(index_error)?;
+			check_deadline(deadline)?;
+			let boundary_tie =
+				scored_docs.len() > window_end && scored_docs[window_end - 1].0 == scored_docs[window_end].0;
+			let hits = if boundary_tie {
+				let scored_docs = searcher
+					.search(
+						query.as_ref(),
+						&StableScoreTieCollector::new(request.offset..window_end),
+					)
+					.map_err(index_error)??;
+				let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
+				let versions = search_hit_versions(searcher, &addresses)?;
+				scored_docs
+					.into_iter()
+					.zip(versions)
+					.map(|(((score, id), _), version)| SearchHit { id, score, version })
+					.collect::<Vec<_>>()
+			} else {
+				let metadata = search_hit_metadata(searcher, &scored_docs)?;
+				let mut ranked = scored_docs
+					.iter()
+					.zip(metadata)
+					.map(|((score, _), metadata)| SearchHit {
+						id: metadata.id,
+						score: *score,
+						version: metadata.version,
+					})
+					.collect::<Vec<_>>();
+				ranked.sort_by(|left, right| {
+					right
+						.score
+						.total_cmp(&left.score)
+						.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+				});
+				ranked.into_iter().skip(request.offset).take(request.limit).collect()
+			};
+			let (total, relation) = if scored_docs.len() <= window_end {
+				(scored_docs.len() as u64, TotalRelation::Exact)
+			} else {
+				(window_end as u64, TotalRelation::LowerBound)
+			};
+			(hits, total, relation)
 		};
 		let (total, total_relation) = if request.exact_total {
 			check_deadline(deadline)?;
@@ -562,10 +596,8 @@ impl Engine {
 				searcher.search(query.as_ref(), &Count).map_err(index_error)? as u64,
 				TotalRelation::Exact,
 			)
-		} else if scored_docs.len() <= window_end {
-			(scored_docs.len() as u64, TotalRelation::Exact)
 		} else {
-			(window_end as u64, TotalRelation::LowerBound)
+			(bounded_total, bounded_total_relation)
 		};
 		check_deadline(deadline)?;
 		let response_bytes = hits
@@ -3342,7 +3374,7 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
-						expression: expression("identical catalog", SearchMode::Any, Vec::new()),
+						expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 						candidate_ids: None,
 						offset,
 						limit,
