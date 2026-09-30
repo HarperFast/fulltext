@@ -1,10 +1,12 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tantivy::collector::sort_key::{SortBySimilarityScore, SortByString};
-use tantivy::collector::{Count, TopDocs};
+use tantivy::collector::sort_key::{NaturalComparator, ReverseComparator};
+use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs, TopNComputer};
+use tantivy::columnar::StrColumn;
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
 use tantivy::query::{
@@ -16,7 +18,10 @@ use tantivy::tokenizer::{
 	AsciiFoldingFilter, Language, LowerCaser, RemoveLongFilter, Stemmer, StopWordFilter, TextAnalyzer, Token,
 	TokenFilter, TokenStream, Tokenizer,
 };
-use tantivy::{DocAddress, Index, IndexReader, IndexSettings, IndexWriter, Order, ReloadPolicy, Searcher, Term};
+use tantivy::{
+	DocAddress, DocId, Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, Score, Searcher, SegmentReader,
+	Term,
+};
 use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
 use unicode_normalization::is_nfkc;
 
@@ -79,6 +84,130 @@ struct EngineField {
 struct BuiltQuery {
 	query: Box<dyn Query>,
 	clauses: usize,
+}
+
+type StableScoreTieHit = ((Score, String), DocAddress);
+
+struct StableScoreTieCollector {
+	doc_range: Range<usize>,
+}
+
+impl StableScoreTieCollector {
+	fn new(doc_range: Range<usize>) -> Self {
+		Self { doc_range }
+	}
+}
+
+struct StableScoreTieSegmentCollector {
+	top_docs: TopNComputer<(Score, u64), DocId, (NaturalComparator, ReverseComparator)>,
+	id_column: StrColumn,
+	segment_ord: u32,
+	missing_id: bool,
+}
+
+impl SegmentCollector for StableScoreTieSegmentCollector {
+	type Fruit = Result<Vec<StableScoreTieHit>>;
+
+	fn collect(&mut self, doc: DocId, score: Score) {
+		let Some(id_ord) = self.id_column.ords().first(doc) else {
+			self.missing_id = true;
+			return;
+		};
+		// A segment's term ordinals preserve the dictionary's byte order.
+		self.top_docs.push((score, id_ord), doc);
+	}
+
+	fn harvest(self) -> Self::Fruit {
+		if self.missing_id {
+			return Err(FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"));
+		}
+		let top_docs = self.top_docs.into_vec();
+		let mut ordinals = top_docs
+			.iter()
+			.enumerate()
+			.map(|(index, hit)| (hit.sort_key.1, index))
+			.collect::<Vec<_>>();
+		ordinals.sort_unstable();
+		let mut ids = vec![None; top_docs.len()];
+		let mut next_ordinal = 0;
+		let found_all = self
+			.id_column
+			.dictionary()
+			.sorted_ords_to_term_cb(ordinals.iter().map(|(ordinal, _)| *ordinal), |id| {
+				let Some((_, result_index)) = ordinals.get(next_ordinal) else {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::InvalidData,
+						"ID dictionary returned too many terms",
+					));
+				};
+				next_ordinal += 1;
+				ids[*result_index] = Some(id.to_vec());
+				Ok(())
+			})
+			.map_err(storage_error)?;
+		if !found_all || next_ordinal != ordinals.len() {
+			return Err(FulltextError::new(
+				"E_NATIVE_FAILURE",
+				"search hit ID ordinal is missing",
+			));
+		}
+		top_docs
+			.into_iter()
+			.zip(ids)
+			.map(|(hit, id)| {
+				let id =
+					id.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit ID ordinal is missing"))?;
+				let id = String::from_utf8(id)
+					.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?;
+				Ok(((hit.sort_key.0, id), DocAddress::new(self.segment_ord, hit.doc)))
+			})
+			.collect()
+	}
+}
+
+impl Collector for StableScoreTieCollector {
+	type Fruit = Result<Vec<StableScoreTieHit>>;
+	type Child = StableScoreTieSegmentCollector;
+
+	fn for_segment(&self, segment_ord: u32, segment: &SegmentReader) -> tantivy::Result<Self::Child> {
+		let id_column = segment
+			.fast_fields()
+			.str(ID_FIELD_NAME)?
+			.ok_or_else(|| tantivy::TantivyError::InternalError("search segment has no ID fast field".to_owned()))?;
+		Ok(StableScoreTieSegmentCollector {
+			top_docs: TopNComputer::new_with_comparator(self.doc_range.end, (NaturalComparator, ReverseComparator)),
+			id_column,
+			segment_ord,
+			missing_id: false,
+		})
+	}
+
+	fn requires_scoring(&self) -> bool {
+		true
+	}
+
+	fn merge_fruits(&self, segment_fruits: Vec<Result<Vec<StableScoreTieHit>>>) -> tantivy::Result<Self::Fruit> {
+		let mut top_docs = TopNComputer::new_with_comparator(
+			self.doc_range.end,
+			((NaturalComparator, ReverseComparator), ReverseComparator),
+		);
+		for segment_hits in segment_fruits {
+			let segment_hits = match segment_hits {
+				Ok(segment_hits) => segment_hits,
+				Err(error) => return Ok(Err(error)),
+			};
+			for (sort_key, address) in segment_hits {
+				// DocAddress makes each merge key unique, so push order cannot break ties.
+				top_docs.push((sort_key, address), address);
+			}
+		}
+		Ok(Ok(top_docs
+			.into_sorted_vec()
+			.into_iter()
+			.skip(self.doc_range.start)
+			.map(|hit| (hit.sort_key.0, hit.doc))
+			.collect()))
+	}
 }
 
 pub struct Writer {
@@ -398,22 +527,16 @@ impl Engine {
 			let scored_docs = searcher
 				.search(
 					query.as_ref(),
-					&TopDocs::for_doc_range(request.offset..window_end).order_by((
-						(SortBySimilarityScore, Order::Desc),
-						(SortByString::for_field(ID_FIELD_NAME), Order::Asc),
-					)),
+					&StableScoreTieCollector::new(request.offset..window_end),
 				)
-				.map_err(index_error)?;
+				.map_err(index_error)??;
 			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
 			let versions = search_hit_versions(searcher, &addresses)?;
 			scored_docs
 				.into_iter()
 				.zip(versions)
-				.map(|(((score, id), _), version)| {
-					id.map(|id| SearchHit { id, score, version })
-						.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID fast field value"))
-				})
-				.collect::<Result<Vec<_>>>()?
+				.map(|(((score, id), _), version)| SearchHit { id, score, version })
+				.collect::<Vec<_>>()
 		} else {
 			let metadata = search_hit_metadata(searcher, &scored_docs)?;
 			let mut ranked = scored_docs
@@ -3031,21 +3154,48 @@ mod tests {
 		writer
 			.inner
 			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
-		for id in ["z", "a"] {
+		let inserted_ids = [
+			"catalog-0009",
+			"catalog-café",
+			"catalog-0001",
+			"catalog-0010",
+			"catalog-café",
+			"catalog-0004",
+			"catalog-0007",
+			"catalog-cafe",
+			"catalog-0002",
+			"catalog-0008",
+			"catalog-0003",
+			"catalog-0006",
+			"catalog-0005",
+			"catalog-0004",
+		];
+		for (chunk_index, ids) in inserted_ids.chunks(7).enumerate() {
 			writer
 				.apply(MutationBatch {
-					upserts: vec![crate::protocol::Upsert {
-						id: id.to_owned(),
-						version: None,
-						fields: vec![("title".to_owned(), vec!["identical catalog text".to_owned()])],
-					}],
+					upserts: ids
+						.iter()
+						.enumerate()
+						.map(|(index, id)| crate::protocol::Upsert {
+							id: (*id).to_owned(),
+							version: (*id == "catalog-0004").then(|| {
+								if chunk_index * 7 + index + 1 == inserted_ids.len() {
+									"latest"
+								} else {
+									"original"
+								}
+								.to_owned()
+							}),
+							fields: vec![("title".to_owned(), vec!["identical catalog text".to_owned()])],
+						})
+						.collect(),
 					deletes: Vec::new(),
 				})
 				.unwrap();
 			writer.commit().unwrap();
 		}
 		let reader = engine.reader().unwrap();
-		let page = |offset| {
+		let page = |offset, limit| {
 			engine
 				.search(
 					&reader.searcher(),
@@ -3053,18 +3203,37 @@ mod tests {
 						expression: expression("identical", SearchMode::Any, Vec::new()),
 						candidate_ids: None,
 						offset,
-						limit: 1,
+						limit,
 						exact_total: false,
 						budget_milliseconds: 30_000,
 					},
 				)
 				.unwrap()
-				.hits[0]
-				.id
-				.clone()
+				.hits
 		};
-		assert_eq!(page(0), "a");
-		assert_eq!(page(1), "z");
+		let mut expected_ids = inserted_ids
+			.into_iter()
+			.collect::<BTreeSet<_>>()
+			.into_iter()
+			.collect::<Vec<_>>();
+		expected_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+		let paged_hits = (0..expected_ids.len())
+			.step_by(3)
+			.flat_map(|offset| page(offset, 3))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			paged_hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+			expected_ids
+		);
+		assert_eq!(
+			paged_hits
+				.iter()
+				.find(|hit| hit.id == "catalog-0004")
+				.unwrap()
+				.version
+				.as_deref(),
+			Some("latest")
+		);
 		writer.close().unwrap();
 		let reopened = Engine::open(directory, &config).unwrap();
 		let result = reopened
@@ -3074,7 +3243,7 @@ mod tests {
 					expression: expression("identical", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					offset: 0,
-					limit: 2,
+					limit: expected_ids.len(),
 					exact_total: false,
 					budget_milliseconds: 30_000,
 				},
@@ -3082,7 +3251,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(
 			result.hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
-			["a", "z"]
+			expected_ids
 		);
 	}
 
