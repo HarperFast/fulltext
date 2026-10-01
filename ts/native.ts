@@ -19,6 +19,7 @@ import { loadAddon } from './load-addon.js';
 import { PublicationState } from './publication.js';
 
 const maxCommitPayloadBytes = 64 * 1024;
+const maxFilterStringBytes = 65_530;
 const filterComparators = new Set(['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between']);
 
 export { FulltextError } from './errors.js';
@@ -293,7 +294,7 @@ export class NativeFullTextIndex {
 	readonly #publication: PublicationState;
 	readonly #maxBatchBytes: number;
 	readonly #fieldNames: ReadonlySet<string>;
-	readonly #filterFieldNames: ReadonlySet<string>;
+	readonly #filterFieldTypes: ReadonlyMap<string, 'string' | 'number' | 'boolean'>;
 	#closed = false;
 	#closedStatus?: FullTextStatus;
 	#closePromise?: Promise<CloseResult>;
@@ -304,13 +305,13 @@ export class NativeFullTextIndex {
 		committedPayload?: string;
 		maxBatchBytes: number;
 		fieldNames: Iterable<string>;
-		filterFieldNames: Iterable<string>;
+		filterFields?: Iterable<{ name: string; type: 'string' | 'number' | 'boolean' }>;
 	}) {
 		this.#handle = options.handle;
 		this.#publication = new PublicationState(options.committedPayload);
 		this.#maxBatchBytes = options.maxBatchBytes;
 		this.#fieldNames = new Set(options.fieldNames);
-		this.#filterFieldNames = new Set(options.filterFieldNames);
+		this.#filterFieldTypes = new Map(Array.from(options.filterFields ?? [], (field) => [field.name, field.type]));
 	}
 
 	get committedPayload(): string | undefined {
@@ -364,7 +365,7 @@ export class NativeFullTextIndex {
 				logical,
 				this.#maxBatchBytes,
 				this.#fieldNames,
-				this.#filterFieldNames,
+				this.#filterFieldTypes,
 				{
 					validateDistinctIds: assumeDistinctIds !== true,
 					stopAfterFirstRejection: rejectedUpsert === 'reject',
@@ -448,7 +449,7 @@ export class NativeFullTextIndex {
 			{ upserts: [], deletes },
 			this.#maxBatchBytes,
 			this.#fieldNames,
-			this.#filterFieldNames,
+			this.#filterFieldTypes,
 			{ validateDistinctIds: false },
 		);
 		let done = false;
@@ -494,7 +495,7 @@ export class NativeFullTextIndex {
 				this.#maxBatchBytes,
 				maxTotalBytes,
 				this.#fieldNames,
-				this.#filterFieldNames,
+				this.#filterFieldTypes,
 			);
 			if (
 				allowPartial !== true &&
@@ -569,7 +570,8 @@ export class NativeFullTextIndex {
 				encodeSearch({
 					expression,
 					candidateIds: request.candidateIds,
-					filter: request.filter === undefined ? undefined : normalizeFilterExpression(request.filter, 0),
+					filter:
+						request.filter === undefined ? undefined : normalizeFilterExpression(request.filter, 0, { leaves: 0 }),
 					offset: request.offset ?? 0,
 					limit: request.limit ?? 20,
 					exactTotal: request.exactTotal ?? false,
@@ -1001,7 +1003,7 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 			committedPayload: payload,
 			maxBatchBytes: config.limits.maxBatchBytes,
 			fieldNames: config.fields.map((field) => field.name),
-			filterFieldNames: config.filterFields.map((field) => field.name),
+			filterFields: config.filterFields,
 		});
 	} catch (error) {
 		await invoke((callback) => loadAddon().__nativeClose(handle, true, callback)).catch(() => undefined);
@@ -1034,7 +1036,7 @@ export async function openNativeFullTextReader(options: NativeFullTextIndexOptio
 				committedPayload: payload,
 				maxBatchBytes: config.limits.maxBatchBytes,
 				fieldNames: config.fields.map((field) => field.name),
-				filterFieldNames: config.filterFields.map((field) => field.name),
+				filterFields: config.filterFields,
 			}),
 		);
 	} catch (error) {
@@ -1064,7 +1066,7 @@ function packedIndexIdentity(options: NativeFullTextIndexInspectionOptions) {
 	return {
 		...options,
 		fields: options.fields.map((field) => ({ name: field.name, weight: field.weight ?? 1 })),
-		filterFields: options.filterFields ?? [],
+		filterFields: (options.filterFields ?? []).map(({ name, type }) => ({ name, type })),
 		stopWords: options.stopWords ?? true,
 		positions: options.positions ?? true,
 		surfaceTerms: options.surfaceTerms ?? false,
@@ -1159,11 +1161,15 @@ function normalizeExpression(expression: SearchExpression, depth: number): impor
 function normalizeFilterExpression(
 	expression: FilterExpression,
 	depth: number,
+	state: { leaves: number },
 ): import('./codec.js').PackedFilterExpression {
 	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > 8) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid filter expression');
 	}
 	if ('field' in expression) {
+		if (++state.leaves > 256) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'filter expression exceeds 256 clauses');
+		}
 		if (typeof expression.field !== 'string' || expression.field.length === 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'filter clauses require a field');
 		}
@@ -1178,6 +1184,12 @@ function normalizeFilterExpression(
 		if (values.some((value) => !['string', 'number', 'boolean'].includes(typeof value))) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'filter values must be strings, numbers, or booleans');
 		}
+		if (values.some((value) => typeof value === 'string' && Buffer.byteLength(value) > maxFilterStringBytes)) {
+			throw new FulltextError(
+				'E_INVALID_ARGUMENT',
+				`filter strings must not exceed ${maxFilterStringBytes} UTF-8 bytes`,
+			);
+		}
 		return { field: expression.field, comparator: expression.comparator, values };
 	}
 	if (
@@ -1190,7 +1202,7 @@ function normalizeFilterExpression(
 	}
 	return {
 		operator: expression.operator,
-		clauses: expression.clauses.map((clause) => normalizeFilterExpression(clause, depth + 1)),
+		clauses: expression.clauses.map((clause) => normalizeFilterExpression(clause, depth + 1, state)),
 	};
 }
 

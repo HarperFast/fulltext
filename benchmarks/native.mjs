@@ -109,8 +109,21 @@ try {
 		{ name: 'fuzzy-prefix', text: 'waterproof tral', mode: 'fuzzy-prefix' },
 		{ name: 'unicode-all', text: 'cafe resume', mode: 'all' },
 		{ name: 'candidate-filter', text: 'waterproof', mode: 'any', candidateIds: ['product-0'] },
+		{ name: 'structured-filter-baseline', text: 'outdoor product', mode: 'any' },
 		{
-			name: 'structured-filter',
+			name: 'structured-filter-exact',
+			text: 'outdoor product',
+			mode: 'any',
+			filter: { field: 'category', comparator: 'equals', value: 'outdoors' },
+		},
+		{
+			name: 'structured-filter-range',
+			text: 'outdoor product',
+			mode: 'any',
+			filter: { field: 'price', comparator: 'between', value: [25, 75] },
+		},
+		{
+			name: 'structured-filter-combined',
 			text: 'outdoor product',
 			mode: 'any',
 			filter: {

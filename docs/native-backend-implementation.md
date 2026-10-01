@@ -367,7 +367,9 @@ the alternatives in BM25 field length, so enabling a rule can affect unrelated-t
 document containing its source. Match tracing uses the same document-side expansion and maps every
 replacement to the source token span. Crossing its 262,144-token-per-value ceiling marks the trace
 incomplete instead of failing the request. Version 2 and 3 sidecars remain parseable for safe reset
-but mismatch v4 open/inspection so the application can retire and rebuild them.
+but mismatch current open/inspection so the application can retire and rebuild them. Filter-free
+indexes keep sidecar v4; indexes with structured filter fields use v5 so their field names and types
+participate in compatibility checks.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`

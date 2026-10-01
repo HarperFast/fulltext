@@ -430,17 +430,19 @@ pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
 	for _ in 0..candidate_count {
 		let _ = cursor.bytes()?;
 	}
-	if cursor.boolean()? {
+	let filter_is_expensive = if cursor.boolean()? {
 		let mut filter_clauses = 0usize;
-		scan_filter_expression(&mut cursor, 0, &mut filter_clauses)?;
-	}
+		scan_filter_expression(&mut cursor, 0, &mut filter_clauses)?
+	} else {
+		false
+	};
 	let _ = cursor.u32()?;
 	let _ = cursor.u32()?;
 	let exact_total = cursor.boolean()?;
-	Ok(cost.has_expensive_mode || !cost.has_positive_anchor || exact_total)
+	Ok(cost.has_expensive_mode || !cost.has_positive_anchor || filter_is_expensive || exact_total)
 }
 
-fn scan_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut usize) -> Result<()> {
+fn scan_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut usize) -> Result<bool> {
 	if depth > 8 {
 		return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
 	}
@@ -460,22 +462,22 @@ fn scan_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut u
 				return Err(FulltextError::invalid("invalid filter value count"));
 			}
 			for _ in 0..count {
-				let _ = decode_filter_value(cursor)?;
+				scan_filter_value(cursor)?;
 			}
-			Ok(())
+			Ok(comparator >= 2 || count > 16)
 		}
-		kind @ (1 | 2) => {
+		1 | 2 => {
 			let count = cursor.u16()? as usize;
 			if count == 0 || count > MAX_QUERY_CLAUSES {
 				return Err(FulltextError::invalid(
 					"filter boolean expression requires 1 to 256 children",
 				));
 			}
+			let mut expensive = false;
 			for _ in 0..count {
-				scan_filter_expression(cursor, depth + 1, clauses)?;
+				expensive |= scan_filter_expression(cursor, depth + 1, clauses)?;
 			}
-			let _ = kind;
-			Ok(())
+			Ok(expensive)
 		}
 		_ => Err(FulltextError::invalid("unknown filter expression type")),
 	}
@@ -1033,6 +1035,24 @@ fn decode_filter_value(cursor: &mut Cursor<'_>) -> Result<FilterValue> {
 	}
 }
 
+fn scan_filter_value(cursor: &mut Cursor<'_>) -> Result<()> {
+	match cursor.u8()? {
+		0 => {
+			let _ = cursor.bytes()?;
+		}
+		1 => {
+			if !cursor.f64()?.is_finite() {
+				return Err(FulltextError::invalid("filter numbers must be finite"));
+			}
+		}
+		2 => {
+			let _ = cursor.boolean()?;
+		}
+		_ => return Err(FulltextError::invalid("unknown filter value type")),
+	}
+	Ok(())
+}
+
 struct Cursor<'a> {
 	bytes: &'a [u8],
 	offset: usize,
@@ -1339,6 +1359,27 @@ mod tests {
 		unanchored_or.extend_from_slice(&leaf);
 		unanchored_or.extend_from_slice(&negated);
 		assert!(search_is_expensive(&request(&unanchored_or, false)).unwrap());
+
+		let filtered_request = |comparator: u8| {
+			let mut bytes = b"FTSQ\x05\x00".to_vec();
+			bytes.extend_from_slice(&leaf);
+			bytes.push(0);
+			bytes.push(1);
+			bytes.push(0);
+			bytes.extend_from_slice(&5u32.to_le_bytes());
+			bytes.extend_from_slice(b"price");
+			bytes.push(comparator);
+			bytes.extend_from_slice(&1u16.to_le_bytes());
+			bytes.push(1);
+			bytes.extend_from_slice(&50f64.to_le_bytes());
+			bytes.extend_from_slice(&0u32.to_le_bytes());
+			bytes.extend_from_slice(&1u32.to_le_bytes());
+			bytes.push(0);
+			bytes.extend_from_slice(&100u32.to_le_bytes());
+			bytes
+		};
+		assert!(!search_is_expensive(&filtered_request(0)).unwrap());
+		assert!(search_is_expensive(&filtered_request(2)).unwrap());
 	}
 
 	#[test]

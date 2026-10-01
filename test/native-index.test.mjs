@@ -451,6 +451,18 @@ test('applies typed structured filters without changing BM25 scores', async (con
 		}),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [{ id: 'wrong-type', fields: { title: 'Invalid' }, filters: { price: '90' } }],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [{ id: 'too-long', fields: { title: 'Invalid' }, filters: { category: 'x'.repeat(65_531) } }],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
 	await index.applyMutationBatch({
 		upserts: [
 			{
@@ -508,10 +520,42 @@ test('applies typed structured filters without changing BM25 scores', async (con
 		).hits.map((hit) => hit.id),
 		['one'],
 	);
+	assert.deepStrictEqual(
+		(
+			await index.search({
+				text: 'waterproof',
+				filter: {
+					operator: 'or',
+					clauses: [
+						{ field: 'price', comparator: 'lt', value: 1 },
+						{ field: 'price', comparator: 'ge', value: 140 },
+					],
+				},
+			})
+		).hits.map((hit) => hit.id),
+		['one', 'three'],
+	);
 	await assert.rejects(
 		index.search({
 			text: 'waterproof',
 			filter: { field: 'price', comparator: 'equals', value: Number.NaN },
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({
+			text: 'waterproof',
+			filter: {
+				operator: 'and',
+				clauses: Array.from({ length: 2 }, () => ({
+					operator: 'or',
+					clauses: Array.from({ length: 129 }, () => ({
+						field: 'active',
+						comparator: 'equals',
+						value: true,
+					})),
+				})),
+			},
 		}),
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);

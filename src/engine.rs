@@ -13,10 +13,12 @@ use tantivy::query::{
 	BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery,
 	Query, RangeQuery, TermQuery, TermSetQuery,
 };
-use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, INDEXED};
+use tantivy::schema::{
+	Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, FAST, INDEXED,
+};
 use tantivy::tokenizer::{
 	AsciiFoldingFilter, Language, LowerCaser, RemoveLongFilter, Stemmer, StopWordFilter, TextAnalyzer, Token,
-	TokenFilter, TokenStream, Tokenizer,
+	TokenFilter, TokenStream, Tokenizer, MAX_TOKEN_LEN,
 };
 use tantivy::{
 	DocAddress, DocId, Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, Score, Searcher, SegmentReader,
@@ -1519,7 +1521,11 @@ impl Engine {
 			.map(|value| filter_term(field, value))
 			.collect::<Result<Vec<_>>>()?;
 		match comparator {
-			FilterComparator::Equals | FilterComparator::In => Ok(Box::new(TermSetQuery::new(terms))),
+			FilterComparator::Equals => Ok(Box::new(TermQuery::new(terms[0].clone(), IndexRecordOption::Basic))),
+			FilterComparator::In if terms.len() == 1 => {
+				Ok(Box::new(TermQuery::new(terms[0].clone(), IndexRecordOption::Basic)))
+			}
+			FilterComparator::In => Ok(Box::new(TermSetQuery::new(terms))),
 			FilterComparator::Lt
 			| FilterComparator::Le
 			| FilterComparator::Gt
@@ -1571,7 +1577,15 @@ impl Engine {
 
 fn filter_term(field: &EngineFilterField, value: &FilterValue) -> Result<Term> {
 	match (field.field_type, value) {
-		(FilterFieldType::String, FilterValue::String(value)) => Ok(Term::from_field_text(field.field, value)),
+		(FilterFieldType::String, FilterValue::String(value)) => {
+			if value.len() > MAX_TOKEN_LEN {
+				return Err(FulltextError::invalid(format!(
+					"filter field {} exceeds {MAX_TOKEN_LEN} UTF-8 bytes",
+					field.name
+				)));
+			}
+			Ok(Term::from_field_text(field.field, value))
+		}
 		(FilterFieldType::Number, FilterValue::Number(value)) => {
 			Ok(Term::from_field_f64(field.field, canonical_number(*value)))
 		}
@@ -1927,6 +1941,11 @@ impl Writer {
 				for value in values {
 					match (filter.field_type, value) {
 						(FilterFieldType::String, FilterValue::String(value)) => {
+							if value.len() > MAX_TOKEN_LEN {
+								return Err(FulltextError::invalid(format!(
+									"mutation filter {name} exceeds {MAX_TOKEN_LEN} UTF-8 bytes"
+								)));
+							}
 							document.add_text(filter.field, &value);
 						}
 						(FilterFieldType::Number, FilterValue::Number(value)) => {
@@ -1936,10 +1955,9 @@ impl Writer {
 							document.add_bool(filter.field, value);
 						}
 						_ => {
-							return Err(FulltextError::new(
-								"E_SCHEMA_MISMATCH",
-								format!("mutation filter {name} has the wrong value type"),
-							));
+							return Err(FulltextError::invalid(format!(
+								"mutation filter {name} has the wrong value type"
+							)));
 						}
 					}
 				}
@@ -2056,7 +2074,7 @@ fn build_schema_with_surface_record(
 					.set_fieldnorms(false);
 				builder.add_text_field(&schema_name, TextOptions::default().set_indexing_options(indexing))
 			}
-			FilterFieldType::Number => builder.add_f64_field(&schema_name, INDEXED),
+			FilterFieldType::Number => builder.add_f64_field(&schema_name, INDEXED | FAST),
 			FilterFieldType::Boolean => builder.add_bool_field(&schema_name, INDEXED),
 		};
 		filter_fields.push(EngineFilterField {
@@ -2603,7 +2621,11 @@ fn canonical_synonym_term(analyzer: &mut TextAnalyzer, text: &str, label: &str) 
 }
 
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
-	let mut bytes = b"HTFI\x05\x00".to_vec();
+	let mut bytes = if config.filter_fields.is_empty() {
+		b"HTFI\x04\x00".to_vec()
+	} else {
+		b"HTFI\x05\x00".to_vec()
+	};
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
 	push_string(&mut bytes, &config.analyzer);
@@ -2624,14 +2646,16 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 	for field in &config.fields {
 		push_string(&mut bytes, &field.name);
 	}
-	bytes.extend_from_slice(&(config.filter_fields.len() as u16).to_le_bytes());
-	for field in &config.filter_fields {
-		push_string(&mut bytes, &field.name);
-		bytes.push(match field.field_type {
-			FilterFieldType::String => 0,
-			FilterFieldType::Number => 1,
-			FilterFieldType::Boolean => 2,
-		});
+	if !config.filter_fields.is_empty() {
+		bytes.extend_from_slice(&(config.filter_fields.len() as u16).to_le_bytes());
+		for field in &config.filter_fields {
+			push_string(&mut bytes, &field.name);
+			bytes.push(match field.field_type {
+				FilterFieldType::String => 0,
+				FilterFieldType::Number => 1,
+				FilterFieldType::Boolean => 2,
+			});
+		}
 	}
 	bytes
 }
@@ -2771,7 +2795,7 @@ fn validated_payload(payload: Option<String>) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::protocol::{FieldConfig, Limits};
+	use crate::protocol::{FieldConfig, FilterFieldConfig, Limits};
 	use std::io;
 	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::sync::Arc;
@@ -3943,6 +3967,7 @@ mod tests {
 	fn validates_the_complete_persisted_identity() {
 		let config = config();
 		let mut identity = identity_bytes(&config.identity);
+		assert_eq!(&identity[4..6], b"\x04\x00");
 		assert_eq!(persisted_index_id(&identity), Some("products"));
 
 		identity.pop();
@@ -3951,6 +3976,15 @@ mod tests {
 		let mut identity = identity_bytes(&config.identity);
 		identity.push(0);
 		assert_eq!(persisted_index_id(&identity), None);
+
+		let mut filtered = config.identity;
+		filtered.filter_fields.push(FilterFieldConfig {
+			name: "category".to_owned(),
+			field_type: FilterFieldType::String,
+		});
+		let identity = identity_bytes(&filtered);
+		assert_eq!(&identity[4..6], b"\x05\x00");
+		assert_eq!(persisted_index_id(&identity), Some("products"));
 	}
 
 	#[test]

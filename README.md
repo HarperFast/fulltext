@@ -234,7 +234,9 @@ Declare only fields that should participate in native filtering. They are separa
 text fields and may reuse the same logical name. String filters are exact and case-sensitive;
 number filters support exact and range comparisons; Boolean filters support exact comparison.
 Arrays add one value per element. Missing fields add no value. Filter clauses are required,
-score-neutral Tantivy queries, so they reduce ranking work without changing BM25 scores.
+score-neutral Tantivy queries, so they reduce ranking work without changing BM25 scores. String
+filter values are limited to 65,530 UTF-8 bytes. Number fields are also stored as Tantivy fast
+fields to keep broad range filters from materializing term bitsets; this increases index size.
 
 ```js
 const result = await index.search({
@@ -426,10 +428,11 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 8 and packed protocol 4. The loader rejects older addon binaries. Native
-identity sidecar v4 fingerprints the internal source-version field in addition to canonical
-synonyms and the completed `english@2` semantics. Older v2 and v3 indexes remain identifiable for
-safe reset but cannot be reopened under the new schema; rebuild them from the authoritative source.
+This API uses native ABI 8 and packed protocol 5. The loader rejects older addon binaries. Native
+identity sidecar v4 remains the identity for indexes without structured filter fields. Configuring
+filter fields uses sidecar v5, which also fingerprints their names and types. Older v2 and v3
+indexes remain identifiable for safe reset but cannot be reopened; rebuild them from the
+authoritative source.
 
 ## Diagnostics and errors
 
