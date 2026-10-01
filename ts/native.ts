@@ -19,6 +19,7 @@ import { loadAddon } from './load-addon.js';
 import { PublicationState } from './publication.js';
 
 const maxCommitPayloadBytes = 64 * 1024;
+const filterComparators = new Set(['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between']);
 
 export { FulltextError } from './errors.js';
 export type { FulltextErrorCode } from './errors.js';
@@ -27,10 +28,10 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	queryApiVersion: 2;
+	queryApiVersion: 3;
 	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
-	mutationBatchApiVersion: 4;
+	mutationBatchApiVersion: 5;
 	storageBackends: ReadonlyArray<'native'>;
 	limits: {
 		maxCommitPayloadBytes: number;
@@ -67,6 +68,7 @@ export interface NativeFullTextIndexOptions {
 	indexId: string;
 	generation: string;
 	fields: Array<{ name: string; weight?: number }>;
+	filterFields?: Array<{ name: string; type: 'string' | 'number' | 'boolean' }>;
 	analyzer: 'english@2';
 	stopWords?: boolean;
 	positions?: boolean;
@@ -119,7 +121,12 @@ export type NativeFullTextIndexResetResult = { state: 'missing' } | { state: 're
 export type NativeFullTextReclaimResult = { removed: number; failed: number };
 
 export interface FullTextMutationBatch {
-	upserts?: Array<{ id: string; version?: string; fields: Record<string, string | string[]> }>;
+	upserts?: Array<{
+		id: string;
+		version?: string;
+		fields: Record<string, string | string[]>;
+		filters?: Record<string, FilterValue | FilterValue[]>;
+	}>;
 	deletes?: string[];
 }
 
@@ -182,6 +189,16 @@ export type SearchExpression =
 	| { operator: 'and' | 'or'; clauses: SearchExpression[] }
 	| { operator: 'not'; clause: SearchExpression };
 
+export type FilterValue = string | number | boolean;
+
+export type FilterExpression =
+	| {
+			field: string;
+			comparator: 'equals' | 'in' | 'lt' | 'le' | 'gt' | 'ge' | 'between';
+			value: FilterValue | FilterValue[];
+	  }
+	| { operator: 'and' | 'or'; clauses: FilterExpression[] };
+
 export interface SearchRequest {
 	text?: string;
 	query?: SearchExpression;
@@ -189,6 +206,7 @@ export interface SearchRequest {
 	operator?: 'any' | 'all';
 	fields?: string[];
 	candidateIds?: string[];
+	filter?: FilterExpression;
 	offset?: number;
 	limit?: number;
 	exactTotal?: boolean;
@@ -275,6 +293,7 @@ export class NativeFullTextIndex {
 	readonly #publication: PublicationState;
 	readonly #maxBatchBytes: number;
 	readonly #fieldNames: ReadonlySet<string>;
+	readonly #filterFieldNames: ReadonlySet<string>;
 	#closed = false;
 	#closedStatus?: FullTextStatus;
 	#closePromise?: Promise<CloseResult>;
@@ -285,11 +304,13 @@ export class NativeFullTextIndex {
 		committedPayload?: string;
 		maxBatchBytes: number;
 		fieldNames: Iterable<string>;
+		filterFieldNames: Iterable<string>;
 	}) {
 		this.#handle = options.handle;
 		this.#publication = new PublicationState(options.committedPayload);
 		this.#maxBatchBytes = options.maxBatchBytes;
 		this.#fieldNames = new Set(options.fieldNames);
+		this.#filterFieldNames = new Set(options.filterFieldNames);
 	}
 
 	get committedPayload(): string | undefined {
@@ -339,11 +360,17 @@ export class NativeFullTextIndex {
 			}
 			const logical = snapshotMutationBatch(batch);
 			const rejectedUpsert = rejectedUpsertOption ?? 'reject';
-			const cursor = new MutationBatchFrameCursor(logical, this.#maxBatchBytes, this.#fieldNames, {
-				validateDistinctIds: assumeDistinctIds !== true,
-				stopAfterFirstRejection: rejectedUpsert === 'reject',
-				requireReplacementDeletes: rejectedUpsert === 'delete',
-			});
+			const cursor = new MutationBatchFrameCursor(
+				logical,
+				this.#maxBatchBytes,
+				this.#fieldNames,
+				this.#filterFieldNames,
+				{
+					validateDistinctIds: assumeDistinctIds !== true,
+					stopAfterFirstRejection: rejectedUpsert === 'reject',
+					requireReplacementDeletes: rejectedUpsert === 'delete',
+				},
+			);
 			if (logical.upserts.length + logical.deletes.length === 0) {
 				this.#logicalMutationState = 'idle';
 				return { processed: 0, rejected: [], encodedBytes: 0, frames: 0 };
@@ -417,9 +444,13 @@ export class NativeFullTextIndex {
 	): Promise<{ encodedBytes: number; frames: number }> {
 		let encodedBytes = 0;
 		let frames = 0;
-		const cursor = new MutationBatchFrameCursor({ upserts: [], deletes }, this.#maxBatchBytes, this.#fieldNames, {
-			validateDistinctIds: false,
-		});
+		const cursor = new MutationBatchFrameCursor(
+			{ upserts: [], deletes },
+			this.#maxBatchBytes,
+			this.#fieldNames,
+			this.#filterFieldNames,
+			{ validateDistinctIds: false },
+		);
 		let done = false;
 		while (!done) {
 			const encoded = cursor.next();
@@ -458,7 +489,13 @@ export class NativeFullTextIndex {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'allowPartial must be a boolean');
 			}
 			const logical = snapshotMutationBatch(batch);
-			const encoded = encodeBatchPartitions(logical, this.#maxBatchBytes, maxTotalBytes, this.#fieldNames);
+			const encoded = encodeBatchPartitions(
+				logical,
+				this.#maxBatchBytes,
+				maxTotalBytes,
+				this.#fieldNames,
+				this.#filterFieldNames,
+			);
 			if (
 				allowPartial !== true &&
 				(encoded.consumedUpserts < logical.upserts.length || encoded.consumedDeletes < logical.deletes.length)
@@ -532,6 +569,7 @@ export class NativeFullTextIndex {
 				encodeSearch({
 					expression,
 					candidateIds: request.candidateIds,
+					filter: request.filter === undefined ? undefined : normalizeFilterExpression(request.filter, 0),
 					offset: request.offset ?? 0,
 					limit: request.limit ?? 20,
 					exactTotal: request.exactTotal ?? false,
@@ -963,6 +1001,7 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 			committedPayload: payload,
 			maxBatchBytes: config.limits.maxBatchBytes,
 			fieldNames: config.fields.map((field) => field.name),
+			filterFieldNames: config.filterFields.map((field) => field.name),
 		});
 	} catch (error) {
 		await invoke((callback) => loadAddon().__nativeClose(handle, true, callback)).catch(() => undefined);
@@ -995,6 +1034,7 @@ export async function openNativeFullTextReader(options: NativeFullTextIndexOptio
 				committedPayload: payload,
 				maxBatchBytes: config.limits.maxBatchBytes,
 				fieldNames: config.fields.map((field) => field.name),
+				filterFieldNames: config.filterFields.map((field) => field.name),
 			}),
 		);
 	} catch (error) {
@@ -1024,6 +1064,7 @@ function packedIndexIdentity(options: NativeFullTextIndexInspectionOptions) {
 	return {
 		...options,
 		fields: options.fields.map((field) => ({ name: field.name, weight: field.weight ?? 1 })),
+		filterFields: options.filterFields ?? [],
 		stopWords: options.stopWords ?? true,
 		positions: options.positions ?? true,
 		surfaceTerms: options.surfaceTerms ?? false,
@@ -1044,10 +1085,10 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			queryApiVersion: info.queryApiVersion as 2,
+			queryApiVersion: info.queryApiVersion as 3,
 			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
-			mutationBatchApiVersion: 4,
+			mutationBatchApiVersion: 5,
 			storageBackends: ['native'],
 			limits: { ...info.limits },
 		};
@@ -1115,6 +1156,44 @@ function normalizeExpression(expression: SearchExpression, depth: number): impor
 	};
 }
 
+function normalizeFilterExpression(
+	expression: FilterExpression,
+	depth: number,
+): import('./codec.js').PackedFilterExpression {
+	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > 8) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid filter expression');
+	}
+	if ('field' in expression) {
+		if (typeof expression.field !== 'string' || expression.field.length === 0) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'filter clauses require a field');
+		}
+		if (!filterComparators.has(expression.comparator)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'unknown filter comparator');
+		}
+		const values = Array.isArray(expression.value) ? expression.value.slice() : [expression.value];
+		const expected = expression.comparator === 'in' ? undefined : expression.comparator === 'between' ? 2 : 1;
+		if (values.length === 0 || values.length > 256 || (expected !== undefined && values.length !== expected)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'invalid filter value count');
+		}
+		if (values.some((value) => !['string', 'number', 'boolean'].includes(typeof value))) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'filter values must be strings, numbers, or booleans');
+		}
+		return { field: expression.field, comparator: expression.comparator, values };
+	}
+	if (
+		(expression.operator !== 'and' && expression.operator !== 'or') ||
+		!Array.isArray(expression.clauses) ||
+		expression.clauses.length === 0 ||
+		expression.clauses.length > 256
+	) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'filter boolean expressions require 1 to 256 clauses');
+	}
+	return {
+		operator: expression.operator,
+		clauses: expression.clauses.map((clause) => normalizeFilterExpression(clause, depth + 1)),
+	};
+}
+
 function snapshotMutationBatch(batch: FullTextMutationBatch): Required<FullTextMutationBatch> {
 	if (!batch || typeof batch !== 'object' || Array.isArray(batch)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch must be an object');
@@ -1129,7 +1208,7 @@ function snapshotMutationBatch(batch: FullTextMutationBatch): Required<FullTextM
 		upserts:
 			batch.upserts?.map((upsert) =>
 				upsert && typeof upsert === 'object'
-					? { id: upsert.id, version: upsert.version, fields: upsert.fields }
+					? { id: upsert.id, version: upsert.version, fields: upsert.fields, filters: upsert.filters }
 					: upsert,
 			) ?? [],
 		deletes: batch.deletes?.slice() ?? [],

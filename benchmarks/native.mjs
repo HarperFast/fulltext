@@ -21,6 +21,11 @@ const config = {
 	indexId: 'products-benchmark',
 	generation: 'benchmark-v1',
 	fields: [{ name: 'title', weight: 3 }, { name: 'description' }, { name: 'category', weight: 1.5 }],
+	filterFields: [
+		{ name: 'category', type: 'string' },
+		{ name: 'price', type: 'number' },
+		{ name: 'available', type: 'boolean' },
+	],
 	analyzer: 'english@2',
 	positions: true,
 	surfaceTerms: true,
@@ -104,6 +109,19 @@ try {
 		{ name: 'fuzzy-prefix', text: 'waterproof tral', mode: 'fuzzy-prefix' },
 		{ name: 'unicode-all', text: 'cafe resume', mode: 'all' },
 		{ name: 'candidate-filter', text: 'waterproof', mode: 'any', candidateIds: ['product-0'] },
+		{
+			name: 'structured-filter',
+			text: 'outdoor product',
+			mode: 'any',
+			filter: {
+				operator: 'and',
+				clauses: [
+					{ field: 'category', comparator: 'in', value: ['shoes', 'outdoors'] },
+					{ field: 'price', comparator: 'between', value: [25, 75] },
+					{ field: 'available', comparator: 'equals', value: true },
+				],
+			},
+		},
 	];
 	for (const query of queryMix) {
 		await index.search({ ...query, limit: 10 });
@@ -224,7 +242,11 @@ function product(id) {
 		],
 	];
 	const [title, description, category] = variants[id % variants.length];
-	return { id: `product-${id}`, fields: { title: `${title} ${id}`, description, category } };
+	return {
+		id: `product-${id}`,
+		fields: { title: `${title} ${id}`, description, category },
+		filters: { category, price: id % 100, available: id % 2 === 0 },
+	};
 }
 
 async function measureSearch(index, queries, count, parallelism, exactTotal) {

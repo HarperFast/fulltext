@@ -1,6 +1,6 @@
 use crate::error::{FulltextError, Result};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 const MAX_STRING_BYTES: usize = 1 << 20;
 pub const MAX_RECORD_ID_BYTES: usize = 4 << 10;
 pub const MAX_RECORD_VERSION_BYTES: usize = 4 << 10;
@@ -9,12 +9,25 @@ pub const MAX_SYNONYM_RULES: usize = 1_024;
 pub const MAX_SYNONYM_REPLACEMENTS: usize = 16;
 pub const MAX_SYNONYM_BYTES: usize = 1 << 20;
 const MUTATION_BATCH_HEADER_BYTES: usize = 14;
-const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 8;
+const MIN_MUTATION_BATCH_BYTES: usize = MUTATION_BATCH_HEADER_BYTES + 10;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldConfig {
 	pub name: String,
 	pub weight: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterFieldType {
+	String,
+	Number,
+	Boolean,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterFieldConfig {
+	pub name: String,
+	pub field_type: FilterFieldType,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,6 +66,7 @@ pub struct EngineIdentityConfig {
 	pub positions: bool,
 	pub surface_terms: bool,
 	pub synonyms: Vec<SynonymRule>,
+	pub filter_fields: Vec<FilterFieldConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,14 +93,44 @@ pub struct NativeResetConfig {
 	pub index_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterValue {
+	String(String),
+	Number(f64),
+	Boolean(bool),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterComparator {
+	Equals,
+	In,
+	Lt,
+	Le,
+	Gt,
+	Ge,
+	Between,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterExpression {
+	Clause {
+		field: String,
+		comparator: FilterComparator,
+		values: Vec<FilterValue>,
+	},
+	And(Vec<FilterExpression>),
+	Or(Vec<FilterExpression>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Upsert {
 	pub id: String,
 	pub version: Option<String>,
 	pub fields: Vec<(String, Vec<String>)>,
+	pub filters: Vec<(String, Vec<FilterValue>)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MutationBatch {
 	pub upserts: Vec<Upsert>,
 	pub deletes: Vec<String>,
@@ -151,10 +195,11 @@ pub enum SearchExpression {
 	Not(Box<SearchExpression>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SearchRequest {
 	pub expression: SearchExpression,
 	pub candidate_ids: Option<Vec<String>>,
+	pub filter: Option<FilterExpression>,
 	pub offset: usize,
 	pub limit: usize,
 	pub exact_total: bool,
@@ -167,7 +212,7 @@ pub struct TraceRecord {
 	pub fields: Vec<(String, Vec<String>)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TraceRequest {
 	pub search: SearchRequest,
 	pub records: Vec<TraceRecord>,
@@ -290,6 +335,23 @@ fn decode_engine_identity_config(cursor: &mut Cursor<'_>) -> Result<EngineIdenti
 		}
 		fields.push(FieldConfig { name, weight });
 	}
+	let filter_field_count = cursor.u16()? as usize;
+	if filter_field_count > MAX_FIELDS {
+		return Err(FulltextError::invalid(
+			"filterFields must not contain more than 1024 entries",
+		));
+	}
+	let mut filter_fields = Vec::with_capacity(filter_field_count);
+	for _ in 0..filter_field_count {
+		let name = cursor.string()?;
+		let field_type = match cursor.u8()? {
+			0 => FilterFieldType::String,
+			1 => FilterFieldType::Number,
+			2 => FilterFieldType::Boolean,
+			_ => return Err(FulltextError::invalid("unknown filter field type")),
+		};
+		filter_fields.push(FilterFieldConfig { name, field_type });
+	}
 	Ok(EngineIdentityConfig {
 		index_id,
 		generation,
@@ -299,6 +361,7 @@ fn decode_engine_identity_config(cursor: &mut Cursor<'_>) -> Result<EngineIdenti
 		positions,
 		surface_terms,
 		synonyms,
+		filter_fields,
 	})
 }
 
@@ -367,10 +430,55 @@ pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
 	for _ in 0..candidate_count {
 		let _ = cursor.bytes()?;
 	}
+	if cursor.boolean()? {
+		let mut filter_clauses = 0usize;
+		scan_filter_expression(&mut cursor, 0, &mut filter_clauses)?;
+	}
 	let _ = cursor.u32()?;
 	let _ = cursor.u32()?;
 	let exact_total = cursor.boolean()?;
 	Ok(cost.has_expensive_mode || !cost.has_positive_anchor || exact_total)
+}
+
+fn scan_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut usize) -> Result<()> {
+	if depth > 8 {
+		return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
+	}
+	match cursor.u8()? {
+		0 => {
+			*clauses += 1;
+			if *clauses > MAX_QUERY_CLAUSES {
+				return Err(FulltextError::invalid("filter expression exceeds 256 clauses"));
+			}
+			let _ = cursor.bytes()?;
+			let comparator = cursor.u8()?;
+			if comparator > 6 {
+				return Err(FulltextError::invalid("unknown filter comparator"));
+			}
+			let count = cursor.u16()? as usize;
+			if count == 0 || count > MAX_QUERY_CLAUSES || count > cursor.remaining() / 2 {
+				return Err(FulltextError::invalid("invalid filter value count"));
+			}
+			for _ in 0..count {
+				let _ = decode_filter_value(cursor)?;
+			}
+			Ok(())
+		}
+		kind @ (1 | 2) => {
+			let count = cursor.u16()? as usize;
+			if count == 0 || count > MAX_QUERY_CLAUSES {
+				return Err(FulltextError::invalid(
+					"filter boolean expression requires 1 to 256 children",
+				));
+			}
+			for _ in 0..count {
+				scan_filter_expression(cursor, depth + 1, clauses)?;
+			}
+			let _ = kind;
+			Ok(())
+		}
+		_ => Err(FulltextError::invalid("unknown filter expression type")),
+	}
 }
 
 struct SearchCost {
@@ -496,7 +604,33 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 			}
 			fields.push((name, values));
 		}
-		upserts.push(Upsert { id, version, fields });
+		let filter_count = cursor.u16()? as usize;
+		if filter_count > MAX_FIELDS || filter_count > cursor.remaining() / 6 {
+			return Err(FulltextError::invalid(
+				"upsert filter count exceeds the packed batch length",
+			));
+		}
+		let mut filters = Vec::with_capacity(filter_count);
+		for _ in 0..filter_count {
+			let name = cursor.string()?;
+			let value_count = cursor.u16()? as usize;
+			if value_count > cursor.remaining() / 2 {
+				return Err(FulltextError::invalid(
+					"filter value count exceeds the packed batch length",
+				));
+			}
+			let mut values = Vec::with_capacity(value_count);
+			for _ in 0..value_count {
+				values.push(decode_filter_value(&mut cursor)?);
+			}
+			filters.push((name, values));
+		}
+		upserts.push(Upsert {
+			id,
+			version,
+			fields,
+			filters,
+		});
 	}
 	if delete_count > cursor.remaining() / 4 {
 		return Err(FulltextError::invalid("delete count exceeds the packed batch length"));
@@ -536,6 +670,12 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 		}
 		candidate_ids.push(id);
 	}
+	let filter = if cursor.boolean()? {
+		let mut filter_clauses = 0usize;
+		Some(decode_filter_expression(&mut cursor, 0, &mut filter_clauses)?)
+	} else {
+		None
+	};
 	let offset = cursor.u32()? as usize;
 	let limit = cursor.u32()? as usize;
 	let exact_total = cursor.boolean()?;
@@ -557,11 +697,73 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	Ok(SearchRequest {
 		expression,
 		candidate_ids: has_candidates.then_some(candidate_ids),
+		filter,
 		offset,
 		limit,
 		exact_total,
 		budget_milliseconds,
 	})
+}
+
+fn decode_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut usize) -> Result<FilterExpression> {
+	if depth > 8 {
+		return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
+	}
+	match cursor.u8()? {
+		0 => {
+			*clauses += 1;
+			if *clauses > MAX_QUERY_CLAUSES {
+				return Err(FulltextError::invalid("filter expression exceeds 256 clauses"));
+			}
+			let field = cursor.string()?;
+			let comparator = match cursor.u8()? {
+				0 => FilterComparator::Equals,
+				1 => FilterComparator::In,
+				2 => FilterComparator::Lt,
+				3 => FilterComparator::Le,
+				4 => FilterComparator::Gt,
+				5 => FilterComparator::Ge,
+				6 => FilterComparator::Between,
+				_ => return Err(FulltextError::invalid("unknown filter comparator")),
+			};
+			let count = cursor.u16()? as usize;
+			let expected = match comparator {
+				FilterComparator::In => None,
+				FilterComparator::Between => Some(2),
+				_ => Some(1),
+			};
+			if count == 0 || count > MAX_QUERY_CLAUSES || expected.is_some_and(|expected| expected != count) {
+				return Err(FulltextError::invalid("invalid filter value count"));
+			}
+			let mut values = Vec::with_capacity(count);
+			for _ in 0..count {
+				values.push(decode_filter_value(cursor)?);
+			}
+			Ok(FilterExpression::Clause {
+				field,
+				comparator,
+				values,
+			})
+		}
+		kind @ (1 | 2) => {
+			let count = cursor.u16()? as usize;
+			if count == 0 || count > MAX_QUERY_CLAUSES {
+				return Err(FulltextError::invalid(
+					"filter boolean expression requires 1 to 256 children",
+				));
+			}
+			let mut children = Vec::with_capacity(count);
+			for _ in 0..count {
+				children.push(decode_filter_expression(cursor, depth + 1, clauses)?);
+			}
+			Ok(if kind == 1 {
+				FilterExpression::And(children)
+			} else {
+				FilterExpression::Or(children)
+			})
+		}
+		_ => Err(FulltextError::invalid("unknown filter expression type")),
+	}
 }
 
 fn decode_search_expression(
@@ -711,6 +913,7 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 		search: SearchRequest {
 			expression: SearchExpression::Clause(SearchClause { text, mode, fields }),
 			candidate_ids: has_candidates.then_some(candidate_ids),
+			filter: None,
 			offset: 0,
 			limit: record_count,
 			exact_total: false,
@@ -804,7 +1007,30 @@ fn validate_identity_config(config: &EngineIdentityConfig) -> Result<()> {
 			));
 		}
 	}
+	let mut filter_names = std::collections::HashSet::with_capacity(config.filter_fields.len());
+	for field in &config.filter_fields {
+		if field.name.is_empty() || field.name.starts_with("__fulltext_") || !filter_names.insert(field.name.as_str()) {
+			return Err(FulltextError::invalid(
+				"filter field names must be non-empty, unique, and outside the reserved __fulltext_ namespace",
+			));
+		}
+	}
 	Ok(())
+}
+
+fn decode_filter_value(cursor: &mut Cursor<'_>) -> Result<FilterValue> {
+	match cursor.u8()? {
+		0 => Ok(FilterValue::String(cursor.string()?)),
+		1 => {
+			let value = cursor.f64()?;
+			if !value.is_finite() {
+				return Err(FulltextError::invalid("filter numbers must be finite"));
+			}
+			Ok(FilterValue::Number(value))
+		}
+		2 => Ok(FilterValue::Boolean(cursor.boolean()?)),
+		_ => Err(FulltextError::invalid("unknown filter value type")),
+	}
 }
 
 struct Cursor<'a> {
@@ -886,6 +1112,13 @@ impl<'a> Cursor<'a> {
 		Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 	}
 
+	fn f64(&mut self) -> Result<f64> {
+		let bytes = self.take(8)?;
+		Ok(f64::from_le_bytes([
+			bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+		]))
+	}
+
 	fn string(&mut self) -> Result<String> {
 		let bytes = self.bytes()?;
 		String::from_utf8(bytes.to_vec()).map_err(|_| FulltextError::invalid("packed string is not valid UTF-8"))
@@ -928,7 +1161,7 @@ mod tests {
 
 	#[test]
 	fn reset_frame_contains_only_path_and_logical_index_id() {
-		let mut bytes = b"FTRX\x04\x00".to_vec();
+		let mut bytes = b"FTRX\x05\x00".to_vec();
 		for value in ["/tmp/index", "products"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -949,7 +1182,7 @@ mod tests {
 
 	#[test]
 	fn inspection_frame_is_distinct_and_rejects_trailing_limits() {
-		let mut bytes = b"FTIP\x04\x00".to_vec();
+		let mut bytes = b"FTIP\x05\x00".to_vec();
 		for value in ["/tmp/index", "products", "one", "english@2"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -960,6 +1193,7 @@ mod tests {
 		bytes.extend_from_slice(&5u32.to_le_bytes());
 		bytes.extend_from_slice(b"title");
 		bytes.extend_from_slice(&1f32.to_le_bytes());
+		bytes.extend_from_slice(&0u16.to_le_bytes());
 
 		let decoded = decode_inspect(&bytes).unwrap();
 		assert_eq!(decoded.path, "/tmp/index");
@@ -972,7 +1206,7 @@ mod tests {
 
 	#[test]
 	fn rejects_counts_before_allocating() {
-		let mut bytes = b"FTMB\x04\x00".to_vec();
+		let mut bytes = b"FTMB\x05\x00".to_vec();
 		bytes.extend_from_slice(&u32::MAX.to_le_bytes());
 		bytes.extend_from_slice(&0u32.to_le_bytes());
 		assert_eq!(decode_batch(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
@@ -1016,7 +1250,7 @@ mod tests {
 
 	#[test]
 	fn distinguishes_batch_size_from_invalid_encoding() {
-		let bytes = b"FTMB\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+		let bytes = b"FTMB\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 		assert_eq!(
 			validate_batch_header(bytes, bytes.len() - 1).unwrap_err().code,
 			"E_BATCH_TOO_LARGE"
@@ -1042,6 +1276,7 @@ mod tests {
 			positions: true,
 			surface_terms: false,
 			synonyms: Vec::new(),
+			filter_fields: Vec::new(),
 		};
 		let limits = Limits {
 			indexing_threads: 1,
@@ -1080,8 +1315,9 @@ mod tests {
 	#[test]
 	fn classifies_negation_and_exact_totals_as_expensive() {
 		fn request(expression: &[u8], exact_total: bool) -> Vec<u8> {
-			let mut bytes = b"FTSQ\x04\x00".to_vec();
+			let mut bytes = b"FTSQ\x05\x00".to_vec();
 			bytes.extend_from_slice(expression);
+			bytes.push(0);
 			bytes.push(0);
 			bytes.extend_from_slice(&0u32.to_le_bytes());
 			bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -1107,14 +1343,14 @@ mod tests {
 
 	#[test]
 	fn rejects_nested_counts_before_allocating() {
-		let mut fields = b"FTMB\x04\x00".to_vec();
+		let mut fields = b"FTMB\x05\x00".to_vec();
 		fields.extend_from_slice(&1u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&u16::MAX.to_le_bytes());
 		assert_eq!(decode_batch(&fields).unwrap_err().code, "E_INVALID_ARGUMENT");
 
-		let mut values = b"FTMB\x04\x00".to_vec();
+		let mut values = b"FTMB\x05\x00".to_vec();
 		values.extend_from_slice(&1u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());

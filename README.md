@@ -38,6 +38,10 @@ const index = await openNativeFullTextIndex({
 	indexId: 'products',
 	generation: 'v1',
 	fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
+	filterFields: [
+		{ name: 'category', type: 'string' },
+		{ name: 'price', type: 'number' },
+	],
 	analyzer: 'english@2',
 	limits: {
 		indexingThreads: 2,
@@ -51,7 +55,14 @@ const index = await openNativeFullTextIndex({
 
 try {
 	await index.applyMutationBatch({
-		upserts: [{ id: 'shoe-1', version: '42', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
+		upserts: [
+			{
+				id: 'shoe-1',
+				version: '42',
+				fields: { title: 'Trail running shoe', description: 'Waterproof' },
+				filters: { category: 'outdoor', price: 89.99 },
+			},
+		],
 	});
 	await index.commit();
 	await index.reload();
@@ -73,6 +84,7 @@ Every example runs against the local build and the packed npm package in CI:
 | ---------------------------------------------------------------------- | ---------------------------------------------------------- |
 | [`examples/basic.mjs`](examples/basic.mjs)                             | Open, mutate, commit, search, and close                    |
 | [`examples/query-modes.mjs`](examples/query-modes.mjs)                 | BM25, phrase, prefix, fuzzy, and candidate filtering       |
+| [`examples/structured-filters.mjs`](examples/structured-filters.mjs)   | Exact and numeric filters combined with BM25               |
 | [`examples/checkpoint-recovery.mjs`](examples/checkpoint-recovery.mjs) | Atomic checkpoint publication, inspection, and reopen      |
 | [`examples/highlighting.mjs`](examples/highlighting.mjs)               | Match tracing, UTF-16 spans, and opt-in snippets           |
 | [`examples/multi-index.mjs`](examples/multi-index.mjs)                 | Optional process limits and concurrent independent indexes |
@@ -215,6 +227,33 @@ fields, so one term searched across two fields takes this path. This prevents se
 different page boundaries from changing tie order, but it visits every match and checks the request
 deadline after collection. Other bounded query shapes start with Tantivy's score-pruned `TopDocs`
 path; a score tie at the requested page boundary falls back to the stable all-match collector.
+
+### Structured filters
+
+Declare only fields that should participate in native filtering. They are separate from analyzed
+text fields and may reuse the same logical name. String filters are exact and case-sensitive;
+number filters support exact and range comparisons; Boolean filters support exact comparison.
+Arrays add one value per element. Missing fields add no value. Filter clauses are required,
+score-neutral Tantivy queries, so they reduce ranking work without changing BM25 scores.
+
+```js
+const result = await index.search({
+	text: 'waterproof shoes',
+	filter: {
+		operator: 'and',
+		clauses: [
+			{ field: 'category', comparator: 'in', value: ['outdoor', 'running'] },
+			{ field: 'price', comparator: 'between', value: [50, 100] },
+		],
+	},
+});
+```
+
+Supported comparators are `equals`, `in`, `lt`, `le`, `gt`, `ge`, and inclusive `between`.
+Range comparators require a number field. Candidate IDs and structured filters may be combined;
+both must match. Filter definitions are part of the persisted index identity, so changing them
+requires a new generation or a rebuild from the authoritative source. Filter terms are present in
+the local Tantivy term dictionary and should be protected like the indexed text itself.
 
 `positions` defaults on and is required for phrase search. `surfaceTerms` defaults off and creates
 an internal unstemmed companion term field used by prefix, fuzzy-prefix, and match tracing. It does

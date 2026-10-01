@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ops::Range;
+use std::ops::{Bound, Range};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,9 +11,9 @@ use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
 use tantivy::query::{
 	BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery,
-	Query, TermQuery, TermSetQuery,
+	Query, RangeQuery, TermQuery, TermSetQuery,
 };
-use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions};
+use tantivy::schema::{Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, INDEXED};
 use tantivy::tokenizer::{
 	AsciiFoldingFilter, Language, LowerCaser, RemoveLongFilter, Stemmer, StopWordFilter, TextAnalyzer, Token,
 	TokenFilter, TokenStream, Tokenizer,
@@ -27,9 +27,10 @@ use unicode_normalization::is_nfkc;
 
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	validate_record_id, EngineConfig, EngineIdentityConfig, MutationBatch, SearchClause, SearchExpression, SearchMode,
-	SearchRequest, SynonymRule, TraceRecord, MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES,
-	MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES, MAX_TRACE_SPANS,
+	validate_record_id, EngineConfig, EngineIdentityConfig, FilterComparator, FilterExpression, FilterFieldType,
+	FilterValue, MutationBatch, SearchClause, SearchExpression, SearchMode, SearchRequest, SynonymRule, TraceRecord,
+	MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES,
+	MAX_TRACE_SPANS,
 };
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
@@ -45,6 +46,7 @@ const MAX_NONSTARTERS: usize = 30;
 const DELETE_MERGE_RATIO: f32 = 0.5;
 const COMBINING_GRAPHEME_JOINER: char = '\u{034f}';
 type SynonymMap = Arc<HashMap<String, Vec<String>>>;
+type BuiltSchema = (Schema, Field, Field, Vec<EngineField>, Vec<EngineFilterField>);
 
 struct CanonicalIdentity {
 	config: EngineIdentityConfig,
@@ -60,6 +62,8 @@ pub struct Engine {
 	version_field: Field,
 	fields: Vec<EngineField>,
 	field_lookup: HashMap<String, usize>,
+	filter_fields: Vec<EngineFilterField>,
+	filter_field_lookup: HashMap<String, usize>,
 	analyzer: TextAnalyzer,
 	surface_analyzer: TextAnalyzer,
 	index_analyzer: TextAnalyzer,
@@ -80,6 +84,13 @@ struct EngineField {
 	field: Field,
 	surface_field: Option<Field>,
 	weight: f32,
+}
+
+#[derive(Clone)]
+struct EngineFilterField {
+	name: String,
+	field: Field,
+	field_type: FilterFieldType,
 }
 
 struct BuiltQuery {
@@ -210,6 +221,8 @@ pub struct Writer {
 	version_field: Field,
 	fields: Vec<EngineField>,
 	field_lookup: HashMap<String, usize>,
+	filter_fields: Vec<EngineFilterField>,
+	filter_field_lookup: HashMap<String, usize>,
 }
 
 pub(crate) struct PreparedBatch {
@@ -305,7 +318,7 @@ impl Engine {
 
 	pub fn inspect<D: Directory + Clone>(directory: D, config: &EngineIdentityConfig) -> Result<InspectionResult> {
 		let identity = canonical_identity(config)?.config;
-		let (expected_schema, _, _, _) = build_schema(&identity)?;
+		let (expected_schema, _, _, _, _) = build_schema(&identity)?;
 		let expected_identity = identity_bytes(&identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
 		let meta_exists = directory.exists(Path::new(META_PATH)).map_err(storage_error)?;
@@ -346,7 +359,7 @@ impl Engine {
 		let canonical = canonical_identity(&config.identity)?;
 		let identity = canonical.config;
 		let analyzer = canonical.analyzer;
-		let (schema, id_field, version_field, fields) = build_schema(&identity)?;
+		let (schema, id_field, version_field, fields, filter_fields) = build_schema(&identity)?;
 		let expected_identity = identity_bytes(&identity);
 		let sidecar_exists = directory.exists(Path::new(IDENTITY_PATH)).map_err(storage_error)?;
 		let meta_exists = directory.exists(Path::new(META_PATH)).map_err(storage_error)?;
@@ -394,12 +407,19 @@ impl Engine {
 			.enumerate()
 			.map(|(index, field)| (field.name.clone(), index))
 			.collect();
+		let filter_field_lookup = filter_fields
+			.iter()
+			.enumerate()
+			.map(|(index, field)| (field.name.clone(), index))
+			.collect();
 		Ok(Self {
 			index,
 			id_field,
 			version_field,
 			fields,
 			field_lookup,
+			filter_fields,
+			filter_field_lookup,
 			analyzer,
 			surface_analyzer,
 			index_analyzer,
@@ -439,6 +459,8 @@ impl Engine {
 				version_field: self.version_field,
 				fields: self.fields.clone(),
 				field_lookup: self.field_lookup.clone(),
+				filter_fields: self.filter_fields.clone(),
+				filter_field_lookup: self.filter_field_lookup.clone(),
 			},
 			payload,
 		))
@@ -512,6 +534,7 @@ impl Engine {
 		check_deadline(deadline)?;
 		let window_end = request.offset + request.limit;
 		let stable_any = request.candidate_ids.is_none()
+			&& request.filter.is_none()
 			&& query.clauses > 1
 			&& matches!(&request.expression, SearchExpression::Clause(clause) if clause.mode == SearchMode::Any);
 		let (hits, bounded_total, bounded_total_relation, collected_total) = if stable_any {
@@ -1027,10 +1050,11 @@ impl Engine {
 	}
 
 	fn query(&self, searcher: &Searcher, request: &SearchRequest) -> Result<BuiltQuery> {
-		let query = self.expression_query(searcher, &request.expression)?;
+		let BuiltQuery { query, clauses } = self.expression_query(searcher, &request.expression)?;
+		let query = self.with_candidates(query, request.candidate_ids.as_deref())?;
 		Ok(BuiltQuery {
-			query: self.with_candidates(query.query, request.candidate_ids.as_deref())?,
-			clauses: query.clauses,
+			query: self.with_filter(query, request.filter.as_ref())?,
+			clauses,
 		})
 	}
 
@@ -1430,6 +1454,93 @@ impl Engine {
 		])))
 	}
 
+	fn with_filter(&self, query: Box<dyn Query>, filter: Option<&FilterExpression>) -> Result<Box<dyn Query>> {
+		let Some(filter) = filter else {
+			return Ok(query);
+		};
+		let filter = Box::new(ConstScoreQuery::new(self.filter_query(filter)?, 0.0));
+		Ok(Box::new(BooleanQuery::new(vec![
+			(Occur::Must, query),
+			(Occur::Must, filter),
+		])))
+	}
+
+	fn filter_query(&self, expression: &FilterExpression) -> Result<Box<dyn Query>> {
+		match expression {
+			FilterExpression::Clause {
+				field,
+				comparator,
+				values,
+			} => self.filter_clause(field, *comparator, values),
+			FilterExpression::And(children) | FilterExpression::Or(children) => {
+				if children.is_empty() || children.len() > MAX_QUERY_CLAUSES {
+					return Err(FulltextError::invalid(format!(
+						"filter boolean expressions require 1 to {MAX_QUERY_CLAUSES} clauses"
+					)));
+				}
+				let occur = if matches!(expression, FilterExpression::And(_)) {
+					Occur::Must
+				} else {
+					Occur::Should
+				};
+				let mut queries = Vec::with_capacity(children.len());
+				for child in children {
+					queries.push((occur, self.filter_query(child)?));
+				}
+				Ok(Box::new(BooleanQuery::new(queries)))
+			}
+		}
+	}
+
+	fn filter_clause(
+		&self,
+		name: &str,
+		comparator: FilterComparator,
+		values: &[FilterValue],
+	) -> Result<Box<dyn Query>> {
+		let expected_values = match comparator {
+			FilterComparator::In => None,
+			FilterComparator::Between => Some(2),
+			_ => Some(1),
+		};
+		if values.is_empty()
+			|| values.len() > MAX_QUERY_CLAUSES
+			|| expected_values.is_some_and(|count| count != values.len())
+		{
+			return Err(FulltextError::invalid("invalid filter value count"));
+		}
+		let index = self
+			.filter_field_lookup
+			.get(name)
+			.ok_or_else(|| FulltextError::invalid(format!("unknown filter field {name}")))?;
+		let field = &self.filter_fields[*index];
+		let terms = values
+			.iter()
+			.map(|value| filter_term(field, value))
+			.collect::<Result<Vec<_>>>()?;
+		match comparator {
+			FilterComparator::Equals | FilterComparator::In => Ok(Box::new(TermSetQuery::new(terms))),
+			FilterComparator::Lt
+			| FilterComparator::Le
+			| FilterComparator::Gt
+			| FilterComparator::Ge
+			| FilterComparator::Between => {
+				if field.field_type != FilterFieldType::Number {
+					return Err(FulltextError::invalid("range filters require a number field"));
+				}
+				let (lower, upper) = match comparator {
+					FilterComparator::Lt => (Bound::Unbounded, Bound::Excluded(terms[0].clone())),
+					FilterComparator::Le => (Bound::Unbounded, Bound::Included(terms[0].clone())),
+					FilterComparator::Gt => (Bound::Excluded(terms[0].clone()), Bound::Unbounded),
+					FilterComparator::Ge => (Bound::Included(terms[0].clone()), Bound::Unbounded),
+					FilterComparator::Between => (Bound::Included(terms[0].clone()), Bound::Included(terms[1].clone())),
+					_ => unreachable!(),
+				};
+				Ok(Box::new(RangeQuery::new(lower, upper)))
+			}
+		}
+	}
+
 	fn require_surface_fields(&self, fields: &[&EngineField]) -> Result<()> {
 		if fields.iter().any(|field| field.surface_field.is_none()) {
 			return Err(FulltextError::invalid(
@@ -1455,6 +1566,20 @@ impl Engine {
 			)));
 		}
 		Ok(())
+	}
+}
+
+fn filter_term(field: &EngineFilterField, value: &FilterValue) -> Result<Term> {
+	match (field.field_type, value) {
+		(FilterFieldType::String, FilterValue::String(value)) => Ok(Term::from_field_text(field.field, value)),
+		(FilterFieldType::Number, FilterValue::Number(value)) => {
+			Ok(Term::from_field_f64(field.field, canonical_number(*value)))
+		}
+		(FilterFieldType::Boolean, FilterValue::Boolean(value)) => Ok(Term::from_field_bool(field.field, *value)),
+		_ => Err(FulltextError::invalid(format!(
+			"filter field {} received the wrong value type",
+			field.name
+		))),
 	}
 }
 
@@ -1790,6 +1915,35 @@ impl Writer {
 					}
 				}
 			}
+			let mut seen_filters = HashSet::with_capacity(upsert.filters.len());
+			for (name, values) in upsert.filters {
+				if !seen_filters.insert(name.clone()) {
+					return Err(FulltextError::invalid(format!("duplicate mutation filter {name}")));
+				}
+				let index = self.filter_field_lookup.get(&name).ok_or_else(|| {
+					FulltextError::new("E_SCHEMA_MISMATCH", format!("unknown mutation filter {name}"))
+				})?;
+				let filter = &self.filter_fields[*index];
+				for value in values {
+					match (filter.field_type, value) {
+						(FilterFieldType::String, FilterValue::String(value)) => {
+							document.add_text(filter.field, &value);
+						}
+						(FilterFieldType::Number, FilterValue::Number(value)) => {
+							document.add_f64(filter.field, canonical_number(value));
+						}
+						(FilterFieldType::Boolean, FilterValue::Boolean(value)) => {
+							document.add_bool(filter.field, value);
+						}
+						_ => {
+							return Err(FulltextError::new(
+								"E_SCHEMA_MISMATCH",
+								format!("mutation filter {name} has the wrong value type"),
+							));
+						}
+					}
+				}
+			}
 			documents.push((upsert.id, document));
 		}
 		Ok(PreparedBatch {
@@ -1844,14 +1998,14 @@ impl Writer {
 	}
 }
 
-fn build_schema(config: &EngineIdentityConfig) -> Result<(Schema, Field, Field, Vec<EngineField>)> {
+fn build_schema(config: &EngineIdentityConfig) -> Result<BuiltSchema> {
 	build_schema_with_surface_record(config, IndexRecordOption::WithFreqs)
 }
 
 fn build_schema_with_surface_record(
 	config: &EngineIdentityConfig,
 	surface_record: IndexRecordOption,
-) -> Result<(Schema, Field, Field, Vec<EngineField>)> {
+) -> Result<BuiltSchema> {
 	let mut builder = Schema::builder();
 	let id_indexing = TextFieldIndexing::default()
 		.set_tokenizer("raw")
@@ -1891,7 +2045,35 @@ fn build_schema_with_surface_record(
 			weight: field.weight,
 		});
 	}
-	Ok((builder.build(), id_field, version_field, fields))
+	let mut filter_fields = Vec::with_capacity(config.filter_fields.len());
+	for (index, filter) in config.filter_fields.iter().enumerate() {
+		let schema_name = format!("__fulltext_filter_{index}");
+		let field = match filter.field_type {
+			FilterFieldType::String => {
+				let indexing = TextFieldIndexing::default()
+					.set_tokenizer("raw")
+					.set_index_option(IndexRecordOption::Basic)
+					.set_fieldnorms(false);
+				builder.add_text_field(&schema_name, TextOptions::default().set_indexing_options(indexing))
+			}
+			FilterFieldType::Number => builder.add_f64_field(&schema_name, INDEXED),
+			FilterFieldType::Boolean => builder.add_bool_field(&schema_name, INDEXED),
+		};
+		filter_fields.push(EngineFilterField {
+			name: filter.name.clone(),
+			field,
+			field_type: filter.field_type,
+		});
+	}
+	Ok((builder.build(), id_field, version_field, fields, filter_fields))
+}
+
+fn canonical_number(value: f64) -> f64 {
+	if value == 0.0 {
+		0.0
+	} else {
+		value
+	}
 }
 
 #[derive(Clone, Default)]
@@ -2421,7 +2603,7 @@ fn canonical_synonym_term(analyzer: &mut TextAnalyzer, text: &str, label: &str) 
 }
 
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
-	let mut bytes = b"HTFI\x04\x00".to_vec();
+	let mut bytes = b"HTFI\x05\x00".to_vec();
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
 	push_string(&mut bytes, &config.analyzer);
@@ -2442,12 +2624,25 @@ fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 	for field in &config.fields {
 		push_string(&mut bytes, &field.name);
 	}
+	bytes.extend_from_slice(&(config.filter_fields.len() as u16).to_le_bytes());
+	for field in &config.filter_fields {
+		push_string(&mut bytes, &field.name);
+		bytes.push(match field.field_type {
+			FilterFieldType::String => 0,
+			FilterFieldType::Number => 1,
+			FilterFieldType::Boolean => 2,
+		});
+	}
 	bytes
 }
 
 pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	let version = bytes.get(4..6)?;
-	if bytes.get(..4)? != b"HTFI" || !matches!(version, b"\x01\x00" | b"\x02\x00" | b"\x03\x00" | b"\x04\x00") {
+	if bytes.get(..4)? != b"HTFI"
+		|| !matches!(
+			version,
+			b"\x01\x00" | b"\x02\x00" | b"\x03\x00" | b"\x04\x00" | b"\x05\x00"
+		) {
 		return None;
 	}
 	let mut offset = 6;
@@ -2462,7 +2657,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 		return None;
 	}
 	offset += 3;
-	if matches!(version, b"\x03\x00" | b"\x04\x00") {
+	if matches!(version, b"\x03\x00" | b"\x04\x00" | b"\x05\x00") {
 		let synonym_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
 		for _ in 0..synonym_count {
@@ -2479,6 +2674,17 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	offset += 2;
 	for _ in 0..field_count {
 		take_string(bytes, &mut offset)?;
+	}
+	if version == b"\x05\x00" {
+		let filter_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
+		offset += 2;
+		for _ in 0..filter_count {
+			take_string(bytes, &mut offset)?;
+			if *bytes.get(offset)? > 2 {
+				return None;
+			}
+			offset += 1;
+		}
 	}
 	(offset == bytes.len()).then_some(index_id)
 }
@@ -2655,6 +2861,7 @@ mod tests {
 				positions: true,
 				surface_terms: false,
 				synonyms: Vec::new(),
+				filter_fields: Vec::new(),
 			},
 			limits: Limits {
 				indexing_threads: 1,
@@ -2682,11 +2889,13 @@ mod tests {
 					id: "one".to_owned(),
 					version: None,
 					fields: vec![("title".to_owned(), vec!["Running Shoes".to_owned()])],
+					filters: Vec::new(),
 				},
 				crate::protocol::Upsert {
 					id: "two".to_owned(),
 					version: None,
 					fields: vec![("description".to_owned(), vec!["shoe rack".to_owned()])],
+					filters: Vec::new(),
 				},
 			],
 			deletes: Vec::new(),
@@ -2697,7 +2906,7 @@ mod tests {
 	fn surface_fields_do_not_store_positions() {
 		let mut config = config();
 		config.identity.surface_terms = true;
-		let (schema, _, _, fields) = build_schema(&config.identity).unwrap();
+		let (schema, _, _, fields, _) = build_schema(&config.identity).unwrap();
 		for field in fields {
 			assert_eq!(
 				schema.get_field_entry(field.field).field_type().index_record_option(),
@@ -2721,7 +2930,7 @@ mod tests {
 		directory
 			.atomic_write(Path::new(IDENTITY_PATH), &identity_bytes(&config.identity))
 			.unwrap();
-		let (positioned_schema, _, _, _) =
+		let (positioned_schema, _, _, _, _) =
 			build_schema_with_surface_record(&config.identity, IndexRecordOption::WithFreqsAndPositions).unwrap();
 		Index::create(directory.clone(), positioned_schema, IndexSettings::default()).unwrap();
 		assert_eq!(
@@ -2775,16 +2984,19 @@ mod tests {
 							("title".to_owned(), vec!["Waterproof shell".to_owned()]),
 							("description".to_owned(), vec!["Trail pack".to_owned()]),
 						],
+						filters: Vec::new(),
 					},
 					crate::protocol::Upsert {
 						id: "title-only".to_owned(),
 						version: None,
 						fields: vec![("title".to_owned(), vec!["Waterproof jacket".to_owned()])],
+						filters: Vec::new(),
 					},
 					crate::protocol::Upsert {
 						id: "description-only".to_owned(),
 						version: None,
 						fields: vec![("description".to_owned(), vec!["Trail guide".to_owned()])],
+						filters: Vec::new(),
 					},
 				],
 				deletes: Vec::new(),
@@ -2799,6 +3011,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("waterproof trail", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: true,
@@ -2836,6 +3049,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("waterproof trail", SearchMode::All, Vec::new()),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: true,
@@ -2853,6 +3067,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("waterproof trail ", SearchMode::Prefix, Vec::new()),
 					candidate_ids: Some(vec!["both".to_owned()]),
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: true,
@@ -3052,6 +3267,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("needle", SearchMode::Any, vec!["description".to_owned()]),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: true,
@@ -3086,11 +3302,13 @@ mod tests {
 						id: "one".to_owned(),
 						version: None,
 						fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
+						filters: Vec::new(),
 					},
 					crate::protocol::Upsert {
 						id: "two".to_owned(),
 						version: None,
 						fields: vec![("title".to_owned(), vec!["monitor stand".to_owned()])],
+						filters: Vec::new(),
 					},
 				],
 				deletes: Vec::new(),
@@ -3105,6 +3323,7 @@ mod tests {
 					&SearchRequest {
 						expression: expression(text, SearchMode::Any, Vec::new()),
 						candidate_ids: None,
+						filter: None,
 						offset: 0,
 						limit: 10,
 						exact_total: true,
@@ -3119,6 +3338,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("television", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: true,
@@ -3138,6 +3358,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("stand", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: true,
@@ -3162,11 +3383,13 @@ mod tests {
 						id: "one".to_owned(),
 						version: None,
 						fields: vec![("title".to_owned(), vec!["TV stand".to_owned()])],
+						filters: Vec::new(),
 					},
 					crate::protocol::Upsert {
 						id: "two".to_owned(),
 						version: None,
 						fields: vec![("title".to_owned(), vec!["monitor stand".to_owned()])],
+						filters: Vec::new(),
 					},
 				],
 				deletes: Vec::new(),
@@ -3180,6 +3403,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("stand", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: true,
@@ -3256,6 +3480,7 @@ mod tests {
 		let mut request = SearchRequest {
 			expression: expression("shoes", SearchMode::Any, Vec::new()),
 			candidate_ids: None,
+			filter: None,
 			offset: 0,
 			limit: 10,
 			exact_total: true,
@@ -3297,16 +3522,19 @@ mod tests {
 						id: "one".to_owned(),
 						version: None,
 						fields: vec![("title".to_owned(), vec!["Waterproof Trail Running Shoes".to_owned()])],
+						filters: Vec::new(),
 					},
 					crate::protocol::Upsert {
 						id: "two".to_owned(),
 						version: None,
 						fields: vec![("title".to_owned(), vec!["Waterproof Road Shoes".to_owned()])],
+						filters: Vec::new(),
 					},
 					crate::protocol::Upsert {
 						id: "three".to_owned(),
 						version: None,
 						fields: vec![("title".to_owned(), vec!["Wireless Headphones".to_owned()])],
+						filters: Vec::new(),
 					},
 				],
 				deletes: Vec::new(),
@@ -3322,6 +3550,7 @@ mod tests {
 					&SearchRequest {
 						expression: expression(text, mode, Vec::new()),
 						candidate_ids: candidates.map(|ids| ids.into_iter().map(str::to_owned).collect()),
+						filter: None,
 						offset: 0,
 						limit: 10,
 						exact_total: true,
@@ -3352,6 +3581,7 @@ mod tests {
 						SearchExpression::Not(Box::new(expression("wireless", SearchMode::Any, Vec::new()))),
 					]),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: true,
@@ -3369,6 +3599,7 @@ mod tests {
 				&SearchRequest {
 					expression: SearchExpression::Not(Box::new(expression("wireless", SearchMode::Any, Vec::new()))),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: true,
@@ -3405,6 +3636,7 @@ mod tests {
 				&SearchRequest {
 					expression,
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: false,
@@ -3457,6 +3689,7 @@ mod tests {
 								.to_owned()
 							}),
 							fields: vec![("title".to_owned(), vec!["identical catalog text".to_owned()])],
+							filters: Vec::new(),
 						})
 						.collect(),
 					deletes: Vec::new(),
@@ -3472,6 +3705,7 @@ mod tests {
 					&SearchRequest {
 						expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 						candidate_ids: None,
+						filter: None,
 						offset,
 						limit,
 						exact_total: false,
@@ -3492,6 +3726,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 3,
 					exact_total: false,
@@ -3507,6 +3742,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 3,
 					exact_total: true,
@@ -3522,6 +3758,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("identical", SearchMode::Any, vec!["title".to_owned()]),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 3,
 					exact_total: true,
@@ -3570,6 +3807,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
+					filter: None,
 					offset: 20,
 					limit: 5,
 					exact_total: false,
@@ -3588,6 +3826,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("identical catalog", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 3,
 					exact_total: false,
@@ -3614,6 +3853,7 @@ mod tests {
 						id: id.to_owned(),
 						version: version.map(str::to_owned),
 						fields: vec![("title".to_owned(), vec!["catalog".to_owned()])],
+						filters: Vec::new(),
 					})
 					.collect(),
 				deletes: Vec::new(),
@@ -3658,6 +3898,7 @@ mod tests {
 						id: id.to_string(),
 						version: None,
 						fields: vec![("title".to_owned(), vec![format!("catalog{id:03}")])],
+						filters: Vec::new(),
 					})
 					.collect(),
 				deletes: Vec::new(),
@@ -3671,6 +3912,7 @@ mod tests {
 				&SearchRequest {
 					expression: expression("cat", SearchMode::Prefix, Vec::new()),
 					candidate_ids: None,
+					filter: None,
 					offset: 0,
 					limit: 10,
 					exact_total: false,
@@ -3864,6 +4106,7 @@ mod tests {
 					id: "three".to_owned(),
 					version: None,
 					fields: vec![("title".to_owned(), vec!["Hiking Boots".to_owned()])],
+					filters: Vec::new(),
 				}],
 				deletes: Vec::new(),
 			})
@@ -3891,6 +4134,7 @@ mod tests {
 					id: format!("product-{id}"),
 					version: Some(version.to_owned()),
 					fields: vec![("title".to_owned(), vec![format!("Trail shoe {id}")])],
+					filters: Vec::new(),
 				})
 				.collect()
 		};
@@ -3938,7 +4182,7 @@ mod tests {
 	fn rejects_meta_without_an_identity_sidecar() {
 		let directory = RamDirectory::create();
 		let config = config();
-		let (schema, _, _, _) = build_schema(&config.identity).unwrap();
+		let (schema, _, _, _, _) = build_schema(&config.identity).unwrap();
 		Index::create(directory.clone(), schema, IndexSettings::default()).unwrap();
 		let error = match Engine::open(directory, &config) {
 			Ok(_) => panic!("meta without an identity sidecar was accepted"),
