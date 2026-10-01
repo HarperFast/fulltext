@@ -1,7 +1,9 @@
 import { FulltextError, type FulltextErrorCode } from './errors.js';
 
-const protocolVersion = 4;
+const protocolVersion = 5;
 const maxStringBytes = 1 << 20;
+const maxFilterStringBytes = 65_530;
+const noFilterNames: string[] = [];
 const maxSynonymRules = 1_024;
 const maxSynonymReplacements = 16;
 const maxSynonymBytes = 1 << 20;
@@ -9,7 +11,7 @@ export const maxRecordIdBytes = 4 << 10;
 export const maxRecordVersionBytes = 4 << 10;
 export const maxFields = 1_024;
 export const mutationBatchHeaderBytes = 14;
-export const minimumMutationBatchBytes = mutationBatchHeaderBytes + 8;
+export const minimumMutationBatchBytes = mutationBatchHeaderBytes + 10;
 const maxPendingWriterChunks = 1_024;
 const invalidSurrogate = /[\uD800-\uDFFF]/u;
 
@@ -18,10 +20,16 @@ export interface PackedFieldConfig {
 	weight: number;
 }
 
+export interface PackedFilterFieldConfig {
+	name: string;
+	type: 'string' | 'number' | 'boolean';
+}
+
 export interface PackedIndexIdentityConfig {
 	indexId: string;
 	generation: string;
 	fields: PackedFieldConfig[];
+	filterFields: PackedFilterFieldConfig[];
 	analyzer: string;
 	stopWords: boolean;
 	positions: boolean;
@@ -62,8 +70,15 @@ export interface PackedRuntimeBudgetLimits {
 	maxExpensiveSearches: number;
 }
 
+export type PackedFilterValue = string | number | boolean;
+
 export interface PackedMutationBatch {
-	upserts: Array<{ id: string; version?: string; fields: Record<string, string | string[]> }>;
+	upserts: Array<{
+		id: string;
+		version?: string;
+		fields: Record<string, string | string[]>;
+		filters?: Record<string, PackedFilterValue | PackedFilterValue[]>;
+	}>;
 	deletes: string[];
 }
 
@@ -141,6 +156,7 @@ export class MutationBatchFrameCursor {
 	readonly #batch: PackedMutationBatch;
 	readonly #maxBytes: number;
 	readonly #fieldNames: ReadonlySet<string>;
+	readonly #filterFieldTypes: ReadonlyMap<string, 'string' | 'number' | 'boolean'>;
 	readonly #stopAfterFirstRejection: boolean;
 	#upsertIndex = 0;
 	#deleteIndex = 0;
@@ -150,6 +166,7 @@ export class MutationBatchFrameCursor {
 		batch: PackedMutationBatch,
 		maxBytes: number,
 		fieldNames: ReadonlySet<string>,
+		filterFieldTypes: ReadonlyMap<string, 'string' | 'number' | 'boolean'>,
 		options: {
 			validateDistinctIds: boolean;
 			stopAfterFirstRejection?: boolean;
@@ -163,6 +180,7 @@ export class MutationBatchFrameCursor {
 		this.#batch = batch;
 		this.#maxBytes = maxBytes;
 		this.#fieldNames = fieldNames;
+		this.#filterFieldTypes = filterFieldTypes;
 		this.#stopAfterFirstRejection = options.stopAfterFirstRejection ?? false;
 	}
 
@@ -226,7 +244,14 @@ export class MutationBatchFrameCursor {
 				return;
 			}
 			try {
-				return encodeUpsertRecord(upsert, id, index, this.#maxBytes - mutationBatchHeaderBytes, this.#fieldNames);
+				return encodeUpsertRecord(
+					upsert,
+					id,
+					index,
+					this.#maxBytes - mutationBatchHeaderBytes,
+					this.#fieldNames,
+					this.#filterFieldTypes,
+				);
 			} catch (error) {
 				if (!(error instanceof FulltextError)) throw error;
 				if (error.code !== 'E_INVALID_ARGUMENT' && error.code !== 'E_BATCH_TOO_LARGE') throw error;
@@ -276,6 +301,7 @@ function encodeUpsertRecord(
 	index: number,
 	maxBytes: number,
 	fieldNames: ReadonlySet<string>,
+	filterFieldTypes: ReadonlyMap<string, 'string' | 'number' | 'boolean'>,
 ): EncodedMutationRecord {
 	if (!upsert.fields || typeof upsert.fields !== 'object' || Array.isArray(upsert.fields)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'upsert fields must be an object');
@@ -291,6 +317,35 @@ function encodeUpsertRecord(
 	for (const name of names) {
 		if (!fieldNames.has(name)) {
 			throw new FulltextError('E_SCHEMA_MISMATCH', 'upsert contains a field outside the opened schema');
+		}
+	}
+	const filters = upsert.filters;
+	if (filters !== undefined && (!filters || typeof filters !== 'object' || Array.isArray(filters))) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'upsert filters must be an object');
+	}
+	const filterPrototype = filters === undefined ? undefined : Object.getPrototypeOf(filters);
+	if (filters !== undefined && filterPrototype !== Object.prototype && filterPrototype !== null) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'upsert filters must be a plain object');
+	}
+	const filterNames = filters === undefined ? noFilterNames : Object.keys(filters);
+	if (filterNames.length > maxFields) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'upsert filter count exceeds the supported limit');
+	}
+	for (const name of filterNames) {
+		const fieldType = filterFieldTypes.get(name);
+		if (!fieldType) {
+			throw new FulltextError('E_SCHEMA_MISMATCH', 'upsert contains a filter outside the opened schema');
+		}
+		const value = filters![name];
+		const values = Array.isArray(value) ? value : [value];
+		if (values.some((entry) => typeof entry !== fieldType)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `filter '${name}' has the wrong value type`);
+		}
+		if (fieldType === 'string' && values.some((entry) => Buffer.byteLength(entry as string) > maxFilterStringBytes)) {
+			throw new FulltextError(
+				'E_INVALID_ARGUMENT',
+				`filter '${name}' strings must not exceed ${maxFilterStringBytes} UTF-8 bytes`,
+			);
 		}
 	}
 	const writer = new ByteWriter(maxBytes, 'E_BATCH_TOO_LARGE');
@@ -310,6 +365,14 @@ function encodeUpsertRecord(
 		const values = Array.isArray(value) ? value : [value];
 		writer.u16(values.length, 'field value count');
 		for (const entry of values) writer.documentValue(entry);
+	}
+	writer.u16(filterNames.length, 'upsert filter count');
+	for (const name of filterNames) {
+		writer.string(name);
+		const value = filters![name];
+		const values = Array.isArray(value) ? value : [value];
+		writer.u16(values.length, 'filter value count');
+		for (const entry of values) writer.filterValue(entry);
 	}
 	return { operation: 'upsert', index, ...writer.take() };
 }
@@ -335,9 +398,18 @@ export type PackedSearchExpression =
 	| { operator: 'and' | 'or'; clauses: PackedSearchExpression[] }
 	| { operator: 'not'; clause: PackedSearchExpression };
 
+export type PackedFilterExpression =
+	| {
+			field: string;
+			comparator: 'equals' | 'in' | 'lt' | 'le' | 'gt' | 'ge' | 'between';
+			values: PackedFilterValue[];
+	  }
+	| { operator: 'and' | 'or'; clauses: PackedFilterExpression[] };
+
 export interface PackedSearchRequest {
 	expression: PackedSearchExpression;
 	candidateIds?: string[];
+	filter?: PackedFilterExpression;
 	offset: number;
 	limit: number;
 	exactTotal: boolean;
@@ -419,6 +491,12 @@ function encodeIndexIdentity(writer: ByteWriter, config: PackedIndexIdentityConf
 		writer.string(field.name);
 		writer.f32(field.weight, 'field.weight');
 	}
+	const filterFields = config.filterFields ?? [];
+	writer.u16(filterFields.length, 'filterFields.length');
+	for (const field of filterFields) {
+		writer.string(field.name);
+		writer.u8(['string', 'number', 'boolean'].indexOf(field.type), 'filter field type');
+	}
 }
 
 function validateSynonyms(synonyms: Array<{ source: string; replacements: string[] }>): void {
@@ -472,6 +550,14 @@ export function encodeBatch(batch: PackedMutationBatch, maxBytes: number): Buffe
 				writer.documentValue(entry);
 			}
 		}
+		const filters = Object.entries(upsert.filters ?? {});
+		writer.u16(filters.length, 'upsert filter count');
+		for (const [name, value] of filters) {
+			writer.string(name);
+			const values = Array.isArray(value) ? value : [value];
+			writer.u16(values.length, 'filter value count');
+			for (const entry of values) writer.filterValue(entry);
+		}
 	}
 	for (const id of batch.deletes) {
 		writer.string(id);
@@ -484,6 +570,7 @@ export function encodeBatchPartitions(
 	maxBytes: number,
 	maxTotalBytes: number,
 	fieldNames: ReadonlySet<string>,
+	filterFieldTypes: ReadonlyMap<string, 'string' | 'number' | 'boolean'>,
 ): PackedMutationBatchPartitions {
 	if (!Array.isArray(batch.upserts) || !Array.isArray(batch.deletes)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'mutation batch arrays are required');
@@ -553,7 +640,14 @@ export function encodeBatchPartitions(
 		}
 		let encoded: EncodedMutationRecord;
 		try {
-			encoded = encodeUpsertRecord(upsert, id, index, maxFrameBytes - mutationBatchHeaderBytes, fieldNames);
+			encoded = encodeUpsertRecord(
+				upsert,
+				id,
+				index,
+				maxFrameBytes - mutationBatchHeaderBytes,
+				fieldNames,
+				filterFieldTypes,
+			);
 		} catch (error) {
 			if (!(error instanceof FulltextError)) throw error;
 			if (error.code === 'E_BATCH_TOO_LARGE') {
@@ -613,11 +707,28 @@ export function encodeSearch(request: PackedSearchRequest): Buffer {
 			writer.string(id);
 		}
 	}
+	writer.boolean(request.filter !== undefined);
+	if (request.filter !== undefined) encodeFilterExpression(writer, request.filter, 0);
 	writer.u32(request.offset, 'offset');
 	writer.u32(request.limit, 'limit');
 	writer.boolean(request.exactTotal);
 	writer.u32(request.budgetMilliseconds, 'budgetMilliseconds');
 	return writer.finish();
+}
+
+function encodeFilterExpression(writer: ByteWriter, expression: PackedFilterExpression, depth: number): void {
+	if (depth > 8) throw new FulltextError('E_INVALID_ARGUMENT', 'filter expression nesting exceeds 8 levels');
+	if ('field' in expression) {
+		writer.u8(0, 'filter expression type');
+		writer.string(expression.field);
+		writer.u8(['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between'].indexOf(expression.comparator), 'filter comparator');
+		writer.u16(expression.values.length, 'filter value count');
+		for (const value of expression.values) writer.filterValue(value);
+		return;
+	}
+	writer.u8(expression.operator === 'and' ? 1 : 2, 'filter expression type');
+	writer.u16(expression.clauses.length, 'filter clauses.length');
+	for (const clause of expression.clauses) encodeFilterExpression(writer, clause, depth + 1);
 }
 
 function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpression, depth: number): void {
@@ -823,12 +934,40 @@ class ByteWriter {
 		this.bytes(buffer);
 	}
 
+	f64(value: number, name: string): void {
+		if (typeof value !== 'number' || !Number.isFinite(value)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `${name} must be a finite number`);
+		}
+		const buffer = Buffer.allocUnsafe(8);
+		buffer.writeDoubleLE(Object.is(value, -0) ? 0 : value);
+		this.bytes(buffer);
+	}
+
 	string(value: string): void {
 		this.utf8String(value, true);
 	}
 
 	documentValue(value: string): void {
 		this.utf8String(value, false);
+	}
+
+	filterValue(value: PackedFilterValue): void {
+		switch (typeof value) {
+			case 'string':
+				this.u8(0, 'filter value type');
+				this.string(value);
+				break;
+			case 'number':
+				this.u8(1, 'filter value type');
+				this.f64(value, 'filter value');
+				break;
+			case 'boolean':
+				this.u8(2, 'filter value type');
+				this.boolean(value);
+				break;
+			default:
+				throw new FulltextError('E_INVALID_ARGUMENT', 'filter values must be strings, numbers, or booleans');
+		}
 	}
 
 	private utf8String(value: string, requireWellFormedUtf16: boolean): void {

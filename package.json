@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/fulltext",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "Native Tantivy full-text indexing for Node.js",
 	"type": "module",
 	"exports": {
@@ -39,7 +39,7 @@
 		"benchmark:multi-index": "npm run build && node scripts/run-local.mjs benchmarks/multi-index.mjs",
 		"benchmark:inspect": "npm run build && node scripts/run-local.mjs benchmarks/inspect.mjs",
 		"benchmark:inspect:smoke": "node scripts/run-local.mjs benchmarks/inspect.mjs --smoke",
-		"examples:smoke": "node scripts/run-local.mjs examples/basic.mjs && node scripts/run-local.mjs examples/query-modes.mjs && node scripts/run-local.mjs examples/checkpoint-recovery.mjs && node scripts/run-local.mjs examples/highlighting.mjs && node scripts/run-local.mjs examples/multi-index.mjs && node scripts/run-local.mjs examples/reset-rebuild.mjs",
+		"examples:smoke": "node scripts/run-local.mjs examples/basic.mjs && node scripts/run-local.mjs examples/query-modes.mjs && node scripts/run-local.mjs examples/structured-filters.mjs && node scripts/run-local.mjs examples/checkpoint-recovery.mjs && node scripts/run-local.mjs examples/highlighting.mjs && node scripts/run-local.mjs examples/multi-index.mjs && node scripts/run-local.mjs examples/reset-rebuild.mjs",
 		"benchmark:smoke": "node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver logical && node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver low-level",
 		"check": "npm run format:check && npm run lint && npm run test",
 		"format": "prettier --write . && cargo fmt",
@@ -66,10 +66,10 @@
 		"url": "git+https://github.com/HarperFast/fulltext.git"
 	},
 	"optionalDependencies": {
-		"@harperfast/fulltext-darwin-arm64": "0.4.0",
-		"@harperfast/fulltext-linux-arm64-gnu": "0.4.0",
-		"@harperfast/fulltext-linux-x64-gnu": "0.4.0",
-		"@harperfast/fulltext-win32-x64-msvc": "0.4.0"
+		"@harperfast/fulltext-darwin-arm64": "0.5.0",
+		"@harperfast/fulltext-linux-arm64-gnu": "0.5.0",
+		"@harperfast/fulltext-linux-x64-gnu": "0.5.0",
+		"@harperfast/fulltext-win32-x64-msvc": "0.5.0"
 	},
 	"devDependencies": {
 		"@napi-rs/cli": "3.10.5",

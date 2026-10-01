@@ -26,10 +26,10 @@ test('loads the artifact for the executing platform', async () => {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
 		nativeAbiVersion: 8,
-		queryApiVersion: 2,
+		queryApiVersion: 3,
 		queryClassIsolationMinimumSearchThreads: 2,
 		lifecycleApiVersion: 1,
-		mutationBatchApiVersion: 4,
+		mutationBatchApiVersion: 5,
 		storageBackends: ['native'],
 		limits: {
 			maxCommitPayloadBytes: 64 * 1024,

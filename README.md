@@ -38,6 +38,10 @@ const index = await openNativeFullTextIndex({
 	indexId: 'products',
 	generation: 'v1',
 	fields: [{ name: 'title', weight: 3 }, { name: 'description' }],
+	filterFields: [
+		{ name: 'category', type: 'string' },
+		{ name: 'price', type: 'number' },
+	],
 	analyzer: 'english@2',
 	limits: {
 		indexingThreads: 2,
@@ -51,7 +55,14 @@ const index = await openNativeFullTextIndex({
 
 try {
 	await index.applyMutationBatch({
-		upserts: [{ id: 'shoe-1', version: '42', fields: { title: 'Trail running shoe', description: 'Waterproof' } }],
+		upserts: [
+			{
+				id: 'shoe-1',
+				version: '42',
+				fields: { title: 'Trail running shoe', description: 'Waterproof' },
+				filters: { category: 'outdoor', price: 89.99 },
+			},
+		],
 	});
 	await index.commit();
 	await index.reload();
@@ -73,6 +84,7 @@ Every example runs against the local build and the packed npm package in CI:
 | ---------------------------------------------------------------------- | ---------------------------------------------------------- |
 | [`examples/basic.mjs`](examples/basic.mjs)                             | Open, mutate, commit, search, and close                    |
 | [`examples/query-modes.mjs`](examples/query-modes.mjs)                 | BM25, phrase, prefix, fuzzy, and candidate filtering       |
+| [`examples/structured-filters.mjs`](examples/structured-filters.mjs)   | Exact and numeric filters combined with BM25               |
 | [`examples/checkpoint-recovery.mjs`](examples/checkpoint-recovery.mjs) | Atomic checkpoint publication, inspection, and reopen      |
 | [`examples/highlighting.mjs`](examples/highlighting.mjs)               | Match tracing, UTF-16 spans, and opt-in snippets           |
 | [`examples/multi-index.mjs`](examples/multi-index.mjs)                 | Optional process limits and concurrent independent indexes |
@@ -138,8 +150,8 @@ handle incomplete when earlier frames were already admitted.
 
 Trusted callers that already enforce distinct IDs may pass `assumeDistinctIds: true` to skip the
 whole-batch duplicate prepass. Supplying duplicates with that option violates the API contract.
-The library snapshots the two mutation arrays, but callers must not mutate record objects, field
-maps, or nested field-value arrays until the returned promise settles.
+The library snapshots the two mutation arrays, but callers must not mutate record objects, field or
+filter maps, or nested field- or filter-value arrays until the returned promise settles.
 
 `encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
 `E_BATCH_TOO_LARGE`; `maxBytes` defaults to 8 MiB and is intended for low-level callers producing a
@@ -215,6 +227,45 @@ fields, so one term searched across two fields takes this path. This prevents se
 different page boundaries from changing tie order, but it visits every match and checks the request
 deadline after collection. Other bounded query shapes start with Tantivy's score-pruned `TopDocs`
 path; a score tie at the requested page boundary falls back to the stable all-match collector.
+
+### Structured filters
+
+Filter fields are typed metadata stored in the Tantivy index alongside the analyzed text. They let
+Tantivy discard non-matching documents before returning ranked IDs, reducing source-record reads
+without changing BM25 scores. The caller's records remain authoritative; filter metadata is a
+derived copy used only to narrow search results.
+
+The library does not infer this metadata. Declare each field in `filterFields` when opening the
+index and supply its value in each upsert's `filters` object. A field omitted from `filterFields`
+cannot be used in a native `filter` expression. The caller may still apply that condition after
+search or use `candidateIds` when it already has a bounded set of matching IDs.
+
+Declare only fields commonly combined with text search. Filter metadata increases index size and
+mutation work, and changing its definition requires a new generation or rebuild. Filter fields are
+separate from analyzed text fields and may reuse the same logical name. String filters are exact
+and case-sensitive; number filters support exact and range comparisons; Boolean filters support
+exact comparison. Arrays add one value per element. Missing fields add no value. String values are
+limited to 65,530 UTF-8 bytes. Number fields are also stored as Tantivy fast fields to keep broad
+range filters from materializing term bitsets; this further increases index size.
+
+```js
+const result = await index.search({
+	text: 'waterproof shoes',
+	filter: {
+		operator: 'and',
+		clauses: [
+			{ field: 'category', comparator: 'in', value: ['outdoor', 'running'] },
+			{ field: 'price', comparator: 'between', value: [50, 100] },
+		],
+	},
+});
+```
+
+Supported comparators are `equals`, `in`, `lt`, `le`, `gt`, `ge`, and inclusive `between`.
+Range comparators require a number field. Candidate IDs and structured filters may be combined;
+both must match. Filter definitions are part of the persisted index identity, so changing them
+requires a new generation or a rebuild from the authoritative source. Filter terms are present in
+the local Tantivy term dictionary and should be protected like the indexed text itself.
 
 `positions` defaults on and is required for phrase search. `surfaceTerms` defaults off and creates
 an internal unstemmed companion term field used by prefix, fuzzy-prefix, and match tracing. It does
@@ -387,10 +438,11 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 8 and packed protocol 4. The loader rejects older addon binaries. Native
-identity sidecar v4 fingerprints the internal source-version field in addition to canonical
-synonyms and the completed `english@2` semantics. Older v2 and v3 indexes remain identifiable for
-safe reset but cannot be reopened under the new schema; rebuild them from the authoritative source.
+This API uses native ABI 8 and packed protocol 5. The loader rejects older addon binaries. Native
+identity sidecar v4 remains the identity for indexes without structured filter fields. Configuring
+filter fields uses sidecar v5, which also fingerprints their names and types. Older v2 and v3
+indexes remain identifiable for safe reset but cannot be reopened; rebuild them from the
+authoritative source.
 
 ## Diagnostics and errors
 

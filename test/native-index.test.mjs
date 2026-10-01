@@ -435,6 +435,133 @@ test('uses the surface field for stop-word prefixes and preserves weighted fuzzy
 	await index.close();
 });
 
+test('applies typed structured filters without changing BM25 scores', async (context) => {
+	const index = await openNativeFullTextIndex(
+		options(temporaryIndex(context), {
+			filterFields: [
+				{ name: 'category', type: 'string' },
+				{ name: 'price', type: 'number' },
+				{ name: 'active', type: 'boolean' },
+			],
+		}),
+	);
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [{ id: 'invalid', fields: { title: 'Invalid' }, filters: { price: Number.POSITIVE_INFINITY } }],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [{ id: 'wrong-type', fields: { title: 'Invalid' }, filters: { price: '90' } }],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [{ id: 'too-long', fields: { title: 'Invalid' }, filters: { category: 'x'.repeat(65_531) } }],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await index.applyMutationBatch({
+		upserts: [
+			{
+				id: 'one',
+				fields: { title: 'Waterproof Trail Shoe' },
+				filters: { category: ['outdoor', 'sale'], price: -0, active: true },
+			},
+			{
+				id: 'two',
+				fields: { title: 'Waterproof Road Shoe' },
+				filters: { category: 'road', price: 90, active: true },
+			},
+			{
+				id: 'three',
+				fields: { title: 'Waterproof Work Shoe' },
+				filters: { category: 'work', price: 140, active: false },
+			},
+		],
+	});
+	await index.commit();
+	await index.reload();
+
+	const unfilteredScore = (await index.search({ text: 'waterproof' })).hits.find((hit) => hit.id === 'one').score;
+	const exact = await index.search({
+		text: 'waterproof',
+		filter: { field: 'category', comparator: 'equals', value: 'outdoor' },
+	});
+	assert.deepStrictEqual(
+		exact.hits.map((hit) => hit.id),
+		['one'],
+	);
+	assert.strictEqual(exact.hits[0].score, unfilteredScore);
+	assert.deepStrictEqual(
+		(
+			await index.search({
+				text: 'waterproof',
+				filter: {
+					operator: 'and',
+					clauses: [
+						{ field: 'category', comparator: 'in', value: ['road', 'work'] },
+						{ field: 'price', comparator: 'between', value: [80, 100] },
+						{ field: 'active', comparator: 'equals', value: true },
+					],
+				},
+			})
+		).hits.map((hit) => hit.id),
+		['two'],
+	);
+	assert.deepStrictEqual(
+		(
+			await index.search({
+				text: 'waterproof',
+				filter: { field: 'price', comparator: 'equals', value: 0 },
+			})
+		).hits.map((hit) => hit.id),
+		['one'],
+	);
+	assert.deepStrictEqual(
+		(
+			await index.search({
+				text: 'waterproof',
+				filter: {
+					operator: 'or',
+					clauses: [
+						{ field: 'price', comparator: 'lt', value: 1 },
+						{ field: 'price', comparator: 'ge', value: 140 },
+					],
+				},
+			})
+		).hits.map((hit) => hit.id),
+		['one', 'three'],
+	);
+	await assert.rejects(
+		index.search({
+			text: 'waterproof',
+			filter: { field: 'price', comparator: 'equals', value: Number.NaN },
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({
+			text: 'waterproof',
+			filter: {
+				operator: 'and',
+				clauses: Array.from({ length: 2 }, () => ({
+					operator: 'or',
+					clauses: Array.from({ length: 129 }, () => ({
+						field: 'active',
+						comparator: 'equals',
+						value: true,
+					})),
+				})),
+			},
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await index.close();
+});
+
 test('preserves phrase positions through stop words in search and tracing', async (context) => {
 	const index = await openNativeFullTextIndex(
 		options(temporaryIndex(context), { positions: true, surfaceTerms: true }),
@@ -553,7 +680,7 @@ test('rejects a mutation frame limit that cannot hold one mutation', async (cont
 
 test('accepts the exact mutation-frame floor for a minimal upsert', async (context) => {
 	const config = options(temporaryIndex(context));
-	config.limits = { ...config.limits, maxBatchBytes: 22 };
+	config.limits = { ...config.limits, maxBatchBytes: 24 };
 	const index = await openNativeFullTextIndex(config);
 	const result = await index.applyMutationBatch(
 		{ upserts: [{ id: 'a', fields: {} }], deletes: [] },

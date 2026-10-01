@@ -198,7 +198,7 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 			`Fulltext native ABI ${info.nativeAbiVersion} from ${artifactPath} does not match ${expectedNativeAbiVersion}`,
 		);
 	}
-	if (info.queryApiVersion !== 2) {
+	if (info.queryApiVersion !== 3) {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',
 			`Fulltext query API ${info.queryApiVersion} from ${artifactPath} is not supported`,
