@@ -230,13 +230,23 @@ path; a score tie at the requested page boundary falls back to the stable all-ma
 
 ### Structured filters
 
-Declare only fields that should participate in native filtering. They are separate from analyzed
-text fields and may reuse the same logical name. String filters are exact and case-sensitive;
-number filters support exact and range comparisons; Boolean filters support exact comparison.
-Arrays add one value per element. Missing fields add no value. Filter clauses are required,
-score-neutral Tantivy queries, so they reduce ranking work without changing BM25 scores. String
-filter values are limited to 65,530 UTF-8 bytes. Number fields are also stored as Tantivy fast
-fields to keep broad range filters from materializing term bitsets; this increases index size.
+Filter fields are typed metadata stored in the Tantivy index alongside the analyzed text. They let
+Tantivy discard non-matching documents before returning ranked IDs, reducing source-record reads
+without changing BM25 scores. The caller's records remain authoritative; filter metadata is a
+derived copy used only to narrow search results.
+
+The library does not infer this metadata. Declare each field in `filterFields` when opening the
+index and supply its value in each upsert's `filters` object. A field omitted from `filterFields`
+cannot be used in a native `filter` expression. The caller may still apply that condition after
+search or use `candidateIds` when it already has a bounded set of matching IDs.
+
+Declare only fields commonly combined with text search. Filter metadata increases index size and
+mutation work, and changing its definition requires a new generation or rebuild. Filter fields are
+separate from analyzed text fields and may reuse the same logical name. String filters are exact
+and case-sensitive; number filters support exact and range comparisons; Boolean filters support
+exact comparison. Arrays add one value per element. Missing fields add no value. String values are
+limited to 65,530 UTF-8 bytes. Number fields are also stored as Tantivy fast fields to keep broad
+range filters from materializing term bitsets; this further increases index size.
 
 ```js
 const result = await index.search({
