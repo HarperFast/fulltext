@@ -432,7 +432,7 @@ pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
 	}
 	let filter_is_expensive = if cursor.boolean()? {
 		let mut filter_clauses = 0usize;
-		scan_filter_expression(&mut cursor, 0, &mut filter_clauses)?
+		scan_filter_expression(&mut cursor, 0, &mut filter_clauses)? || filter_clauses > 16
 	} else {
 		false
 	};
@@ -1380,6 +1380,27 @@ mod tests {
 		};
 		assert!(!search_is_expensive(&filtered_request(0)).unwrap());
 		assert!(search_is_expensive(&filtered_request(2)).unwrap());
+
+		let mut many_exact_filters = b"FTSQ\x05\x00".to_vec();
+		many_exact_filters.extend_from_slice(&leaf);
+		many_exact_filters.push(0);
+		many_exact_filters.push(1);
+		many_exact_filters.push(1);
+		many_exact_filters.extend_from_slice(&17u16.to_le_bytes());
+		for _ in 0..17 {
+			many_exact_filters.push(0);
+			many_exact_filters.extend_from_slice(&5u32.to_le_bytes());
+			many_exact_filters.extend_from_slice(b"price");
+			many_exact_filters.push(0);
+			many_exact_filters.extend_from_slice(&1u16.to_le_bytes());
+			many_exact_filters.push(1);
+			many_exact_filters.extend_from_slice(&50f64.to_le_bytes());
+		}
+		many_exact_filters.extend_from_slice(&0u32.to_le_bytes());
+		many_exact_filters.extend_from_slice(&1u32.to_le_bytes());
+		many_exact_filters.push(0);
+		many_exact_filters.extend_from_slice(&100u32.to_le_bytes());
+		assert!(search_is_expensive(&many_exact_filters).unwrap());
 	}
 
 	#[test]
