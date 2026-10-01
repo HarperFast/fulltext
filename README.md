@@ -150,8 +150,8 @@ handle incomplete when earlier frames were already admitted.
 
 Trusted callers that already enforce distinct IDs may pass `assumeDistinctIds: true` to skip the
 whole-batch duplicate prepass. Supplying duplicates with that option violates the API contract.
-The library snapshots the two mutation arrays, but callers must not mutate record objects, field
-maps, or nested field-value arrays until the returned promise settles.
+The library snapshots the two mutation arrays, but callers must not mutate record objects, field or
+filter maps, or nested field- or filter-value arrays until the returned promise settles.
 
 `encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
 `E_BATCH_TOO_LARGE`; `maxBytes` defaults to 8 MiB and is intended for low-level callers producing a

@@ -121,6 +121,10 @@ export type NativeFullTextIndexResetResult = { state: 'missing' } | { state: 're
 
 export type NativeFullTextReclaimResult = { removed: number; failed: number };
 
+/**
+ * The input arrays are snapshotted. Record objects, field and filter maps, and nested value arrays are borrowed until
+ * `applyMutationBatch()` settles.
+ */
 export interface FullTextMutationBatch {
 	upserts?: Array<{
 		id: string;
