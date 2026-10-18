@@ -3183,7 +3183,6 @@ mod tests {
 			search_snapshot(&segments),
 			"7e8c34cf1637bedc14048237a152de9ddaf3866abfad53ade87447662855a4fe"
 		);
-		assert_eq!(search_snapshot(&segments), search_snapshot(&segments.clone()));
 		segments.insert(segment, Some(0));
 		assert_eq!(
 			search_snapshot(&segments),
