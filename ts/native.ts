@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual, webcrypto } from 'node:crypto';
 import { lstat, readdir, realpath, rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 
@@ -13,6 +13,7 @@ import {
 	encodeRuntimeBudget,
 	encodeSearchFrame,
 	maxRecordIdBytes,
+	maxSearchRequestBytes,
 	maxCommitPayloadBytes,
 	maxFilterStringBytes,
 	maxSearchBudgetMilliseconds,
@@ -29,6 +30,8 @@ import { PublicationState } from './publication.js';
 const continuationOffsets = { handle: 1, digest: 5, snapshot: 37, score: 53, id: 57 };
 const maxContinuationBytes = continuationOffsets.id + maxRecordIdBytes;
 const maxContinuationCharacters = Math.ceil((maxContinuationBytes * 4) / 3);
+const maxSynchronousIdentityBytes = 64 * 1024;
+const maxPreparationCommands = Math.floor(maxSearchRequestBytes / maxSynchronousIdentityBytes);
 const filterComparators = new Set(['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between']);
 
 export { FulltextError } from './errors.js';
@@ -324,7 +327,11 @@ export class NativeFullTextIndex {
 	#closedStatus?: FullTextStatus;
 	#closePromise?: Promise<CloseResult>;
 	#logicalMutationState: 'idle' | 'active' | 'incomplete' = 'idle';
-	#continuationIdentity?: Buffer;
+	#continuationKey?: Buffer;
+	readonly #maxPreparationCommands: number;
+	readonly #maxPreparationBytes: number;
+	#preparationCommands = 0;
+	#preparationBytes = 0;
 
 	constructor(options: {
 		handle: number;
@@ -332,7 +339,17 @@ export class NativeFullTextIndex {
 		maxBatchBytes: number;
 		fieldNames: Iterable<string>;
 		filterFields?: Iterable<{ name: string; type: 'string' | 'number' | 'boolean' }>;
+		searchLimits?: Pick<NativeFullTextIndexLimits, 'maxQueuedCommands' | 'maxQueuedBytes'>;
 	}) {
+		const preparationCommands = options.searchLimits?.maxQueuedCommands ?? maxPreparationCommands;
+		const preparationBytes = options.searchLimits?.maxQueuedBytes ?? maxSearchRequestBytes;
+		for (const value of [preparationCommands, preparationBytes]) {
+			if (!Number.isInteger(value) || value < 1 || value > 0xffffffff) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'search preparation limits must be positive u32 integers');
+			}
+		}
+		this.#maxPreparationCommands = Math.min(preparationCommands, maxPreparationCommands);
+		this.#maxPreparationBytes = Math.min(preparationBytes, maxSearchRequestBytes);
 		this.#handle = options.handle;
 		this.#publication = new PublicationState(options.committedPayload);
 		this.#maxBatchBytes = options.maxBatchBytes;
@@ -585,6 +602,26 @@ export class NativeFullTextIndex {
 		this.#publication.refresh(sequence, payload);
 	}
 
+	#assertPreparationOpen(): void {
+		if (this.#closed || this.#closePromise) throw new FulltextError('E_CLOSED', 'fulltext index is closing or closed');
+	}
+
+	async #prepareTraversalDigest(bytes: Buffer, identityLength: number): Promise<Buffer> {
+		if (bytes.length > this.#maxPreparationBytes - this.#preparationBytes) {
+			throw new FulltextError('E_QUEUE_FULL', 'traversal preparation byte capacity is full');
+		}
+		this.#preparationCommands++;
+		this.#preparationBytes += bytes.length;
+		try {
+			return Buffer.from(await webcrypto.subtle.digest('SHA-256', bytes.subarray(0, identityLength)));
+		} catch (error) {
+			throw normalizeNativeError(error);
+		} finally {
+			this.#preparationCommands--;
+			this.#preparationBytes -= bytes.length;
+		}
+	}
+
 	search(request: SearchRequest, options: SearchExecutionOptions = {}): Promise<SearchResult> {
 		return this.#search(request, options, false);
 	}
@@ -598,6 +635,7 @@ export class NativeFullTextIndex {
 		options: SearchExecutionOptions,
 		traversal: boolean,
 	): Promise<SearchPageResult> {
+		const preparationStarted = traversal ? performance.now() : 0;
 		const expression = normalizeSearchExpression(request);
 		if (traversal && request.offset != null && request.offset !== 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'searchPage requires offset zero');
@@ -611,6 +649,8 @@ export class NativeFullTextIndex {
 			exactTotal: request.exactTotal ?? false,
 			budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
 		};
+		const deadline = traversal ? preparationStarted + packed.budgetMilliseconds : 0;
+		let tokenBytes: Buffer | undefined;
 		let tokenDigest: Buffer | undefined;
 		let after: { snapshot: string; score: number; id: string } | undefined;
 		if (traversal && request.continuation !== undefined) {
@@ -623,11 +663,12 @@ export class NativeFullTextIndex {
 				bytes.length < continuationOffsets.id + 1 ||
 				bytes.length > maxContinuationBytes ||
 				bytes.toString('base64url') !== token ||
-				bytes[0] !== 1 ||
+				bytes[0] !== 2 ||
 				bytes.readUInt32LE(continuationOffsets.handle) !== this.#handle
 			) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'continuation does not belong to this reader and query');
 			}
+			tokenBytes = bytes;
 			tokenDigest = bytes.subarray(continuationOffsets.digest, continuationOffsets.snapshot);
 			after = {
 				snapshot: bytes.toString('ascii', continuationOffsets.snapshot, continuationOffsets.score),
@@ -642,15 +683,34 @@ export class NativeFullTextIndex {
 		if (request.mode !== undefined && request.operator !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 		}
+		if (traversal) {
+			this.#assertPreparationOpen();
+			if (this.#preparationCommands >= this.#maxPreparationCommands) {
+				throw new FulltextError('E_QUEUE_FULL', 'traversal preparation command capacity is full');
+			}
+			this.#continuationKey ??= randomBytes(32);
+		}
 		const frame = encodeSearchFrame({ ...packed, ...(traversal ? { traversal: { after } } : {}) });
-		const digest = traversal
-			? createHash('sha256')
-					.update((this.#continuationIdentity ??= randomBytes(16)))
-					.update(frame.bytes.subarray(0, frame.identityLength))
-					.digest()
-			: undefined;
-		if (tokenDigest && !tokenDigest.equals(digest!)) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'continuation does not belong to this reader and query');
+		let digest: Buffer | undefined;
+		if (traversal) {
+			const identity = frame.bytes.subarray(0, frame.identityLength);
+			digest =
+				identity.length <= maxSynchronousIdentityBytes
+					? createHash('sha256').update(identity).digest()
+					: await this.#prepareTraversalDigest(frame.bytes, frame.identityLength);
+			this.#assertPreparationOpen();
+			const remaining = Math.floor(deadline - performance.now());
+			if (remaining <= 0) throw new FulltextError('E_TIMEOUT', 'traversal preparation exceeded its execution budget');
+			frame.bytes.writeUInt32LE(remaining, frame.bytes.length - 4);
+			if (tokenDigest) {
+				const expected = continuationMac(this.#continuationKey!, digest, tokenBytes!);
+				if (tokenDigest.length !== expected.length || !timingSafeEqual(tokenDigest, expected)) {
+					throw new FulltextError(
+						'E_INVALID_ARGUMENT',
+						'continuation does not belong to this reader, query and boundary',
+					);
+				}
+			}
 		}
 		const cursor = await invoke((callback) => loadAddon().__nativeSearch(this.#handle, frame.bytes, callback));
 		const total = safeNumber(cursor.u64(), 'search total');
@@ -672,9 +732,8 @@ export class NativeFullTextIndex {
 			if (more === 1) {
 				const last = hits[hits.length - 1];
 				const bytes = Buffer.alloc(continuationOffsets.id + Buffer.byteLength(last.id));
-				bytes[0] = 1;
+				bytes[0] = 2;
 				bytes.writeUInt32LE(this.#handle, continuationOffsets.handle);
-				digest!.copy(bytes, continuationOffsets.digest);
 				bytes.write(
 					snapshot,
 					continuationOffsets.snapshot,
@@ -683,6 +742,7 @@ export class NativeFullTextIndex {
 				);
 				bytes.writeFloatLE(last.score, continuationOffsets.score);
 				bytes.write(last.id, continuationOffsets.id, 'utf8');
+				continuationMac(this.#continuationKey!, digest!, bytes).copy(bytes, continuationOffsets.digest);
 				continuation = bytes.toString('base64url');
 			}
 		}
@@ -1107,6 +1167,7 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 			handle,
 			committedPayload: payload,
 			maxBatchBytes: config.limits.maxBatchBytes,
+			searchLimits: config.limits,
 			fieldNames: config.fields.map((field) => field.name),
 			filterFields: config.filterFields,
 		});
@@ -1140,6 +1201,7 @@ export async function openNativeFullTextReader(options: NativeFullTextIndexOptio
 				handle,
 				committedPayload: payload,
 				maxBatchBytes: config.limits.maxBatchBytes,
+				searchLimits: config.limits,
 				fieldNames: config.fields.map((field) => field.name),
 				filterFields: config.filterFields,
 			}),
@@ -1400,4 +1462,12 @@ async function canonicalSiblingPath(value: string): Promise<string> {
 		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return value;
 		throw error;
 	}
+}
+
+function continuationMac(key: Buffer, digest: Buffer, token: Buffer): Buffer {
+	return createHmac('sha256', key)
+		.update(token.subarray(0, continuationOffsets.digest))
+		.update(token.subarray(continuationOffsets.snapshot))
+		.update(digest)
+		.digest();
 }

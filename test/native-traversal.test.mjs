@@ -187,6 +187,43 @@ test('rejects mismatched and malformed continuations without poisoning the reade
 	assert.strictEqual(continued.continuation, undefined);
 });
 
+test('authenticates finite continuation boundaries and rejects spliced tokens', async (context) => {
+	const config = options();
+	const writer = await openNativeFullTextIndex(config);
+	context.after(() => writer.close({ mode: 'rollback' }));
+	await writer.applyMutationBatch({ upserts: ['a', 'b', 'c'].map((id) => ({ id, fields: { title: 'widget' } })) });
+	await writer.publish('one');
+	const reader = await openNativeFullTextReader(config);
+	context.after(() => reader.close());
+	const first = await reader.searchPage({ text: 'widget', limit: 1 });
+	const second = await reader.searchPage({ text: 'widget', limit: 1, continuation: first.continuation });
+	const original = Buffer.from(first.continuation, 'base64url');
+	const changedScore = Buffer.from(original);
+	changedScore.writeFloatLE(original.readFloatLE(53) + 1, 53);
+	const changedId = Buffer.from(original);
+	changedId.write('b', 57);
+	const changedSnapshot = Buffer.from(original);
+	changedSnapshot[37] = changedSnapshot[37] === 48 ? 49 : 48;
+	const spliced = Buffer.concat([original.subarray(0, 37), Buffer.from(second.continuation, 'base64url').subarray(37)]);
+	const oldVersion = Buffer.from(original);
+	oldVersion[0] = 1;
+	for (const bytes of [changedScore, changedId, changedSnapshot, spliced, oldVersion]) {
+		await assert.rejects(
+			reader.searchPage({ text: 'widget', limit: 1, continuation: bytes.toString('base64url') }),
+			codeIs('E_INVALID_ARGUMENT'),
+		);
+	}
+	const resumed = await reader.searchPage(
+		{ text: 'widget', limit: 2, continuation: first.continuation },
+		{ remainingBudgetMilliseconds: 1000 },
+	);
+	assert.deepStrictEqual(
+		resumed.hits.map((hit) => hit.id),
+		['b', 'c'],
+	);
+	assert.equal(resumed.continuation, undefined);
+});
+
 test('native decoding rejects damaged traversal frames without poisoning the handle', async (context) => {
 	const config = options();
 	const addon = loadAddon();

@@ -8,7 +8,9 @@ Traversal must use the same scoring topology on every page. In pinned Tantivy 0.
 
 The test `traversal_retains_a_merged_snapshot_and_stops_collection_on_deadline` enforces collection-stage expiry and preservation of an old searcher through a forced merge. Public traversal tests compare complete scored sequences against ordinary search, including filtered, candidate, Boolean, and zero-score queries.
 
-The facade salts each query digest with a lazily created per-object random identity. Native handle numbers restart in a new process, so the number and segment fingerprint alone cannot enforce reader/process binding. The public cross-process replay test uses handle 1 in both processes to enforce this boundary.
+The facade authenticates token version/handle and snapshot/score/ID bytes plus a fixed query digest using HMAC-SHA256 and an object-local 32-byte key minted before asynchronous work. Version-2 tokens reject boundary edits and splicing. Native handle numbers restart in a new process, so the number and segment fingerprint alone cannot enforce reader/process binding; the cross-process replay test uses handle 1 in both processes.
+
+Query identities up to 64 KiB hash synchronously; larger identities use WebCrypto under bounded preparation admission. The threshold selects execution, not accepted capacity. Preparation frame bytes are capped by the configured search queue bytes and the existing request-frame ceiling; command capacity also respects configuration and a frame/threshold-derived ceiling. Hash reservations release before native submission. After asynchronous work, closing/closed state and the remaining monotonic budget must be rechecked before invoking native. Native status counters exclude this JavaScript stage; preparation overload errors identify it explicitly.
 
 The protocol decoder and public Rust engine share `validate_search_window`: offset capacity and traversal page capacity are separate contracts, and checked arithmetic must precede collector allocation. Native/TypeScript boundary tests cover advertised page/filter limits; analyzer recall and trace completeness are qualified in [the limits guide](../docs/limits.md).
 

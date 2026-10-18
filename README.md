@@ -266,13 +266,14 @@ changes the active indexed snapshot; use a dedicated reader when ingestion conti
 Continuations are bound to that handle and the original
 query, fields, filters, and candidate IDs; they cannot be moved to a reopened handle, another worker,
 or another process. Restart traversal after an addon upgrade. You may change page size or execution
-budget between pages. Tokens are bounded
-misuse-detection values, not authentication or authorization credentials. The consuming application
+budget between pages. Tokens carry a bounded HMAC-protected boundary and query identity. They are not authorization credentials. The consuming application
 must still enforce its own permissions and manage reader lifetime, including any cursor TTL.
 
 Retained winners depend on page size rather than depth, but each page scans all matching documents
 and computes an exact total. Traversing N matches in pages of P requires approximately N²/P
 matching-document visits. This is a bounded-memory traversal API, not a constant-time seek.
+Traversal charges request preparation against its execution budget. Identities up to 64 KiB use a bounded synchronous hash; larger identities hash asynchronously through WebCrypto. This scheduling threshold does not reduce accepted query capacity. Large-hash preparation has separate per-handle command/frame-byte admission, limited by configured search queue limits and internal ceilings derived from the 8 MiB request bound (at most 128 preparations and 8 MiB of retained frames). WebCrypto may copy those identity bytes; these limits are not total RSS bounds. Preparation overload reports `E_QUEUE_FULL` with a preparation-specific message; native `status()` queue metrics exclude this JavaScript stage. Factory-created handles receive the configured search limits; direct `NativeFullTextIndex` construction can supply `searchLimits`, otherwise the protocol-derived preparation ceilings apply. WebCrypto shares the host's libuv pool, so other pool work can delay a large request. Timeout or close is checked after hashing settles and before native admission; hashing already dispatched is not interruptible.
+
 Traversal checks its deadline between batches of matching documents. Query construction and individual
 Tantivy operations can still exceed the budget; `close()` waits for in-flight native work. Use at
 least two search threads for ordinary/expensive lane isolation; with one thread, traversal shares
@@ -576,6 +577,8 @@ multiple actual segments, a broader fuzzy vocabulary, concurrent writes and ordi
 and response-size recovery. Build first with `npm run build`; use `--smoke` for the smaller CI
 correctness profile. Output reports actual segment counts, workload sizes, timings and process RSS.
 It does not enforce production latency targets or claim a peak-memory bound.
+
+`node scripts/run-local.mjs benchmarks/traversal-preparation.mjs current` measures synchronous submission time, completion time and event-loop delay for a legal large candidate/filter identity. Build first; compare repeated runs on the same idle hardware. It measures encoding/copying and native work as well as hashing, so it does not isolate crypto cost or establish a production latency target.
 
 For a paired ordinary-search comparison, build baseline and current worktrees with the same optimized
 native profile, then run `FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/ordinary-search.mjs /absolute/worktree baseline`
