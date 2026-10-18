@@ -11,17 +11,19 @@ Tantivy's `MmapDirectory`.
 
 The backend covers native index creation and reopen, batched document upsert/delete, explicit
 commit and checkpoint publication, weighted BM25, phrase, bounded prefix/autocomplete, fuzzy and
-fuzzy-prefix queries, score-neutral candidate filtering, current-record match tracing, status, and
-deterministic close. Source-data projection, replication, and readiness policy remain outside the
+fuzzy-prefix queries, score-neutral candidate filtering, current-record match tracing, status,
+ranked snapshot traversal, and deterministic close. Source-data projection, replication, and readiness policy remain outside the
 package.
 
 It implements the native portions of [the façade and lifecycle contract](https://github.com/HarperFast/fulltext/issues/14)
 and [bounded native execution](https://github.com/HarperFast/fulltext/issues/17). The facade uses
 versioned packed mutation and search frames, stable error codes, and explicit lifecycle operations.
 Each index has one bounded writer actor and a bounded search executor, while the optional process
-governor provides checked aggregate admission across indexes. Sustained work stays off JavaScript
-and libuv, and search remains independent of write and commit latency. Shared cross-index executors,
-multi-environment handles and cancellation of started Tantivy collectors remain outside this
+governor provides checked aggregate admission across indexes. Native indexing and search execute on
+owned threads, independently of write and commit latency. Large traversal-query identities hash
+through WebCrypto on the shared libuv pool under separate bounded admission. Traversal checks its
+deadline between document batches; ordinary collection and individual Tantivy operations remain
+uninterruptible. Shared cross-index executors and multi-environment handles remain outside this
 contract.
 
 ## Invariant
@@ -33,7 +35,7 @@ the consuming application. The Node package contributes canonical path handling 
 ## Verified constraints
 
 - The package exports one hand-written `@harperfast/fulltext/native` facade for runtime information,
-  index lifecycle, batched mutation, checkpoint publication, and search.
+  index lifecycle, batched mutation, checkpoint publication, search, and snapshot traversal.
   `verify: ts/native.ts, package.json:6-11`
 - The addon already contains a panic boundary and per-handle poison primitive.
   `verify: src/boundary.rs:8-40`
@@ -133,7 +135,17 @@ interface SearchRequest {
 interface SearchResult {
 	total: number;
 	totalRelation: 'exact' | 'lower-bound';
-	hits: Array<{ id: string; score: number }>;
+	hits: Array<{ id: string; score: number; version?: string }>;
+}
+
+interface SearchPageRequest extends Omit<SearchRequest, 'offset' | 'exactTotal'> {
+	offset?: number | null;
+	exactTotal?: boolean | null;
+	continuation?: string;
+}
+
+interface SearchPageResult extends SearchResult {
+	continuation?: string;
 }
 
 interface FullTextStatus {
@@ -190,7 +202,11 @@ The exported flow is:
 4. `commit()` serializes behind earlier writer commands and publishes through Tantivy's ordinary
    commit path. It does not imply reader reload.
 5. `reload()` crosses the writer barrier and then refreshes the reader on the search executor;
-   `search()` uses one captured immutable searcher without waiting behind indexing or commit work.
+   `search()` and `searchPage()` use one captured immutable searcher without waiting behind indexing
+   or commit work. `searchPage()` returns an authenticated continuation for the next ranked page.
+   Keep a dedicated reader open without reloading to retain the original snapshot across writer
+   publications; changed-snapshot reload expires its continuations. The host bounds reader leases
+   and continues enforcing current authorization and source-version checks.
 6. `close()` rejects new work, settles admitted commands, shuts down the writer, releases the path
    reservation, and is idempotent.
 7. `status()` reads bounded counters and state without entering either sustained-work queue.
@@ -264,8 +280,10 @@ N-API handle registry ── canonical path reservation
 writer actor ─► shared engine ─► MmapDirectory
 ```
 
-The native addon owns these threads and queues; no sustained operation runs on the JavaScript event
-loop or libuv pool. The writer actor is the sole owner of `IndexWriter`, making mutation, commit,
+The native addon owns these threads and queues; native indexing and search do not execute on the
+JavaScript event loop or libuv pool. Traversal preparation separately uses a bounded synchronous
+hash for identities up to 64 KiB and WebCrypto on libuv for larger identities. A dispatched hash
+cannot be forcibly cancelled; deadline and close state are checked before native submission. The writer actor is the sole owner of `IndexWriter`, making mutation, commit,
 rollback, and shutdown ordering explicit. A small configurable search pool shares the active
 immutable `Searcher`, so searches overlap each other as well as indexing and commit. `reload()`
 first crosses the writer queue as a barrier. It
@@ -402,9 +420,10 @@ tracing uses the same positional rule. Prefix expansion is capped; exceeding the
 `E_PREFIX_TOO_BROAD` rather than truncating the term set and silently biasing recall or rank. A
 caller may catch that distinct code and choose a documented fallback. Fuzzy-prefix remains a
 preview capability until the catalog-scale benchmark qualifies it. Request budgets cover
-queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing;
-Tantivy's collector itself cannot be interrupted, so an expired search result is discarded after
-the collector returns. If all eligible workers are executing, an expired queued request is rejected
+queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing.
+Traversal also charges preparation against that budget and checks its deadline every 1,024 scorer
+advances. Ordinary collection, query construction, and individual Tantivy operations remain
+uninterruptible; an expired result is discarded after control returns. If all eligible workers are executing, an expired queued request is rejected
 when a worker next examines it rather than at the exact wall-clock deadline.
 
 ## Failure and lifecycle behavior

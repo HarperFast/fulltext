@@ -19,6 +19,7 @@ test-panic = ["node-api"]
 napi = { version = "=3.13.0", default-features = false, features = ["dyn-symbols", "napi8"], optional = true }
 napi-derive = { version = "=3.6.9", optional = true }
 tantivy = "=0.26.2"
+sha2 = { version = "=0.10.9", default-features = false }
 unicode-normalization = "=0.1.24"
 
 [build-dependencies]

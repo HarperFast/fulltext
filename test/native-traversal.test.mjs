@@ -181,9 +181,9 @@ test('rejects mismatched and malformed continuations without poisoning the reade
 		codeIs('E_INVALID_ARGUMENT'),
 	);
 	const nan = Buffer.from(first.continuation, 'base64url');
-	nan.writeFloatLE(NaN, 53);
+	nan.writeFloatLE(NaN, 101);
 	const badUtf8 = Buffer.from(first.continuation, 'base64url');
-	badUtf8[57] = 255;
+	badUtf8[105] = 255;
 	for (const continuation of [
 		'',
 		'!',
@@ -221,16 +221,23 @@ test('authenticates finite continuation boundaries and rejects spliced tokens', 
 	const first = await reader.searchPage({ text: 'widget', limit: 1 });
 	const second = await reader.searchPage({ text: 'widget', limit: 1, continuation: first.continuation });
 	const original = Buffer.from(first.continuation, 'base64url');
+	assert.equal(original[0], 3);
+	assert.match(original.toString('ascii', 37, 101), /^[0-9a-f]{64}$/);
 	const changedScore = Buffer.from(original);
-	changedScore.writeFloatLE(original.readFloatLE(53) + 1, 53);
+	changedScore.writeFloatLE(original.readFloatLE(101) + 1, 101);
 	const changedId = Buffer.from(original);
-	changedId.write('b', 57);
+	changedId.write('b', 105);
 	const changedSnapshot = Buffer.from(original);
 	changedSnapshot[37] = changedSnapshot[37] === 48 ? 49 : 48;
 	const spliced = Buffer.concat([original.subarray(0, 37), Buffer.from(second.continuation, 'base64url').subarray(37)]);
 	const oldVersion = Buffer.from(original);
-	oldVersion[0] = 1;
-	for (const bytes of [changedScore, changedId, changedSnapshot, spliced, oldVersion]) {
+	oldVersion[0] = 2;
+	await assert.rejects(
+		reader.searchPage({ text: 'widget', continuation: oldVersion.toString('base64url') }),
+		(error) =>
+			error.code === 'E_INVALID_ARGUMENT' && error.message === 'continuation does not belong to this reader and query',
+	);
+	for (const bytes of [changedScore, changedId, changedSnapshot, spliced]) {
 		await assert.rejects(
 			reader.searchPage({ text: 'widget', limit: 1, continuation: bytes.toString('base64url') }),
 			codeIs('E_INVALID_ARGUMENT'),
@@ -269,8 +276,20 @@ test('native decoding rejects damaged traversal frames without poisoning the han
 		limit: 25,
 		exactTotal: false,
 		budgetMilliseconds: 30000,
-		traversal: { after: { snapshot: '0000000000000000', score: 1, id: 'a' } },
+		traversal: { after: { snapshot: '0'.repeat(64), score: 1, id: 'a' } },
 	});
+	const oldSnapshot = encodeSearch({
+		expression: { text: 'widget', mode: 'any', fields: [] },
+		offset: 0,
+		limit: 25,
+		exactTotal: false,
+		budgetMilliseconds: 30000,
+		traversal: { after: { snapshot: '0'.repeat(16), score: 1, id: 'a' } },
+	});
+	await assert.rejects(
+		invoke((callback) => addon.__nativeSearch(handle, oldSnapshot, callback)),
+		(error) => error.code === 'E_INVALID_ARGUMENT' && /invalid search continuation boundary/.test(error.message),
+	);
 	const nonFinite = Buffer.from(frame);
 	nonFinite.writeFloatLE(NaN, frame.length - 13);
 	await assert.rejects(
@@ -311,7 +330,7 @@ test('bounds continuation IDs and native response bytes at their advertised limi
 	});
 	await writer.publish('large-ids');
 	const first = await writer.searchPage({ text: 'widget', limit: 1 });
-	assert.strictEqual(first.continuation.length, 5538);
+	assert.strictEqual(first.continuation.length, 5602);
 	const next = await writer.searchPage({ text: 'widget', limit: 1, continuation: first.continuation });
 	assert.strictEqual(next.hits[0].id, 'b' + suffix);
 	await writer.applyMutationBatch({

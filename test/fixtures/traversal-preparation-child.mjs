@@ -78,7 +78,7 @@ try {
 			reader.searchPage({ ...shared, limit: 2 }),
 		]);
 		const changed = Buffer.from(first.continuation, 'base64url');
-		changed.writeFloatLE(123, 53);
+		changed.writeFloatLE(123, 101);
 		await assert.rejects(
 			reader.searchPage({ ...shared, continuation: changed.toString('base64url') }),
 			(error) => error.code === 'E_INVALID_ARGUMENT',
@@ -108,7 +108,7 @@ try {
 	assert.equal((await reader.searchPage({ text: 'widget', limit: 1 })).hits[0].id, 'a');
 	const first = await reader.searchPage({ text: 'widget', limit: 1 });
 	const edited = Buffer.from(first.continuation, 'base64url');
-	edited.writeFloatLE(123, 53);
+	edited.writeFloatLE(123, 101);
 	await assert.rejects(
 		reader.searchPage({ text: 'widget', continuation: edited.toString('base64url') }),
 		(error) => error.code === 'E_INVALID_ARGUMENT',

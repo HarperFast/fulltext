@@ -748,7 +748,12 @@ fn decode_search_traversal(cursor: &mut Cursor<'_>) -> Result<(bool, Option<Sear
 		let snapshot = cursor.string()?;
 		let score = cursor.f32()?;
 		let id = cursor.record_id()?;
-		if snapshot.len() != 16 || !snapshot.bytes().all(|byte| byte.is_ascii_hexdigit()) || !score.is_finite() {
+		if snapshot.len() != 64
+			|| !snapshot
+				.bytes()
+				.all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+			|| !score.is_finite()
+		{
 			return Err(FulltextError::invalid("invalid search continuation boundary"));
 		}
 		Some(SearchBoundary { snapshot, score, id })

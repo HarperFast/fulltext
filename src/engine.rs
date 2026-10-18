@@ -1,15 +1,17 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Bound, Range};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+
+use sha2::{Digest, Sha256};
 
 use tantivy::collector::sort_key::{NaturalComparator, ReverseComparator};
 use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs, TopNComputer};
 use tantivy::columnar::StrColumn;
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
+use tantivy::index::SegmentId;
 use tantivy::query::{
 	BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery,
 	Query, RangeQuery, TermQuery, TermSetQuery,
@@ -22,8 +24,8 @@ use tantivy::tokenizer::{
 	TokenFilter, TokenStream, Tokenizer, MAX_TOKEN_LEN,
 };
 use tantivy::{
-	DocAddress, DocId, Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, Score, Searcher, SegmentReader,
-	Term,
+	DocAddress, DocId, Index, IndexReader, IndexSettings, IndexWriter, Opstamp, ReloadPolicy, Score, Searcher,
+	SegmentReader, Term,
 };
 use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
 use unicode_normalization::is_nfkc;
@@ -626,9 +628,7 @@ impl Engine {
 		}
 		check_deadline(deadline)?;
 		let snapshot = if request.traversal {
-			let mut hasher = std::collections::hash_map::DefaultHasher::new();
-			searcher.generation().segments().hash(&mut hasher);
-			let snapshot = format!("{:016x}", hasher.finish());
+			let snapshot = search_snapshot(searcher.generation().segments());
 			if request.after.as_ref().is_some_and(|after| after.snapshot != snapshot) {
 				return Err(FulltextError::new(
 					"E_CURSOR_EXPIRED",
@@ -1743,6 +1743,20 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
 	} else {
 		Ok(())
 	}
+}
+
+fn search_snapshot(segments: &BTreeMap<SegmentId, Option<Opstamp>>) -> String {
+	let mut digest = Sha256::new();
+	digest.update(b"fulltext-snapshot-v1\0");
+	digest.update((segments.len() as u64).to_le_bytes());
+	for (segment, deleted_at) in segments {
+		digest.update(segment.uuid_string().as_bytes());
+		digest.update([u8::from(deleted_at.is_some())]);
+		if let Some(opstamp) = deleted_at {
+			digest.update(opstamp.to_le_bytes());
+		}
+	}
+	format!("{:x}", digest.finalize())
 }
 
 fn search_response_bytes(hits: &[SearchHit], header_bytes: usize) -> Result<usize> {
@@ -3074,6 +3088,32 @@ mod tests {
 			],
 			deletes: Vec::new(),
 		}
+	}
+
+	#[test]
+	fn snapshot_digest_binds_segment_ids_and_deletion_generations() {
+		let mut segments = BTreeMap::new();
+		assert_eq!(
+			search_snapshot(&segments),
+			"1962c405bdaf56d05c10327878eb6165ba017eae08c3bda932e3d36d24406361"
+		);
+		let segment = SegmentId::from_uuid_string("00112233445566778899aabbccddeeff").unwrap();
+		segments.insert(segment, None);
+		assert_eq!(
+			search_snapshot(&segments),
+			"7e8c34cf1637bedc14048237a152de9ddaf3866abfad53ade87447662855a4fe"
+		);
+		assert_eq!(search_snapshot(&segments), search_snapshot(&segments.clone()));
+		segments.insert(segment, Some(0));
+		assert_eq!(
+			search_snapshot(&segments),
+			"99c84530ae8d4b1b7b401d1b0b9aa3dd07da7b8faf2ee4599b872647f7f3886a"
+		);
+		let deleted = search_snapshot(&segments);
+		segments.insert(segment, Some(1));
+		assert_ne!(search_snapshot(&segments), deleted);
+		let replacement = SegmentId::from_uuid_string("10112233445566778899aabbccddeeff").unwrap();
+		assert_ne!(search_snapshot(&BTreeMap::from([(replacement, Some(0))])), deleted);
 	}
 
 	#[test]

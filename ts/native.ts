@@ -27,7 +27,14 @@ import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
 import { PublicationState } from './publication.js';
 
-const continuationOffsets = { handle: 1, digest: 5, snapshot: 37, score: 53, id: 57 };
+const snapshotHexBytes = 64;
+const continuationOffsets = {
+	handle: 1,
+	digest: 5,
+	snapshot: 37,
+	score: 37 + snapshotHexBytes,
+	id: 41 + snapshotHexBytes,
+};
 const maxContinuationBytes = continuationOffsets.id + maxRecordIdBytes;
 const maxContinuationCharacters = Math.ceil((maxContinuationBytes * 4) / 3);
 const maxSynchronousIdentityBytes = 64 * 1024;
@@ -671,7 +678,7 @@ export class NativeFullTextIndex {
 				bytes.length < continuationOffsets.id + 1 ||
 				bytes.length > maxContinuationBytes ||
 				bytes.toString('base64url') !== token ||
-				bytes[0] !== 2 ||
+				bytes[0] !== 3 ||
 				bytes.readUInt32LE(continuationOffsets.handle) !== this.#handle
 			) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'continuation does not belong to this reader and query');
@@ -736,13 +743,18 @@ export class NativeFullTextIndex {
 		if (traversal) {
 			const snapshot = cursor.string();
 			const more = cursor.u8();
-			if (!/^[0-9a-f]{16}$/.test(snapshot) || more > 1 || (more === 1 && hits.length === 0)) {
+			if (
+				snapshot.length !== snapshotHexBytes ||
+				!/^[0-9a-f]+$/.test(snapshot) ||
+				more > 1 ||
+				(more === 1 && hits.length === 0)
+			) {
 				throw new FulltextError('E_NATIVE_FAILURE', 'invalid native search continuation');
 			}
 			if (more === 1) {
 				const last = hits[hits.length - 1];
 				const bytes = Buffer.alloc(continuationOffsets.id + Buffer.byteLength(last.id));
-				bytes[0] = 2;
+				bytes[0] = 3;
 				bytes.writeUInt32LE(this.#handle, continuationOffsets.handle);
 				bytes.write(
 					snapshot,
