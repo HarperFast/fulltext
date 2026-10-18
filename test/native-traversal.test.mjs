@@ -150,6 +150,10 @@ test('rejects mismatched and malformed continuations without poisoning the reade
 	}
 	assert(first.continuation);
 	for (const target of [writer, reader]) {
+		for (const request of [null, undefined]) {
+			await assert.rejects(target.search(request), codeIs('E_INVALID_ARGUMENT'));
+			await assert.rejects(target.searchPage(request), codeIs('E_INVALID_ARGUMENT'));
+		}
 		await assert.rejects(
 			target.search({ text: 'widget', continuation: first.continuation }),
 			codeIs('E_INVALID_ARGUMENT'),
