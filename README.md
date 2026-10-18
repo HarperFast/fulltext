@@ -240,6 +240,8 @@ Use a dedicated read-only handle to retain the original snapshot while the write
 merges newer data:
 
 ```js
+import { openNativeFullTextReader } from '@harperfast/fulltext/native';
+
 const reader = await openNativeFullTextReader(options);
 try {
 	let continuation;
@@ -262,11 +264,21 @@ misuse-detection values, not authentication or authorization credentials. The co
 must still enforce its own permissions and manage reader lifetime, including any cursor TTL.
 
 Retained winners depend on page size rather than depth, but each page scans all matching documents
-and computes an exact total. This is a bounded-memory traversal API, not a constant-time seek.
+and computes an exact total. Traversing N matches in pages of P requires approximately N²/P
+matching-document visits. This is a bounded-memory traversal API, not a constant-time seek.
+Traversal checks its deadline between batches of matching documents. Query construction and individual
+Tantivy operations can still exceed the budget; `close()` waits for in-flight native work. Use at least two search threads for ordinary/expensive lane isolation; with
+one thread, traversal shares the handle's only search lane.
 Snapshot leases retain old segment files until readers close; keep concurrent reader counts and
 lifetimes controlled with the existing runtime budget and application lifecycle. Prefix and
 fuzzy-prefix queries are rejected by `searchPage()` pending separate autocomplete qualification.
 Source projection, current-record validation, and Harper REST integration remain host responsibilities.
+
+Observed on 2026-10-18 in one local macOS arm64 / Node 24 optimized-build sample: 100,000 equal-score
+matches across 500 pages of 200 took 406 ms accumulated page-call time (first page 1.70 ms; last page
+0.73 ms). A 50,000-hit structured-filter traversal took 233 ms; 1,024 candidate hits took 6.9 ms.
+These observations are not production latency guarantees; corpus, query, segment layout, and load
+change the cost.
 
 ### Structured filters
 
@@ -359,8 +371,9 @@ Search and tracing share a maximum 30-second queue-plus-execution budget. Applic
 shorter remaining request budget through the second method argument; larger values are clamped to
 30 seconds. The budget determines whether queued or completed work is accepted; it is not a
 callback timer. If every eligible worker is already executing non-interruptible work, an expired
-queued request is rejected when a worker next examines it. Tantivy search itself is not
-interruptible, so a search that expires in flight is discarded after Tantivy returns. Match tracing
+queued request is rejected when a worker next examines it. Ordinary offset search is not
+interruptible, so an expired offset search is discarded after Tantivy returns. Traversal checks its
+deadline during collection. Match tracing
 checks its deadline while tokenizing and matching. With at least two search threads, one worker is
 reserved for ordinary bounded `any`/`all` BM25. The remaining workers prioritize phrase, prefix,
 fuzzy, unanchored-negation, exact-total, and trace work, then steal ordinary work when that queue is

@@ -17,7 +17,7 @@ after(() => {
 	for (const directory of directories) rmSync(directory, { recursive: true, force: true });
 });
 
-function options(context) {
+function options() {
 	const directory = mkdtempSync(path.join(tmpdir(), 'fulltext-traversal-'));
 	directories.push(directory);
 	return {
@@ -38,12 +38,14 @@ function options(context) {
 	};
 }
 
-async function pages(reader, query, first) {
+async function pages(reader, query, expectedTotal, first) {
 	const hits = [];
 	let page = first ?? (await reader.searchPage(query));
-	const total = page.total;
+	let pageCount = 0;
+	const maxPages = Math.max(1, Math.ceil(expectedTotal / (query.limit ?? 20)));
 	do {
-		assert.strictEqual(page.total, total);
+		assert(++pageCount <= maxPages, 'continuation did not advance');
+		assert.strictEqual(page.total, expectedTotal);
 		assert.strictEqual(page.totalRelation, 'exact');
 		hits.push(...page.hits);
 		if (!page.continuation) break;
@@ -55,7 +57,7 @@ async function pages(reader, query, first) {
 const codeIs = (code) => (error) => error.code === code;
 
 test('traverses more than 10,000 original matches while the writer publishes updates', async (context) => {
-	const config = options(context);
+	const config = options();
 	const writer = await openNativeFullTextIndex(config);
 	context.after(() => writer.close({ mode: 'rollback' }));
 	const ids = Array.from({ length: 10025 }, (_, i) => String(i).padStart(5, '0'));
@@ -74,13 +76,14 @@ test('traverses more than 10,000 original matches while the writer publishes upd
 		upserts: [{ id: 'new', version: 'new', fields: { title: 'widget' } }],
 	});
 	await writer.publish('updated');
-	const hits = await pages(reader, { text: 'widget', limit: 997 }, first);
+	await writer.close();
+	const hits = await pages(reader, { text: 'widget', limit: 997 }, 10025, first);
 	assert.deepStrictEqual(
 		hits.map((hit) => hit.id),
 		ids,
 	);
 	assert(hits.every((hit) => hit.version === 'original'));
-	await assert.rejects(writer.search({ text: 'widget', offset: 10000, limit: 25 }), codeIs('E_INVALID_ARGUMENT'));
+	await assert.rejects(reader.search({ text: 'widget', offset: 10000, limit: 25 }), codeIs('E_INVALID_ARGUMENT'));
 	await assert.rejects(resetNativeFullTextIndex({ path: config.path, indexId: config.indexId }), codeIs('E_LOCK_BUSY'));
 	await reader.reload();
 	await assert.rejects(
@@ -92,7 +95,7 @@ test('traverses more than 10,000 original matches while the writer publishes upd
 });
 
 test('preserves mixed-score and UTF-8 tie order across pages, filters and Boolean queries', async (context) => {
-	const config = options(context);
+	const config = options();
 	const writer = await openNativeFullTextIndex(config);
 	context.after(() => writer.close({ mode: 'rollback' }));
 	const ids = Array.from({ length: 120 }, (_, i) => `${i % 2 ? 'é' : 'z'}-${String(i).padStart(3, '0')}`);
@@ -116,17 +119,17 @@ test('preserves mixed-score and UTF-8 tie order across pages, filters and Boolea
 		{ query: { operator: 'or', clauses: [{ text: 'widget' }, { text: 'catalog' }] } },
 	]) {
 		const expected = await reader.search({ ...query, limit: 120, exactTotal: true });
-		const hits = await pages(reader, { ...query, limit: 17 });
+		const hits = await pages(reader, { ...query, limit: 17 }, expected.total);
 		assert.deepStrictEqual(hits, expected.hits);
 	}
 	const empty = await reader.searchPage({ text: 'absent' });
 	assert.deepStrictEqual(empty, { total: 0, totalRelation: 'exact', hits: [] });
-	const exact = await pages(reader, { text: 'widget', limit: 30 });
+	const exact = await pages(reader, { text: 'widget', limit: 30 }, 120);
 	assert.strictEqual(exact.length, 120);
 });
 
 test('rejects mismatched and malformed continuations without poisoning the reader', async (context) => {
-	const config = options(context);
+	const config = options();
 	const writer = await openNativeFullTextIndex(config);
 	context.after(() => writer.close({ mode: 'rollback' }));
 	await writer.applyMutationBatch({ upserts: ['a', 'b', 'c'].map((id) => ({ id, fields: { title: 'widget' } })) });
@@ -136,6 +139,13 @@ test('rejects mismatched and malformed continuations without poisoning the reade
 	context.after(() => reader.close());
 	context.after(() => other.close());
 	const first = await reader.searchPage({ text: 'widget', limit: 1 });
+	const undefinedFields = await reader.searchPage({
+		text: 'widget',
+		limit: 1,
+		offset: undefined,
+		exactTotal: undefined,
+	});
+	assert.deepStrictEqual(undefinedFields, first);
 	assert(first.continuation);
 	await assert.rejects(
 		other.searchPage({ text: 'widget', continuation: first.continuation }),
@@ -178,7 +188,7 @@ test('rejects mismatched and malformed continuations without poisoning the reade
 });
 
 test('native decoding rejects damaged traversal frames without poisoning the handle', async (context) => {
-	const config = options(context);
+	const config = options();
 	const addon = loadAddon();
 	const { encodeOpen, decodeResponse } = await import('../dist/codec.js');
 	const packed = encodeOpen({
@@ -229,7 +239,7 @@ test('native decoding rejects damaged traversal frames without poisoning the han
 });
 
 test('bounds continuation IDs and native response bytes at their advertised limits', async (context) => {
-	const config = options(context);
+	const config = options();
 	const writer = await openNativeFullTextIndex(config);
 	context.after(() => writer.close({ mode: 'rollback' }));
 	const suffix = 'x'.repeat(4095);

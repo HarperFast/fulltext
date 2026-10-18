@@ -697,6 +697,10 @@ function encodeBatchHeader(upserts: number, deletes: number): Buffer {
 }
 
 export function encodeSearch(request: PackedSearchRequest): Buffer {
+	return encodeSearchFrame(request).bytes;
+}
+
+export function encodeSearchFrame(request: PackedSearchRequest): { bytes: Buffer; identityLength: number } {
 	validateCandidateIds(request.candidateIds);
 	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
 	writer.header('FTSQ');
@@ -710,6 +714,7 @@ export function encodeSearch(request: PackedSearchRequest): Buffer {
 	}
 	writer.boolean(request.filter !== undefined);
 	if (request.filter !== undefined) encodeFilterExpression(writer, request.filter, 0);
+	const identityLength = writer.length;
 	writer.u32(request.offset, 'offset');
 	writer.u32(request.limit, 'limit');
 	writer.boolean(request.exactTotal);
@@ -729,7 +734,7 @@ export function encodeSearch(request: PackedSearchRequest): Buffer {
 		}
 	}
 	writer.u32(request.budgetMilliseconds, 'budgetMilliseconds');
-	return writer.finish();
+	return { bytes: writer.finish(), identityLength };
 }
 
 function encodeFilterExpression(writer: ByteWriter, expression: PackedFilterExpression, depth: number): void {
@@ -909,6 +914,10 @@ class ByteWriter {
 		}
 		this.#maxBytes = maxBytes;
 		this.#sizeErrorCode = sizeErrorCode;
+	}
+
+	get length(): number {
+		return this.#length;
 	}
 
 	header(magic: string): void {

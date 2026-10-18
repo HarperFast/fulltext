@@ -105,17 +105,11 @@ type StableScoreTieHit = ((Score, String), DocAddress);
 
 struct StableScoreTieCollector {
 	doc_range: Range<usize>,
-	after: Option<crate::protocol::SearchBoundary>,
-	deadline: Option<Instant>,
 }
 
 impl StableScoreTieCollector {
 	fn new(doc_range: Range<usize>) -> Self {
-		Self {
-			doc_range,
-			after: None,
-			deadline: None,
-		}
+		Self { doc_range }
 	}
 }
 
@@ -125,9 +119,6 @@ struct StableScoreTieSegmentCollector {
 	segment_ord: u32,
 	match_count: u64,
 	missing_id: bool,
-	after: Option<(Score, Option<u64>)>,
-	deadline: Option<Instant>,
-	timed_out: bool,
 }
 
 impl SegmentCollector for StableScoreTieSegmentCollector {
@@ -135,34 +126,15 @@ impl SegmentCollector for StableScoreTieSegmentCollector {
 
 	fn collect(&mut self, doc: DocId, score: Score) {
 		self.match_count += 1;
-		if self.match_count.is_multiple_of(1024) && self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-			self.timed_out = true;
-		}
-		if self.timed_out {
-			return;
-		}
 		let Some(id_ord) = self.id_column.ords().first(doc) else {
 			self.missing_id = true;
 			return;
 		};
-		if let Some((boundary_score, first_after_id)) = self.after {
-			match score.total_cmp(&boundary_score) {
-				std::cmp::Ordering::Greater => return,
-				std::cmp::Ordering::Equal if first_after_id.is_none_or(|first| id_ord < first) => return,
-				_ => {}
-			}
-		}
 		// A segment's term ordinals preserve the dictionary's byte order.
 		self.top_docs.push((score, id_ord), doc);
 	}
 
 	fn harvest(self) -> Self::Fruit {
-		if self.timed_out {
-			return Err(FulltextError::new(
-				"E_TIMEOUT",
-				"search traversal exceeded its execution budget",
-			));
-		}
 		if self.missing_id {
 			return Err(FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"));
 		}
@@ -202,28 +174,12 @@ impl Collector for StableScoreTieCollector {
 			.fast_fields()
 			.str(ID_FIELD_NAME)?
 			.ok_or_else(|| tantivy::TantivyError::InternalError("search segment has no ID fast field".to_owned()))?;
-		let after = self
-			.after
-			.as_ref()
-			.map(|boundary| {
-				let mut stream = id_column
-					.dictionary()
-					.range()
-					.gt(boundary.id.as_bytes())
-					.into_stream()?;
-				let first_after_id = stream.advance().then(|| stream.term_ord());
-				Ok::<_, std::io::Error>((boundary.score, first_after_id))
-			})
-			.transpose()?;
 		Ok(StableScoreTieSegmentCollector {
 			top_docs: TopNComputer::new_with_comparator(self.doc_range.end, (NaturalComparator, ReverseComparator)),
 			id_column,
 			segment_ord,
 			match_count: 0,
 			missing_id: false,
-			after,
-			deadline: self.deadline,
-			timed_out: false,
 		})
 	}
 
@@ -258,6 +214,98 @@ impl Collector for StableScoreTieCollector {
 				.map(|hit| (hit.sort_key.0, hit.doc))
 				.collect(),
 		)))
+	}
+}
+
+struct TraversalScoreTieCollector {
+	inner: StableScoreTieCollector,
+	after: Option<crate::protocol::SearchBoundary>,
+	deadline: Option<Instant>,
+}
+
+struct TraversalScoreTieSegmentCollector {
+	inner: StableScoreTieSegmentCollector,
+	after: Option<(Score, Option<u64>)>,
+}
+
+impl SegmentCollector for TraversalScoreTieSegmentCollector {
+	type Fruit = Result<(u64, Vec<StableScoreTieHit>)>;
+
+	fn collect(&mut self, doc: DocId, score: Score) {
+		self.inner.match_count += 1;
+		let Some(id_ord) = self.inner.id_column.ords().first(doc) else {
+			self.inner.missing_id = true;
+			return;
+		};
+		if let Some((boundary_score, first_after_id)) = self.after {
+			match score.total_cmp(&boundary_score) {
+				std::cmp::Ordering::Greater => return,
+				std::cmp::Ordering::Equal if first_after_id.is_none_or(|first| id_ord < first) => return,
+				_ => {}
+			}
+		}
+		self.inner.top_docs.push((score, id_ord), doc);
+	}
+
+	fn harvest(self) -> Self::Fruit {
+		self.inner.harvest()
+	}
+}
+
+impl Collector for TraversalScoreTieCollector {
+	type Fruit = Result<(usize, u64, Vec<StableScoreTieHit>)>;
+	type Child = TraversalScoreTieSegmentCollector;
+
+	fn for_segment(&self, segment_ord: u32, segment: &SegmentReader) -> tantivy::Result<Self::Child> {
+		let inner = self.inner.for_segment(segment_ord, segment)?;
+		let after = self
+			.after
+			.as_ref()
+			.map(|boundary| {
+				let mut stream = inner
+					.id_column
+					.dictionary()
+					.range()
+					.gt(boundary.id.as_bytes())
+					.into_stream()?;
+				let first_after_id = stream.advance().then(|| stream.term_ord());
+				Ok::<_, std::io::Error>((boundary.score, first_after_id))
+			})
+			.transpose()?;
+		Ok(TraversalScoreTieSegmentCollector { inner, after })
+	}
+
+	fn requires_scoring(&self) -> bool {
+		true
+	}
+
+	fn merge_fruits(&self, fruits: Vec<<Self::Child as SegmentCollector>::Fruit>) -> tantivy::Result<Self::Fruit> {
+		self.inner.merge_fruits(fruits)
+	}
+
+	fn collect_segment(
+		&self,
+		weight: &dyn tantivy::query::Weight,
+		segment_ord: u32,
+		reader: &SegmentReader,
+	) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
+		let mut collector = self.for_segment(segment_ord, reader)?;
+		let mut scorer = weight.scorer(reader, 1.0)?;
+		let mut visited = 0_u64;
+		let mut doc = scorer.doc();
+		while doc != tantivy::TERMINATED {
+			if visited.is_multiple_of(1024) {
+				if let Err(error) = check_deadline(self.deadline) {
+					return Ok(Err(error));
+				}
+			}
+			if reader.alive_bitset().is_none_or(|alive| alive.is_alive(doc)) {
+				collector.collect(doc, scorer.score());
+			}
+			visited += 1;
+			doc = scorer.advance();
+		}
+		Ok(collector.harvest())
 	}
 }
 
@@ -590,9 +638,11 @@ impl Engine {
 					"search snapshot changed; restart traversal on a dedicated reader",
 				));
 			}
-			let mut collector = StableScoreTieCollector::new(0..request.limit + 1);
-			collector.after = request.after.clone();
-			collector.deadline = deadline;
+			let collector = TraversalScoreTieCollector {
+				inner: StableScoreTieCollector::new(0..request.limit.saturating_add(1)),
+				after: request.after.clone(),
+				deadline,
+			};
 			let (_, total, mut scored_docs) = searcher
 				.search(query.query.as_ref(), &collector)
 				.map_err(index_error)??;
@@ -3017,6 +3067,73 @@ mod tests {
 			],
 			deletes: Vec::new(),
 		}
+	}
+
+	#[test]
+	fn traversal_retains_a_merged_snapshot_and_stops_collection_on_deadline() {
+		let directory = RamDirectory::create();
+		let config = config();
+		let engine = Engine::open(directory, &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for mut upsert in batch().upserts {
+			upsert.version = Some("original".to_owned());
+			writer
+				.apply(MutationBatch {
+					upserts: vec![upsert],
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let reader = engine.reader().unwrap();
+		let pinned = reader.searcher();
+		assert_eq!(pinned.segment_readers().len(), 2);
+		let mut request = SearchRequest {
+			expression: expression("shoes", SearchMode::Any, Vec::new()),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 1,
+			exact_total: false,
+			budget_milliseconds: 30_000,
+			traversal: true,
+			after: None,
+		};
+		let first = engine.search(&pinned, &request).unwrap();
+		assert_eq!(first.total, 2);
+		let query = engine.query(&pinned, &request).unwrap();
+		let expired = TraversalScoreTieCollector {
+			inner: StableScoreTieCollector::new(0..2),
+			after: None,
+			deadline: Some(Instant::now() - std::time::Duration::from_millis(1)),
+		};
+		assert_eq!(
+			pinned.search(query.query.as_ref(), &expired).unwrap().unwrap_err().code,
+			"E_TIMEOUT"
+		);
+		let segments = engine.index.searchable_segment_ids().unwrap();
+		writer.inner.merge(&segments).wait().unwrap();
+		let last = first.hits.last().unwrap();
+		request.after = Some(crate::protocol::SearchBoundary {
+			snapshot: first.traversal.unwrap().0,
+			score: last.score,
+			id: last.id.clone(),
+		});
+		let second = engine.search(&pinned, &request).unwrap();
+		assert_eq!(second.total, 2);
+		assert_eq!(second.hits.len(), 1);
+		assert_ne!(second.hits[0].id, last.id);
+		assert_eq!(second.hits[0].version.as_deref(), Some("original"));
+		reader.reload().unwrap();
+		assert_eq!(reader.searcher().segment_readers().len(), 1);
+		assert_eq!(
+			engine.search(&reader.searcher(), &request).unwrap_err().code,
+			"E_CURSOR_EXPIRED"
+		);
+		writer.close().unwrap();
 	}
 
 	#[test]

@@ -11,7 +11,8 @@ import {
 	encodeOpen,
 	encodeReset,
 	encodeRuntimeBudget,
-	encodeSearch,
+	encodeSearchFrame,
+	maxRecordIdBytes,
 	encodeTrace,
 	MutationBatchFrameCursor,
 } from './codec.js';
@@ -19,6 +20,9 @@ import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
 import { PublicationState } from './publication.js';
 
+const continuationOffsets = { handle: 1, digest: 5, snapshot: 37, score: 53, id: 57 };
+const maxContinuationBytes = continuationOffsets.id + maxRecordIdBytes;
+const maxContinuationCharacters = Math.ceil((maxContinuationBytes * 4) / 3);
 const maxCommitPayloadBytes = 64 * 1024;
 const maxFilterStringBytes = 65_530;
 const filterComparators = new Set(['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between']);
@@ -584,7 +588,7 @@ export class NativeFullTextIndex {
 		traversal: boolean,
 	): Promise<SearchPageResult> {
 		const expression = normalizeSearchExpression(request);
-		if (traversal && ('offset' in request || 'exactTotal' in request)) {
+		if (traversal && (request.offset !== undefined || request.exactTotal !== undefined)) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'searchPage does not accept offset or exactTotal');
 		}
 		const packed = {
@@ -596,34 +600,30 @@ export class NativeFullTextIndex {
 			exactTotal: request.exactTotal ?? false,
 			budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
 		};
-		const digest = traversal
-			? createHash('sha256')
-					.update(encodeSearch({ ...packed, offset: 0, limit: 0, exactTotal: false, budgetMilliseconds: 0 }))
-					.digest()
-			: undefined;
+		let tokenDigest: Buffer | undefined;
 		let after: { snapshot: string; score: number; id: string } | undefined;
 		if (traversal && request.continuation !== undefined) {
 			const token = request.continuation;
-			if (typeof token !== 'string' || token.length > 5538 || !/^[A-Za-z0-9_-]+$/.test(token)) {
+			if (typeof token !== 'string' || token.length > maxContinuationCharacters || !/^[A-Za-z0-9_-]+$/.test(token)) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search continuation');
 			}
 			const bytes = Buffer.from(token, 'base64url');
 			if (
-				bytes.length < 58 ||
-				bytes.length > 4153 ||
+				bytes.length < continuationOffsets.id + 1 ||
+				bytes.length > maxContinuationBytes ||
 				bytes.toString('base64url') !== token ||
 				bytes[0] !== 1 ||
-				bytes.readUInt32LE(1) !== this.#handle ||
-				!bytes.subarray(5, 37).equals(digest!)
+				bytes.readUInt32LE(continuationOffsets.handle) !== this.#handle
 			) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'continuation does not belong to this reader and query');
 			}
+			tokenDigest = bytes.subarray(continuationOffsets.digest, continuationOffsets.snapshot);
 			after = {
-				snapshot: bytes.toString('ascii', 37, 53),
-				score: bytes.readFloatLE(53),
-				id: bytes.toString('utf8', 57),
+				snapshot: bytes.toString('ascii', continuationOffsets.snapshot, continuationOffsets.score),
+				score: bytes.readFloatLE(continuationOffsets.score),
+				id: bytes.toString('utf8', continuationOffsets.id),
 			};
-			if (!Buffer.from(after.id).equals(bytes.subarray(57))) {
+			if (!Buffer.from(after.id).equals(bytes.subarray(continuationOffsets.id))) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'continuation ID is not valid UTF-8');
 			}
 		}
@@ -631,13 +631,14 @@ export class NativeFullTextIndex {
 		if (request.mode !== undefined && request.operator !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 		}
-		const cursor = await invoke((callback) =>
-			loadAddon().__nativeSearch(
-				this.#handle,
-				encodeSearch({ ...packed, ...(traversal ? { traversal: { after } } : {}) }),
-				callback,
-			),
-		);
+		const frame = encodeSearchFrame({ ...packed, ...(traversal ? { traversal: { after } } : {}) });
+		const digest = traversal
+			? createHash('sha256').update(frame.bytes.subarray(0, frame.identityLength)).digest()
+			: undefined;
+		if (tokenDigest && !tokenDigest.equals(digest!)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'continuation does not belong to this reader and query');
+		}
+		const cursor = await invoke((callback) => loadAddon().__nativeSearch(this.#handle, frame.bytes, callback));
 		const total = safeNumber(cursor.u64(), 'search total');
 		const relation = cursor.u8();
 		const hitCount = cursor.u32();
@@ -656,13 +657,18 @@ export class NativeFullTextIndex {
 			}
 			if (more === 1) {
 				const last = hits[hits.length - 1];
-				const bytes = Buffer.alloc(57 + Buffer.byteLength(last.id));
+				const bytes = Buffer.alloc(continuationOffsets.id + Buffer.byteLength(last.id));
 				bytes[0] = 1;
-				bytes.writeUInt32LE(this.#handle, 1);
-				digest!.copy(bytes, 5);
-				bytes.write(snapshot, 37, 16, 'ascii');
-				bytes.writeFloatLE(last.score, 53);
-				bytes.write(last.id, 57, 'utf8');
+				bytes.writeUInt32LE(this.#handle, continuationOffsets.handle);
+				digest!.copy(bytes, continuationOffsets.digest);
+				bytes.write(
+					snapshot,
+					continuationOffsets.snapshot,
+					continuationOffsets.score - continuationOffsets.snapshot,
+					'ascii',
+				);
+				bytes.writeFloatLE(last.score, continuationOffsets.score);
+				bytes.write(last.id, continuationOffsets.id, 'utf8');
 				continuation = bytes.toString('base64url');
 			}
 		}

@@ -448,7 +448,7 @@ pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
 	let _ = cursor.u32()?;
 	let _ = cursor.u32()?;
 	let exact_total = cursor.boolean()?;
-	let traversal = cursor.remaining() > 4 && cursor.boolean()?;
+	let (traversal, _) = decode_search_traversal(&mut cursor)?;
 	Ok(traversal || cost.has_expensive_mode || !cost.has_positive_anchor || filter_is_expensive || exact_total)
 }
 
@@ -691,18 +691,7 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	let offset = cursor.u32()? as usize;
 	let limit = cursor.u32()? as usize;
 	let exact_total = cursor.boolean()?;
-	let traversal = cursor.remaining() > 4 && cursor.boolean()?;
-	let after = if traversal && cursor.boolean()? {
-		let snapshot = cursor.string()?;
-		let score = cursor.f32()?;
-		let id = cursor.record_id()?;
-		if snapshot.len() != 16 || !snapshot.bytes().all(|byte| byte.is_ascii_hexdigit()) || !score.is_finite() {
-			return Err(FulltextError::invalid("invalid search continuation boundary"));
-		}
-		Some(SearchBoundary { snapshot, score, id })
-	} else {
-		None
-	};
+	let (traversal, after) = decode_search_traversal(&mut cursor)?;
 	let budget_milliseconds = cursor.u32()?;
 	cursor.finish()?;
 	if budget_milliseconds == 0 || budget_milliseconds > MAX_SEARCH_BUDGET_MILLISECONDS {
@@ -732,6 +721,22 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 		traversal,
 		after,
 	})
+}
+
+fn decode_search_traversal(cursor: &mut Cursor<'_>) -> Result<(bool, Option<SearchBoundary>)> {
+	let traversal = cursor.remaining() > 4 && cursor.boolean()?;
+	let after = if traversal && cursor.boolean()? {
+		let snapshot = cursor.string()?;
+		let score = cursor.f32()?;
+		let id = cursor.record_id()?;
+		if snapshot.len() != 16 || !snapshot.bytes().all(|byte| byte.is_ascii_hexdigit()) || !score.is_finite() {
+			return Err(FulltextError::invalid("invalid search continuation boundary"));
+		}
+		Some(SearchBoundary { snapshot, score, id })
+	} else {
+		None
+	};
+	Ok((traversal, after))
 }
 
 fn decode_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut usize) -> Result<FilterExpression> {

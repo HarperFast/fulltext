@@ -575,4 +575,4 @@ and establishes bounded off-event-loop execution.
 - A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe
   callback as part of a future shared multi-environment runtime.
 - Fixed-host regression thresholds for representative application workloads.
-- Cancellation of an already-running Tantivy scorer.
+- Cancellation of ordinary offset-search collection and individual in-flight Tantivy operations.
