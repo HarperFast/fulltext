@@ -454,8 +454,13 @@ test('normalizes traversal candidate order without weakening input limits', asyn
 				value: Array.from({ length: 128 }, (_, i) => String(i).padStart(4, '0') + 'v'.repeat(59996)),
 			},
 		};
-		for (const method of ['search', 'searchPage'])
-			await assert.rejects(target[method](oversized), codeIs('E_INVALID_ARGUMENT'));
+		for (const method of ['search', 'searchPage']) {
+			await assert.rejects(
+				target[method](oversized),
+				(error) => error.code === 'E_INVALID_ARGUMENT' && /exceeds 8388608 bytes/.test(error.message),
+			);
+			assert.equal((await target[method]({ ...oversized, candidateIds: [oversized.candidateIds[0]] })).total, 0);
+		}
 		assert.equal(target.status().state, 'open');
 	}
 	assert.deepStrictEqual(candidates, ['😀', 'b', 'a', 'b', 'é', '\uE000', 'c']);
