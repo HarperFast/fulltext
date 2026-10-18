@@ -228,6 +228,46 @@ different page boundaries from changing tie order, but it visits every match and
 deadline after collection. Other bounded query shapes start with Tantivy's score-pruned `TopDocs`
 path; a score tie at the requested page boundary falls back to the stable all-match collector.
 
+### Traversing beyond 10,000 matches
+
+`searchPage()` traverses ordinary full-text results in score-descending, UTF-8 ID-ascending order.
+It returns an opaque `continuation` while another page remains. Each page has an exact `total`
+for the entire matching set; `limit` bounds an individual page to at most 10,000 hits. There is no
+fixed ceiling on the number of matching results you can traverse and no direct page-number jump.
+The existing `search({ offset, limit })` window and autocomplete limits remain unchanged.
+
+Use a dedicated read-only handle to retain the original snapshot while the writer publishes or
+merges newer data:
+
+```js
+const reader = await openNativeFullTextReader(options);
+try {
+	let continuation;
+	do {
+		const page = await reader.searchPage({ text: 'widget', limit: 1_000, continuation });
+		for (const hit of page.hits) await consume(hit);
+		continuation = page.continuation;
+	} while (continuation);
+} finally {
+	await reader.close();
+}
+```
+
+Do not call `reader.reload()` during traversal. Reloading to a different segment/deletion snapshot
+expires its continuations with `E_CURSOR_EXPIRED`; reloading the same snapshot keeps them valid.
+Closing the reader ends its snapshot lease. Continuations are bound to that handle and the original
+query, fields, filters, and candidate IDs; they cannot be moved to a reopened handle, another worker,
+or another process. You may change page size or execution budget between pages. Tokens are bounded
+misuse-detection values, not authentication or authorization credentials. The consuming application
+must still enforce its own permissions and manage reader lifetime, including any cursor TTL.
+
+Retained winners depend on page size rather than depth, but each page scans all matching documents
+and computes an exact total. This is a bounded-memory traversal API, not a constant-time seek.
+Snapshot leases retain old segment files until readers close; keep concurrent reader counts and
+lifetimes controlled with the existing runtime budget and application lifecycle. Prefix and
+fuzzy-prefix queries are rejected by `searchPage()` pending separate autocomplete qualification.
+Source projection, current-record validation, and Harper REST integration remain host responsibilities.
+
 ### Structured filters
 
 Filter fields are typed metadata stored in the Tantivy index alongside the analyzed text. They let
@@ -438,7 +478,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 8 and packed protocol 5. The loader rejects older addon binaries. Native
+This API uses native ABI 9 and packed protocol 5. The loader rejects older addon binaries. Native
 identity sidecar v4 remains the identity for indexes without structured filter fields. Configuring
 filter fields uses sidecar v5, which also fingerprints their names and types. Older v2 and v3
 indexes remain identifiable for safe reset but cannot be reopened; rebuild them from the

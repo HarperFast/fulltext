@@ -414,6 +414,7 @@ export interface PackedSearchRequest {
 	limit: number;
 	exactTotal: boolean;
 	budgetMilliseconds: number;
+	traversal?: { after?: { snapshot: string; score: number; id: string } };
 }
 
 export interface PackedTraceRequest {
@@ -712,6 +713,21 @@ export function encodeSearch(request: PackedSearchRequest): Buffer {
 	writer.u32(request.offset, 'offset');
 	writer.u32(request.limit, 'limit');
 	writer.boolean(request.exactTotal);
+	if (request.traversal) {
+		writer.boolean(true);
+		writer.boolean(request.traversal.after !== undefined);
+		if (request.traversal.after) {
+			const { snapshot, score, id } = request.traversal.after;
+			if (!Number.isFinite(score) || !Number.isFinite(Math.fround(score))) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'continuation score must be a finite float32');
+			}
+			writer.string(snapshot);
+			const packedScore = Buffer.alloc(4);
+			packedScore.writeFloatLE(score);
+			writer.u32(packedScore.readUInt32LE(0), 'continuation.score');
+			writer.string(id);
+		}
+	}
 	writer.u32(request.budgetMilliseconds, 'budgetMilliseconds');
 	return writer.finish();
 }

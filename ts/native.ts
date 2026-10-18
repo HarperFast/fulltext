@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { lstat, readdir, realpath, rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 
@@ -29,7 +30,7 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	queryApiVersion: 3;
+	queryApiVersion: 4;
 	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
 	mutationBatchApiVersion: 5;
@@ -215,6 +216,12 @@ export interface SearchRequest {
 	offset?: number;
 	limit?: number;
 	exactTotal?: boolean;
+}
+
+export type SearchPageRequest = Omit<SearchRequest, 'offset' | 'exactTotal'> & { continuation?: string };
+
+export interface SearchPageResult extends SearchResult {
+	continuation?: string;
 }
 
 export interface TraceSearchRequest {
@@ -563,24 +570,71 @@ export class NativeFullTextIndex {
 		this.#publication.refresh(sequence, payload);
 	}
 
-	async search(request: SearchRequest, options: SearchExecutionOptions = {}): Promise<SearchResult> {
+	search(request: SearchRequest, options: SearchExecutionOptions = {}): Promise<SearchResult> {
+		return this.#search(request, options, false);
+	}
+
+	searchPage(request: SearchPageRequest, options: SearchExecutionOptions = {}): Promise<SearchPageResult> {
+		return this.#search(request, options, true);
+	}
+
+	async #search(
+		request: SearchRequest & { continuation?: string },
+		options: SearchExecutionOptions,
+		traversal: boolean,
+	): Promise<SearchPageResult> {
 		const expression = normalizeSearchExpression(request);
+		if (traversal && ('offset' in request || 'exactTotal' in request)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'searchPage does not accept offset or exactTotal');
+		}
+		const packed = {
+			expression,
+			candidateIds: request.candidateIds,
+			filter: request.filter === undefined ? undefined : normalizeFilterExpression(request.filter, 0, { leaves: 0 }),
+			offset: request.offset ?? 0,
+			limit: request.limit ?? 20,
+			exactTotal: request.exactTotal ?? false,
+			budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
+		};
+		const digest = traversal
+			? createHash('sha256')
+					.update(encodeSearch({ ...packed, offset: 0, limit: 0, exactTotal: false, budgetMilliseconds: 0 }))
+					.digest()
+			: undefined;
+		let after: { snapshot: string; score: number; id: string } | undefined;
+		if (traversal && request.continuation !== undefined) {
+			const token = request.continuation;
+			if (typeof token !== 'string' || token.length > 5538 || !/^[A-Za-z0-9_-]+$/.test(token)) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search continuation');
+			}
+			const bytes = Buffer.from(token, 'base64url');
+			if (
+				bytes.length < 58 ||
+				bytes.length > 4153 ||
+				bytes.toString('base64url') !== token ||
+				bytes[0] !== 1 ||
+				bytes.readUInt32LE(1) !== this.#handle ||
+				!bytes.subarray(5, 37).equals(digest!)
+			) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'continuation does not belong to this reader and query');
+			}
+			after = {
+				snapshot: bytes.toString('ascii', 37, 53),
+				score: bytes.readFloatLE(53),
+				id: bytes.toString('utf8', 57),
+			};
+			if (!Buffer.from(after.id).equals(bytes.subarray(57))) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'continuation ID is not valid UTF-8');
+			}
+		}
+
 		if (request.mode !== undefined && request.operator !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 		}
 		const cursor = await invoke((callback) =>
 			loadAddon().__nativeSearch(
 				this.#handle,
-				encodeSearch({
-					expression,
-					candidateIds: request.candidateIds,
-					filter:
-						request.filter === undefined ? undefined : normalizeFilterExpression(request.filter, 0, { leaves: 0 }),
-					offset: request.offset ?? 0,
-					limit: request.limit ?? 20,
-					exactTotal: request.exactTotal ?? false,
-					budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
-				}),
+				encodeSearch({ ...packed, ...(traversal ? { traversal: { after } } : {}) }),
 				callback,
 			),
 		);
@@ -593,6 +647,25 @@ export class NativeFullTextIndex {
 			const version = cursor.u8() === 1 ? cursor.string() : undefined;
 			return { score, id, ...(version === undefined ? {} : { version }) };
 		});
+		let continuation: string | undefined;
+		if (traversal) {
+			const snapshot = cursor.string();
+			const more = cursor.u8();
+			if (!/^[0-9a-f]{16}$/.test(snapshot) || more > 1 || (more === 1 && hits.length === 0)) {
+				throw new FulltextError('E_NATIVE_FAILURE', 'invalid native search continuation');
+			}
+			if (more === 1) {
+				const last = hits[hits.length - 1];
+				const bytes = Buffer.alloc(57 + Buffer.byteLength(last.id));
+				bytes[0] = 1;
+				bytes.writeUInt32LE(this.#handle, 1);
+				digest!.copy(bytes, 5);
+				bytes.write(snapshot, 37, 16, 'ascii');
+				bytes.writeFloatLE(last.score, 53);
+				bytes.write(last.id, 57, 'utf8');
+				continuation = bytes.toString('base64url');
+			}
+		}
 		cursor.finish();
 		if (relation !== 0 && relation !== 1) {
 			throw new FulltextError('E_NATIVE_FAILURE', `Unknown total relation ${relation}`);
@@ -601,6 +674,7 @@ export class NativeFullTextIndex {
 			total,
 			totalRelation: relation === 0 ? 'exact' : 'lower-bound',
 			hits,
+			...(continuation === undefined ? {} : { continuation }),
 		};
 	}
 
@@ -810,6 +884,10 @@ export class NativeFullTextReader {
 
 	search(request: SearchRequest, options: SearchExecutionOptions = {}): Promise<SearchResult> {
 		return this.#inner.search(request, options);
+	}
+
+	searchPage(request: SearchPageRequest, options: SearchExecutionOptions = {}): Promise<SearchPageResult> {
+		return this.#inner.searchPage(request, options);
 	}
 
 	traceMatches(
@@ -1091,7 +1169,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			queryApiVersion: info.queryApiVersion as 3,
+			queryApiVersion: info.queryApiVersion as 4,
 			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
 			mutationBatchApiVersion: 5,

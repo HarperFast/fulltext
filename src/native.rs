@@ -3114,6 +3114,10 @@ fn search_body(result: SearchResult) -> Vec<u8> {
 			push_string(&mut bytes, &version);
 		}
 	}
+	if let Some((snapshot, more)) = result.traversal {
+		push_string(&mut bytes, &snapshot);
+		bytes.push(more as u8);
+	}
 	bytes
 }
 

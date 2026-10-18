@@ -196,6 +196,13 @@ pub enum SearchExpression {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct SearchBoundary {
+	pub snapshot: String,
+	pub score: f32,
+	pub id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct SearchRequest {
 	pub expression: SearchExpression,
 	pub candidate_ids: Option<Vec<String>>,
@@ -204,6 +211,8 @@ pub struct SearchRequest {
 	pub limit: usize,
 	pub exact_total: bool,
 	pub budget_milliseconds: u32,
+	pub traversal: bool,
+	pub after: Option<SearchBoundary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -439,7 +448,8 @@ pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
 	let _ = cursor.u32()?;
 	let _ = cursor.u32()?;
 	let exact_total = cursor.boolean()?;
-	Ok(cost.has_expensive_mode || !cost.has_positive_anchor || filter_is_expensive || exact_total)
+	let traversal = cursor.remaining() > 4 && cursor.boolean()?;
+	Ok(traversal || cost.has_expensive_mode || !cost.has_positive_anchor || filter_is_expensive || exact_total)
 }
 
 fn scan_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut usize) -> Result<bool> {
@@ -681,6 +691,18 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	let offset = cursor.u32()? as usize;
 	let limit = cursor.u32()? as usize;
 	let exact_total = cursor.boolean()?;
+	let traversal = cursor.remaining() > 4 && cursor.boolean()?;
+	let after = if traversal && cursor.boolean()? {
+		let snapshot = cursor.string()?;
+		let score = cursor.f32()?;
+		let id = cursor.record_id()?;
+		if snapshot.len() != 16 || !snapshot.bytes().all(|byte| byte.is_ascii_hexdigit()) || !score.is_finite() {
+			return Err(FulltextError::invalid("invalid search continuation boundary"));
+		}
+		Some(SearchBoundary { snapshot, score, id })
+	} else {
+		None
+	};
 	let budget_milliseconds = cursor.u32()?;
 	cursor.finish()?;
 	if budget_milliseconds == 0 || budget_milliseconds > MAX_SEARCH_BUDGET_MILLISECONDS {
@@ -691,7 +713,10 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	if limit == 0 || offset.saturating_add(limit) > MAX_SEARCH_WINDOW {
 		return Err(FulltextError::invalid("search window must be between 1 and 10000"));
 	}
-	if contains_prefix(&expression) && (offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS) {
+	if traversal && offset != 0 {
+		return Err(FulltextError::invalid("search traversal requires offset zero"));
+	}
+	if contains_prefix(&expression) && (traversal || offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS) {
 		return Err(FulltextError::invalid(
 			"prefix search requires offset zero and a limit no greater than 100",
 		));
@@ -704,6 +729,8 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 		limit,
 		exact_total,
 		budget_milliseconds,
+		traversal,
+		after,
 	})
 }
 
@@ -920,6 +947,8 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 			limit: record_count,
 			exact_total: false,
 			budget_milliseconds,
+			traversal: false,
+			after: None,
 		},
 		records,
 	})

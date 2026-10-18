@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::ops::{Bound, Range};
 use std::path::Path;
 use std::sync::Arc;
@@ -104,11 +105,17 @@ type StableScoreTieHit = ((Score, String), DocAddress);
 
 struct StableScoreTieCollector {
 	doc_range: Range<usize>,
+	after: Option<crate::protocol::SearchBoundary>,
+	deadline: Option<Instant>,
 }
 
 impl StableScoreTieCollector {
 	fn new(doc_range: Range<usize>) -> Self {
-		Self { doc_range }
+		Self {
+			doc_range,
+			after: None,
+			deadline: None,
+		}
 	}
 }
 
@@ -118,6 +125,9 @@ struct StableScoreTieSegmentCollector {
 	segment_ord: u32,
 	match_count: u64,
 	missing_id: bool,
+	after: Option<(Score, Option<u64>)>,
+	deadline: Option<Instant>,
+	timed_out: bool,
 }
 
 impl SegmentCollector for StableScoreTieSegmentCollector {
@@ -125,15 +135,34 @@ impl SegmentCollector for StableScoreTieSegmentCollector {
 
 	fn collect(&mut self, doc: DocId, score: Score) {
 		self.match_count += 1;
+		if self.match_count.is_multiple_of(1024) && self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+			self.timed_out = true;
+		}
+		if self.timed_out {
+			return;
+		}
 		let Some(id_ord) = self.id_column.ords().first(doc) else {
 			self.missing_id = true;
 			return;
 		};
+		if let Some((boundary_score, first_after_id)) = self.after {
+			match score.total_cmp(&boundary_score) {
+				std::cmp::Ordering::Greater => return,
+				std::cmp::Ordering::Equal if first_after_id.is_none_or(|first| id_ord < first) => return,
+				_ => {}
+			}
+		}
 		// A segment's term ordinals preserve the dictionary's byte order.
 		self.top_docs.push((score, id_ord), doc);
 	}
 
 	fn harvest(self) -> Self::Fruit {
+		if self.timed_out {
+			return Err(FulltextError::new(
+				"E_TIMEOUT",
+				"search traversal exceeded its execution budget",
+			));
+		}
 		if self.missing_id {
 			return Err(FulltextError::new("E_NATIVE_FAILURE", "search hit has no ID ordinal"));
 		}
@@ -173,12 +202,28 @@ impl Collector for StableScoreTieCollector {
 			.fast_fields()
 			.str(ID_FIELD_NAME)?
 			.ok_or_else(|| tantivy::TantivyError::InternalError("search segment has no ID fast field".to_owned()))?;
+		let after = self
+			.after
+			.as_ref()
+			.map(|boundary| {
+				let mut stream = id_column
+					.dictionary()
+					.range()
+					.gt(boundary.id.as_bytes())
+					.into_stream()?;
+				let first_after_id = stream.advance().then(|| stream.term_ord());
+				Ok::<_, std::io::Error>((boundary.score, first_after_id))
+			})
+			.transpose()?;
 		Ok(StableScoreTieSegmentCollector {
 			top_docs: TopNComputer::new_with_comparator(self.doc_range.end, (NaturalComparator, ReverseComparator)),
 			id_column,
 			segment_ord,
 			match_count: 0,
 			missing_id: false,
+			after,
+			deadline: self.deadline,
+			timed_out: false,
 		})
 	}
 
@@ -251,6 +296,7 @@ pub struct SearchResult {
 	pub total: u64,
 	pub total_relation: TotalRelation,
 	pub hits: Vec<SearchHit>,
+	pub traversal: Option<(String, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -534,6 +580,52 @@ impl Engine {
 		check_deadline(deadline)?;
 		let query = self.query(searcher, request)?;
 		check_deadline(deadline)?;
+		if request.traversal {
+			let mut hasher = std::collections::hash_map::DefaultHasher::new();
+			searcher.generation().segments().hash(&mut hasher);
+			let snapshot = format!("{:016x}", hasher.finish());
+			if request.after.as_ref().is_some_and(|after| after.snapshot != snapshot) {
+				return Err(FulltextError::new(
+					"E_CURSOR_EXPIRED",
+					"search snapshot changed; restart traversal on a dedicated reader",
+				));
+			}
+			let mut collector = StableScoreTieCollector::new(0..request.limit + 1);
+			collector.after = request.after.clone();
+			collector.deadline = deadline;
+			let (_, total, mut scored_docs) = searcher
+				.search(query.query.as_ref(), &collector)
+				.map_err(index_error)??;
+			check_deadline(deadline)?;
+			let more = scored_docs.len() > request.limit;
+			scored_docs.truncate(request.limit);
+			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
+			let versions = search_hit_versions(searcher, &addresses)?;
+			let hits = scored_docs
+				.into_iter()
+				.zip(versions)
+				.map(|(((score, id), _), version)| SearchHit { id, score, version })
+				.collect::<Vec<_>>();
+			let bytes = hits
+				.iter()
+				.try_fold(13 + 4 + snapshot.len() + 1, |bytes: usize, hit| {
+					bytes.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, |version| 4 + version.len()))
+				})
+				.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))?;
+			if bytes > MAX_SEARCH_RESPONSE_BYTES {
+				return Err(FulltextError::new(
+					"E_RESULT_TOO_LARGE",
+					"search traversal response exceeds its byte limit",
+				));
+			}
+			check_deadline(deadline)?;
+			return Ok(SearchResult {
+				total,
+				total_relation: TotalRelation::Exact,
+				hits,
+				traversal: Some((snapshot, more)),
+			});
+		}
 		let window_end = request.offset + request.limit;
 		let stable_any = request.candidate_ids.is_none()
 			&& request.filter.is_none()
@@ -650,6 +742,7 @@ impl Engine {
 			total,
 			total_relation,
 			hits,
+			traversal: None,
 		})
 	}
 
@@ -3040,6 +3133,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3078,6 +3173,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3096,6 +3193,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3296,6 +3395,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 				&[TraceRecord {
 					id: "one".to_owned(),
@@ -3352,6 +3453,8 @@ mod tests {
 						limit: 10,
 						exact_total: true,
 						budget_milliseconds: 30_000,
+						traversal: false,
+						after: None,
 					},
 				)
 				.unwrap();
@@ -3367,6 +3470,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 				&[TraceRecord {
 					id: "one".to_owned(),
@@ -3387,6 +3492,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap()
@@ -3432,6 +3539,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap()
@@ -3509,6 +3618,8 @@ mod tests {
 			limit: 10,
 			exact_total: true,
 			budget_milliseconds: 30_000,
+			traversal: false,
+			after: None,
 		};
 		let result = engine.search(&reader.searcher(), &request).unwrap();
 		assert_eq!(result.total, 2);
@@ -3579,6 +3690,8 @@ mod tests {
 						limit: 10,
 						exact_total: true,
 						budget_milliseconds: 30_000,
+						traversal: false,
+						after: None,
 					},
 				)
 				.unwrap()
@@ -3610,6 +3723,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3628,6 +3743,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3665,6 +3782,8 @@ mod tests {
 					limit: 10,
 					exact_total: false,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap_err();
@@ -3734,6 +3853,8 @@ mod tests {
 						limit,
 						exact_total: false,
 						budget_milliseconds: 30_000,
+						traversal: false,
+						after: None,
 					},
 				)
 				.unwrap()
@@ -3755,6 +3876,8 @@ mod tests {
 					limit: 3,
 					exact_total: false,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3771,6 +3894,8 @@ mod tests {
 					limit: 3,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3787,6 +3912,8 @@ mod tests {
 					limit: 3,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3836,6 +3963,8 @@ mod tests {
 					limit: 5,
 					exact_total: false,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3855,6 +3984,8 @@ mod tests {
 					limit: 3,
 					exact_total: false,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3941,6 +4072,8 @@ mod tests {
 					limit: 10,
 					exact_total: false,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap_err();
