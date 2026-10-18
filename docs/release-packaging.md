@@ -1,6 +1,6 @@
 # Release packaging
 
-## TL;DR
+## Release steps
 
 - Publish a binary-free `@harperfast/fulltext` facade.
 - Publish one exact-version optional package for each supported platform.
