@@ -24,7 +24,7 @@ These are fixed safety bounds in this release, not index configuration options. 
 | Search response             | 8 MiB                                                | Fails with `E_RESULT_TOO_LARGE`. Reduce `limit` and retry. A legal 10,000-hit page can exceed this bound when IDs/versions are large.                                                                                                                                   |
 | Queue plus execution budget | 30,000 ms maximum                                    | The facade defaults to this ceiling, clamps larger supplied budgets to it, rounds down fractional milliseconds, and uses at least 1 ms. Native frames outside 1–30,000 ms reject. `E_TIMEOUT` does not imply a hard callback-time bound.                                |
 
-Traversal checks the original candidate count and combined UTF-8 bytes against native-reported capacities before sorting a copy. Duplicates remain and count toward those limits and request identity; field order is unchanged.
+Traversal snapshots the candidate list, checks original count and combined UTF-8 bytes against native-reported capacities, then sorts its unique IDs for identity. Duplicate count does not change identity, but duplicates still count toward original input limits and the packed-request bound; field order is unchanged.
 
 Ordinary `search()` may return `totalRelation: 'lower-bound'`; do not interpret that total as an exact match count. Request `exactTotal` when needed. Traversal returns an exact total on each page. Neither a page-size limit nor `hits.length` alone is a completeness signal for ordinary search.
 
@@ -120,7 +120,7 @@ These native-only samples exclude Harper source projection, its JavaScript heap 
 
 ## Traversal token integrity and preparation
 
-Version-2 continuations authenticate the header and full snapshot/score/ID boundary together with the query digest. Valid-looking finite boundary edits, token splicing and older tokens reject with `E_INVALID_ARGUMENT`; tokens still do not grant authorization. Page size and execution budget remain changeable.
+Version-2 continuations authenticate the header and full snapshot/score/ID boundary together with the query digest. Contents are not encrypted; the boundary ID and score are readable. Valid-looking finite boundary edits, token splicing and older tokens reject with `E_INVALID_ARGUMENT`; tokens still do not grant authorization. Page size and execution budget remain changeable.
 
 The 64 KiB synchronous-identity threshold is a scheduling choice, not an input ceiling. Larger accepted identities use asynchronous WebCrypto. Preparation has separate per-object command and frame-byte admission capped by configured search queue limits, 128 commands derived from the request/threshold ratio, and 8 MiB retained frames. WebCrypto input copies and caller-owned input are additional memory; native status and process reservation counters do not include this JavaScript stage. `E_QUEUE_FULL` identifies preparation versus native saturation in its message. Small synchronous pages bypass preparation capacity; failed large requests may transiently encode one request-sized frame before admission rejects. Reservations are released on settlement before native submission; remaining time and close state are rechecked. The libuv pool may delay preparation, and close does not forcibly cancel a dispatched hash.
 

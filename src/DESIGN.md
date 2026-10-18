@@ -16,9 +16,9 @@ The protocol decoder and public Rust engine share `validate_search_window`: offs
 
 Both search paths use `search_response_bytes` to reject non-finite computed scores before exposing hits or continuations. Finite field weights can overflow BM25 scores; the recovery regression reopens the same data with lower weights.
 
-Traversal checks its segment/deletion snapshot before constructing a query against that snapshot. A stale prefix continuation must return `E_CURSOR_EXPIRED` even if newly indexed terms would make the original prefix too broad; the public regression covers writer publication and reader reload.
+Traversal checks its segment/deletion snapshot before constructing a query against that snapshot. Native query/schema checks follow that guard; wire/window/ID checks still precede it. A stale prefix continuation must return `E_CURSOR_EXPIRED` even if newly indexed terms would make the original prefix too broad; the public regression covers writer publication and reader reload.
 
-The facade lazily reads native candidate capacities once per object and passes them to the existing frame encoder for traversal. Original list count and UTF-8 bytes are bounded before sorting a copy; duplicate multiplicity and frame size remain unchanged. JS UTF-16 ordering is only the deterministic request-identity convention, not hit ordering. Fields and query clauses retain their scoring order; ordinary search keeps its existing encoding. No Rust-side candidate canonicalization is required.
+The facade lazily reads native candidate capacities once per object and passes them to the existing frame encoder for traversal. The original indexed entries are captured once before validation and sorting unique IDs, avoiding caller accessors changing values between admission and normalization. Original list count and UTF-8 bytes are bounded first; bytes omitted by normalization still count toward the original packed-request limit. The normalized frame alone determines hashing and async-preparation retention. JS UTF-16 ordering is only the deterministic request-identity convention, not hit ordering. Fields and query clauses retain their scoring order; ordinary search keeps its existing encoding. No Rust-side candidate canonicalization is required.
 
 ## Open items
 

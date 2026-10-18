@@ -233,7 +233,7 @@ path; a score tie at the requested page boundary falls back to the stable all-ma
 ### Traversing beyond 10,000 matches
 
 `searchPage()` traverses ordinary, prefix, and fuzzy-prefix full-text results in score-descending, UTF-8 ID-ascending order.
-It returns an opaque `continuation` while another page remains. Each page has an exact `total`
+It returns an authenticated `continuation` while another page remains. Each page has an exact `total`
 for the entire matching set; `limit` bounds an individual page to at most 10,000 hits. There is no
 fixed ceiling on the number of matching results you can traverse and no direct page-number jump.
 The existing `search({ offset, limit })` window and its legacy 100-hit autocomplete limit remain unchanged.
@@ -269,8 +269,9 @@ Continuations are bound to that handle and the original
 query, fields, filters, and candidate IDs; they cannot be moved to a reopened handle, another worker,
 or another process. Restart traversal after an addon upgrade. You may change page size or execution
 budget between pages. Traversal sorts a copy of candidate IDs for request identity on each page, so reordering
-an otherwise identical list preserves continuation. Duplicates remain in the list and count toward the original
-native count/byte limits, which are checked before sorting; the caller's array is unchanged. Preserve field
+the same candidate set preserves continuation even if order or duplicate counts change. The original
+list still counts toward native count/byte limits and the packed-request bound before duplicates are
+removed. The caller's array is unchanged. Preserve field
 and query-clause order between pages. Tokens carry a bounded HMAC-protected boundary and query identity. Their contents are authenticated, not encrypted. They are not authorization credentials. The consuming application
 must still enforce its own permissions and manage reader lifetime, including any cursor TTL.
 

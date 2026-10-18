@@ -9,7 +9,7 @@ import {
 	openNativeFullTextReader,
 	resetNativeFullTextIndex,
 } from '@harperfast/fulltext/native';
-import { encodeSearch } from '../dist/codec.js';
+import { encodeSearch, encodeSearchFrame } from '../dist/codec.js';
 import { invoke } from '../dist/invoke.js';
 import { loadAddon } from '../dist/load-addon.js';
 
@@ -415,11 +415,26 @@ test('normalizes traversal candidate order without weakening input limits', asyn
 			hits.map((hit) => hit.id),
 			ids,
 		);
+		const deduplicated = await pages(target, { text: 'widget', candidateIds: ids, limit: 2 }, ids.length, first);
+		assert.deepStrictEqual(
+			deduplicated.map((hit) => hit.id),
+			ids,
+		);
 		await assert.rejects(
 			target.searchPage({ text: 'widget', candidateIds: ['a', 'b'], continuation: first.continuation }),
 			codeIs('E_INVALID_ARGUMENT'),
 		);
 		assert.deepStrictEqual((await target.searchPage({ text: 'widget', candidateIds: [] })).hits, []);
+		let lengthReads = 0;
+		const mutableLength = new Proxy(['a', 'b'], {
+			get(array, key, receiver) {
+				if (key === 'length') return ++lengthReads === 1 ? 2 : 1025;
+				return Reflect.get(array, key, receiver);
+			},
+		});
+		assert.equal((await target.searchPage({ text: 'widget', candidateIds: mutableLength })).total, 2);
+		assert.equal(lengthReads, 1);
+
 		for (const candidateIds of [Array(1025).fill('a'), Array(257).fill('x'.repeat(4096))]) {
 			for (const method of ['search', 'searchPage']) {
 				await assert.rejects(target[method]({ text: 'widget', candidateIds }), codeIs('E_INVALID_ARGUMENT'));
@@ -430,7 +445,58 @@ test('normalizes traversal candidate order without weakening input limits', asyn
 			(await target.searchPage({ text: 'widget', candidateIds: Array(256).fill('x'.repeat(4096)) })).total,
 			0,
 		);
+		const oversized = {
+			text: 'widget',
+			candidateIds: Array(256).fill('x'.repeat(4096)),
+			filter: {
+				field: 'category',
+				comparator: 'in',
+				value: Array.from({ length: 128 }, (_, i) => String(i).padStart(4, '0') + 'v'.repeat(59996)),
+			},
+		};
+		for (const method of ['search', 'searchPage'])
+			await assert.rejects(target[method](oversized), codeIs('E_INVALID_ARGUMENT'));
 		assert.equal(target.status().state, 'open');
 	}
 	assert.deepStrictEqual(candidates, ['😀', 'b', 'a', 'b', 'é', '\uE000', 'c']);
+});
+
+test('requires native candidate capacities when encoding traversal candidates', () => {
+	assert.throws(
+		() =>
+			encodeSearch({
+				expression: { text: 'widget', mode: 'any', fields: [] },
+				candidateIds: ['a'],
+				offset: 0,
+				limit: 1,
+				exactTotal: false,
+				budgetMilliseconds: 30000,
+				traversal: {},
+			}),
+		codeIs('E_NATIVE_FAILURE'),
+	);
+});
+
+test('hashes the normalized candidate identity while retaining original frame admission', () => {
+	const candidateIds = Array(23).fill('x'.repeat(4096));
+	const request = {
+		expression: { text: 'widget', mode: 'any', fields: [] },
+		candidateIds,
+		offset: 0,
+		limit: 1,
+		exactTotal: false,
+		budgetMilliseconds: 30000,
+	};
+	const ordinary = encodeSearch(request);
+	assert(ordinary.length > 64 * 1024);
+	const frame = encodeSearchFrame({ ...request, traversal: {} }, { maxCandidateIds: 1024, maxCandidateBytes: 1 << 20 });
+	assert(frame.identityLength < 64 * 1024);
+	assert.deepStrictEqual(
+		frame,
+		encodeSearchFrame(
+			{ ...request, candidateIds: [candidateIds[0]], traversal: {} },
+			{ maxCandidateIds: 1024, maxCandidateBytes: 1 << 20 },
+		),
+	);
+	assert.equal(candidateIds.length, 23);
 });

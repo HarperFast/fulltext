@@ -54,8 +54,11 @@ try {
 		}
 	}
 	const median = (values) => {
+		assert.equal(values.length, samples);
+		assert(values.length > 0);
 		values.sort((a, b) => a - b);
-		return (values[samples / 2 - 1] + values[samples / 2]) / 2;
+		const middle = Math.floor(values.length / 2);
+		return values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
 	};
 	const ordinaryMedianMs = median(times.search);
 	const traversalMedianMs = median(times.searchPage);

@@ -710,33 +710,46 @@ export function encodeSearchFrame(
 	request: PackedSearchRequest,
 	candidateLimits?: { maxCandidateIds: number; maxCandidateBytes: number },
 ): { bytes: Buffer; identityLength: number } {
-	validateCandidateIds(request.candidateIds);
+	let candidateIds = request.candidateIds;
+	let omittedCandidateBytes = 0;
+	if (request.traversal && candidateIds !== undefined) {
+		if (!candidateLimits) {
+			throw new FulltextError('E_NATIVE_FAILURE', 'traversal candidate encoding requires native capacities');
+		}
+		if (!Array.isArray(candidateIds)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'candidateIds must be an array of strings');
+		}
+		const count = candidateIds.length;
+		if (!Number.isInteger(count) || count < 0 || count > candidateLimits.maxCandidateIds) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `candidate ID count exceeds ${candidateLimits.maxCandidateIds}`);
+		}
+		const original = candidateIds;
+		candidateIds = Array.from({ length: count }, (_, index) => original[index]);
+		validateCandidateIds(candidateIds);
+		let bytes = 0;
+		for (const id of candidateIds) {
+			bytes += Buffer.byteLength(id, 'utf8');
+			if (bytes > candidateLimits.maxCandidateBytes) {
+				throw new FulltextError(
+					'E_INVALID_ARGUMENT',
+					`candidate IDs exceed ${candidateLimits.maxCandidateBytes} UTF-8 bytes`,
+				);
+			}
+		}
+		omittedCandidateBytes = bytes + candidateIds.length * 4;
+		candidateIds = [...new Set(candidateIds)].sort();
+	} else {
+		validateCandidateIds(candidateIds);
+	}
 	const writer = new ByteWriter(maxSearchRequestBytes, 'E_INVALID_ARGUMENT');
 	writer.header('FTSQ');
 	encodeSearchExpression(writer, request.expression, 0);
-	writer.boolean(request.candidateIds !== undefined);
-	if (request.candidateIds !== undefined) {
-		let candidateIds = request.candidateIds;
-		if (request.traversal && candidateLimits) {
-			if (candidateIds.length > candidateLimits.maxCandidateIds) {
-				throw new FulltextError('E_INVALID_ARGUMENT', `candidate ID count exceeds ${candidateLimits.maxCandidateIds}`);
-			}
-			let bytes = 0;
-			for (const id of candidateIds) {
-				bytes += Buffer.byteLength(id, 'utf8');
-				if (bytes > candidateLimits.maxCandidateBytes) {
-					throw new FulltextError(
-						'E_INVALID_ARGUMENT',
-						`candidate IDs exceed ${candidateLimits.maxCandidateBytes} UTF-8 bytes`,
-					);
-				}
-			}
-			candidateIds = [...candidateIds].sort();
-		}
+	writer.boolean(candidateIds !== undefined);
+	if (candidateIds !== undefined) {
 		writer.u16(candidateIds.length, 'candidateIds.length');
-		for (const id of candidateIds) {
-			writer.string(id);
-		}
+		const candidateDataStart = writer.length;
+		for (const id of candidateIds) writer.string(id);
+		if (request.traversal) omittedCandidateBytes -= writer.length - candidateDataStart;
 	}
 	writer.boolean(request.filter !== undefined);
 	if (request.filter !== undefined) encodeFilterExpression(writer, request.filter, 0);
@@ -760,6 +773,9 @@ export function encodeSearchFrame(
 		}
 	}
 	writer.u32(request.budgetMilliseconds, 'budgetMilliseconds');
+	if (request.traversal && writer.length + omittedCandidateBytes > maxSearchRequestBytes) {
+		throw new FulltextError('E_INVALID_ARGUMENT', `packed value exceeds ${maxSearchRequestBytes} bytes`);
+	}
 	return { bytes: writer.finish(), identityLength };
 }
 
