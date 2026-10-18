@@ -571,6 +571,12 @@ between durability points; it materially affects throughput and peak memory beca
 replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
 comparisons require controlled hardware.
 
+For a paired ordinary-search comparison, build baseline and current worktrees with the same optimized
+native profile, then run `FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/ordinary-search.mjs /absolute/worktree baseline`
+and repeat with the current worktree and label. The fixture checks totals and hit counts, warms each
+query, and emits timings for empty, sparse, and broad exact searches at limits 20 and 1,000.
+Alternate process order across repeated pairs on idle hardware; these observations are not a latency gate.
+
 `benchmark:multi-index` exercises independent writers in parallel under the process budget. It
 includes heavy-tail field sizes, bounded synonyms, update/delete churn, resource-cap rejection,
 warm concurrent queries, close/reopen, and cold queries. CI runs the two-index smoke profile; the
