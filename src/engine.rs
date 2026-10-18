@@ -291,6 +291,7 @@ impl Collector for TraversalScoreTieCollector {
 	) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
 		let mut collector = self.for_segment(segment_ord, reader)?;
 		let mut scorer = weight.scorer(reader, 1.0)?;
+		let alive = reader.alive_bitset();
 		let mut visited = 0_u64;
 		let mut doc = scorer.doc();
 		while doc != tantivy::TERMINATED {
@@ -299,7 +300,7 @@ impl Collector for TraversalScoreTieCollector {
 					return Ok(Err(error));
 				}
 			}
-			if reader.alive_bitset().is_none_or(|alive| alive.is_alive(doc)) {
+			if alive.is_none_or(|alive| alive.is_alive(doc)) {
 				collector.collect(doc, scorer.score());
 			}
 			visited += 1;
@@ -624,9 +625,7 @@ impl Engine {
 			}
 		}
 		check_deadline(deadline)?;
-		let query = self.query(searcher, request)?;
-		check_deadline(deadline)?;
-		if request.traversal {
+		let snapshot = if request.traversal {
 			let mut hasher = std::collections::hash_map::DefaultHasher::new();
 			searcher.generation().segments().hash(&mut hasher);
 			let snapshot = format!("{:016x}", hasher.finish());
@@ -636,6 +635,13 @@ impl Engine {
 					"search snapshot changed; restart traversal on a dedicated reader",
 				));
 			}
+			Some(snapshot)
+		} else {
+			None
+		};
+		let query = self.query(searcher, request)?;
+		check_deadline(deadline)?;
+		if let Some(snapshot) = snapshot {
 			let collector = TraversalScoreTieCollector {
 				inner: StableScoreTieCollector::new(0..request.limit.saturating_add(1)),
 				after: request.after.clone(),

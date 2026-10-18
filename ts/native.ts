@@ -328,6 +328,7 @@ export class NativeFullTextIndex {
 	#closePromise?: Promise<CloseResult>;
 	#logicalMutationState: 'idle' | 'active' | 'incomplete' = 'idle';
 	#continuationKey?: Buffer;
+	#candidateLimits?: Pick<RuntimeInfo['limits'], 'maxCandidateIds' | 'maxCandidateBytes'>;
 	readonly #maxPreparationCommands: number;
 	readonly #maxPreparationBytes: number;
 	#preparationCommands = 0;
@@ -694,7 +695,12 @@ export class NativeFullTextIndex {
 			this.#assertPreparationOpen();
 			this.#continuationKey ??= randomBytes(32);
 		}
-		const frame = encodeSearchFrame(traversal ? { ...packed, traversal: { after } } : packed);
+		const frame = encodeSearchFrame(
+			traversal ? { ...packed, traversal: { after } } : packed,
+			traversal && packed.candidateIds !== undefined
+				? (this.#candidateLimits ??= loadAddon().runtimeInfo().limits)
+				: undefined,
+		);
 		let digest: Buffer | undefined;
 		if (traversal) {
 			const identity = frame.bytes.subarray(0, frame.identityLength);

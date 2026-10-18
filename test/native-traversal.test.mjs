@@ -362,3 +362,75 @@ test('continuations reject replay in another process with the same native handle
 	assert.strictEqual(second.code, 'E_INVALID_ARGUMENT');
 	assert.notStrictEqual(first.continuation, second.continuation);
 });
+
+test('expires prefix continuations before rebuilding a changed snapshot query', async (context) => {
+	const config = { ...options(), surfaceTerms: true };
+	const writer = await openNativeFullTextIndex(config);
+	context.after(() => writer.close({ mode: 'rollback' }));
+	await writer.applyMutationBatch({
+		upserts: [
+			{ id: 'a', fields: { title: 'widgetaa' } },
+			{ id: 'b', fields: { title: 'widgetab' } },
+		],
+	});
+	await writer.publish('one');
+	const reader = await openNativeFullTextReader(config);
+	context.after(() => reader.close());
+	const query = { text: 'wid', mode: 'prefix', limit: 1 };
+	const first = await Promise.all([writer.searchPage(query), reader.searchPage(query)]);
+	assert(first.every((page) => page.continuation && page.total === 2));
+	await writer.applyMutationBatch({
+		upserts: Array.from({ length: 51 }, (_, i) => ({
+			id: `new-${i}`,
+			fields: { title: `widget${String.fromCharCode(97 + Math.floor(i / 26))}${String.fromCharCode(97 + (i % 26))}z` },
+		})),
+	});
+	await writer.publish('two');
+	await reader.reload();
+	for (const [index, target] of [writer, reader].entries()) {
+		await assert.rejects(
+			target.searchPage({ ...query, continuation: first[index].continuation }),
+			codeIs('E_CURSOR_EXPIRED'),
+		);
+		await assert.rejects(target.searchPage(query), codeIs('E_PREFIX_TOO_BROAD'));
+		assert.equal(target.status().state, 'open');
+	}
+});
+
+test('normalizes traversal candidate order without weakening input limits', async (context) => {
+	const config = options();
+	const writer = await openNativeFullTextIndex(config);
+	context.after(() => writer.close({ mode: 'rollback' }));
+	const ids = ['a', 'b', 'c', 'é', '\uE000', '😀'];
+	await writer.applyMutationBatch({ upserts: ids.map((id) => ({ id, fields: { title: 'widget' } })) });
+	await writer.publish('one');
+	const reader = await openNativeFullTextReader(config);
+	context.after(() => reader.close());
+	const candidates = Object.freeze(['😀', 'b', 'a', 'b', 'é', '\uE000', 'c']);
+	const reversed = [...candidates].reverse();
+	for (const target of [writer, reader]) {
+		const first = await target.searchPage({ text: 'widget', candidateIds: candidates, limit: 2 });
+		const hits = await pages(target, { text: 'widget', candidateIds: reversed, limit: 2 }, ids.length, first);
+		assert.deepStrictEqual(
+			hits.map((hit) => hit.id),
+			ids,
+		);
+		await assert.rejects(
+			target.searchPage({ text: 'widget', candidateIds: ['a', 'b'], continuation: first.continuation }),
+			codeIs('E_INVALID_ARGUMENT'),
+		);
+		assert.deepStrictEqual((await target.searchPage({ text: 'widget', candidateIds: [] })).hits, []);
+		for (const candidateIds of [Array(1025).fill('a'), Array(257).fill('x'.repeat(4096))]) {
+			for (const method of ['search', 'searchPage']) {
+				await assert.rejects(target[method]({ text: 'widget', candidateIds }), codeIs('E_INVALID_ARGUMENT'));
+			}
+		}
+		assert.equal((await target.searchPage({ text: 'widget', candidateIds: Array(1024).fill('a') })).total, 1);
+		assert.equal(
+			(await target.searchPage({ text: 'widget', candidateIds: Array(256).fill('x'.repeat(4096)) })).total,
+			0,
+		);
+		assert.equal(target.status().state, 'open');
+	}
+	assert.deepStrictEqual(candidates, ['😀', 'b', 'a', 'b', 'é', '\uE000', 'c']);
+});

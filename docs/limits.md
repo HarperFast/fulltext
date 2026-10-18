@@ -24,6 +24,8 @@ These are fixed safety bounds in this release, not index configuration options. 
 | Search response             | 8 MiB                                                | Fails with `E_RESULT_TOO_LARGE`. Reduce `limit` and retry. A legal 10,000-hit page can exceed this bound when IDs/versions are large.                                                                                                                                   |
 | Queue plus execution budget | 30,000 ms maximum                                    | The facade defaults to this ceiling, clamps larger supplied budgets to it, rounds down fractional milliseconds, and uses at least 1 ms. Native frames outside 1–30,000 ms reject. `E_TIMEOUT` does not imply a hard callback-time bound.                                |
 
+Traversal checks the original candidate count and combined UTF-8 bytes against native-reported capacities before sorting a copy. Duplicates remain and count toward those limits and request identity; field order is unchanged.
+
 Ordinary `search()` may return `totalRelation: 'lower-bound'`; do not interpret that total as an exact match count. Request `exactTotal` when needed. Traversal returns an exact total on each page. Neither a page-size limit nor `hits.length` alone is a completeness signal for ordinary search.
 
 ## Indexing, schema, and encoding
@@ -127,3 +129,9 @@ One optimized macOS arm64 / Node 24 before/after pair using `benchmarks/traversa
 On 2026-10-17, three alternating optimized pairs on macOS arm64 / Node v24.16.0 used `benchmarks/ordinary-search.mjs` to compare baseline `a162f80890cd7516ba8e4fd21a7d329531ac58d0` (0.5.0) with the pre-copy-removal traversal implementation, using 10,000 records and limits 20 / 1,000. Empty-query median times were 14.00 / 10.92 µs per call on the baseline and 14.18 / 11.58 µs on traversal. The relative empty-query changes (+1.3% / +6.0%) vary despite equivalent zero-hit work; sparse changes also cross zero (−2.7% / +1.2%), and broad changes were −0.1% / −0.8%. These samples do not resolve the cost of the facade allocation and are not production latency bounds. The ordinary path now passes its existing packed request directly to the encoder, removing the unnecessary spread/copy; no post-removal speedup is claimed.
 
 The shared encoder still returns one small frame-metadata object on ordinary searches. This measured-path tradeoff is accepted; the samples above do not justify specializing the encoder API solely to remove it.
+
+### Local traversal driver comparison
+
+On 2026-10-18, optimized macOS arm64 / Node v24.16.0 runs compared ordinary `search` and the first `searchPage` on one retained snapshot: 65,536 equal-length two-term records, query `widget catalog`, exact totals and 128 hits. Each run alternated method order for 60 calls per method after 10 warmup pairs, asserting identical scored hits. `benchmarks/traversal-driver.mjs` reproduces this profile.
+
+Three pre-cleanup runs at `0f3bf3f` observed ordinary medians 0.63–0.68 ms and traversal medians 0.74–0.79 ms (ratios 1.17–1.18). Three runs after moving the snapshot check and hoisting the alive-bitset accessor observed 0.56–0.61 ms and 0.65–0.70 ms (ratios 1.13–1.17). These sequential local samples include all facade and native work; they do not isolate dispatch cost or prove a causal speedup from the hoist. Traversal still owns its interruptible boxed-scorer loop, and full traversal still rescans matches per page. Broader query reuse and pruning remain separately tracked; no production latency bound is established.

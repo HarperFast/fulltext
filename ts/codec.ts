@@ -706,15 +706,35 @@ export function encodeSearch(request: PackedSearchRequest): Buffer {
 	return encodeSearchFrame(request).bytes;
 }
 
-export function encodeSearchFrame(request: PackedSearchRequest): { bytes: Buffer; identityLength: number } {
+export function encodeSearchFrame(
+	request: PackedSearchRequest,
+	candidateLimits?: { maxCandidateIds: number; maxCandidateBytes: number },
+): { bytes: Buffer; identityLength: number } {
 	validateCandidateIds(request.candidateIds);
 	const writer = new ByteWriter(maxSearchRequestBytes, 'E_INVALID_ARGUMENT');
 	writer.header('FTSQ');
 	encodeSearchExpression(writer, request.expression, 0);
 	writer.boolean(request.candidateIds !== undefined);
 	if (request.candidateIds !== undefined) {
-		writer.u16(request.candidateIds.length, 'candidateIds.length');
-		for (const id of request.candidateIds) {
+		let candidateIds = request.candidateIds;
+		if (request.traversal && candidateLimits) {
+			if (candidateIds.length > candidateLimits.maxCandidateIds) {
+				throw new FulltextError('E_INVALID_ARGUMENT', `candidate ID count exceeds ${candidateLimits.maxCandidateIds}`);
+			}
+			let bytes = 0;
+			for (const id of candidateIds) {
+				bytes += Buffer.byteLength(id, 'utf8');
+				if (bytes > candidateLimits.maxCandidateBytes) {
+					throw new FulltextError(
+						'E_INVALID_ARGUMENT',
+						`candidate IDs exceed ${candidateLimits.maxCandidateBytes} UTF-8 bytes`,
+					);
+				}
+			}
+			candidateIds = [...candidateIds].sort();
+		}
+		writer.u16(candidateIds.length, 'candidateIds.length');
+		for (const id of candidateIds) {
 			writer.string(id);
 		}
 	}

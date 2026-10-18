@@ -102,7 +102,7 @@ try {
 			assert(++calls <= Math.ceil(expected / 128));
 			const before = performance.now();
 			const [page, ordinary] = await Promise.all([
-				reader.searchPage({ text, mode, limit: 128, continuation }, { remainingBudgetMilliseconds: 5000 }),
+				reader.searchPage({ text, mode, limit: 128, continuation }, smoke ? {} : { remainingBudgetMilliseconds: 5000 }),
 				reader.search({ text: 'catalog', limit: 1 }),
 			]);
 			milliseconds += performance.now() - before;

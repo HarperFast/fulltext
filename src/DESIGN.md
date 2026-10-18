@@ -16,6 +16,10 @@ The protocol decoder and public Rust engine share `validate_search_window`: offs
 
 Both search paths use `search_response_bytes` to reject non-finite computed scores before exposing hits or continuations. Finite field weights can overflow BM25 scores; the recovery regression reopens the same data with lower weights.
 
+Traversal checks its segment/deletion snapshot before constructing a query against that snapshot. A stale prefix continuation must return `E_CURSOR_EXPIRED` even if newly indexed terms would make the original prefix too broad; the public regression covers writer publication and reader reload.
+
+The facade lazily reads native candidate capacities once per object and passes them to the existing frame encoder for traversal. Original list count and UTF-8 bytes are bounded before sorting a copy; duplicate multiplicity and frame size remain unchanged. JS UTF-16 ordering is only the deterministic request-identity convention, not hit ordering. Fields and query clauses retain their scoring order; ordinary search keeps its existing encoding. No Rust-side candidate canonicalization is required.
+
 ## Open items
 
 Linux and Windows behavior is for CI; local verification covers macOS arm64. Individual Tantivy operations and query construction remain uninterruptible.

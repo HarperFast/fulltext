@@ -268,7 +268,10 @@ changes the active indexed snapshot; use a dedicated reader when ingestion conti
 Continuations are bound to that handle and the original
 query, fields, filters, and candidate IDs; they cannot be moved to a reopened handle, another worker,
 or another process. Restart traversal after an addon upgrade. You may change page size or execution
-budget between pages. Tokens carry a bounded HMAC-protected boundary and query identity. They are not authorization credentials. The consuming application
+budget between pages. Traversal sorts a copy of candidate IDs for request identity on each page, so reordering
+an otherwise identical list preserves continuation. Duplicates remain in the list and count toward the original
+native count/byte limits, which are checked before sorting; the caller's array is unchanged. Preserve field
+and query-clause order between pages. Tokens carry a bounded HMAC-protected boundary and query identity. Their contents are authenticated, not encrypted. They are not authorization credentials. The consuming application
 must still enforce its own permissions and manage reader lifetime, including any cursor TTL.
 
 Retained winners depend on page size rather than depth, but each page scans all matching documents
@@ -611,6 +614,11 @@ multiple index counts. It reports equivalent first-pass and warm p50/p95/p99/max
 synchronous wall time per inspection sweep, metadata size, and the actual segment count produced by
 the seed workload. It does not claim to model OS-cold storage. `--indexes` accepts configurations
 that create at most 10,000 temporary index directories across both benchmark paths.
+
+For a controlled same-query comparison of ordinary and traversal first-page overhead, run
+`npm run build && node scripts/run-local.mjs benchmarks/traversal-driver.mjs`. It alternates
+60 calls per method after warmup on one retained snapshot, with identical exact totals and
+page size. This manual benchmark has no timing assertion or CI performance threshold.
 
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.
