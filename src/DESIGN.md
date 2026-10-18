@@ -8,6 +8,8 @@ Traversal must use the same scoring topology on every page. In pinned Tantivy 0.
 
 The test `traversal_retains_a_merged_snapshot_and_stops_collection_on_deadline` enforces collection-stage expiry and preservation of an old searcher through a forced merge. Public traversal tests compare complete scored sequences against ordinary search, including filtered, candidate, Boolean, and zero-score queries.
 
+The facade salts each query digest with a lazily created per-object random identity. Native handle numbers restart in a new process, so the number and segment fingerprint alone cannot enforce reader/process binding. The public cross-process replay test uses handle 1 in both processes to enforce this boundary.
+
 ## Open items
 
 Linux and Windows behavior is for CI; local verification covers macOS arm64. Individual Tantivy operations and query construction remain uninterruptible.
@@ -15,5 +17,6 @@ Linux and Windows behavior is for CI; local verification covers macOS arm64. Ind
 ## Sources
 
 - [Collector and native tests](engine.rs)
+- [Facade and token identity](../ts/native.ts)
 - [Public API tests](../test/native-traversal.test.mjs)
 - [Pinned Tantivy version](../Cargo.toml)

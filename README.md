@@ -235,6 +235,8 @@ It returns an opaque `continuation` while another page remains. Each page has an
 for the entire matching set; `limit` bounds an individual page to at most 10,000 hits. There is no
 fixed ceiling on the number of matching results you can traverse and no direct page-number jump.
 The existing `search({ offset, limit })` window and autocomplete limits remain unchanged.
+Shared request objects may include a zero or null offset and an `exactTotal` preference; nonzero
+offsets are rejected, and `searchPage()` always returns exact totals.
 
 Use a dedicated read-only handle to retain the original snapshot while the writer publishes or
 merges newer data:
@@ -257,9 +259,12 @@ try {
 
 Do not call `reader.reload()` during traversal. Reloading to a different segment/deletion snapshot
 expires its continuations with `E_CURSOR_EXPIRED`; reloading the same snapshot keeps them valid.
-Closing the reader ends its snapshot lease. Continuations are bound to that handle and the original
+Closing the reader ends its snapshot lease. Writer-handle continuations expire when `publish()`
+changes the active indexed snapshot; use a dedicated reader when ingestion continues.
+Continuations are bound to that handle and the original
 query, fields, filters, and candidate IDs; they cannot be moved to a reopened handle, another worker,
-or another process. You may change page size or execution budget between pages. Tokens are bounded
+or another process. Restart traversal after an addon upgrade. You may change page size or execution
+budget between pages. Tokens are bounded
 misuse-detection values, not authentication or authorization credentials. The consuming application
 must still enforce its own permissions and manage reader lifetime, including any cursor TTL.
 
@@ -267,8 +272,11 @@ Retained winners depend on page size rather than depth, but each page scans all 
 and computes an exact total. Traversing N matches in pages of P requires approximately N²/P
 matching-document visits. This is a bounded-memory traversal API, not a constant-time seek.
 Traversal checks its deadline between batches of matching documents. Query construction and individual
-Tantivy operations can still exceed the budget; `close()` waits for in-flight native work. Use at least two search threads for ordinary/expensive lane isolation; with
-one thread, traversal shares the handle's only search lane.
+Tantivy operations can still exceed the budget; `close()` waits for in-flight native work. Use at
+least two search threads for ordinary/expensive lane isolation; with one thread, traversal shares
+the handle's only search lane. Each page is classified as expensive and holds a process-wide
+expensive-search permit when a runtime budget is configured. Size `maxExpensiveSearches` for
+concurrent traversals alongside phrase, fuzzy, and other expensive searches on every index.
 Snapshot leases retain old segment files until readers close; keep concurrent reader counts and
 lifetimes controlled with the existing runtime budget and application lifecycle. Prefix and
 fuzzy-prefix queries are rejected by `searchPage()` pending separate autocomplete qualification.

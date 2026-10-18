@@ -33,7 +33,7 @@ use crate::protocol::{
 	validate_record_id, EngineConfig, EngineIdentityConfig, FilterComparator, FilterExpression, FilterFieldType,
 	FilterValue, MutationBatch, SearchClause, SearchExpression, SearchMode, SearchRequest, SynonymRule, TraceRecord,
 	MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES,
-	MAX_TRACE_SPANS,
+	MAX_SEARCH_WINDOW, MAX_TRACE_SPANS,
 };
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
@@ -619,6 +619,11 @@ impl Engine {
 	) -> Result<SearchResult> {
 		if request.limit == 0 {
 			return Err(FulltextError::invalid("search limit must be greater than zero"));
+		}
+		if request.traversal && (request.offset != 0 || request.limit > MAX_SEARCH_WINDOW) {
+			return Err(FulltextError::invalid(
+				"search traversal requires offset zero and a limit at most 10000",
+			));
 		}
 		if let Some(candidate_ids) = &request.candidate_ids {
 			for id in candidate_ids {
@@ -3104,6 +3109,12 @@ mod tests {
 		};
 		let first = engine.search(&pinned, &request).unwrap();
 		assert_eq!(first.total, 2);
+		let mut invalid = request.clone();
+		invalid.limit = usize::MAX;
+		assert_eq!(engine.search(&pinned, &invalid).unwrap_err().code, "E_INVALID_ARGUMENT");
+		invalid.limit = 1;
+		invalid.offset = 1;
+		assert_eq!(engine.search(&pinned, &invalid).unwrap_err().code, "E_INVALID_ARGUMENT");
 		let query = engine.query(&pinned, &request).unwrap();
 		let expired = TraversalScoreTieCollector {
 			inner: StableScoreTieCollector::new(0..2),

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { lstat, readdir, realpath, rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 
@@ -222,7 +222,11 @@ export interface SearchRequest {
 	exactTotal?: boolean;
 }
 
-export type SearchPageRequest = Omit<SearchRequest, 'offset' | 'exactTotal'> & { continuation?: string };
+export interface SearchPageRequest extends Omit<SearchRequest, 'offset' | 'exactTotal'> {
+	offset?: number | null;
+	exactTotal?: boolean | null;
+	continuation?: string;
+}
 
 export interface SearchPageResult extends SearchResult {
 	continuation?: string;
@@ -314,6 +318,7 @@ export class NativeFullTextIndex {
 	#closedStatus?: FullTextStatus;
 	#closePromise?: Promise<CloseResult>;
 	#logicalMutationState: 'idle' | 'active' | 'incomplete' = 'idle';
+	#continuationIdentity?: Buffer;
 
 	constructor(options: {
 		handle: number;
@@ -583,13 +588,13 @@ export class NativeFullTextIndex {
 	}
 
 	async #search(
-		request: SearchRequest & { continuation?: string },
+		request: SearchPageRequest,
 		options: SearchExecutionOptions,
 		traversal: boolean,
 	): Promise<SearchPageResult> {
 		const expression = normalizeSearchExpression(request);
-		if (traversal && (request.offset !== undefined || request.exactTotal !== undefined)) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'searchPage does not accept offset or exactTotal');
+		if (traversal && request.offset != null && request.offset !== 0) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'searchPage requires offset zero');
 		}
 		const packed = {
 			expression,
@@ -633,7 +638,10 @@ export class NativeFullTextIndex {
 		}
 		const frame = encodeSearchFrame({ ...packed, ...(traversal ? { traversal: { after } } : {}) });
 		const digest = traversal
-			? createHash('sha256').update(frame.bytes.subarray(0, frame.identityLength)).digest()
+			? createHash('sha256')
+					.update((this.#continuationIdentity ??= randomBytes(16)))
+					.update(frame.bytes.subarray(0, frame.identityLength))
+					.digest()
 			: undefined;
 		if (tokenDigest && !tokenDigest.equals(digest!)) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'continuation does not belong to this reader and query');
@@ -1191,7 +1199,9 @@ function asBuffer(value: Uint8Array): Buffer {
 	return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
 }
 
-function normalizeSearchExpression(request: SearchRequest): import('./codec.js').PackedSearchExpression {
+function normalizeSearchExpression(
+	request: Pick<SearchRequest, 'text' | 'query' | 'mode' | 'operator' | 'fields'>,
+): import('./codec.js').PackedSearchExpression {
 	if (!request || typeof request !== 'object' || Array.isArray(request)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'search request must be an object');
 	}
