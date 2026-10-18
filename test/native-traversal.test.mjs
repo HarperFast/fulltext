@@ -173,8 +173,6 @@ test('rejects mismatched and malformed continuations without poisoning the reade
 		assert.strictEqual(reader.status().state, 'open');
 	}
 	for (const query of [
-		{ text: 'wid', mode: 'prefix' },
-		{ text: 'widg', mode: 'fuzzy-prefix' },
 		{ text: 'widget', limit: 0 },
 		{ text: 'widget', limit: 10001 },
 		{ text: 'widget', offset: 1 },

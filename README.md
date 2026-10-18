@@ -188,8 +188,8 @@ See [limits and their effects](docs/limits.md) for query, result, analyzer, muta
 Search uses weighted BM25 and a typed request; raw Tantivy query syntax is not exposed. `mode` is
 `any`, `all`, `phrase`, `prefix`, `fuzzy`, or `fuzzy-prefix`. The older `operator: 'any' | 'all'`
 spelling remains a compatibility alias and cannot be combined with `mode`. Candidate IDs compile to
-a score-neutral required filter. Prefix modes are autocomplete-oriented, require offset zero, and
-return at most 100 hits. Fuzzy and prefix work has fixed term, clause, expansion, request, result,
+a score-neutral required filter. Prefix modes are autocomplete-oriented. Legacy `search()` requires offset zero and
+returns at most 100 hits; `searchPage()` can continue through all accepted prefix matches. Fuzzy and prefix work has fixed term, clause, expansion, request, result,
 and execution ceilings. Prefix expansion fails with `E_PREFIX_TOO_BROAD` instead of silently
 truncating the term set and returning incomplete rankings. `fuzzy-prefix` is a preview capability
 until catalog-scale benchmark qualification is complete.
@@ -232,11 +232,11 @@ path; a score tie at the requested page boundary falls back to the stable all-ma
 
 ### Traversing beyond 10,000 matches
 
-`searchPage()` traverses ordinary full-text results in score-descending, UTF-8 ID-ascending order.
+`searchPage()` traverses ordinary, prefix, and fuzzy-prefix full-text results in score-descending, UTF-8 ID-ascending order.
 It returns an opaque `continuation` while another page remains. Each page has an exact `total`
 for the entire matching set; `limit` bounds an individual page to at most 10,000 hits. There is no
 fixed ceiling on the number of matching results you can traverse and no direct page-number jump.
-The existing `search({ offset, limit })` window and autocomplete limits remain unchanged.
+The existing `search({ offset, limit })` window and its legacy 100-hit autocomplete limit remain unchanged.
 Shared request objects may include a zero or null offset and an `exactTotal` preference; nonzero
 offsets are rejected, and `searchPage()` always returns exact totals.
 
@@ -280,11 +280,12 @@ the handle's only search lane. Each page is classified as expensive and holds a 
 expensive-search permit when a runtime budget is configured. Size `maxExpensiveSearches` for
 concurrent traversals alongside phrase, fuzzy, and other expensive searches on every index.
 Snapshot leases retain old segment files until readers close; keep concurrent reader counts and
-lifetimes controlled with the existing runtime budget and application lifecycle. Prefix and
-fuzzy-prefix queries are rejected by `searchPage()` pending separate autocomplete qualification.
+lifetimes controlled with the existing runtime budget and application lifecycle. Prefix traversal
+still enforces the independent 50-term expansion guard; continuation does not make an overly broad
+prefix acceptable. Fuzzy-prefix retains its existing preview status.
 Source projection, current-record validation, and Harper REST integration remain host responsibilities.
 
-Observed on 2026-10-18 in one local macOS arm64 / Node 24 optimized-build sample: 100,000 equal-score
+Observed on 2026-10-18 UTC in one local macOS arm64 / Node 24 optimized-build sample: 100,000 equal-score
 matches across 500 pages of 200 took 406 ms accumulated page-call time (first page 1.70 ms; last page
 0.73 ms). A 50,000-hit structured-filter traversal took 233 ms; 1,024 candidate hits took 6.9 ms.
 These observations are not production latency guarantees; corpus, query, segment layout, and load

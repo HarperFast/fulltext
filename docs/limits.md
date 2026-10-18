@@ -12,10 +12,10 @@ These are fixed safety bounds in this release, not index configuration options. 
 | --------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Ordinary `offset + limit`   | 10,000                                               | Rejects deeper windows. Use `searchPage()` rather than increasing offsets.                                                                                                                                                                                              |
 | Traversal page `limit`      | 1–10,000                                             | Returns at most `limit` hits after merging; retains at most `limit + 1` candidates per segment, independent of traversal depth. Continue until the continuation is absent.                                                                                              |
-| Prefix/fuzzy-prefix hits    | 100, offset zero                                     | Autocomplete is a bounded ranked result, not exhaustive traversal. `searchPage()` rejects these modes. Narrow autocomplete or use an ordinary query for complete traversal.                                                                                             |
+| Prefix/fuzzy-prefix hits    | 100, offset zero                                     | Applies to legacy `search()` only. Use `searchPage()` for subsequent prefix/fuzzy-prefix matches; its independent page and byte budgets apply.                                                                                                                          |
 | Candidate IDs               | 1,024 IDs and 1 MiB combined UTF-8 ID bytes          | Rejects larger candidate lists; it does not silently select the first 1,024. Use indexed structured filters where applicable. Splitting candidates requires caller-owned global ordering, totals, and merging; independent top-k batches are not a drop-in replacement. |
 | Query text                  | 64 KiB total UTF-8 bytes                             | Applies across Boolean leaf text. Narrow the query; do not truncate user text silently.                                                                                                                                                                                 |
-| Analyzed query terms        | 64                                                   | Rejects too many analyzed terms. Analysis can remove stop words or produce different terms from raw whitespace splitting.                                                                                                                                               |
+| Analyzed query terms        | 64                                                   | Applies per analyzed query leaf, not to the whole Boolean tree. The compiled clause budget also applies. Analysis can remove stop words or produce different terms from raw whitespace splitting.                                                                       |
 | Query/filter clauses        | 256                                                  | Query terms, selected fields, and expansions can multiply compiled clauses. A valid schema with 1,024 fields does not imply that an all-field query fits this budget. Select the fields needed by the query.                                                            |
 | Expression depth            | 8 edges from the root                                | Search and filter trees reject deeper nesting. Flatten equivalent Boolean groups where semantics permit.                                                                                                                                                                |
 | Exact prefix expansion      | 50 distinct terms per selected field across segments | Exceeding this rejects with `E_PREFIX_TOO_BROAD`; rankings are not silently truncated. A longer prefix or narrower field set may help. Candidate IDs and structured record filters do not narrow term-dictionary expansion.                                             |
@@ -83,3 +83,31 @@ Per-index indexing/search threads, writer memory, queued commands/bytes, and mut
 - ABI/query/protocol versions, enum tags, frame widths, filenames, and reserved field names are compatibility identifiers. They are intentionally fixed. They must be changed through a coordinated format/API upgrade, not exposed as arbitrary configuration.
 
 Tests and benchmarks also contain dataset sizes, timing fixtures, and panic/delay hooks. Those are verification inputs, not production policy. This audit covers the repository's production wrapper; pinned Tantivy has its own format and allocation constraints, so the table is not a claim that every possible corpus below these bounds is indexable or executable within budget.
+
+## Capacity and integration implications
+
+The response-byte limit is checked after collection; it is not a peak-memory limit. Each segment can retain up to page-size-plus-one winners, including resolved IDs, before the global merge. Larger pages reduce repeated scans but increase intermediate memory. Optional process admission accounts for configured resource reservations, not total RSS, mmap/cache residency, or disk retained by snapshots.
+
+Fuzzy matching has no equivalent of the exact-prefix 50-term dictionary guard. Tantivy builds a per-segment document bitset and walks matching terms/postings while constructing its scorer. That construction is not interruptible by the traversal checkpoints. A deadline therefore cannot substitute for concurrency limits and workload qualification.
+
+Host-side eligibility checks must continue past rejected raw hits. Keep raw batch size separate from visible page size, retain unconsumed raw hits, and bound cumulative request work with an explicit timeout/resume outcome. Exact native totals count snapshot matches, not currently authorized source records or complete source-table coverage.
+
+Harper encodes table identity and primary keys into native IDs using base64url. Validate the encoded UTF-8 size, not merely the original key size. Rejected oversized or invalid source values can remove a derived record during replacement; processed indexing progress alone does not prove complete coverage. The host must expose rejection health and a recovery path.
+
+Retained readers need bounded lifetimes and counts, cleanup on every exit path, owner-process routing, and explicit expiration on restart/rebuild. Native snapshots freeze indexed hits, not current source values or permissions. Current authorization and version checks remain necessary.
+
+The 64-term/256-clause configuration policy is tracked in [Make query term and clause limits configurable with bounded resource policy](https://github.com/HarperFast/fulltext/issues/63). Long-token omission and language/analyzer changes require a versioned analyzer and rebuild rather than silently raising a constant.
+
+### Local autocomplete qualification
+
+Observed on 2026-10-18 UTC, macOS arm64 / Node 24, optimized native build: 100,000 equal-score `widget` records, one selected field, one expensive-search permit, and a retained reader. Every traversal returned all IDs in order; an illustrative host predicate accepting one in 1,000 found all 100 eligible records.
+
+| Raw page size | Calls | Exact prefix, accumulated page time | Fuzzy prefix, accumulated page time |
+| ------------- | ----: | ----------------------------------: | ----------------------------------: |
+| 20            | 5,000 |                            2,924 ms |                            9,026 ms |
+| 200           |   500 |                              338 ms |                              938 ms |
+| 1,000         |   100 |                              107 ms |                              229 ms |
+
+A separate finite batch of six ordinary and six fuzzy-prefix searches all completed within 15 ms under that governor. This demonstrates progress for this sample, not starvation freedom or a production SLO. Process RSS sampled after traversals was approximately 305–309 MB, including the fixture, writer, reader, and caches; this is not collector-only memory or a worst-case bound. The corpus has a small vocabulary and does not qualify arbitrary fuzzy expansion, many segments, large IDs, or large source documents. The regression suite separately accepts 50 exact-prefix dictionary terms and rejects 51 even with restrictive candidate/filter inputs.
+
+Choose raw batch sizes from measured latency and byte/memory costs; a universal minimum of 1,000 would be inappropriate for maximum-size IDs/versions. Budget the entire host operation, not only each native page call.

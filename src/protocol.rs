@@ -724,9 +724,9 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 		)));
 	}
 	validate_search_window(offset, limit, traversal)?;
-	if contains_prefix(&expression) && (traversal || offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS) {
+	if contains_prefix(&expression) && !traversal && (offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS) {
 		return Err(FulltextError::invalid(
-			"prefix search requires offset zero and a limit no greater than 100",
+			"prefix search requires offset zero and a limit no greater than 100; use searchPage for subsequent matches",
 		));
 	}
 	Ok(SearchRequest {

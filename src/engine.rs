@@ -3148,6 +3148,81 @@ mod tests {
 	}
 
 	#[test]
+	fn autocomplete_traversal_matches_the_ordinary_collector_beyond_one_hundred_hits() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for segment in 0..4 {
+			let upserts = (segment * 90..(segment + 1) * 90)
+				.map(|i| crate::protocol::Upsert {
+					id: format!("{}{:03}", ["z", "é", "中", "😀"][i % 4], i),
+					version: Some("original".to_owned()),
+					fields: vec![
+						(
+							"title".to_owned(),
+							vec![if i % 4 == 0 {
+								"wodget catalog".to_owned()
+							} else {
+								"widget ".repeat(i % 3 + 1)
+							}],
+						),
+						(
+							"description".to_owned(),
+							vec![if i % 5 == 0 { "widget" } else { "catalog" }.to_owned()],
+						),
+					],
+					filters: Vec::new(),
+				})
+				.collect();
+			writer
+				.apply(MutationBatch {
+					upserts,
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let reader = engine.reader().unwrap();
+		let snapshot = reader.searcher();
+		for mode in [SearchMode::Prefix, SearchMode::FuzzyPrefix] {
+			let mut request = SearchRequest {
+				expression: expression("widg", mode, Vec::new()),
+				candidate_ids: None,
+				filter: None,
+				offset: 0,
+				limit: 500,
+				exact_total: true,
+				budget_milliseconds: 30_000,
+				traversal: false,
+				after: None,
+			};
+			let expected = engine.search(&snapshot, &request).unwrap();
+			assert!(expected.hits.len() > 100);
+			request.traversal = true;
+			request.limit = 17;
+			let mut actual = Vec::new();
+			for _ in 0..expected.hits.len().div_ceil(request.limit) {
+				let page = engine.search(&snapshot, &request).unwrap();
+				assert_eq!(page.total, expected.total);
+				let last = page.hits.last().unwrap();
+				request.after = Some(crate::protocol::SearchBoundary {
+					snapshot: page.traversal.unwrap().0,
+					score: last.score,
+					id: last.id.clone(),
+				});
+				actual.extend(page.hits);
+			}
+			assert_eq!(actual, expected.hits);
+			assert!(engine.search(&snapshot, &request).unwrap().hits.is_empty());
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
 	fn surface_fields_do_not_store_positions() {
 		let mut config = config();
 		config.identity.surface_terms = true;
