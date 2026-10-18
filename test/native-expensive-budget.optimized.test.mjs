@@ -73,10 +73,13 @@ for (const scenario of ['phrase', 'traversal']) {
 		await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
 		const long = searchExpensive({ remainingBudgetMilliseconds: 1_000 });
 		await waitFor(() => index.status().searchQueuedCommands > 0n);
-		const short = index.searchPage(
-			{ text: 'trai', mode: 'fuzzy-prefix', limit: 1, continuation: firstPage.continuation },
-			{ remainingBudgetMilliseconds: 10 },
-		);
+		const short =
+			scenario === 'phrase'
+				? searchExpensive({ remainingBudgetMilliseconds: 10 })
+				: index.searchPage(
+						{ text: 'trai', mode: 'fuzzy-prefix', limit: 1, continuation: firstPage.continuation },
+						{ remainingBudgetMilliseconds: 10 },
+					);
 		assert.strictEqual(
 			await Promise.race([
 				short.then(
