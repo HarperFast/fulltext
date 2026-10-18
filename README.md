@@ -237,6 +237,7 @@ It returns an opaque `continuation` while another page remains. Each page has an
 for the entire matching set; `limit` bounds an individual page to at most 10,000 hits. There is no
 fixed ceiling on the number of matching results you can traverse and no direct page-number jump.
 The existing `search({ offset, limit })` window and its legacy 100-hit autocomplete limit remain unchanged.
+A defined `continuation` passed to `search()` rejects with `E_INVALID_ARGUMENT`; resume through `searchPage()`.
 Shared request objects may include a zero or null offset and an `exactTotal` preference; nonzero
 offsets are rejected, and `searchPage()` always returns exact totals.
 

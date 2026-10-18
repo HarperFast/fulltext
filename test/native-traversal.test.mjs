@@ -149,6 +149,12 @@ test('rejects mismatched and malformed continuations without poisoning the reade
 		assert.deepStrictEqual(await reader.searchPage({ text: 'widget', limit: 1, ...defaults }), first);
 	}
 	assert(first.continuation);
+	for (const target of [writer, reader]) {
+		await assert.rejects(
+			target.search({ text: 'widget', continuation: first.continuation }),
+			codeIs('E_INVALID_ARGUMENT'),
+		);
+	}
 	await assert.rejects(
 		other.searchPage({ text: 'widget', continuation: first.continuation }),
 		codeIs('E_INVALID_ARGUMENT'),

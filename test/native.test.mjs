@@ -37,6 +37,34 @@ const tantivyVersion = /^tantivy\s*=\s*"=([^"]+)"/m.exec(tomlSection(cargoManife
 
 test('loads the artifact for the executing platform', async () => {
 	assert.deepStrictEqual(loadAddon().runtimeInfo().storageBackends, ['native']);
+	assert.deepStrictEqual(
+		{
+			maxCommitPayloadBytes,
+			maxQueryClauses,
+			maxRecordIdBytes,
+			maxRecordVersionBytes,
+			maxFilterStringBytes,
+			maxSearchRequestBytes,
+			maxSearchBudgetMilliseconds,
+			maxTraceRecords,
+			maxSynonymRules,
+			maxSynonymReplacements,
+			maxSynonymBytes,
+		},
+		{
+			maxCommitPayloadBytes: 64 * 1024,
+			maxQueryClauses: 256,
+			maxRecordIdBytes: 4 << 10,
+			maxRecordVersionBytes: 4 << 10,
+			maxFilterStringBytes: 65_530,
+			maxSearchRequestBytes: 8 << 20,
+			maxSearchBudgetMilliseconds: 30_000,
+			maxTraceRecords: 100,
+			maxSynonymRules: 1_024,
+			maxSynonymReplacements: 16,
+			maxSynonymBytes: 1 << 20,
+		},
+	);
 	const info = await runtimeInfo();
 	assert.deepStrictEqual(info, {
 		packageVersion: packageManifest.version,

@@ -640,6 +640,9 @@ export class NativeFullTextIndex {
 		traversal: boolean,
 	): Promise<SearchPageResult> {
 		const preparationStarted = traversal ? performance.now() : 0;
+		if (!traversal && request.continuation !== undefined) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'continuation requires searchPage');
+		}
 		const expression = normalizeSearchExpression(request);
 		if (traversal && request.offset != null && request.offset !== 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'searchPage requires offset zero');
