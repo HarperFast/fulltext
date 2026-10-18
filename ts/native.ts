@@ -694,7 +694,7 @@ export class NativeFullTextIndex {
 			this.#assertPreparationOpen();
 			this.#continuationKey ??= randomBytes(32);
 		}
-		const frame = encodeSearchFrame({ ...packed, ...(traversal ? { traversal: { after } } : {}) });
+		const frame = encodeSearchFrame(traversal ? { ...packed, traversal: { after } } : packed);
 		let digest: Buffer | undefined;
 		if (traversal) {
 			const identity = frame.bytes.subarray(0, frame.identityLength);
