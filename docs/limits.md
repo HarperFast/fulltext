@@ -135,3 +135,20 @@ The shared encoder still returns one small frame-metadata object on ordinary sea
 On 2026-10-18, optimized macOS arm64 / Node v24.16.0 runs compared ordinary `search` and the first `searchPage` on one retained snapshot: 65,536 equal-length two-term records, query `widget catalog`, exact totals and 128 hits. Each run alternated method order for 60 calls per method after 10 warmup pairs, asserting identical scored hits. `benchmarks/traversal-driver.mjs` reproduces this profile.
 
 Three pre-cleanup runs at `0f3bf3f` observed ordinary medians 0.63–0.68 ms and traversal medians 0.74–0.79 ms (ratios 1.17–1.18). Three runs after moving the snapshot check and hoisting the alive-bitset accessor observed 0.56–0.61 ms and 0.65–0.70 ms (ratios 1.13–1.17). These sequential local samples include all facade and native work; they do not isolate dispatch cost or prove a causal speedup from the hoist. Traversal still owns its interruptible boxed-scorer loop, and full traversal still rescans matches per page. Broader query reuse and pruning remain separately tracked; no production latency bound is established.
+
+### SHA-256 snapshot qualification
+
+The version-3 response body reserves 82 bytes before hit payloads (`13 + 4 + 64 + 1`), including its 64-character snapshot. This is 48 bytes more than the earlier unreleased version-2 traversal header; the same 8 MiB body ceiling applies. Reduce page size and retry the original continuation when large IDs or versions exceed it.
+
+An optimized native Rust qualification on 2026-10-18, macOS arm64 / Rust 1.90.0, compared pre-SHA `f9ec4a4` with the SHA-256 engine in `61fd1ad`. Both used the identical 512-record, two-term fixture with `NoMergePolicy`, exactly 1 or 256 segments, and page sizes 1 or 32. Each of three alternating before/after process pairs performed two warmup walks and five timed full walks per shape; every walk asserted exact totals and the complete scored sequence against ordinary search. This excludes JavaScript, N-API, libuv and host projection.
+
+| Actual segments | Page size | Before: median full-walk range | SHA-256: median full-walk range | Paired change range |
+| --------------- | --------- | ------------------------------ | ------------------------------- | ------------------- |
+| 1               | 1         | 5.83–7.63 ms                   | 5.77–7.78 ms                    | −1.0% to +2.0%      |
+| 1               | 32        | 0.210–0.245 ms                 | 0.227–0.247 ms                  | +0.7% to +9.0%      |
+| 256             | 1         | 288.7–294.4 ms                 | 296.6–296.9 ms                  | +0.8% to +2.8%      |
+| 256             | 32        | 9.28–9.41 ms                   | 9.50–9.57 ms                    | +1.3% to +2.3%      |
+
+These are local whole-engine observations, including per-segment UUID formatting and SHA-256, not isolated hashing timings or production bounds. The small fixed-work samples vary; no causal claim or statistical latency guarantee follows from three pairs. The measured many-segment cost is accepted for stronger intrinsic snapshot identity; repeated full scans remain the larger separately tracked scaling cost. Reproduce the fixture with `cargo test --release --lib --no-default-features traversal_many_segment_qualification -- --ignored --nocapture`.
+
+The post-SHA public Node first-page driver also passed the existing 65,536-record profile: one sample observed 0.565 ms ordinary and 0.658 ms traversal medians (ratio 1.165). It includes the full facade/native path but does not qualify the many-segment case above.

@@ -12,8 +12,8 @@ Tantivy's `MmapDirectory`.
 The backend covers native index creation and reopen, batched document upsert/delete, explicit
 commit and checkpoint publication, weighted BM25, phrase, bounded prefix/autocomplete, fuzzy and
 fuzzy-prefix queries, score-neutral candidate filtering, current-record match tracing, status,
-ranked snapshot traversal, and deterministic close. Source-data projection, replication, and readiness policy remain outside the
-package.
+ranked snapshot traversal, and deterministic close. Source-data projection, replication, and
+readiness policy remain outside the package.
 
 It implements the native portions of [the façade and lifecycle contract](https://github.com/HarperFast/fulltext/issues/14)
 and [bounded native execution](https://github.com/HarperFast/fulltext/issues/17). The facade uses
@@ -283,7 +283,8 @@ writer actor ─► shared engine ─► MmapDirectory
 The native addon owns these threads and queues; native indexing and search do not execute on the
 JavaScript event loop or libuv pool. Traversal preparation separately uses a bounded synchronous
 hash for identities up to 64 KiB and WebCrypto on libuv for larger identities. A dispatched hash
-cannot be forcibly cancelled; deadline and close state are checked before native submission. The writer actor is the sole owner of `IndexWriter`, making mutation, commit,
+cannot be forcibly cancelled; deadline and close state are checked before native submission. The
+writer actor is the sole owner of `IndexWriter`, making mutation, commit,
 rollback, and shutdown ordering explicit. A small configurable search pool shares the active
 immutable `Searcher`, so searches overlap each other as well as indexing and commit. `reload()`
 first crosses the writer queue as a barrier. It
@@ -423,7 +424,8 @@ preview capability until the catalog-scale benchmark qualifies it. Request budge
 queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing.
 Traversal also charges preparation against that budget and checks its deadline every 1,024 scorer
 advances. Ordinary collection, query construction, and individual Tantivy operations remain
-uninterruptible; an expired result is discarded after control returns. If all eligible workers are executing, an expired queued request is rejected
+uninterruptible; an expired result is discarded after control returns. If all eligible workers are
+executing, an expired queued request is rejected
 when a worker next examines it rather than at the exact wall-clock deadline.
 
 ## Failure and lifecycle behavior

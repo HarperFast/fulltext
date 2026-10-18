@@ -275,6 +275,8 @@ removed. The caller's array is unchanged. Preserve field
 and query-clause order between pages. Tokens carry a bounded HMAC-protected boundary and query identity. Their contents are authenticated, not encrypted. They are not authorization credentials. The consuming application
 must still enforce its own permissions and manage reader lifetime, including any cursor TTL.
 
+A deterministic many-segment native qualification is available with `cargo test --release --lib --no-default-features traversal_many_segment_qualification -- --ignored --nocapture`; see the [qualified snapshot costs](docs/limits.md#sha-256-snapshot-qualification).
+
 Retained winners depend on page size rather than depth, but each page scans all matching documents
 and computes an exact total. Traversing N matches in pages of P requires approximately N²/P
 matching-document visits. This is a bounded-memory traversal API, not a constant-time seek.

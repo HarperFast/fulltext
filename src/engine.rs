@@ -3091,6 +3091,86 @@ mod tests {
 	}
 
 	#[test]
+	#[ignore]
+	fn traversal_many_segment_qualification() {
+		for segment_count in [1, 256] {
+			let config = config();
+			let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+			let mut writer = engine.writer(&config).unwrap();
+			writer
+				.inner
+				.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+			for segment in 0..segment_count {
+				let per_segment = 512 / segment_count;
+				writer
+					.apply(MutationBatch {
+						upserts: (segment * per_segment..(segment + 1) * per_segment)
+							.map(|i| crate::protocol::Upsert {
+								id: format!("{i:04}"),
+								version: None,
+								fields: vec![("title".to_owned(), vec!["widget catalog".to_owned()])],
+								filters: Vec::new(),
+							})
+							.collect(),
+						deletes: Vec::new(),
+					})
+					.unwrap();
+				writer.commit().unwrap();
+			}
+			let reader = engine.reader().unwrap();
+			let searcher = reader.searcher();
+			assert_eq!(searcher.segment_readers().len(), segment_count);
+			let mut request = SearchRequest {
+				expression: expression("widget catalog", SearchMode::Any, vec!["title".to_owned()]),
+				candidate_ids: None,
+				filter: None,
+				offset: 0,
+				limit: 512,
+				exact_total: true,
+				budget_milliseconds: 30_000,
+				traversal: false,
+				after: None,
+			};
+			let expected = engine.search(&searcher, &request).unwrap().hits;
+			assert_eq!(expected.len(), 512);
+			request.traversal = true;
+			for page_size in [1, 32] {
+				request.limit = page_size;
+				let mut samples = Vec::new();
+				for iteration in 0..7 {
+					request.after = None;
+					let started = Instant::now();
+					let mut hits = Vec::new();
+					loop {
+						let page = engine.search(&searcher, &request).unwrap();
+						assert_eq!(page.total, 512);
+						let (snapshot, more) = page.traversal.unwrap();
+						if more {
+							let last = page.hits.last().unwrap();
+							request.after = Some(crate::protocol::SearchBoundary {
+								snapshot,
+								score: last.score,
+								id: last.id.clone(),
+							});
+						}
+						hits.extend(page.hits);
+						if !more {
+							break;
+						}
+					}
+					assert_eq!(hits, expected);
+					if iteration >= 2 {
+						samples.push(started.elapsed().as_secs_f64() * 1000.0);
+					}
+				}
+				samples.sort_by(f64::total_cmp);
+				println!("{{\"segments\":{segment_count},\"records\":512,\"pageSize\":{page_size},\"samples\":5,\"medianMs\":{}}}", samples[2]);
+			}
+			writer.close().unwrap();
+		}
+	}
+
+	#[test]
 	fn snapshot_digest_binds_segment_ids_and_deletion_generations() {
 		let mut segments = BTreeMap::new();
 		assert_eq!(
