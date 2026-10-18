@@ -154,8 +154,15 @@ test('rejects mismatched and malformed continuations without poisoning the reade
 			target.search({ text: 'widget', continuation: first.continuation }),
 			codeIs('E_INVALID_ARGUMENT'),
 		);
+		await assert.rejects(target.search({ text: 'widget', continuation: null }), codeIs('E_INVALID_ARGUMENT'));
+		await assert.rejects(target.searchPage({ text: 'widget', continuation: null }), codeIs('E_INVALID_ARGUMENT'));
 		assert.strictEqual(target.status().state, 'open');
-		const recovered = await target.searchPage({ text: 'widget', limit: 1 });
+		const ordinary = await target.search({ text: 'widget', limit: 1, continuation: undefined });
+		assert.deepStrictEqual(
+			ordinary.hits.map((hit) => hit.id),
+			['a'],
+		);
+		const recovered = await target.searchPage({ text: 'widget', limit: 1, continuation: undefined });
 		assert.deepStrictEqual(
 			recovered.hits.map((hit) => hit.id),
 			['a'],
