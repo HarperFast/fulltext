@@ -40,6 +40,8 @@ pub struct RuntimeLimits {
 	pub max_prefix_expansions: u32,
 	pub max_fuzzy_terms: u32,
 	pub max_search_window: u32,
+	pub max_search_page_size: u32,
+	pub max_filter_string_bytes: u32,
 	pub max_autocomplete_results: u32,
 	pub max_search_request_bytes: u32,
 	pub max_search_response_bytes: u32,
@@ -86,6 +88,8 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 			max_prefix_expansions: protocol::MAX_PREFIX_EXPANSIONS as u32,
 			max_fuzzy_terms: protocol::MAX_FUZZY_TERMS as u32,
 			max_search_window: protocol::MAX_SEARCH_WINDOW as u32,
+			max_search_page_size: protocol::MAX_SEARCH_PAGE_SIZE as u32,
+			max_filter_string_bytes: tantivy::tokenizer::MAX_TOKEN_LEN as u32,
 			max_autocomplete_results: protocol::MAX_AUTOCOMPLETE_RESULTS as u32,
 			max_search_request_bytes: protocol::MAX_SEARCH_REQUEST_BYTES as u32,
 			max_search_response_bytes: protocol::MAX_SEARCH_RESPONSE_BYTES as u32,
@@ -141,4 +145,21 @@ fn test_handle(id: u32) -> boundary::Result<Arc<boundary::PoisonState>> {
 			.cloned()
 	})?;
 	handle.ok_or_else(|| napi::Error::new("E_NATIVE_FAILURE", "unknown test handle"))
+}
+
+#[cfg(all(test, feature = "node-api"))]
+mod runtime_limit_tests {
+	#[test]
+	fn advertised_page_and_filter_limits_use_the_native_authorities() {
+		let limits = super::runtime_info().unwrap().limits;
+		assert_eq!(limits.max_search_window as usize, crate::protocol::MAX_SEARCH_WINDOW);
+		assert_eq!(
+			limits.max_search_page_size as usize,
+			crate::protocol::MAX_SEARCH_PAGE_SIZE
+		);
+		assert_eq!(
+			limits.max_filter_string_bytes as usize,
+			tantivy::tokenizer::MAX_TOKEN_LEN
+		);
+	}
 }

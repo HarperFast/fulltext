@@ -10,6 +10,8 @@ The test `traversal_retains_a_merged_snapshot_and_stops_collection_on_deadline` 
 
 The facade salts each query digest with a lazily created per-object random identity. Native handle numbers restart in a new process, so the number and segment fingerprint alone cannot enforce reader/process binding. The public cross-process replay test uses handle 1 in both processes to enforce this boundary.
 
+The protocol decoder and public Rust engine share `validate_search_window`: offset capacity and traversal page capacity are separate contracts, and checked arithmetic must precede collector allocation. Native/TypeScript boundary tests cover advertised page/filter limits; analyzer recall and trace completeness are qualified in [the limits guide](../docs/limits.md).
+
 ## Open items
 
 Linux and Windows behavior is for CI; local verification covers macOS arm64. Individual Tantivy operations and query construction remain uninterruptible.

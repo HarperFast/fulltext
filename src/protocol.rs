@@ -139,15 +139,35 @@ pub struct MutationBatch {
 pub const MAX_QUERY_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_QUERY_TERMS: usize = 64;
 pub const MAX_QUERY_CLAUSES: usize = 256;
+pub const MAX_EXPRESSION_DEPTH: usize = 8;
 pub const MAX_CANDIDATE_IDS: usize = 1_024;
 pub const MAX_CANDIDATE_BYTES: usize = 1 << 20;
 pub const MAX_PREFIX_EXPANSIONS: usize = 50;
 pub const MAX_FUZZY_TERMS: usize = 16;
 pub const MAX_SEARCH_WINDOW: usize = 10_000;
+pub const MAX_SEARCH_PAGE_SIZE: usize = 10_000;
 pub const MAX_AUTOCOMPLETE_RESULTS: usize = 100;
 pub const MAX_SEARCH_REQUEST_BYTES: usize = 8 << 20;
 pub const MAX_SEARCH_RESPONSE_BYTES: usize = 8 << 20;
 pub const MAX_SEARCH_BUDGET_MILLISECONDS: u32 = 30_000;
+
+pub(crate) fn validate_search_window(offset: usize, limit: usize, traversal: bool) -> Result<()> {
+	if limit == 0 {
+		return Err(FulltextError::invalid("search limit must be greater than zero"));
+	}
+	if traversal {
+		if offset != 0 || limit > MAX_SEARCH_PAGE_SIZE {
+			return Err(FulltextError::invalid(format!(
+				"searchPage requires offset zero and limit at most {MAX_SEARCH_PAGE_SIZE}; reduce page size, not total traversal results"
+			)));
+		}
+	} else if offset.checked_add(limit).is_none_or(|end| end > MAX_SEARCH_WINDOW) {
+		return Err(FulltextError::invalid(format!(
+			"offset + limit must not exceed {MAX_SEARCH_WINDOW}; use searchPage for deeper results"
+		)));
+	}
+	Ok(())
+}
 
 pub(crate) fn validate_record_id(id: &str) -> Result<()> {
 	if id.is_empty() {
@@ -453,8 +473,10 @@ pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
 }
 
 fn scan_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut usize) -> Result<bool> {
-	if depth > 8 {
-		return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
+	if depth > MAX_EXPRESSION_DEPTH {
+		return Err(FulltextError::invalid(format!(
+			"filter expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
+		)));
 	}
 	match cursor.u8()? {
 		0 => {
@@ -504,8 +526,10 @@ fn scan_search_expression(
 	clause_count: &mut usize,
 	text_bytes: &mut usize,
 ) -> Result<SearchCost> {
-	if depth > 8 {
-		return Err(FulltextError::invalid("search expression nesting exceeds 8 levels"));
+	if depth > MAX_EXPRESSION_DEPTH {
+		return Err(FulltextError::invalid(format!(
+			"search expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
+		)));
 	}
 	match cursor.u8()? {
 		0 => {
@@ -699,12 +723,7 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 			"search budget must be between 1 and {MAX_SEARCH_BUDGET_MILLISECONDS} milliseconds"
 		)));
 	}
-	if limit == 0 || offset.saturating_add(limit) > MAX_SEARCH_WINDOW {
-		return Err(FulltextError::invalid("search window must be between 1 and 10000"));
-	}
-	if traversal && offset != 0 {
-		return Err(FulltextError::invalid("search traversal requires offset zero"));
-	}
+	validate_search_window(offset, limit, traversal)?;
 	if contains_prefix(&expression) && (traversal || offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS) {
 		return Err(FulltextError::invalid(
 			"prefix search requires offset zero and a limit no greater than 100",
@@ -740,8 +759,10 @@ fn decode_search_traversal(cursor: &mut Cursor<'_>) -> Result<(bool, Option<Sear
 }
 
 fn decode_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut usize) -> Result<FilterExpression> {
-	if depth > 8 {
-		return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
+	if depth > MAX_EXPRESSION_DEPTH {
+		return Err(FulltextError::invalid(format!(
+			"filter expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
+		)));
 	}
 	match cursor.u8()? {
 		0 => {
@@ -806,8 +827,10 @@ fn decode_search_expression(
 	clause_count: &mut usize,
 	text_bytes: &mut usize,
 ) -> Result<SearchExpression> {
-	if depth > 8 {
-		return Err(FulltextError::invalid("search expression nesting exceeds 8 levels"));
+	if depth > MAX_EXPRESSION_DEPTH {
+		return Err(FulltextError::invalid(format!(
+			"search expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
+		)));
 	}
 	let kind = cursor.u8()?;
 	match kind {

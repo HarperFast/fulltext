@@ -183,6 +183,8 @@ publisher between frames. Searches may still run concurrently with either writer
 
 ## Search
 
+See [limits and their effects](docs/limits.md) for query, result, analyzer, mutation, and runtime constraints, completeness signals, and recovery paths. Use the installed addon’s `(await runtimeInfo()).limits` rather than copying numeric ceilings into integrations.
+
 Search uses weighted BM25 and a typed request; raw Tantivy query syntax is not exposed. `mode` is
 `any`, `all`, `phrase`, `prefix`, `fuzzy`, or `fuzzy-prefix`. The older `operator: 'any' | 'all'`
 spelling remains a compatibility alias and cannot be combined with `mode`. Candidate IDs compile to

@@ -1,6 +1,7 @@
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { maxExpressionDepth, maxFields, maxStringBytes } from '../dist/codec.js';
 
 test('keeps Rust and TypeScript error codes in parity', () => {
 	const rust = readFileSync(new URL('../src/error.rs', import.meta.url), 'utf8');
@@ -16,7 +17,7 @@ function codesIn(source) {
 
 test('keeps the checkpoint payload byte limit aligned across Rust and TypeScript', () => {
 	const rust = readFileSync(new URL('../src/engine.rs', import.meta.url), 'utf8');
-	const typescript = readFileSync(new URL('../ts/native.ts', import.meta.url), 'utf8');
+	const typescript = readFileSync(new URL('../ts/codec.ts', import.meta.url), 'utf8');
 	const rustLimit = /MAX_COMMIT_PAYLOAD_BYTES: usize = ([\d\s*]+);/.exec(rust)?.[1];
 	const tsLimit = /maxCommitPayloadBytes = ([\d\s*]+);/.exec(typescript)?.[1];
 	assert(rustLimit && tsLimit);
@@ -43,3 +44,10 @@ function constantBlock(source, marker, terminator) {
 	assert.notStrictEqual(end, -1);
 	return source.slice(start, end);
 }
+
+test('keeps non-advertised expression and encoding mirrors aligned with native constants', () => {
+	const rust = readFileSync(new URL('../src/protocol.rs', import.meta.url), 'utf8');
+	assert.strictEqual(maxExpressionDepth, Number(/MAX_EXPRESSION_DEPTH: usize = (\d+);/.exec(rust)?.[1]));
+	assert.strictEqual(maxFields, Number(/MAX_FIELDS: usize = ([\d_]+);/.exec(rust)?.[1].replaceAll('_', '')));
+	assert.strictEqual(maxStringBytes, 1 << Number(/MAX_STRING_BYTES: usize = 1 << (\d+);/.exec(rust)?.[1]));
+});

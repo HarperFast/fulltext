@@ -25,6 +25,8 @@ export interface RuntimeLimits {
   maxPrefixExpansions: number
   maxFuzzyTerms: number
   maxSearchWindow: number
+  maxSearchPageSize: number
+  maxFilterStringBytes: number
   maxAutocompleteResults: number
   maxSearchRequestBytes: number
   maxSearchResponseBytes: number

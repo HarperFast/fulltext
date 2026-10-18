@@ -13,6 +13,12 @@ import {
 	encodeRuntimeBudget,
 	encodeSearchFrame,
 	maxRecordIdBytes,
+	maxCommitPayloadBytes,
+	maxFilterStringBytes,
+	maxSearchBudgetMilliseconds,
+	maxTraceRecords,
+	maxExpressionDepth,
+	maxQueryClauses,
 	encodeTrace,
 	MutationBatchFrameCursor,
 } from './codec.js';
@@ -23,8 +29,6 @@ import { PublicationState } from './publication.js';
 const continuationOffsets = { handle: 1, digest: 5, snapshot: 37, score: 53, id: 57 };
 const maxContinuationBytes = continuationOffsets.id + maxRecordIdBytes;
 const maxContinuationCharacters = Math.ceil((maxContinuationBytes * 4) / 3);
-const maxCommitPayloadBytes = 64 * 1024;
-const maxFilterStringBytes = 65_530;
 const filterComparators = new Set(['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between']);
 
 export { FulltextError } from './errors.js';
@@ -51,6 +55,8 @@ export interface RuntimeInfo {
 		maxPrefixExpansions: number;
 		maxFuzzyTerms: number;
 		maxSearchWindow: number;
+		maxSearchPageSize: number;
+		maxFilterStringBytes: number;
 		maxAutocompleteResults: number;
 		maxSearchRequestBytes: number;
 		maxSearchResponseBytes: number;
@@ -702,8 +708,11 @@ export class NativeFullTextIndex {
 		if (request.mode !== undefined && request.operator !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 		}
-		if (!Array.isArray(records) || records.length > 100) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'trace records must be an array with at most 100 entries');
+		if (!Array.isArray(records) || records.length > maxTraceRecords) {
+			throw new FulltextError(
+				'E_INVALID_ARGUMENT',
+				`trace records must be an array with at most ${maxTraceRecords} entries`,
+			);
 		}
 		const seenIds = new Set<string>();
 		const sourceById = new Map<string, Record<string, string[]>>();
@@ -1227,7 +1236,7 @@ function normalizeSearchExpression(
 }
 
 function normalizeExpression(expression: SearchExpression, depth: number): import('./codec.js').PackedSearchExpression {
-	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > 8) {
+	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > maxExpressionDepth) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search expression');
 	}
 	if ('text' in expression) {
@@ -1261,12 +1270,12 @@ function normalizeFilterExpression(
 	depth: number,
 	state: { leaves: number },
 ): import('./codec.js').PackedFilterExpression {
-	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > 8) {
+	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > maxExpressionDepth) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid filter expression');
 	}
 	if ('field' in expression) {
-		if (++state.leaves > 256) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'filter expression exceeds 256 clauses');
+		if (++state.leaves > maxQueryClauses) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `filter expression exceeds ${maxQueryClauses} clauses`);
 		}
 		if (typeof expression.field !== 'string' || expression.field.length === 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'filter clauses require a field');
@@ -1276,7 +1285,11 @@ function normalizeFilterExpression(
 		}
 		const values = Array.isArray(expression.value) ? expression.value.slice() : [expression.value];
 		const expected = expression.comparator === 'in' ? undefined : expression.comparator === 'between' ? 2 : 1;
-		if (values.length === 0 || values.length > 256 || (expected !== undefined && values.length !== expected)) {
+		if (
+			values.length === 0 ||
+			values.length > maxQueryClauses ||
+			(expected !== undefined && values.length !== expected)
+		) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'invalid filter value count');
 		}
 		if (values.some((value) => !['string', 'number', 'boolean'].includes(typeof value))) {
@@ -1294,9 +1307,9 @@ function normalizeFilterExpression(
 		(expression.operator !== 'and' && expression.operator !== 'or') ||
 		!Array.isArray(expression.clauses) ||
 		expression.clauses.length === 0 ||
-		expression.clauses.length > 256
+		expression.clauses.length > maxQueryClauses
 	) {
-		throw new FulltextError('E_INVALID_ARGUMENT', 'filter boolean expressions require 1 to 256 clauses');
+		throw new FulltextError('E_INVALID_ARGUMENT', `filter boolean expressions require 1 to ${maxQueryClauses} clauses`);
 	}
 	return {
 		operator: expression.operator,
@@ -1333,11 +1346,11 @@ function safeNumber(value: bigint, name: string): number {
 }
 
 function searchBudget(value: number | undefined): number {
-	if (value === undefined) return 30_000;
+	if (value === undefined) return maxSearchBudgetMilliseconds;
 	if (!Number.isFinite(value) || value <= 0) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'remainingBudgetMilliseconds must be greater than zero');
 	}
-	return Math.min(30_000, Math.max(1, Math.floor(value)));
+	return Math.min(maxSearchBudgetMilliseconds, Math.max(1, Math.floor(value)));
 }
 
 function traceFragments(

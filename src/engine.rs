@@ -30,10 +30,10 @@ use unicode_normalization::is_nfkc;
 
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	validate_record_id, EngineConfig, EngineIdentityConfig, FilterComparator, FilterExpression, FilterFieldType,
-	FilterValue, MutationBatch, SearchClause, SearchExpression, SearchMode, SearchRequest, SynonymRule, TraceRecord,
-	MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES,
-	MAX_SEARCH_WINDOW, MAX_TRACE_SPANS,
+	validate_record_id, validate_search_window, EngineConfig, EngineIdentityConfig, FilterComparator, FilterExpression,
+	FilterFieldType, FilterValue, MutationBatch, SearchClause, SearchExpression, SearchMode, SearchRequest,
+	SynonymRule, TraceRecord, MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS,
+	MAX_SEARCH_RESPONSE_BYTES, MAX_TRACE_SPANS,
 };
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
@@ -617,14 +617,7 @@ impl Engine {
 		request: &SearchRequest,
 		deadline: Option<Instant>,
 	) -> Result<SearchResult> {
-		if request.limit == 0 {
-			return Err(FulltextError::invalid("search limit must be greater than zero"));
-		}
-		if request.traversal && (request.offset != 0 || request.limit > MAX_SEARCH_WINDOW) {
-			return Err(FulltextError::invalid(
-				"search traversal requires offset zero and a limit at most 10000",
-			));
-		}
+		validate_search_window(request.offset, request.limit, request.traversal)?;
 		if let Some(candidate_ids) = &request.candidate_ids {
 			for id in candidate_ids {
 				validate_record_id(id)?;
@@ -3114,6 +3107,10 @@ mod tests {
 		assert_eq!(engine.search(&pinned, &invalid).unwrap_err().code, "E_INVALID_ARGUMENT");
 		invalid.limit = 1;
 		invalid.offset = 1;
+		assert_eq!(engine.search(&pinned, &invalid).unwrap_err().code, "E_INVALID_ARGUMENT");
+		invalid.traversal = false;
+		invalid.offset = usize::MAX - 1;
+		invalid.limit = 2;
 		assert_eq!(engine.search(&pinned, &invalid).unwrap_err().code, "E_INVALID_ARGUMENT");
 		let query = engine.query(&pinned, &request).unwrap();
 		let expired = TraversalScoreTieCollector {

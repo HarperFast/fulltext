@@ -6,11 +6,26 @@ import test from 'node:test';
 
 import {
 	NativeFullTextIndex,
+	encodeMutationBatch,
 	openNativeFullTextIndex,
 	resetNativeFullTextIndex,
 	runtimeInfo,
 } from '@harperfast/fulltext/native';
-import { decodeResponse, encodeOpen } from '../dist/codec.js';
+import {
+	decodeResponse,
+	encodeOpen,
+	maxCommitPayloadBytes,
+	maxSearchRequestBytes,
+	maxSearchBudgetMilliseconds,
+	maxTraceRecords,
+	maxQueryClauses,
+	maxFilterStringBytes,
+	maxSynonymRules,
+	maxSynonymReplacements,
+	maxSynonymBytes,
+	maxRecordIdBytes,
+	maxRecordVersionBytes,
+} from '../dist/codec.js';
 import { normalizeNativeError } from '../dist/errors.js';
 import { loadAddon, platformTriple } from '../dist/load-addon.js';
 
@@ -32,27 +47,29 @@ test('loads the artifact for the executing platform', async () => {
 		mutationBatchApiVersion: 5,
 		storageBackends: ['native'],
 		limits: {
-			maxCommitPayloadBytes: 64 * 1024,
+			maxCommitPayloadBytes,
 			maxQueryTextBytes: 64 * 1024,
 			maxQueryTerms: 64,
-			maxQueryClauses: 256,
+			maxQueryClauses,
 			maxCandidateIds: 1_024,
 			maxCandidateBytes: 1 << 20,
-			maxRecordIdBytes: 4 << 10,
-			maxRecordVersionBytes: 4 << 10,
+			maxRecordIdBytes,
+			maxRecordVersionBytes,
 			maxPrefixExpansions: 50,
 			maxFuzzyTerms: 16,
 			maxSearchWindow: 10_000,
+			maxSearchPageSize: 10_000,
+			maxFilterStringBytes,
 			maxAutocompleteResults: 100,
-			maxSearchRequestBytes: 8 << 20,
+			maxSearchRequestBytes,
 			maxSearchResponseBytes: 8 << 20,
-			maxSearchBudgetMilliseconds: 30_000,
-			maxTraceRecords: 100,
+			maxSearchBudgetMilliseconds,
+			maxTraceRecords,
 			maxTraceSourceBytes: 1 << 20,
 			maxTraceSpans: 1_024,
-			maxSynonymRules: 1_024,
-			maxSynonymReplacements: 16,
-			maxSynonymBytes: 1 << 20,
+			maxSynonymRules,
+			maxSynonymReplacements,
+			maxSynonymBytes,
 		},
 	});
 	assert.strictEqual(cargoPackageVersion, packageManifest.version);
@@ -243,3 +260,85 @@ function tomlSection(manifest, name) {
 	const nextSection = manifest.indexOf('\n[', bodyStart);
 	return manifest.slice(bodyStart, nextSection === -1 ? undefined : nextSection);
 }
+
+test('enforces advertised page and filter bounds without truncation through both mutation APIs', async (context) => {
+	const parent = mkdtempSync(path.join(tmpdir(), 'fulltext-limits-'));
+	let index;
+	context.after(async () => {
+		if (index) await index.close({ mode: 'rollback' });
+		rmSync(parent, { recursive: true, force: true });
+	});
+	const options = nativeOptions(path.join(parent, 'index'), 'limits');
+	options.filterFields = [{ name: 'key', type: 'string' }];
+	index = await openNativeFullTextIndex(options);
+	const { limits } = await runtimeInfo();
+	const value = 'x'.repeat(limits.maxFilterStringBytes);
+	await index.applyMutationBatch({
+		upserts: [{ id: 'logical', fields: { title: 'widget' }, filters: { key: value } }],
+	});
+	await index.apply(
+		encodeMutationBatch({ upserts: [{ id: 'raw', fields: { title: 'widget' }, filters: { key: value } }] }),
+	);
+	await assert.rejects(
+		index.apply(
+			encodeMutationBatch({ upserts: [{ id: 'invalid', fields: { title: 'widget' }, filters: { key: `${value}x` } }] }),
+		),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.applyMutationBatch({
+			upserts: [{ id: 'invalid-logical', fields: { title: 'widget' }, filters: { key: `${value}x` } }],
+		}),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await index.publish('limits');
+	assert.strictEqual(
+		(await index.search({ text: 'widget', filter: { field: 'key', comparator: 'equals', value }, exactTotal: true }))
+			.total,
+		2,
+	);
+	await assert.rejects(
+		index.search({ text: 'widget', filter: { field: 'key', comparator: 'equals', value: `${value}x` } }),
+		(error) => error.code === 'E_INVALID_ARGUMENT',
+	);
+	await assert.rejects(
+		index.search({ text: 'widget', offset: limits.maxSearchWindow, limit: 1 }),
+		(error) => error.code === 'E_INVALID_ARGUMENT' && /searchPage/.test(error.message),
+	);
+	assert.strictEqual((await index.searchPage({ text: 'widget', limit: limits.maxSearchPageSize })).hits.length, 2);
+	await assert.rejects(
+		index.searchPage({ text: 'widget', limit: limits.maxSearchPageSize + 1 }),
+		(error) => error.code === 'E_INVALID_ARGUMENT' && /reduce page size/.test(error.message),
+	);
+});
+
+test('makes analyzer byte boundaries and incomplete trace analysis explicit', async (context) => {
+	const parent = mkdtempSync(path.join(tmpdir(), 'fulltext-analysis-limits-'));
+	let index;
+	context.after(async () => {
+		if (index) await index.close({ mode: 'rollback' });
+		rmSync(parent, { recursive: true, force: true });
+	});
+	const options = nativeOptions(path.join(parent, 'index'), 'analysis-limits');
+	options.surfaceTerms = true;
+	index = await openNativeFullTextIndex(options);
+	const terms = ['x'.repeat(39), 'x'.repeat(40), 'x'.repeat(41), '中'.repeat(13), '中'.repeat(14)];
+	await index.applyMutationBatch({ upserts: terms.map((title, i) => ({ id: String(i), fields: { title } })) });
+	await index.publish('analysis');
+	for (const [i, text] of terms.entries()) {
+		const result = await index.search({ text, exactTotal: true });
+		assert.deepStrictEqual(
+			result.hits.map((hit) => hit.id),
+			Buffer.byteLength(text) < 40 ? [String(i)] : [],
+		);
+	}
+	const exhausted = await index.traceMatches({ text: 'needle' }, [
+		{ id: 'source', fields: { title: `${'x '.repeat(262_144)}needle` } },
+	]);
+	assert.deepStrictEqual(exhausted, { complete: false, records: [] });
+	const bounded = await index.traceMatches({ text: 'needle' }, [
+		{ id: 'source', fields: { title: 'needle '.repeat(1_025) } },
+	]);
+	assert.strictEqual(bounded.complete, false);
+	assert.strictEqual(bounded.records[0].values[0].spans.length, (await runtimeInfo()).limits.maxTraceSpans);
+});

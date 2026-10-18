@@ -1,12 +1,18 @@
 import { FulltextError, type FulltextErrorCode } from './errors.js';
 
 const protocolVersion = 5;
-const maxStringBytes = 1 << 20;
-const maxFilterStringBytes = 65_530;
+export const maxStringBytes = 1 << 20;
+export const maxFilterStringBytes = 65_530;
+export const maxCommitPayloadBytes = 64 * 1024;
+export const maxSearchRequestBytes = 8 * 1024 * 1024;
+export const maxSearchBudgetMilliseconds = 30_000;
+export const maxTraceRecords = 100;
+export const maxExpressionDepth = 8;
+export const maxQueryClauses = 256;
 const noFilterNames: string[] = [];
-const maxSynonymRules = 1_024;
-const maxSynonymReplacements = 16;
-const maxSynonymBytes = 1 << 20;
+export const maxSynonymRules = 1_024;
+export const maxSynonymReplacements = 16;
+export const maxSynonymBytes = 1 << 20;
 export const maxRecordIdBytes = 4 << 10;
 export const maxRecordVersionBytes = 4 << 10;
 export const maxFields = 1_024;
@@ -702,7 +708,7 @@ export function encodeSearch(request: PackedSearchRequest): Buffer {
 
 export function encodeSearchFrame(request: PackedSearchRequest): { bytes: Buffer; identityLength: number } {
 	validateCandidateIds(request.candidateIds);
-	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
+	const writer = new ByteWriter(maxSearchRequestBytes, 'E_INVALID_ARGUMENT');
 	writer.header('FTSQ');
 	encodeSearchExpression(writer, request.expression, 0);
 	writer.boolean(request.candidateIds !== undefined);
@@ -738,7 +744,8 @@ export function encodeSearchFrame(request: PackedSearchRequest): { bytes: Buffer
 }
 
 function encodeFilterExpression(writer: ByteWriter, expression: PackedFilterExpression, depth: number): void {
-	if (depth > 8) throw new FulltextError('E_INVALID_ARGUMENT', 'filter expression nesting exceeds 8 levels');
+	if (depth > maxExpressionDepth)
+		throw new FulltextError('E_INVALID_ARGUMENT', `filter expression nesting exceeds ${maxExpressionDepth} levels`);
 	if ('field' in expression) {
 		writer.u8(0, 'filter expression type');
 		writer.string(expression.field);
@@ -753,7 +760,8 @@ function encodeFilterExpression(writer: ByteWriter, expression: PackedFilterExpr
 }
 
 function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpression, depth: number): void {
-	if (depth > 8) throw new FulltextError('E_INVALID_ARGUMENT', 'search expression nesting exceeds 8 levels');
+	if (depth > maxExpressionDepth)
+		throw new FulltextError('E_INVALID_ARGUMENT', `search expression nesting exceeds ${maxExpressionDepth} levels`);
 	if ('text' in expression) {
 		writer.u8(0, 'expression type');
 		writer.string(expression.text);
@@ -775,7 +783,7 @@ function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpr
 export function encodeTrace(request: PackedTraceRequest): Buffer {
 	validateCandidateIds(request.candidateIds);
 	for (const record of request.records) validateRecordId(record.id);
-	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
+	const writer = new ByteWriter(maxSearchRequestBytes, 'E_INVALID_ARGUMENT');
 	writer.header('FTTM');
 	writer.string(request.text);
 	writer.u8(['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'].indexOf(request.mode), 'mode');
