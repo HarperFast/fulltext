@@ -14,6 +14,7 @@ import {
 import {
 	decodeResponse,
 	encodeOpen,
+	encodeSearch,
 	maxCommitPayloadBytes,
 	maxSearchRequestBytes,
 	maxSearchBudgetMilliseconds,
@@ -198,9 +199,8 @@ test('an unproven close releases environment tracking and quarantines the index'
 	await healthy.close();
 });
 
-async function testIndex(indexPath, indexId) {
+async function testIndex(indexPath, indexId, options = nativeOptions(indexPath, indexId)) {
 	const addon = loadAddon();
-	const options = nativeOptions(indexPath, indexId);
 	const opened = await invoke((callback) => addon.__nativeOpen(encodeOpen(options), callback));
 	const handle = opened.u32();
 	assert.strictEqual(opened.u8(), 0);
@@ -212,6 +212,7 @@ async function testIndex(indexPath, indexId) {
 			handle,
 			maxBatchBytes: options.limits.maxBatchBytes,
 			fieldNames: options.fields.map((field) => field.name),
+			filterFields: options.filterFields,
 		}),
 	};
 }
@@ -270,7 +271,8 @@ test('enforces advertised page and filter bounds without truncation through both
 	});
 	const options = nativeOptions(path.join(parent, 'index'), 'limits');
 	options.filterFields = [{ name: 'key', type: 'string' }];
-	index = await openNativeFullTextIndex(options);
+	const opened = await testIndex(options.path, options.indexId, options);
+	index = opened.index;
 	const { limits } = await runtimeInfo();
 	const value = 'x'.repeat(limits.maxFilterStringBytes);
 	await index.applyMutationBatch({
@@ -292,6 +294,24 @@ test('enforces advertised page and filter bounds without truncation through both
 		(error) => error.code === 'E_INVALID_ARGUMENT',
 	);
 	await index.publish('limits');
+	await assert.rejects(
+		invoke((callback) =>
+			opened.addon.__nativeSearch(
+				opened.handle,
+				encodeSearch({
+					expression: { text: 'widget', mode: 'any', fields: [] },
+					filter: { field: 'key', comparator: 'equals', values: [`${value}x`] },
+					offset: 0,
+					limit: 20,
+					exactTotal: false,
+					budgetMilliseconds: maxSearchBudgetMilliseconds,
+				}),
+				callback,
+			),
+		),
+		(error) => error.code === 'E_INVALID_ARGUMENT' && error.message.includes(String(limits.maxFilterStringBytes)),
+	);
+
 	assert.strictEqual(
 		(await index.search({ text: 'widget', filter: { field: 'key', comparator: 'equals', value }, exactTotal: true }))
 			.total,
@@ -341,4 +361,34 @@ test('makes analyzer byte boundaries and incomplete trace analysis explicit', as
 	]);
 	assert.strictEqual(bounded.complete, false);
 	assert.strictEqual(bounded.records[0].values[0].spans.length, (await runtimeInfo()).limits.maxTraceSpans);
+});
+
+test('rejects score overflow before returning hits or continuations and recovers with lower weights', async (context) => {
+	const parent = mkdtempSync(path.join(tmpdir(), 'fulltext-score-limits-'));
+	let index;
+	context.after(async () => {
+		if (index) await index.close({ mode: 'rollback' });
+		rmSync(parent, { recursive: true, force: true });
+	});
+	const options = nativeOptions(path.join(parent, 'index'), 'score-limits');
+	options.fields = [{ name: 'title', weight: 3e38 }];
+	index = await openNativeFullTextIndex(options);
+	await index.applyMutationBatch({
+		upserts: Array.from({ length: 100 }, (_, i) => ({ id: String(i), fields: { title: i < 2 ? 'needle' : 'common' } })),
+	});
+	await index.publish('scores');
+	const overflow = (error) => error.code === 'E_INVALID_ARGUMENT' && /lower field weights/.test(error.message);
+	await assert.rejects(index.search({ text: 'needle' }), overflow);
+	await assert.rejects(index.searchPage({ text: 'needle', limit: 1 }), overflow);
+	await index.close();
+	options.fields = [{ name: 'title', weight: 1 }];
+	index = await openNativeFullTextIndex(options);
+	const first = await index.searchPage({ text: 'needle', limit: 1 });
+	const second = await index.searchPage({ text: 'needle', limit: 1, continuation: first.continuation });
+	assert.deepStrictEqual(
+		[...first.hits, ...second.hits].map((hit) => hit.id),
+		['0', '1'],
+	);
+	assert([...first.hits, ...second.hits].every((hit) => Number.isFinite(hit.score)));
+	assert.strictEqual(second.continuation, undefined);
 });

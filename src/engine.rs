@@ -654,12 +654,7 @@ impl Engine {
 				.zip(versions)
 				.map(|(((score, id), _), version)| SearchHit { id, score, version })
 				.collect::<Vec<_>>();
-			let bytes = hits
-				.iter()
-				.try_fold(13 + 4 + snapshot.len() + 1, |bytes: usize, hit| {
-					bytes.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, |version| 4 + version.len()))
-				})
-				.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))?;
+			let bytes = search_response_bytes(&hits, 13 + 4 + snapshot.len() + 1)?;
 			if bytes > MAX_SEARCH_RESPONSE_BYTES {
 				return Err(FulltextError::new(
 					"E_RESULT_TOO_LARGE",
@@ -774,12 +769,7 @@ impl Engine {
 			(bounded_total, bounded_total_relation)
 		};
 		check_deadline(deadline)?;
-		let response_bytes = hits
-			.iter()
-			.try_fold(13usize, |bytes, hit| {
-				bytes.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, |version| 4 + version.len()))
-			})
-			.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))?;
+		let response_bytes = search_response_bytes(&hits, 13)?;
 		if response_bytes > MAX_SEARCH_RESPONSE_BYTES {
 			return Err(FulltextError::new(
 				"E_RESULT_TOO_LARGE",
@@ -1747,6 +1737,19 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
 	} else {
 		Ok(())
 	}
+}
+
+fn search_response_bytes(hits: &[SearchHit], header_bytes: usize) -> Result<usize> {
+	hits.iter().try_fold(header_bytes, |bytes, hit| {
+		if !hit.score.is_finite() {
+			return Err(FulltextError::invalid(
+				"search score overflow; reopen with lower field weights",
+			));
+		}
+		bytes
+			.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, |version| 4 + version.len()))
+			.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))
+	})
 }
 
 fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<Vec<Option<String>>> {

@@ -12,6 +12,8 @@ The facade salts each query digest with a lazily created per-object random ident
 
 The protocol decoder and public Rust engine share `validate_search_window`: offset capacity and traversal page capacity are separate contracts, and checked arithmetic must precede collector allocation. Native/TypeScript boundary tests cover advertised page/filter limits; analyzer recall and trace completeness are qualified in [the limits guide](../docs/limits.md).
 
+Both search paths use `search_response_bytes` to reject non-finite computed scores before exposing hits or continuations. Finite field weights can overflow BM25 scores; the recovery regression reopens the same data with lower weights.
+
 ## Open items
 
 Linux and Windows behavior is for CI; local verification covers macOS arm64. Individual Tantivy operations and query construction remain uninterruptible.
