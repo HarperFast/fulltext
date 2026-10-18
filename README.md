@@ -571,6 +571,12 @@ between durability points; it materially affects throughput and peak memory beca
 replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
 comparisons require controlled hardware.
 
+`node scripts/run-local.mjs benchmarks/traversal.mjs` qualifies traversal with large IDs/versions,
+multiple actual segments, a broader fuzzy vocabulary, concurrent writes and ordinary searches,
+and response-size recovery. Build first with `npm run build`; use `--smoke` for the smaller CI
+correctness profile. Output reports actual segment counts, workload sizes, timings and process RSS.
+It does not enforce production latency targets or claim a peak-memory bound.
+
 For a paired ordinary-search comparison, build baseline and current worktrees with the same optimized
 native profile, then run `FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/ordinary-search.mjs /absolute/worktree baseline`
 and repeat with the current worktree and label. The fixture checks totals and hit counts, warms each

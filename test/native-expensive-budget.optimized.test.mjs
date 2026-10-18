@@ -53,17 +53,24 @@ test('optimized native searches preserve ordinary capacity and close queued expe
 		fieldNames: options.fields.map((field) => field.name),
 	});
 	context.after(() => index.close({ mode: 'rollback' }).catch(() => undefined));
-	await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'waterproof trail running shoe' } }] });
+	await index.applyMutationBatch({
+		upserts: ['one', 'two'].map((id) => ({ id, fields: { title: 'waterproof trail running shoe' } })),
+	});
 	await index.commit();
 	await index.reload();
+	const firstPage = await index.searchPage({ text: 'trai', mode: 'fuzzy-prefix', limit: 1 });
+	assert(firstPage.continuation);
 
 	addon.__testDelayNextExpensiveSearch(handle, 150);
 	const beforeContention = index.status();
-	const first = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });
+	const first = index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' }, { remainingBudgetMilliseconds: 1_000 });
 	await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
-	const long = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });
+	const long = index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' }, { remainingBudgetMilliseconds: 1_000 });
 	await waitFor(() => index.status().searchQueuedCommands > 0n);
-	const short = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 10 });
+	const short = index.searchPage(
+		{ text: 'trai', mode: 'fuzzy-prefix', limit: 1, continuation: firstPage.continuation },
+		{ remainingBudgetMilliseconds: 10 },
+	);
 	assert.strictEqual(
 		await Promise.race([
 			short.then(
@@ -77,8 +84,19 @@ test('optimized native searches preserve ordinary capacity and close queued expe
 		]),
 		'timeout',
 	);
-	assert.strictEqual((await first).total, 1);
-	assert.strictEqual((await long).total, 1);
+	assert.strictEqual((await first).total, 2);
+	assert.strictEqual((await long).total, 2);
+	const resumed = await index.searchPage({
+		text: 'trai',
+		mode: 'fuzzy-prefix',
+		limit: 1,
+		continuation: firstPage.continuation,
+	});
+	assert.deepStrictEqual(
+		resumed.hits.map((hit) => hit.id),
+		['two'],
+	);
+	assert.strictEqual(resumed.continuation, undefined);
 	const afterContention = index.status();
 	assert(
 		afterContention.metrics.searchQueueNanoseconds - beforeContention.metrics.searchQueueNanoseconds >= 5_000_000n,
@@ -88,13 +106,13 @@ test('optimized native searches preserve ordinary capacity and close queued expe
 	const ordinaryBlocker = index.search({ text: 'trail' });
 	await waitFor(() => addon.__testExpensiveSearchState(handle)[2] === 0);
 	addon.__testDelayNextExpensiveSearch(handle, 150);
-	const expensiveHolder = index.search(
-		{ text: 'trail running', mode: 'phrase' },
+	const expensiveHolder = index.searchPage(
+		{ text: 'trai', mode: 'fuzzy-prefix' },
 		{ remainingBudgetMilliseconds: 1_000 },
 	);
 	await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
-	const expensiveQueued = index.search(
-		{ text: 'trail running', mode: 'phrase' },
+	const expensiveQueued = index.searchPage(
+		{ text: 'trai', mode: 'fuzzy-prefix' },
 		{ remainingBudgetMilliseconds: 1_000 },
 	);
 	await waitFor(() => index.status().searchQueuedCommands > 0n);
@@ -103,18 +121,55 @@ test('optimized native searches preserve ordinary capacity and close queued expe
 		await Promise.race([ordinary.then(() => 'ordinary'), expensiveHolder.then(() => 'expensive')]),
 		'ordinary',
 	);
-	assert.strictEqual((await ordinary).total, 1);
+	assert.strictEqual((await ordinary).total, 2);
 	await Promise.all([ordinaryBlocker, expensiveHolder, expensiveQueued]);
 
+	addon.__testDelayNextOrdinarySearch(handle, 200);
+	const fullOrdinary = index.search({ text: 'waterproof' });
+	await waitFor(() => addon.__testExpensiveSearchState(handle)[2] === 0);
 	addon.__testDelayNextExpensiveSearch(handle, 150);
-	const holding = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });
+	const fullHolder = index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' });
 	await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
-	const waiting = index.search({ text: 'trail running', mode: 'phrase' }, { remainingBudgetMilliseconds: 1_000 });
+	const burst = await Promise.all(
+		Array.from({ length: 48 }, () =>
+			index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' }).then(
+				() => 'completed',
+				(error) => {
+					assert.strictEqual(error.code, 'E_QUEUE_FULL');
+					return 'queue-full';
+				},
+			),
+		),
+	);
+	assert(burst.includes('queue-full'));
+	assert(burst.includes('completed'));
+	await Promise.all([fullOrdinary, fullHolder]);
+	assert.strictEqual((await index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' })).total, 2);
+
+	addon.__testDelayNextExpensiveSearch(handle, 150);
+	const holding = index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' }, { remainingBudgetMilliseconds: 1_000 });
+	await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
+	const waiting = index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' }, { remainingBudgetMilliseconds: 1_000 });
 	await waitFor(() => index.status().searchQueuedCommands > 0n);
 	const closing = index.close();
 	await assert.rejects(waiting, (error) => error.code === 'E_CLOSED');
 	await holding;
 	await closing;
+	const reopened = await invoke((callback) => addon.__nativeOpen(encodeOpen(options), callback));
+	const reopenedHandle = reopened.u32();
+	assert.strictEqual(reopened.u8(), 0);
+	reopened.finish();
+	const recovered = new NativeFullTextIndex({
+		handle: reopenedHandle,
+		maxBatchBytes: options.limits.maxBatchBytes,
+		fieldNames: ['title'],
+	});
+	try {
+		assert.strictEqual((await recovered.searchPage({ text: 'trai', mode: 'fuzzy-prefix' })).total, 2);
+		assert.strictEqual((await recovered.search({ text: 'waterproof' })).total, 2);
+	} finally {
+		await recovered.close();
+	}
 });
 
 async function waitFor(condition) {
