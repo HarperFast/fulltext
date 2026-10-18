@@ -607,6 +607,10 @@ export class NativeFullTextIndex {
 	}
 
 	async #prepareTraversalDigest(bytes: Buffer, identityLength: number): Promise<Buffer> {
+		this.#assertPreparationOpen();
+		if (this.#preparationCommands >= this.#maxPreparationCommands) {
+			throw new FulltextError('E_QUEUE_FULL', 'traversal preparation command capacity is full');
+		}
 		if (bytes.length > this.#maxPreparationBytes - this.#preparationBytes) {
 			throw new FulltextError('E_QUEUE_FULL', 'traversal preparation byte capacity is full');
 		}

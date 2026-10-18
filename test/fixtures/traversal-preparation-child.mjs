@@ -52,6 +52,21 @@ try {
 			);
 		assert.equal((await reader.search({ text: 'widget' })).total, 3);
 		assert.equal((await pending).total, 0);
+	} else if (scenario === 'reentrant') {
+		const shared = { text: 'widget', candidateIds: ['a', 'b', 'c', ...query.candidateIds.slice(0, 20)] };
+		const ids = shared.candidateIds.slice();
+		let nested;
+		Object.defineProperty(ids, 0, {
+			get() {
+				nested ??= reader.searchPage(shared);
+				return 'a';
+			},
+		});
+		await assert.rejects(
+			reader.searchPage({ ...shared, candidateIds: ids }),
+			(error) => error.code === 'E_QUEUE_FULL' && /preparation/.test(error.message),
+		);
+		assert.equal((await nested).total, 3);
 	} else if (scenario === 'concurrent') {
 		const shared = { text: 'widget', candidateIds: ['a', 'b', 'c', ...query.candidateIds.slice(0, 20)] };
 		const [first, second] = await Promise.all([
