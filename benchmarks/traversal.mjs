@@ -63,7 +63,7 @@ try {
 	}
 	reader = await openNativeFullTextReader(config);
 	const metadata = JSON.parse(await readFile(path.join(directory, 'meta.json'), 'utf8'));
-	assert(metadata.segments.length > 1, 'qualification requires multiple actual segments');
+	if (!smoke) assert(metadata.segments.length > 1, 'full qualification requires multiple actual segments');
 	console.log(
 		JSON.stringify({
 			runtime: await runtimeInfo(),
