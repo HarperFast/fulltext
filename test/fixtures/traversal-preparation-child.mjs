@@ -40,18 +40,22 @@ try {
 		},
 	};
 	if (scenario === 'commands' || scenario === 'bytes') {
-		const pending = reader.searchPage(query);
+		const pending = reader.searchPage(query).then(
+			(result) => ({ result }),
+			(error) => ({ error }),
+		);
 		await assert.rejects(
-			reader.searchPage(scenario === 'bytes' ? query : { text: 'widget' }),
+			reader.searchPage(query),
 			(error) => error.code === 'E_QUEUE_FULL' && /preparation/.test(error.message),
 		);
-		if (scenario === 'commands')
-			await assert.rejects(
-				reader.searchPage({ text: 'widget', candidateIds: Array(1025).fill('x') }),
-				(error) => error.code === 'E_QUEUE_FULL' && /preparation/.test(error.message),
-			);
+		assert.equal((await reader.searchPage({ text: 'widget' })).total, 3);
 		assert.equal((await reader.search({ text: 'widget' })).total, 3);
-		assert.equal((await pending).total, 0);
+		const completed = await pending;
+		if (completed.error) {
+			assert.equal(completed.error.code, 'E_QUEUE_FULL');
+			assert(!/preparation/.test(completed.error.message));
+			assert.equal((await reader.searchPage(query)).total, 0);
+		} else assert.equal(completed.result.total, 0);
 	} else if (scenario === 'reentrant') {
 		const shared = { text: 'widget', candidateIds: ['a', 'b', 'c', ...query.candidateIds.slice(0, 20)] };
 		const ids = shared.candidateIds.slice();

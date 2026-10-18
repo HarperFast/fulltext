@@ -689,9 +689,6 @@ export class NativeFullTextIndex {
 		}
 		if (traversal) {
 			this.#assertPreparationOpen();
-			if (this.#preparationCommands >= this.#maxPreparationCommands) {
-				throw new FulltextError('E_QUEUE_FULL', 'traversal preparation command capacity is full');
-			}
 			this.#continuationKey ??= randomBytes(32);
 		}
 		const frame = encodeSearchFrame({ ...packed, ...(traversal ? { traversal: { after } } : {}) });

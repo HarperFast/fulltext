@@ -5,7 +5,6 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 
-// Run in separate processes against built baseline/current worktrees with the same native profile.
 const root = path.resolve(process.argv[2] ?? '.');
 const label = process.argv[3] ?? 'current';
 const { openNativeFullTextIndex } = await import(pathToFileURL(path.join(root, 'dist/native.js')));

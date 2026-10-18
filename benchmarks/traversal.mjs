@@ -63,6 +63,10 @@ try {
 	}
 	reader = await openNativeFullTextReader(config);
 	const metadata = JSON.parse(await readFile(path.join(directory, 'meta.json'), 'utf8'));
+	assert(
+		metadata !== null && typeof metadata === 'object' && Array.isArray(metadata.segments),
+		'Tantivy meta.json no longer exposes a segments array; update traversal qualification for the pinned layout',
+	);
 	if (!smoke) assert(metadata.segments.length > 1, 'full qualification requires multiple actual segments');
 	console.log(
 		JSON.stringify({
