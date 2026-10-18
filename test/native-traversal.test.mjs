@@ -227,3 +227,29 @@ test('native decoding rejects damaged traversal frames without poisoning the han
 		assert.strictEqual(decodeResponse(addon.__nativeStatus(handle)).u8(), 0);
 	}
 });
+
+test('bounds continuation IDs and native response bytes at their advertised limits', async (context) => {
+	const config = options(context);
+	const writer = await openNativeFullTextIndex(config);
+	context.after(() => writer.close({ mode: 'rollback' }));
+	const suffix = 'x'.repeat(4095);
+	await writer.applyMutationBatch({
+		upserts: ['a', 'b'].map((prefix) => ({ id: prefix + suffix, fields: { title: 'widget' } })),
+	});
+	await writer.publish('large-ids');
+	const first = await writer.searchPage({ text: 'widget', limit: 1 });
+	assert.strictEqual(first.continuation.length, 5538);
+	const next = await writer.searchPage({ text: 'widget', limit: 1, continuation: first.continuation });
+	assert.strictEqual(next.hits[0].id, 'b' + suffix);
+	await writer.applyMutationBatch({
+		deletes: ['a' + suffix, 'b' + suffix],
+		upserts: Array.from({ length: 1100 }, (_, i) => ({
+			id: String(i).padStart(4, '0') + 'x'.repeat(4092),
+			version: 'v'.repeat(4096),
+			fields: { title: 'widget' },
+		})),
+	});
+	await writer.publish('large-response');
+	await assert.rejects(writer.searchPage({ text: 'widget', limit: 1100 }), codeIs('E_RESULT_TOO_LARGE'));
+	assert.strictEqual(writer.status().state, 'open');
+});
