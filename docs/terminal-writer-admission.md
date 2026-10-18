@@ -10,14 +10,15 @@ executing on a terminal generation. Native Tantivy files remain the delivery tar
 
 ## Failure on the baseline
 
-Before this fix, traced at commit `d188ecc` in `src/native.rs`:
+Before this fix, traced at [commit d188ecc](https://github.com/HarperFast/fulltext/commit/d188ecc) in
+[`src/native.rs`](../src/native.rs):
 
 - `Runtime::enqueue_writer` checks `require_open()` before `BoundedQueue::try_push` takes the queue mutex. Apply, commit, publish, and reload share this path.
 - `Runtime::poison` stores `STATE_POISONED`, drains the writer queue under its mutex, and preserves one queued close by converting it to rollback.
 - A producer can pass the state check, pause, and enqueue after that drain. The writer loop does not revalidate such a command before executing it.
 - Search poison closes its queue permanently. Writer poison cannot use that mechanism unchanged: the writer actor still needs to receive close.
 - Normal close changes the runtime state before force-enqueuing its control command.
-- A dirty close currently stores `STATE_OPEN` unconditionally. If poison occurs after close's state transition but before close enters the queue, that command misses the drain and can reopen a terminal generation.
+- The baseline dirty close stores `STATE_OPEN` unconditionally. If poison occurs after close's state transition but before close enters the queue, that command misses the drain and can reopen a terminal generation.
 
 ## Approaches considered
 
@@ -45,3 +46,8 @@ The added successful-path work is one atomic state load under a mutex already ac
 
 Process-wide budgets, general shutdown-state redesign, and panic cleanup remain separate work under
 the existing execution issues. This change does not complete the broader bounded-execution issue.
+
+## Source reference
+
+- [Queue admission and poison transitions](../src/native.rs)
+- [Admission regressions](../test/native-admission.test.mjs)

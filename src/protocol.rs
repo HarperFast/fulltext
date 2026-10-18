@@ -139,15 +139,35 @@ pub struct MutationBatch {
 pub const MAX_QUERY_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_QUERY_TERMS: usize = 64;
 pub const MAX_QUERY_CLAUSES: usize = 256;
+pub const MAX_EXPRESSION_DEPTH: usize = 8;
 pub const MAX_CANDIDATE_IDS: usize = 1_024;
 pub const MAX_CANDIDATE_BYTES: usize = 1 << 20;
 pub const MAX_PREFIX_EXPANSIONS: usize = 50;
 pub const MAX_FUZZY_TERMS: usize = 16;
 pub const MAX_SEARCH_WINDOW: usize = 10_000;
+pub const MAX_SEARCH_PAGE_SIZE: usize = 10_000;
 pub const MAX_AUTOCOMPLETE_RESULTS: usize = 100;
 pub const MAX_SEARCH_REQUEST_BYTES: usize = 8 << 20;
 pub const MAX_SEARCH_RESPONSE_BYTES: usize = 8 << 20;
 pub const MAX_SEARCH_BUDGET_MILLISECONDS: u32 = 30_000;
+
+pub(crate) fn validate_search_window(offset: usize, limit: usize, traversal: bool) -> Result<()> {
+	if limit == 0 {
+		return Err(FulltextError::invalid("search limit must be greater than zero"));
+	}
+	if traversal {
+		if offset != 0 || limit > MAX_SEARCH_PAGE_SIZE {
+			return Err(FulltextError::invalid(format!(
+				"searchPage requires offset zero and limit at most {MAX_SEARCH_PAGE_SIZE}; reduce page size, not total traversal results"
+			)));
+		}
+	} else if offset.checked_add(limit).is_none_or(|end| end > MAX_SEARCH_WINDOW) {
+		return Err(FulltextError::invalid(format!(
+			"offset + limit must not exceed {MAX_SEARCH_WINDOW}; use searchPage for deeper results"
+		)));
+	}
+	Ok(())
+}
 
 pub(crate) fn validate_record_id(id: &str) -> Result<()> {
 	if id.is_empty() {
@@ -196,6 +216,13 @@ pub enum SearchExpression {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct SearchBoundary {
+	pub snapshot: String,
+	pub score: f32,
+	pub id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct SearchRequest {
 	pub expression: SearchExpression,
 	pub candidate_ids: Option<Vec<String>>,
@@ -204,6 +231,8 @@ pub struct SearchRequest {
 	pub limit: usize,
 	pub exact_total: bool,
 	pub budget_milliseconds: u32,
+	pub traversal: bool,
+	pub after: Option<SearchBoundary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -439,12 +468,15 @@ pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
 	let _ = cursor.u32()?;
 	let _ = cursor.u32()?;
 	let exact_total = cursor.boolean()?;
-	Ok(cost.has_expensive_mode || !cost.has_positive_anchor || filter_is_expensive || exact_total)
+	let (traversal, _) = decode_search_traversal(&mut cursor)?;
+	Ok(traversal || cost.has_expensive_mode || !cost.has_positive_anchor || filter_is_expensive || exact_total)
 }
 
 fn scan_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut usize) -> Result<bool> {
-	if depth > 8 {
-		return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
+	if depth > MAX_EXPRESSION_DEPTH {
+		return Err(FulltextError::invalid(format!(
+			"filter expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
+		)));
 	}
 	match cursor.u8()? {
 		0 => {
@@ -494,8 +526,10 @@ fn scan_search_expression(
 	clause_count: &mut usize,
 	text_bytes: &mut usize,
 ) -> Result<SearchCost> {
-	if depth > 8 {
-		return Err(FulltextError::invalid("search expression nesting exceeds 8 levels"));
+	if depth > MAX_EXPRESSION_DEPTH {
+		return Err(FulltextError::invalid(format!(
+			"search expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
+		)));
 	}
 	match cursor.u8()? {
 		0 => {
@@ -681,6 +715,7 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	let offset = cursor.u32()? as usize;
 	let limit = cursor.u32()? as usize;
 	let exact_total = cursor.boolean()?;
+	let (traversal, after) = decode_search_traversal(&mut cursor)?;
 	let budget_milliseconds = cursor.u32()?;
 	cursor.finish()?;
 	if budget_milliseconds == 0 || budget_milliseconds > MAX_SEARCH_BUDGET_MILLISECONDS {
@@ -688,12 +723,10 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 			"search budget must be between 1 and {MAX_SEARCH_BUDGET_MILLISECONDS} milliseconds"
 		)));
 	}
-	if limit == 0 || offset.saturating_add(limit) > MAX_SEARCH_WINDOW {
-		return Err(FulltextError::invalid("search window must be between 1 and 10000"));
-	}
-	if contains_prefix(&expression) && (offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS) {
+	validate_search_window(offset, limit, traversal)?;
+	if contains_prefix(&expression) && !traversal && (offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS) {
 		return Err(FulltextError::invalid(
-			"prefix search requires offset zero and a limit no greater than 100",
+			"prefix search requires offset zero and a limit no greater than 100; use searchPage for subsequent matches",
 		));
 	}
 	Ok(SearchRequest {
@@ -704,12 +737,37 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 		limit,
 		exact_total,
 		budget_milliseconds,
+		traversal,
+		after,
 	})
 }
 
+fn decode_search_traversal(cursor: &mut Cursor<'_>) -> Result<(bool, Option<SearchBoundary>)> {
+	let traversal = cursor.remaining() > 4 && cursor.boolean()?;
+	let after = if traversal && cursor.boolean()? {
+		let snapshot = cursor.string()?;
+		let score = cursor.f32()?;
+		let id = cursor.record_id()?;
+		if snapshot.len() != 64
+			|| !snapshot
+				.bytes()
+				.all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+			|| !score.is_finite()
+		{
+			return Err(FulltextError::invalid("invalid search continuation boundary"));
+		}
+		Some(SearchBoundary { snapshot, score, id })
+	} else {
+		None
+	};
+	Ok((traversal, after))
+}
+
 fn decode_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut usize) -> Result<FilterExpression> {
-	if depth > 8 {
-		return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
+	if depth > MAX_EXPRESSION_DEPTH {
+		return Err(FulltextError::invalid(format!(
+			"filter expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
+		)));
 	}
 	match cursor.u8()? {
 		0 => {
@@ -774,8 +832,10 @@ fn decode_search_expression(
 	clause_count: &mut usize,
 	text_bytes: &mut usize,
 ) -> Result<SearchExpression> {
-	if depth > 8 {
-		return Err(FulltextError::invalid("search expression nesting exceeds 8 levels"));
+	if depth > MAX_EXPRESSION_DEPTH {
+		return Err(FulltextError::invalid(format!(
+			"search expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
+		)));
 	}
 	let kind = cursor.u8()?;
 	match kind {
@@ -920,6 +980,8 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 			limit: record_count,
 			exact_total: false,
 			budget_milliseconds,
+			traversal: false,
+			after: None,
 		},
 		records,
 	})

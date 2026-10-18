@@ -11,17 +11,19 @@ Tantivy's `MmapDirectory`.
 
 The backend covers native index creation and reopen, batched document upsert/delete, explicit
 commit and checkpoint publication, weighted BM25, phrase, bounded prefix/autocomplete, fuzzy and
-fuzzy-prefix queries, score-neutral candidate filtering, current-record match tracing, status, and
-deterministic close. Source-data projection, replication, and readiness policy remain outside the
-package.
+fuzzy-prefix queries, score-neutral candidate filtering, current-record match tracing, status,
+ranked snapshot traversal, and deterministic close. Source-data projection, replication, and
+readiness policy remain outside the package.
 
 It implements the native portions of [the façade and lifecycle contract](https://github.com/HarperFast/fulltext/issues/14)
 and [bounded native execution](https://github.com/HarperFast/fulltext/issues/17). The facade uses
 versioned packed mutation and search frames, stable error codes, and explicit lifecycle operations.
 Each index has one bounded writer actor and a bounded search executor, while the optional process
-governor provides checked aggregate admission across indexes. Sustained work stays off JavaScript
-and libuv, and search remains independent of write and commit latency. Shared cross-index executors,
-multi-environment handles and cancellation of started Tantivy collectors remain outside this
+governor provides checked aggregate admission across indexes. Native indexing and search execute on
+owned threads, independently of write and commit latency. Large traversal-query identities hash
+through WebCrypto on the shared libuv pool under separate bounded admission. Traversal checks its
+deadline between document batches; ordinary collection and individual Tantivy operations remain
+uninterruptible. Shared cross-index executors and multi-environment handles remain outside this
 contract.
 
 ## Invariant
@@ -33,27 +35,28 @@ the consuming application. The Node package contributes canonical path handling 
 ## Verified constraints
 
 - The package exports one hand-written `@harperfast/fulltext/native` facade for runtime information,
-  index lifecycle, batched mutation, checkpoint publication, and search.
-  `verify: ts/native.ts, package.json:6-11`
+  index lifecycle, batched mutation, checkpoint publication, search, and snapshot traversal.
+  Sources: [`ts/native.ts`](../ts/native.ts), [`package.json`](../package.json).
 - The addon already contains a panic boundary and per-handle poison primitive.
-  `verify: src/boundary.rs:8-40`
+  Source: [`src/boundary.rs`](../src/boundary.rs).
 - The directory harness exercises Tantivy create, write, commit, query, and reopen behavior against
   `MmapDirectory`.
-  `verify: src/directory_harness.rs`
+  Source: [`src/directory_harness.rs`](../src/directory_harness.rs).
 - Tantivy 0.26.2 is pinned and compiled into the addon. Its `Index::open` wraps a supplied directory
   in `ManagedDirectory`, while `Index::writer_with_num_threads` acquires the writer lock and divides
   the supplied memory budget across the requested indexing threads.
-  `verify: Cargo.toml:20-25; tantivy 0.26.2 src/index/index.rs:509-590`
+  Sources: [`Cargo.toml`](../Cargo.toml), pinned Tantivy `src/index/index.rs`.
 - `MmapDirectory::open` requires an existing directory, canonicalizes it, and owns its mmap cache,
   watcher, filesystem access, and lock behavior.
-  `verify: tantivy 0.26.2 src/directory/mmap_directory/mod.rs:166-175,232-295`
+  Source: pinned Tantivy `src/directory/mmap_directory/mod.rs`.
 - The reader uses `ReloadPolicy::Manual`, which does not call `Directory::watch`; Tantivy's mmap
   watcher starts its polling thread only when `watch()` is called. The native backend therefore
   does not add a metadata-watcher thread per open index.
-  `verify: src/engine.rs:458; tantivy 0.26.2 src/reader/mod.rs:80-98; src/directory/mmap_directory/file_watcher.rs:35-71`
+  Sources: [`src/engine.rs`](../src/engine.rs), pinned Tantivy `src/reader/mod.rs` and
+  `src/directory/mmap_directory/file_watcher.rs`.
 - napi-rs `AsyncTask` executes on the shared libuv pool, so it is not the execution primitive for
   sustained indexing or search.
-  `verify: napi 3.13.0 src/bindgen_runtime/js_values/task.rs:18-43; src/async_work.rs:181-195`
+  Source: pinned napi 3.13.0 `src/bindgen_runtime/js_values/task.rs` and `src/async_work.rs`.
 
 ## Tantivy ownership boundary
 
@@ -82,92 +85,17 @@ count. Re-run that comparison when Tantivy's string sorting or this collector ch
 wrapper collector if the native path reaches parity. Prefix expansion is likewise policy around
 Tantivy's dictionary and query objects, not a replacement postings implementation.
 
-## Public slice
+## Public API
 
-The hand-written TypeScript facade remains authoritative. Generated addon declarations remain
-private.
+The public types in [`ts/native.ts`](../ts/native.ts) define the API. Generated declarations in
+`ts/addon.d.ts` describe the private addon interface and are not consumer types.
 
-```ts
-interface NativeFullTextIndexOptions {
-	path: string;
-	indexId: string;
-	generation: string;
-	fields: Array<{ name: string; weight?: number }>;
-	analyzer: 'english@2';
-	stopWords?: boolean;
-	positions?: boolean;
-	surfaceTerms?: boolean;
-	limits: {
-		indexingThreads: number;
-		writerMemoryBytes: number;
-		maxQueuedCommands: number;
-		maxQueuedBytes: number;
-		maxBatchBytes: number;
-		searchThreads: number;
-	};
-}
+Use the [README examples](../README.md#native-usage) for opening an index, mutations, Boolean
+queries, structured filters, and traversal. Keeping the type definitions in one place avoids stale
+copies when the API changes. Each open requires explicit per-index thread, writer-memory, and queue
+limits; [limits and their effects](limits.md) explains their constraints.
 
-type NativeFullTextIndexInspectionOptions = Omit<NativeFullTextIndexOptions, 'limits'>;
-
-interface FullTextMutationBatch {
-	upserts?: Array<{ id: string; fields: Record<string, string | string[]> }>;
-	deletes?: string[];
-}
-
-interface EncodeFullTextMutationBatchesOptions {
-	maxTotalBytes?: number;
-	allowPartial?: boolean;
-}
-
-interface SearchRequest {
-	text: string;
-	mode?: 'any' | 'all' | 'phrase' | 'prefix' | 'fuzzy' | 'fuzzy-prefix';
-	operator?: 'any' | 'all';
-	fields?: string[];
-	candidateIds?: string[];
-	offset?: number;
-	limit?: number;
-	exactTotal?: boolean;
-}
-
-interface SearchResult {
-	total: number;
-	totalRelation: 'exact' | 'lower-bound';
-	hits: Array<{ id: string; score: number }>;
-}
-
-interface FullTextStatus {
-	state: 'open' | 'closing' | 'closed' | 'poisoned';
-	uncommittedMutations: bigint;
-	writerQueuedCommands: bigint;
-	writerQueuedBytes: bigint;
-	searchQueuedCommands: bigint;
-	searchQueuedBytes: bigint;
-	commitOpstamp: bigint;
-	metrics: {
-		writerQueueNanoseconds: bigint;
-		writerExecutionNanoseconds: bigint;
-		searchQueueNanoseconds: bigint;
-		searchExecutionNanoseconds: bigint;
-	};
-}
-
-type NativeFullTextIndexInspection =
-	| { state: 'missing' }
-	| { state: 'cursorless' }
-	| { state: 'checkpointed'; committedPayload: string }
-	| {
-			state: 'incompatible';
-			code:
-				| 'E_IDENTITY_MISMATCH'
-				| 'E_INCOMPLETE_CREATE'
-				| 'E_INDEX_CORRUPT'
-				| 'E_INDEX_FORMAT_INCOMPATIBLE'
-				| 'E_SCHEMA_MISMATCH';
-	  };
-```
-
-These native-only per-index limits keep standalone measurements reproducible. The optional process
+Explicit per-index limits make standalone measurements reproducible. The optional process
 governor adds aggregate caps without moving policy into the shared engine. The application supplies
 resolved per-index limits and configures the process budget once before opening indexes.
 
@@ -190,7 +118,11 @@ The exported flow is:
 4. `commit()` serializes behind earlier writer commands and publishes through Tantivy's ordinary
    commit path. It does not imply reader reload.
 5. `reload()` crosses the writer barrier and then refreshes the reader on the search executor;
-   `search()` uses one captured immutable searcher without waiting behind indexing or commit work.
+   `search()` and `searchPage()` use one captured immutable searcher without waiting behind indexing
+   or commit work. `searchPage()` returns an authenticated continuation for the next ranked page.
+   Keep a dedicated reader open without reloading to retain the original snapshot across writer
+   publications; changed-snapshot reload expires its continuations. The host bounds reader leases
+   and continues enforcing current authorization and source-version checks.
 6. `close()` rejects new work, settles admitted commands, shuts down the writer, releases the path
    reservation, and is idempotent.
 7. `status()` reads bounded counters and state without entering either sustained-work queue.
@@ -264,8 +196,11 @@ N-API handle registry ── canonical path reservation
 writer actor ─► shared engine ─► MmapDirectory
 ```
 
-The native addon owns these threads and queues; no sustained operation runs on the JavaScript event
-loop or libuv pool. The writer actor is the sole owner of `IndexWriter`, making mutation, commit,
+The native addon owns these threads and queues; native indexing and search do not execute on the
+JavaScript event loop or libuv pool. Traversal preparation separately uses a bounded synchronous
+hash for identities up to 64 KiB and WebCrypto on libuv for larger identities. A dispatched hash
+cannot be forcibly cancelled; deadline and close state are checked before native submission. The
+writer actor is the sole owner of `IndexWriter`, making mutation, commit,
 rollback, and shutdown ordering explicit. A small configurable search pool shares the active
 immutable `Searcher`, so searches overlap each other as well as indexing and commit. `reload()`
 first crosses the writer queue as a barrier. It
@@ -402,9 +337,11 @@ tracing uses the same positional rule. Prefix expansion is capped; exceeding the
 `E_PREFIX_TOO_BROAD` rather than truncating the term set and silently biasing recall or rank. A
 caller may catch that distinct code and choose a documented fallback. Fuzzy-prefix remains a
 preview capability until the catalog-scale benchmark qualifies it. Request budgets cover
-queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing;
-Tantivy's collector itself cannot be interrupted, so an expired search result is discarded after
-the collector returns. If all eligible workers are executing, an expired queued request is rejected
+queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing.
+Traversal also charges preparation against that budget and checks its deadline every 1,024 scorer
+advances. Ordinary collection, query construction, and individual Tantivy operations remain
+uninterruptible; an expired result is discarded after control returns. If all eligible workers are
+executing, an expired queued request is rejected
 when a worker next examines it rather than at the exact wall-clock deadline.
 
 ## Failure and lifecycle behavior
@@ -483,7 +420,7 @@ reopen must preserve results, and every operation count must match. The benchmar
 replacement-safe upserts emit delete terms, so `--commit-every` is an explicit workload dimension
 rather than allowing an unbounded final commit to masquerade as a production ingestion profile.
 The benchmark does not claim a 100-million-document or p99-under-50-ms release gate; those remain
-fixed-host qualification work. This slice establishes the standalone native baseline.
+fixed-host qualification work. This benchmark establishes the standalone native baseline.
 
 CI runs correctness tests and an explicit small benchmark-smoke command that performs ranking,
 commit, close, and reopen assertions before validating nonzero measurements. Shared runners enforce
@@ -550,7 +487,7 @@ performance baseline required for the wrapper.
 
 ### Do less on runtime: engine benchmark plus separate per-index writer and search executors
 
-Partially adopted. The engine remains generic over `Directory`, and the Node slice keeps separate,
+Partially adopted. The engine remains generic over `Directory`, and the Node runtime keeps separate,
 byte-bounded per-index writer and search executors. A small optional process governor accounts for
 aggregate index, thread, writer-memory, queue-capacity, and expensive-search budgets; it does not
 introduce a shared cross-index executor or scheduler.
@@ -562,7 +499,7 @@ to future checkpoint/watermark publication and lets any omitted `set_payload()` 
 immutable sidecar written through the same `Directory` contract prevents that failure and works
 with `MmapDirectory` without custom filesystem code.
 
-### Chosen: one shared engine slice with a thin MmapDirectory constructor
+### Chosen: shared engine with a thin MmapDirectory constructor
 
 This produces a usable standalone backend, avoids reimplementing Tantivy filesystem primitives,
 and establishes bounded off-event-loop execution.
@@ -575,4 +512,4 @@ and establishes bounded off-event-loop execution.
 - A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe
   callback as part of a future shared multi-environment runtime.
 - Fixed-host regression thresholds for representative application workloads.
-- Cancellation of an already-running Tantivy collector and cursor-based deep pagination.
+- Cancellation of ordinary offset-search collection and individual in-flight Tantivy operations.

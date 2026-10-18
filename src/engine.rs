@@ -1,14 +1,17 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Bound, Range};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+
+use sha2::{Digest, Sha256};
 
 use tantivy::collector::sort_key::{NaturalComparator, ReverseComparator};
 use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs, TopNComputer};
 use tantivy::columnar::StrColumn;
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
+use tantivy::index::SegmentId;
 use tantivy::query::{
 	BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery,
 	Query, RangeQuery, TermQuery, TermSetQuery,
@@ -21,18 +24,18 @@ use tantivy::tokenizer::{
 	TokenFilter, TokenStream, Tokenizer, MAX_TOKEN_LEN,
 };
 use tantivy::{
-	DocAddress, DocId, Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, Score, Searcher, SegmentReader,
-	Term,
+	DocAddress, DocId, Index, IndexReader, IndexSettings, IndexWriter, Opstamp, ReloadPolicy, Score, Searcher,
+	SegmentReader, Term,
 };
 use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
 use unicode_normalization::is_nfkc;
 
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	validate_record_id, EngineConfig, EngineIdentityConfig, FilterComparator, FilterExpression, FilterFieldType,
-	FilterValue, MutationBatch, SearchClause, SearchExpression, SearchMode, SearchRequest, SynonymRule, TraceRecord,
-	MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS, MAX_SEARCH_RESPONSE_BYTES,
-	MAX_TRACE_SPANS,
+	validate_record_id, validate_search_window, EngineConfig, EngineIdentityConfig, FilterComparator, FilterExpression,
+	FilterFieldType, FilterValue, MutationBatch, SearchClause, SearchExpression, SearchMode, SearchRequest,
+	SynonymRule, TraceRecord, MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS,
+	MAX_SEARCH_RESPONSE_BYTES, MAX_TRACE_SPANS,
 };
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
@@ -216,6 +219,99 @@ impl Collector for StableScoreTieCollector {
 	}
 }
 
+struct TraversalScoreTieCollector {
+	inner: StableScoreTieCollector,
+	after: Option<crate::protocol::SearchBoundary>,
+	deadline: Option<Instant>,
+}
+
+struct TraversalScoreTieSegmentCollector {
+	inner: StableScoreTieSegmentCollector,
+	after: Option<(Score, Option<u64>)>,
+}
+
+impl SegmentCollector for TraversalScoreTieSegmentCollector {
+	type Fruit = Result<(u64, Vec<StableScoreTieHit>)>;
+
+	fn collect(&mut self, doc: DocId, score: Score) {
+		self.inner.match_count += 1;
+		let Some(id_ord) = self.inner.id_column.ords().first(doc) else {
+			self.inner.missing_id = true;
+			return;
+		};
+		if let Some((boundary_score, first_after_id)) = self.after {
+			match score.total_cmp(&boundary_score) {
+				std::cmp::Ordering::Greater => return,
+				std::cmp::Ordering::Equal if first_after_id.is_none_or(|first| id_ord < first) => return,
+				_ => {}
+			}
+		}
+		self.inner.top_docs.push((score, id_ord), doc);
+	}
+
+	fn harvest(self) -> Self::Fruit {
+		self.inner.harvest()
+	}
+}
+
+impl Collector for TraversalScoreTieCollector {
+	type Fruit = Result<(usize, u64, Vec<StableScoreTieHit>)>;
+	type Child = TraversalScoreTieSegmentCollector;
+
+	fn for_segment(&self, segment_ord: u32, segment: &SegmentReader) -> tantivy::Result<Self::Child> {
+		let inner = self.inner.for_segment(segment_ord, segment)?;
+		let after = self
+			.after
+			.as_ref()
+			.map(|boundary| {
+				let mut stream = inner
+					.id_column
+					.dictionary()
+					.range()
+					.gt(boundary.id.as_bytes())
+					.into_stream()?;
+				let first_after_id = stream.advance().then(|| stream.term_ord());
+				Ok::<_, std::io::Error>((boundary.score, first_after_id))
+			})
+			.transpose()?;
+		Ok(TraversalScoreTieSegmentCollector { inner, after })
+	}
+
+	fn requires_scoring(&self) -> bool {
+		true
+	}
+
+	fn merge_fruits(&self, fruits: Vec<<Self::Child as SegmentCollector>::Fruit>) -> tantivy::Result<Self::Fruit> {
+		self.inner.merge_fruits(fruits)
+	}
+
+	fn collect_segment(
+		&self,
+		weight: &dyn tantivy::query::Weight,
+		segment_ord: u32,
+		reader: &SegmentReader,
+	) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
+		let mut collector = self.for_segment(segment_ord, reader)?;
+		let mut scorer = weight.scorer(reader, 1.0)?;
+		let alive = reader.alive_bitset();
+		let mut visited = 0_u64;
+		let mut doc = scorer.doc();
+		while doc != tantivy::TERMINATED {
+			if visited.is_multiple_of(1024) {
+				if let Err(error) = check_deadline(self.deadline) {
+					return Ok(Err(error));
+				}
+			}
+			if alive.is_none_or(|alive| alive.is_alive(doc)) {
+				collector.collect(doc, scorer.score());
+			}
+			visited += 1;
+			doc = scorer.advance();
+		}
+		Ok(collector.harvest())
+	}
+}
+
 pub struct Writer {
 	inner: IndexWriter,
 	checkpoint_required: bool,
@@ -251,6 +347,7 @@ pub struct SearchResult {
 	pub total: u64,
 	pub total_relation: TotalRelation,
 	pub hits: Vec<SearchHit>,
+	pub traversal: Option<(String, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -523,17 +620,61 @@ impl Engine {
 		request: &SearchRequest,
 		deadline: Option<Instant>,
 	) -> Result<SearchResult> {
-		if request.limit == 0 {
-			return Err(FulltextError::invalid("search limit must be greater than zero"));
-		}
+		validate_search_window(request.offset, request.limit, request.traversal)?;
 		if let Some(candidate_ids) = &request.candidate_ids {
 			for id in candidate_ids {
 				validate_record_id(id)?;
 			}
 		}
 		check_deadline(deadline)?;
+		let snapshot = if request.traversal {
+			let snapshot = search_snapshot(searcher.generation().segments());
+			if request.after.as_ref().is_some_and(|after| after.snapshot != snapshot) {
+				return Err(FulltextError::new(
+					"E_CURSOR_EXPIRED",
+					"search snapshot changed; restart traversal on a dedicated reader",
+				));
+			}
+			Some(snapshot)
+		} else {
+			None
+		};
 		let query = self.query(searcher, request)?;
 		check_deadline(deadline)?;
+		if let Some(snapshot) = snapshot {
+			let collector = TraversalScoreTieCollector {
+				inner: StableScoreTieCollector::new(0..request.limit.saturating_add(1)),
+				after: request.after.clone(),
+				deadline,
+			};
+			let (_, total, mut scored_docs) = searcher
+				.search(query.query.as_ref(), &collector)
+				.map_err(index_error)??;
+			check_deadline(deadline)?;
+			let more = scored_docs.len() > request.limit;
+			scored_docs.truncate(request.limit);
+			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
+			let versions = search_hit_versions(searcher, &addresses)?;
+			let hits = scored_docs
+				.into_iter()
+				.zip(versions)
+				.map(|(((score, id), _), version)| SearchHit { id, score, version })
+				.collect::<Vec<_>>();
+			let bytes = search_response_bytes(&hits, 13 + 4 + snapshot.len() + 1)?;
+			if bytes > MAX_SEARCH_RESPONSE_BYTES {
+				return Err(FulltextError::new(
+					"E_RESULT_TOO_LARGE",
+					"search traversal response exceeds its byte limit",
+				));
+			}
+			check_deadline(deadline)?;
+			return Ok(SearchResult {
+				total,
+				total_relation: TotalRelation::Exact,
+				hits,
+				traversal: Some((snapshot, more)),
+			});
+		}
 		let window_end = request.offset + request.limit;
 		let stable_any = request.candidate_ids.is_none()
 			&& request.filter.is_none()
@@ -634,12 +775,7 @@ impl Engine {
 			(bounded_total, bounded_total_relation)
 		};
 		check_deadline(deadline)?;
-		let response_bytes = hits
-			.iter()
-			.try_fold(13usize, |bytes, hit| {
-				bytes.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, |version| 4 + version.len()))
-			})
-			.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))?;
+		let response_bytes = search_response_bytes(&hits, 13)?;
 		if response_bytes > MAX_SEARCH_RESPONSE_BYTES {
 			return Err(FulltextError::new(
 				"E_RESULT_TOO_LARGE",
@@ -650,6 +786,7 @@ impl Engine {
 			total,
 			total_relation,
 			hits,
+			traversal: None,
 		})
 	}
 
@@ -1606,6 +1743,33 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
 	} else {
 		Ok(())
 	}
+}
+
+fn search_snapshot(segments: &BTreeMap<SegmentId, Option<Opstamp>>) -> String {
+	let mut digest = Sha256::new();
+	digest.update(b"fulltext-snapshot-v1\0");
+	digest.update((segments.len() as u64).to_le_bytes());
+	for (segment, deleted_at) in segments {
+		digest.update(segment.uuid_string().as_bytes());
+		digest.update([u8::from(deleted_at.is_some())]);
+		if let Some(opstamp) = deleted_at {
+			digest.update(opstamp.to_le_bytes());
+		}
+	}
+	format!("{:x}", digest.finalize())
+}
+
+fn search_response_bytes(hits: &[SearchHit], header_bytes: usize) -> Result<usize> {
+	hits.iter().try_fold(header_bytes, |bytes, hit| {
+		if !hit.score.is_finite() {
+			return Err(FulltextError::invalid(
+				"search score overflow; reopen with lower field weights",
+			));
+		}
+		bytes
+			.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, |version| 4 + version.len()))
+			.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))
+	})
 }
 
 fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<Vec<Option<String>>> {
@@ -2927,6 +3091,263 @@ mod tests {
 	}
 
 	#[test]
+	#[ignore]
+	fn traversal_many_segment_qualification() {
+		for segment_count in [1, 256] {
+			let config = config();
+			let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+			let mut writer = engine.writer(&config).unwrap();
+			writer
+				.inner
+				.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+			for segment in 0..segment_count {
+				let per_segment = 512 / segment_count;
+				writer
+					.apply(MutationBatch {
+						upserts: (segment * per_segment..(segment + 1) * per_segment)
+							.map(|i| crate::protocol::Upsert {
+								id: format!("{i:04}"),
+								version: None,
+								fields: vec![("title".to_owned(), vec!["widget catalog".to_owned()])],
+								filters: Vec::new(),
+							})
+							.collect(),
+						deletes: Vec::new(),
+					})
+					.unwrap();
+				writer.commit().unwrap();
+			}
+			let reader = engine.reader().unwrap();
+			let searcher = reader.searcher();
+			assert_eq!(searcher.segment_readers().len(), segment_count);
+			let mut request = SearchRequest {
+				expression: expression("widget catalog", SearchMode::Any, vec!["title".to_owned()]),
+				candidate_ids: None,
+				filter: None,
+				offset: 0,
+				limit: 512,
+				exact_total: true,
+				budget_milliseconds: 30_000,
+				traversal: false,
+				after: None,
+			};
+			let expected = engine.search(&searcher, &request).unwrap().hits;
+			assert_eq!(expected.len(), 512);
+			request.traversal = true;
+			for page_size in [1, 32] {
+				request.limit = page_size;
+				let mut samples = Vec::new();
+				for iteration in 0..7 {
+					request.after = None;
+					let started = Instant::now();
+					let mut hits = Vec::new();
+					loop {
+						let page = engine.search(&searcher, &request).unwrap();
+						assert_eq!(page.total, 512);
+						let (snapshot, more) = page.traversal.unwrap();
+						if more {
+							let last = page.hits.last().unwrap();
+							request.after = Some(crate::protocol::SearchBoundary {
+								snapshot,
+								score: last.score,
+								id: last.id.clone(),
+							});
+						}
+						hits.extend(page.hits);
+						if !more {
+							break;
+						}
+					}
+					assert_eq!(hits, expected);
+					if iteration >= 2 {
+						samples.push(started.elapsed().as_secs_f64() * 1000.0);
+					}
+				}
+				samples.sort_by(f64::total_cmp);
+				println!("{{\"segments\":{segment_count},\"records\":512,\"pageSize\":{page_size},\"samples\":5,\"medianMs\":{}}}", samples[2]);
+			}
+			writer.close().unwrap();
+		}
+	}
+
+	#[test]
+	fn snapshot_digest_binds_segment_ids_and_deletion_generations() {
+		let mut segments = BTreeMap::new();
+		assert_eq!(
+			search_snapshot(&segments),
+			"1962c405bdaf56d05c10327878eb6165ba017eae08c3bda932e3d36d24406361"
+		);
+		let segment = SegmentId::from_uuid_string("00112233445566778899aabbccddeeff").unwrap();
+		segments.insert(segment, None);
+		assert_eq!(
+			search_snapshot(&segments),
+			"7e8c34cf1637bedc14048237a152de9ddaf3866abfad53ade87447662855a4fe"
+		);
+		segments.insert(segment, Some(0));
+		assert_eq!(
+			search_snapshot(&segments),
+			"99c84530ae8d4b1b7b401d1b0b9aa3dd07da7b8faf2ee4599b872647f7f3886a"
+		);
+		let deleted = search_snapshot(&segments);
+		segments.insert(segment, Some(1));
+		assert_ne!(search_snapshot(&segments), deleted);
+		let replacement = SegmentId::from_uuid_string("10112233445566778899aabbccddeeff").unwrap();
+		assert_ne!(search_snapshot(&BTreeMap::from([(replacement, Some(0))])), deleted);
+	}
+
+	#[test]
+	fn traversal_retains_a_merged_snapshot_and_stops_collection_on_deadline() {
+		let directory = RamDirectory::create();
+		let config = config();
+		let engine = Engine::open(directory, &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for mut upsert in batch().upserts {
+			upsert.version = Some("original".to_owned());
+			writer
+				.apply(MutationBatch {
+					upserts: vec![upsert],
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let reader = engine.reader().unwrap();
+		let pinned = reader.searcher();
+		assert_eq!(pinned.segment_readers().len(), 2);
+		let mut request = SearchRequest {
+			expression: expression("shoes", SearchMode::Any, Vec::new()),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 1,
+			exact_total: false,
+			budget_milliseconds: 30_000,
+			traversal: true,
+			after: None,
+		};
+		let first = engine.search(&pinned, &request).unwrap();
+		assert_eq!(first.total, 2);
+		let mut invalid = request.clone();
+		invalid.limit = usize::MAX;
+		assert_eq!(engine.search(&pinned, &invalid).unwrap_err().code, "E_INVALID_ARGUMENT");
+		invalid.limit = 1;
+		invalid.offset = 1;
+		assert_eq!(engine.search(&pinned, &invalid).unwrap_err().code, "E_INVALID_ARGUMENT");
+		invalid.traversal = false;
+		invalid.offset = usize::MAX - 1;
+		invalid.limit = 2;
+		assert_eq!(engine.search(&pinned, &invalid).unwrap_err().code, "E_INVALID_ARGUMENT");
+		let query = engine.query(&pinned, &request).unwrap();
+		let expired = TraversalScoreTieCollector {
+			inner: StableScoreTieCollector::new(0..2),
+			after: None,
+			deadline: Some(Instant::now() - std::time::Duration::from_millis(1)),
+		};
+		assert_eq!(
+			pinned.search(query.query.as_ref(), &expired).unwrap().unwrap_err().code,
+			"E_TIMEOUT"
+		);
+		let segments = engine.index.searchable_segment_ids().unwrap();
+		writer.inner.merge(&segments).wait().unwrap();
+		let last = first.hits.last().unwrap();
+		request.after = Some(crate::protocol::SearchBoundary {
+			snapshot: first.traversal.unwrap().0,
+			score: last.score,
+			id: last.id.clone(),
+		});
+		let second = engine.search(&pinned, &request).unwrap();
+		assert_eq!(second.total, 2);
+		assert_eq!(second.hits.len(), 1);
+		assert_ne!(second.hits[0].id, last.id);
+		assert_eq!(second.hits[0].version.as_deref(), Some("original"));
+		reader.reload().unwrap();
+		assert_eq!(reader.searcher().segment_readers().len(), 1);
+		assert_eq!(
+			engine.search(&reader.searcher(), &request).unwrap_err().code,
+			"E_CURSOR_EXPIRED"
+		);
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn autocomplete_traversal_matches_the_ordinary_collector_beyond_one_hundred_hits() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for segment in 0..4 {
+			let upserts = (segment * 90..(segment + 1) * 90)
+				.map(|i| crate::protocol::Upsert {
+					id: format!("{}{:03}", ["z", "é", "中", "😀"][i % 4], i),
+					version: Some("original".to_owned()),
+					fields: vec![
+						(
+							"title".to_owned(),
+							vec![if i % 4 == 0 {
+								"wodget catalog".to_owned()
+							} else {
+								"widget ".repeat(i % 3 + 1)
+							}],
+						),
+						(
+							"description".to_owned(),
+							vec![if i % 5 == 0 { "widget" } else { "catalog" }.to_owned()],
+						),
+					],
+					filters: Vec::new(),
+				})
+				.collect();
+			writer
+				.apply(MutationBatch {
+					upserts,
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let reader = engine.reader().unwrap();
+		let snapshot = reader.searcher();
+		for mode in [SearchMode::Prefix, SearchMode::FuzzyPrefix] {
+			let mut request = SearchRequest {
+				expression: expression("widg", mode, Vec::new()),
+				candidate_ids: None,
+				filter: None,
+				offset: 0,
+				limit: 500,
+				exact_total: true,
+				budget_milliseconds: 30_000,
+				traversal: false,
+				after: None,
+			};
+			let expected = engine.search(&snapshot, &request).unwrap();
+			assert!(expected.hits.len() > 100);
+			request.traversal = true;
+			request.limit = 17;
+			let mut actual = Vec::new();
+			for _ in 0..expected.hits.len().div_ceil(request.limit) {
+				let page = engine.search(&snapshot, &request).unwrap();
+				assert_eq!(page.total, expected.total);
+				let last = page.hits.last().unwrap();
+				request.after = Some(crate::protocol::SearchBoundary {
+					snapshot: page.traversal.unwrap().0,
+					score: last.score,
+					id: last.id.clone(),
+				});
+				actual.extend(page.hits);
+			}
+			assert_eq!(actual, expected.hits);
+			assert!(engine.search(&snapshot, &request).unwrap().hits.is_empty());
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
 	fn surface_fields_do_not_store_positions() {
 		let mut config = config();
 		config.identity.surface_terms = true;
@@ -3040,6 +3461,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3078,6 +3501,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3096,6 +3521,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3296,6 +3723,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 				&[TraceRecord {
 					id: "one".to_owned(),
@@ -3352,6 +3781,8 @@ mod tests {
 						limit: 10,
 						exact_total: true,
 						budget_milliseconds: 30_000,
+						traversal: false,
+						after: None,
 					},
 				)
 				.unwrap();
@@ -3367,6 +3798,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 				&[TraceRecord {
 					id: "one".to_owned(),
@@ -3387,6 +3820,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap()
@@ -3432,6 +3867,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap()
@@ -3509,6 +3946,8 @@ mod tests {
 			limit: 10,
 			exact_total: true,
 			budget_milliseconds: 30_000,
+			traversal: false,
+			after: None,
 		};
 		let result = engine.search(&reader.searcher(), &request).unwrap();
 		assert_eq!(result.total, 2);
@@ -3579,6 +4018,8 @@ mod tests {
 						limit: 10,
 						exact_total: true,
 						budget_milliseconds: 30_000,
+						traversal: false,
+						after: None,
 					},
 				)
 				.unwrap()
@@ -3610,6 +4051,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3628,6 +4071,8 @@ mod tests {
 					limit: 10,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3665,6 +4110,8 @@ mod tests {
 					limit: 10,
 					exact_total: false,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap_err();
@@ -3734,6 +4181,8 @@ mod tests {
 						limit,
 						exact_total: false,
 						budget_milliseconds: 30_000,
+						traversal: false,
+						after: None,
 					},
 				)
 				.unwrap()
@@ -3755,6 +4204,8 @@ mod tests {
 					limit: 3,
 					exact_total: false,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3771,6 +4222,8 @@ mod tests {
 					limit: 3,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3787,6 +4240,8 @@ mod tests {
 					limit: 3,
 					exact_total: true,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3836,6 +4291,8 @@ mod tests {
 					limit: 5,
 					exact_total: false,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3855,6 +4312,8 @@ mod tests {
 					limit: 3,
 					exact_total: false,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap();
@@ -3941,6 +4400,8 @@ mod tests {
 					limit: 10,
 					exact_total: false,
 					budget_milliseconds: 30_000,
+					traversal: false,
+					after: None,
 				},
 			)
 			.unwrap_err();

@@ -1,12 +1,18 @@
 import { FulltextError, type FulltextErrorCode } from './errors.js';
 
 const protocolVersion = 5;
-const maxStringBytes = 1 << 20;
-const maxFilterStringBytes = 65_530;
+export const maxStringBytes = 1 << 20;
+export const maxFilterStringBytes = 65_530;
+export const maxCommitPayloadBytes = 64 * 1024;
+export const maxSearchRequestBytes = 8 * 1024 * 1024;
+export const maxSearchBudgetMilliseconds = 30_000;
+export const maxTraceRecords = 100;
+export const maxExpressionDepth = 8;
+export const maxQueryClauses = 256;
 const noFilterNames: string[] = [];
-const maxSynonymRules = 1_024;
-const maxSynonymReplacements = 16;
-const maxSynonymBytes = 1 << 20;
+export const maxSynonymRules = 1_024;
+export const maxSynonymReplacements = 16;
+export const maxSynonymBytes = 1 << 20;
 export const maxRecordIdBytes = 4 << 10;
 export const maxRecordVersionBytes = 4 << 10;
 export const maxFields = 1_024;
@@ -414,6 +420,7 @@ export interface PackedSearchRequest {
 	limit: number;
 	exactTotal: boolean;
 	budgetMilliseconds: number;
+	traversal?: { after?: { snapshot: string; score: number; id: string } };
 }
 
 export interface PackedTraceRequest {
@@ -696,28 +703,85 @@ function encodeBatchHeader(upserts: number, deletes: number): Buffer {
 }
 
 export function encodeSearch(request: PackedSearchRequest): Buffer {
-	validateCandidateIds(request.candidateIds);
-	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
+	return encodeSearchFrame(request).bytes;
+}
+
+export function encodeSearchFrame(
+	request: PackedSearchRequest,
+	candidateLimits?: { maxCandidateIds: number; maxCandidateBytes: number },
+): { bytes: Buffer; identityLength: number } {
+	let candidateIds = request.candidateIds;
+	let omittedCandidateBytes = 0;
+	if (request.traversal && candidateIds !== undefined) {
+		if (!candidateLimits) {
+			throw new FulltextError('E_NATIVE_FAILURE', 'traversal candidate encoding requires native capacities');
+		}
+		if (!Array.isArray(candidateIds)) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'candidateIds must be an array of strings');
+		}
+		const count = candidateIds.length;
+		if (!Number.isInteger(count) || count < 0 || count > candidateLimits.maxCandidateIds) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `candidate ID count exceeds ${candidateLimits.maxCandidateIds}`);
+		}
+		const original = candidateIds;
+		candidateIds = Array.from({ length: count }, (_, index) => original[index]);
+		validateCandidateIds(candidateIds);
+		let bytes = 0;
+		for (const id of candidateIds) {
+			bytes += Buffer.byteLength(id, 'utf8');
+			if (bytes > candidateLimits.maxCandidateBytes) {
+				throw new FulltextError(
+					'E_INVALID_ARGUMENT',
+					`candidate IDs exceed ${candidateLimits.maxCandidateBytes} UTF-8 bytes`,
+				);
+			}
+		}
+		omittedCandidateBytes = bytes + candidateIds.length * 4;
+		candidateIds = [...new Set(candidateIds)].sort();
+	} else {
+		validateCandidateIds(candidateIds);
+	}
+	const writer = new ByteWriter(maxSearchRequestBytes, 'E_INVALID_ARGUMENT');
 	writer.header('FTSQ');
 	encodeSearchExpression(writer, request.expression, 0);
-	writer.boolean(request.candidateIds !== undefined);
-	if (request.candidateIds !== undefined) {
-		writer.u16(request.candidateIds.length, 'candidateIds.length');
-		for (const id of request.candidateIds) {
-			writer.string(id);
-		}
+	writer.boolean(candidateIds !== undefined);
+	if (candidateIds !== undefined) {
+		writer.u16(candidateIds.length, 'candidateIds.length');
+		const candidateDataStart = writer.length;
+		for (const id of candidateIds) writer.string(id);
+		if (request.traversal) omittedCandidateBytes -= writer.length - candidateDataStart;
 	}
 	writer.boolean(request.filter !== undefined);
 	if (request.filter !== undefined) encodeFilterExpression(writer, request.filter, 0);
+	const identityLength = writer.length;
 	writer.u32(request.offset, 'offset');
 	writer.u32(request.limit, 'limit');
 	writer.boolean(request.exactTotal);
+	if (request.traversal) {
+		writer.boolean(true);
+		writer.boolean(request.traversal.after !== undefined);
+		if (request.traversal.after) {
+			const { snapshot, score, id } = request.traversal.after;
+			if (!Number.isFinite(score) || !Number.isFinite(Math.fround(score))) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'continuation score must be a finite float32');
+			}
+			writer.string(snapshot);
+			const packedScore = Buffer.alloc(4);
+			packedScore.writeFloatLE(score);
+			writer.u32(packedScore.readUInt32LE(0), 'continuation.score');
+			writer.string(id);
+		}
+	}
 	writer.u32(request.budgetMilliseconds, 'budgetMilliseconds');
-	return writer.finish();
+	if (request.traversal && writer.length + omittedCandidateBytes > maxSearchRequestBytes) {
+		throw new FulltextError('E_INVALID_ARGUMENT', `packed value exceeds ${maxSearchRequestBytes} bytes`);
+	}
+	return { bytes: writer.finish(), identityLength };
 }
 
 function encodeFilterExpression(writer: ByteWriter, expression: PackedFilterExpression, depth: number): void {
-	if (depth > 8) throw new FulltextError('E_INVALID_ARGUMENT', 'filter expression nesting exceeds 8 levels');
+	if (depth > maxExpressionDepth)
+		throw new FulltextError('E_INVALID_ARGUMENT', `filter expression nesting exceeds ${maxExpressionDepth} levels`);
 	if ('field' in expression) {
 		writer.u8(0, 'filter expression type');
 		writer.string(expression.field);
@@ -732,7 +796,8 @@ function encodeFilterExpression(writer: ByteWriter, expression: PackedFilterExpr
 }
 
 function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpression, depth: number): void {
-	if (depth > 8) throw new FulltextError('E_INVALID_ARGUMENT', 'search expression nesting exceeds 8 levels');
+	if (depth > maxExpressionDepth)
+		throw new FulltextError('E_INVALID_ARGUMENT', `search expression nesting exceeds ${maxExpressionDepth} levels`);
 	if ('text' in expression) {
 		writer.u8(0, 'expression type');
 		writer.string(expression.text);
@@ -754,7 +819,7 @@ function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpr
 export function encodeTrace(request: PackedTraceRequest): Buffer {
 	validateCandidateIds(request.candidateIds);
 	for (const record of request.records) validateRecordId(record.id);
-	const writer = new ByteWriter(8 * 1024 * 1024, 'E_INVALID_ARGUMENT');
+	const writer = new ByteWriter(maxSearchRequestBytes, 'E_INVALID_ARGUMENT');
 	writer.header('FTTM');
 	writer.string(request.text);
 	writer.u8(['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'].indexOf(request.mode), 'mode');
@@ -893,6 +958,10 @@ class ByteWriter {
 		}
 		this.#maxBytes = maxBytes;
 		this.#sizeErrorCode = sizeErrorCode;
+	}
+
+	get length(): number {
+		return this.#length;
 	}
 
 	header(magic: string): void {

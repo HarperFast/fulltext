@@ -2,8 +2,8 @@
 
 ## Setup
 
-Install Node.js 22.18 or newer and Rust 1.90, then install JavaScript dependencies without running
-package lifecycle scripts:
+Install Node.js 22.18 or newer in the 22.x line, or Node.js 24 or newer, and Rust 1.90, then install
+JavaScript dependencies without running package lifecycle scripts:
 
 ```bash
 npm ci --ignore-scripts
@@ -38,8 +38,9 @@ cannot run these reviews because GitHub withholds the required provider secrets 
 - Keep the package on Tantivy's native filesystem storage; do not add storage fallback.
 - Source-data projection, replication, and readiness policy belong in the consuming application.
 - Do not expose generated Node-API declarations as the public TypeScript API.
-- Keep CPU and sustained I/O work off the Node.js event loop. The promise-shaped capability call and
-  process-budget configuration may synchronously load the addon once; budget configuration performs
+- Keep sustained native CPU and I/O work off the Node.js event loop. Request encoding and small
+  query-identity hashes run synchronously in JavaScript; large identity hashes use WebCrypto.
+  Runtime information and process-budget configuration may synchronously load the addon once; budget configuration performs
   no storage I/O. Bounded, synchronous native index inspection is permitted only for lifecycle
   ownership changes; search, indexing, commit, and request-path storage remain async.
 - Add a direct test for each source module.

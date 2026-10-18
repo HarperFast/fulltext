@@ -10,19 +10,20 @@ or query-readiness policy.
 
 ## Invariant
 
-Once native close or reset resolves, no writer, reader, search actor, merge thread, queued command,
-memory mapping, or registry reservation from the completed operation can still use the live
-physical index path.
+A resolved close means that handle has released its writer, search workers, readers, merge threads,
+file mappings, and path reservation. Other open readers remain the responsibility of their owners.
+Reset rejects live handles in this process. Applications must also close readers in other processes
+before reset; the lifecycle lock does not track their lifetime.
 
-## Lifecycle baseline
+## Behavior before the close fix (historical)
 
 - `NativeFullTextIndex.close()` delegates to `__nativeClose` and resolves from the writer command's
   callback (`ts/native.ts`, `src/native.rs`).
 - The close command drains the search queue, joins the search workers, closes the writer, removes
   the path from the process registry, and then completes the callback (`src/native.rs`). The writer
   thread still owns its `Arc<Runtime>` at callback time, and `Runtime` owns the `Engine` and
-  `IndexReader`; therefore callback completion is not currently proof that all mappings were
-  dropped.
+  `IndexReader`; therefore callback completion alone did not prove that all mappings were
+  dropped. The current teardown described below releases these references before completion.
 - The process registry rejects a second live writer for the same canonical physical directory.
   Environment cleanup force-closes tracked handles and waits on their completion signals
   (`src/native.rs`). Tantivy's writer lock excludes established writers across processes; this
@@ -166,13 +167,16 @@ remediation rather than falling back to in-place deletion.
 
 - `E_LOCK_BUSY` is a retryable ownership/quiescence result, not corruption and not permission to
   rebuild through a live owner.
-- A failed close does not prove quiescence. Tantivy 0.26.2 can return early from
+- A close rejected with `E_DIRTY_CLOSE` leaves the handle open so the caller can publish or close
+  with rollback. `E_QUIESCENCE_FAILED` means native resources may still be in use. Tantivy 0.26.2 can return early from
   `wait_merging_threads()` after an indexing-worker failure without joining every remaining worker.
   The wrapper therefore removes the unusable handle and quarantines its canonical path until process
   restart. The quarantine is path-scoped so another index using the same logical ID is
   unaffected. Callers must not rename or remove an unproven directory; external filesystem mutation
   is outside this lifecycle protocol and cannot establish safety. The host keeps the affected index
   unavailable; availability is not allowed to weaken the file-lifetime invariant.
+- A close that releases resources but encounters a cleanup error resolves with `{ cleanupError }`;
+  the path can still be reset once other handles are closed.
 - Close has no internal timeout. Resolving while a writer or merge thread may still own files would
   violate the barrier. Node-environment cleanup logs after its bounded wait, while process shutdown
   remains the hard-stop mechanism for a native thread that never returns.
@@ -194,8 +198,7 @@ remediation rather than falling back to in-place deletion.
 The wrapper retires the live directory with a same-filesystem rename instead of deleting it in
 place. This avoids recursive deletion overlapping a new directory created at the same path, creates
 one publication point, and keeps deletion recoverable. Reset never force-closes by path because a
-caller cannot prove it owns a handle opened by another Node environment. It also does not wait or
-retry; the consuming application owns that policy, and `E_LOCK_BUSY` is sufficient for callers.
+caller cannot prove it owns a handle opened by another Node environment. It does not wait for another owner or retry ownership conflicts; the consuming application owns that policy, and `E_LOCK_BUSY` is sufficient for callers.
 
 Reset checks the logical `indexId`, but not the full schema or generation. Schema and generation
 incompatibility are reasons to rebuild; requiring them to match would block the repair operation.
@@ -222,3 +225,9 @@ durable catalog alongside Tantivy `meta.json`.
 The end-to-end route is the package's Node test suite against the built N-API addon. It exercises
 the public TypeScript API through the Rust registry, Tantivy lock, and real filesystem rename rather
 than substituting a mock directory.
+
+## Source reference
+
+- [Runtime teardown and reset](../src/native.rs)
+- [Public lifecycle API and retired-file cleanup](../ts/native.ts)
+- [Lifecycle tests](../test/native.test.mjs)

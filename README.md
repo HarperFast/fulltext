@@ -183,12 +183,16 @@ publisher between frames. Searches may still run concurrently with either writer
 
 ## Search
 
+See [limits and their effects](docs/limits.md) for query, result, analyzer, mutation, and runtime
+constraints, completeness signals, and recovery paths. Use the installed addon’s `(await runtimeInfo()).limits` rather than copying numeric ceilings into integrations.
+
 Search uses weighted BM25 and a typed request; raw Tantivy query syntax is not exposed. `mode` is
 `any`, `all`, `phrase`, `prefix`, `fuzzy`, or `fuzzy-prefix`. The older `operator: 'any' | 'all'`
 spelling remains a compatibility alias and cannot be combined with `mode`. Candidate IDs compile to
-a score-neutral required filter. Prefix modes are autocomplete-oriented, require offset zero, and
-return at most 100 hits. Fuzzy and prefix work has fixed term, clause, expansion, request, result,
-and execution ceilings. Prefix expansion fails with `E_PREFIX_TOO_BROAD` instead of silently
+a required filter that does not change scores. Prefix modes support autocomplete. For `prefix` and
+`fuzzy-prefix`, `search()` requires offset zero and returns at most 100 hits; `searchPage()` can
+continue through all accepted prefix matches. Fuzzy and prefix work has fixed term, clause,
+expansion, request, result, and execution ceilings. Prefix expansion fails with `E_PREFIX_TOO_BROAD` instead of silently
 truncating the term set and returning incomplete rankings. `fuzzy-prefix` is a preview capability
 until catalog-scale benchmark qualification is complete.
 
@@ -197,8 +201,8 @@ An upsert may include an opaque `version` string of up to 4,096 UTF-8 bytes. The
 with its search hit, allowing a derived-index consumer to discard a hit when the authoritative
 record has moved past the indexed version.
 
-Use `query` for Boolean expressions within one index. Expressions may nest to eight levels and are
-bounded by the same request, term, and clause limits as simple searches:
+Use `query` for Boolean expressions within one index. Expression nesting is limited to eight edges
+from the root. Expressions are bounded by the same request, term, and clause limits as simple searches:
 
 ```js
 const result = await index.search({
@@ -227,6 +231,92 @@ fields, so one term searched across two fields takes this path. This prevents se
 different page boundaries from changing tie order, but it visits every match and checks the request
 deadline after collection. Other bounded query shapes start with Tantivy's score-pruned `TopDocs`
 path; a score tie at the requested page boundary falls back to the stable all-match collector.
+
+### Traversing beyond 10,000 matches
+
+`searchPage()` traverses ordinary, prefix, and fuzzy-prefix full-text results in score-descending,
+UTF-8 ID-ascending order.
+It returns an authenticated `continuation` while another page remains. Each page has an exact `total`
+for the entire matching set; `limit` bounds an individual page to at most 10,000 hits. There is no
+fixed ceiling on the number of matching results you can traverse and no direct page-number jump.
+The existing `search({ offset, limit })` window and its legacy 100-hit autocomplete limit remain unchanged.
+A defined `continuation` passed to `search()` rejects with `E_INVALID_ARGUMENT`; resume through
+`searchPage()`.
+Both methods reject a `null` continuation. Omit it or pass `undefined` to start without a continuation.
+Shared request objects may include a zero or null offset and an `exactTotal` preference; nonzero
+offsets are rejected, and `searchPage()` always returns exact totals.
+
+Use a dedicated read-only handle to retain the original snapshot while the writer publishes or
+merges newer data:
+
+```js
+import { openNativeFullTextReader } from '@harperfast/fulltext/native';
+
+const reader = await openNativeFullTextReader(options);
+try {
+	let continuation;
+	do {
+		const page = await reader.searchPage({ text: 'widget', limit: 1_000, continuation });
+		for (const hit of page.hits) await consume(hit);
+		continuation = page.continuation;
+	} while (continuation);
+} finally {
+	await reader.close();
+}
+```
+
+Do not call `reader.reload()` during traversal. Reloading to a different segment/deletion snapshot
+expires its continuations with `E_CURSOR_EXPIRED`; reloading the same snapshot keeps them valid.
+Closing the reader releases its retained snapshot. Writer-handle continuations expire when `publish()`
+changes the active indexed snapshot; use a dedicated reader when ingestion continues.
+Continuations are bound to that handle and the original
+query, fields, filters, and candidate IDs; they cannot be moved to a reopened handle, another worker,
+or another process. Restart traversal after an addon upgrade. You may change page size or execution
+budget between pages. Traversal sorts a copy of candidate IDs for request identity on each page, so reordering
+the same candidate set preserves continuation even if order or duplicate counts change. The original
+list still counts toward native count/byte limits and the packed-request bound before duplicates are
+removed. The caller's array is unchanged. Preserve field
+and query-clause order between pages. Tokens authenticate the last hit and the query identity. Their
+contents are readable, including the last hit’s ID and score. Applications must still check permissions and close readers when the search
+finishes or expires; the library does not set a reader expiration time.
+
+A deterministic many-segment native qualification is available with `cargo test --release --lib --no-default-features traversal_many_segment_qualification -- --ignored --nocapture`; see the
+[qualified snapshot costs](docs/limits.md#sha-256-snapshot-qualification).
+
+Retained winners depend on page size rather than depth, but each page scans all matching documents
+and computes an exact total. Traversing N matches in pages of P requires approximately N²/P
+matching-document visits. This is a bounded-memory traversal API, not a constant-time seek.
+
+#### Preparing large requests
+
+The execution budget includes request preparation. Query identities up to 64 KiB hash on the
+JavaScript thread; larger ones use asynchronous WebCrypto, which shares Node’s libuv worker pool.
+Encoding and copying still run on the JavaScript thread. Other work in the pool can delay hashing,
+and a dispatched hash runs to completion before timeout or close is checked.
+
+Each handle bounds large-request preparation by its configured search queue limits, with ceilings
+of 128 requests and 8 MiB of retained frames. WebCrypto copies and caller-owned input use additional
+memory. Small synchronous requests bypass these preparation limits; native queue limits still apply
+to every request. `E_QUEUE_FULL` identifies preparation overload in its message, but native `status()`
+counters exclude preparation. A request larger than the configured byte capacity cannot succeed by
+retrying unchanged, even on an idle handle. Reduce it or increase capacity within the process budget.
+
+The open functions pass the configured limits to the handle. Callers constructing
+`NativeFullTextIndex` directly can supply `searchLimits`; otherwise the preparation ceilings apply.
+
+#### Execution and reader lifetime
+
+Traversal checks its deadline between batches of matching documents. Query construction and individual
+Tantivy operations can still exceed the budget; `close()` waits for in-flight native work. Use at
+least two search threads to keep ordinary searches running alongside expensive ones; with one
+thread, traversal shares the handle's only search lane. Each page is classified as expensive and holds a process-wide
+expensive-search permit when a runtime budget is configured. Size `maxExpensiveSearches` for
+concurrent traversals alongside phrase, fuzzy, and other expensive searches on every index.
+A retained reader can keep old segment files on disk. Bound the number of open readers with the
+runtime budget and close each one when its search finishes or expires. Prefix traversal
+still enforces the independent 50-term expansion guard; continuation does not make an overly broad
+prefix acceptable. Fuzzy-prefix retains its existing preview status.
+Source projection, current-record validation, and Harper REST integration remain host responsibilities.
 
 ### Structured filters
 
@@ -319,8 +409,9 @@ Search and tracing share a maximum 30-second queue-plus-execution budget. Applic
 shorter remaining request budget through the second method argument; larger values are clamped to
 30 seconds. The budget determines whether queued or completed work is accepted; it is not a
 callback timer. If every eligible worker is already executing non-interruptible work, an expired
-queued request is rejected when a worker next examines it. Tantivy search itself is not
-interruptible, so a search that expires in flight is discarded after Tantivy returns. Match tracing
+queued request is rejected when a worker next examines it. Ordinary offset search is not
+interruptible, so an expired offset search is discarded after Tantivy returns. Traversal checks its
+deadline during collection. Match tracing
 checks its deadline while tokenizing and matching. With at least two search threads, one worker is
 reserved for ordinary bounded `any`/`all` BM25. The remaining workers prioritize phrase, prefix,
 fuzzy, unanchored-negation, exact-total, and trace work, then steal ordinary work when that queue is
@@ -400,9 +491,9 @@ search limits because inspection creates none of those resources.
 `validateNativeFullTextIndexOptions(options)` runs the same native configuration decoder as open
 without creating files or starting actors. This is intended for activation-time validation.
 
-`close()` is also the native quiescence barrier. A resolved result means the writer, search actors,
-readers, merge threads, and memory mappings no longer use the index path. After closing an
-incompatible or corrupt local index, retire it atomically before rebuilding:
+`close()` also waits for the handle’s native work to stop and its file mappings to be released.
+Other open handles still own their readers and mappings; close those before resetting the path.
+After closing an incompatible or corrupt local index, retire it atomically before rebuilding:
 
 ```js
 const result = await resetNativeFullTextIndex({ path: './search/products', indexId: 'products' });
@@ -423,7 +514,7 @@ with `E_INVALID_ARGUMENT`. A malformed identity sidecar fails closed with `E_IND
 success, reset renames the live directory into a unique path below the parent's `.fulltext-retired`
 directory. The library does not delete it automatically. Call
 `reclaimRetiredNativeFullTextIndexes({ path, retiredPath: result.retiredPath })` at a lifecycle point
-chosen by the application. Passing the opaque reset result verifies that the hint belongs to the
+chosen by the application. Passing the returned `retiredPath` verifies that the hint belongs to the
 requested index. Use the same `path` value for reset and reclaim so generated names match. The
 reclaimer removes only retired trees generated for that index path, ignores unrelated entries and
 other indices, and returns `{ removed, failed }`. Applications choose when retired files are safe
@@ -438,7 +529,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 8 and packed protocol 5. The loader rejects older addon binaries. Native
+This API uses native ABI 9 and packed protocol 5. The loader rejects older addon binaries. Native
 identity sidecar v4 remains the identity for indexes without structured filter fields. Configuring
 filter fields uses sidecar v5, which also fingerprints their names and types. Older v2 and v3
 indexes remain identifiable for safe reset but cannot be reopened; rebuild them from the
@@ -507,6 +598,24 @@ between durability points; it materially affects throughput and peak memory beca
 replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
 comparisons require controlled hardware.
 
+`node scripts/run-local.mjs benchmarks/traversal.mjs` qualifies traversal with large IDs/versions,
+multiple actual segments, a broader fuzzy vocabulary, concurrent writes and ordinary searches,
+and response-size recovery. Build first with `npm run build`; use `--smoke` for the smaller CI
+correctness profile. Output reports actual segment counts, workload sizes, timings and process RSS.
+It does not enforce production latency targets or claim a peak-memory bound.
+
+`node scripts/run-local.mjs benchmarks/traversal-preparation.mjs current` measures synchronous
+submission time, completion time and event-loop delay for a legal large candidate/filter identity.
+Build first; compare repeated runs on the same idle hardware. It measures encoding/copying and
+native work as well as hashing, so it does not isolate crypto cost or establish a production latency
+target.
+
+For a paired ordinary-search comparison, build baseline and current worktrees with the same optimized
+native profile, then run `FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/ordinary-search.mjs /absolute/worktree baseline`
+and repeat with the current worktree and label. The fixture checks totals and hit counts, warms each
+query, and emits timings for empty, sparse, and broad exact searches at limits 20 and 1,000.
+Alternate process order across repeated pairs on idle hardware; these observations are not a latency gate.
+
 `benchmark:multi-index` exercises independent writers in parallel under the process budget. It
 includes heavy-tail field sizes, bounded synonyms, update/delete churn, resource-cap rejection,
 warm concurrent queries, close/reopen, and cold queries. CI runs the two-index smoke profile; the
@@ -530,6 +639,11 @@ multiple index counts. It reports equivalent first-pass and warm p50/p95/p99/max
 synchronous wall time per inspection sweep, metadata size, and the actual segment count produced by
 the seed workload. It does not claim to model OS-cold storage. `--indexes` accepts configurations
 that create at most 10,000 temporary index directories across both benchmark paths.
+
+For a controlled same-query comparison of ordinary and traversal first-page overhead, run
+`npm run build && node scripts/run-local.mjs benchmarks/traversal-driver.mjs`. It alternates
+60 calls per method after warmup on one retained snapshot, with identical exact totals and
+page size. This manual benchmark has no timing assertion or CI performance threshold.
 
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.

@@ -79,3 +79,9 @@ Lower-layer metadata interception would couple the wrapper to Tantivy's JSON for
 write. A reserved checkpoint document would change schema identity and query filtering. Silently
 carrying an old payload into plain commits would hide callers that advance content without its
 checkpoint. None is needed for this contract.
+
+## Source reference
+
+- [Writer commit and checkpoint guard](../src/engine.rs)
+- [Native publication and reload](../src/native.rs)
+- [Public payload readback](../ts/native.ts)

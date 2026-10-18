@@ -5,13 +5,16 @@ reviewed before merge.
 
 ## Rust runtime and build graph
 
-| Dependency                     | Scope                           | Purpose                                                                    |
-| ------------------------------ | ------------------------------- | -------------------------------------------------------------------------- |
-| `tantivy` 0.26.2               | runtime                         | Full-text indexing and search engine, including native filesystem storage. |
-| `unicode-normalization` 0.1.24 | runtime                         | Applies the versioned English analyzer's NFKC token normalization.         |
-| `napi` 3.13.0                  | optional runtime                | Node-API values, error conversion, and addon-image retention.              |
-| `napi-derive` 3.6.9            | optional build/runtime boundary | Generates Node-API exports.                                                |
-| `napi-build` 2.5.0             | build                           | Configures platform-specific addon linking.                                |
+| Dependency                     | Scope                           | Purpose                                                                      |
+| ------------------------------ | ------------------------------- | ---------------------------------------------------------------------------- |
+| `tantivy` 0.26.2               | runtime                         | Full-text indexing and search engine, including native filesystem storage.   |
+| `sha2` 0.10.9                  | runtime                         | SHA-256 snapshot identity over Tantivy segment IDs and deletion generations. |
+| `unicode-normalization` 0.1.24 | runtime                         | Applies the versioned English analyzer's NFKC token normalization.           |
+| `napi` 3.13.0                  | optional runtime                | Node-API values, error conversion, and addon-image retention.                |
+| `napi-derive` 3.6.9            | optional build/runtime boundary | Generates Node-API exports.                                                  |
+| `napi-build` 2.5.0             | build                           | Configures platform-specific addon linking.                                  |
+
+Snapshot identity is computed inside the engine for both direct Rust and Node callers. The exact-pinned, no-default-features `sha2` implementation avoids hand-written cryptography and per-reader lease state; no third-party type enters the public API.
 
 The Rust dependency graph must not include RocksDB. The library uses Tantivy's native filesystem
 backend and does not link another database runtime into the addon.

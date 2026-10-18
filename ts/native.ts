@@ -1,3 +1,4 @@
+import { createHash, createHmac, randomBytes, timingSafeEqual, webcrypto } from 'node:crypto';
 import { lstat, readdir, realpath, rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 
@@ -10,7 +11,15 @@ import {
 	encodeOpen,
 	encodeReset,
 	encodeRuntimeBudget,
-	encodeSearch,
+	encodeSearchFrame,
+	maxRecordIdBytes,
+	maxSearchRequestBytes,
+	maxCommitPayloadBytes,
+	maxFilterStringBytes,
+	maxSearchBudgetMilliseconds,
+	maxTraceRecords,
+	maxExpressionDepth,
+	maxQueryClauses,
 	encodeTrace,
 	MutationBatchFrameCursor,
 } from './codec.js';
@@ -18,8 +27,18 @@ import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
 import { PublicationState } from './publication.js';
 
-const maxCommitPayloadBytes = 64 * 1024;
-const maxFilterStringBytes = 65_530;
+const snapshotHexBytes = 64;
+const continuationOffsets = {
+	handle: 1,
+	digest: 5,
+	snapshot: 37,
+	score: 37 + snapshotHexBytes,
+	id: 41 + snapshotHexBytes,
+};
+const maxContinuationBytes = continuationOffsets.id + maxRecordIdBytes;
+const maxContinuationCharacters = Math.ceil((maxContinuationBytes * 4) / 3);
+const maxSynchronousIdentityBytes = 64 * 1024;
+const maxPreparationCommands = Math.floor(maxSearchRequestBytes / maxSynchronousIdentityBytes);
 const filterComparators = new Set(['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between']);
 
 export { FulltextError } from './errors.js';
@@ -29,7 +48,7 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	queryApiVersion: 3;
+	queryApiVersion: 4;
 	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
 	mutationBatchApiVersion: 5;
@@ -46,6 +65,8 @@ export interface RuntimeInfo {
 		maxPrefixExpansions: number;
 		maxFuzzyTerms: number;
 		maxSearchWindow: number;
+		maxSearchPageSize: number;
+		maxFilterStringBytes: number;
 		maxAutocompleteResults: number;
 		maxSearchRequestBytes: number;
 		maxSearchResponseBytes: number;
@@ -217,6 +238,16 @@ export interface SearchRequest {
 	exactTotal?: boolean;
 }
 
+export interface SearchPageRequest extends Omit<SearchRequest, 'offset' | 'exactTotal'> {
+	offset?: number | null;
+	exactTotal?: boolean | null;
+	continuation?: string;
+}
+
+export interface SearchPageResult extends SearchResult {
+	continuation?: string;
+}
+
 export interface TraceSearchRequest {
 	text: string;
 	mode?: SearchMode;
@@ -303,6 +334,12 @@ export class NativeFullTextIndex {
 	#closedStatus?: FullTextStatus;
 	#closePromise?: Promise<CloseResult>;
 	#logicalMutationState: 'idle' | 'active' | 'incomplete' = 'idle';
+	#continuationKey?: Buffer;
+	#candidateLimits?: Pick<RuntimeInfo['limits'], 'maxCandidateIds' | 'maxCandidateBytes'>;
+	readonly #maxPreparationCommands: number;
+	readonly #maxPreparationBytes: number;
+	#preparationCommands = 0;
+	#preparationBytes = 0;
 
 	constructor(options: {
 		handle: number;
@@ -310,7 +347,17 @@ export class NativeFullTextIndex {
 		maxBatchBytes: number;
 		fieldNames: Iterable<string>;
 		filterFields?: Iterable<{ name: string; type: 'string' | 'number' | 'boolean' }>;
+		searchLimits?: Pick<NativeFullTextIndexLimits, 'maxQueuedCommands' | 'maxQueuedBytes'>;
 	}) {
+		const preparationCommands = options.searchLimits?.maxQueuedCommands ?? maxPreparationCommands;
+		const preparationBytes = options.searchLimits?.maxQueuedBytes ?? maxSearchRequestBytes;
+		for (const value of [preparationCommands, preparationBytes]) {
+			if (!Number.isInteger(value) || value < 1 || value > 0xffffffff) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'search preparation limits must be positive u32 integers');
+			}
+		}
+		this.#maxPreparationCommands = Math.min(preparationCommands, maxPreparationCommands);
+		this.#maxPreparationBytes = Math.min(preparationBytes, maxSearchRequestBytes);
 		this.#handle = options.handle;
 		this.#publication = new PublicationState(options.committedPayload);
 		this.#maxBatchBytes = options.maxBatchBytes;
@@ -563,27 +610,126 @@ export class NativeFullTextIndex {
 		this.#publication.refresh(sequence, payload);
 	}
 
-	async search(request: SearchRequest, options: SearchExecutionOptions = {}): Promise<SearchResult> {
+	#assertPreparationOpen(): void {
+		if (this.#closed || this.#closePromise) throw new FulltextError('E_CLOSED', 'fulltext index is closing or closed');
+	}
+
+	async #prepareTraversalDigest(bytes: Buffer, identityLength: number): Promise<Buffer> {
+		this.#assertPreparationOpen();
+		if (this.#preparationCommands >= this.#maxPreparationCommands) {
+			throw new FulltextError('E_QUEUE_FULL', 'traversal preparation command capacity is full');
+		}
+		if (bytes.length > this.#maxPreparationBytes - this.#preparationBytes) {
+			throw new FulltextError('E_QUEUE_FULL', 'traversal preparation byte capacity is full');
+		}
+		this.#preparationCommands++;
+		this.#preparationBytes += bytes.length;
+		try {
+			return Buffer.from(await webcrypto.subtle.digest('SHA-256', bytes.subarray(0, identityLength)));
+		} catch (error) {
+			throw normalizeNativeError(error);
+		} finally {
+			this.#preparationCommands--;
+			this.#preparationBytes -= bytes.length;
+		}
+	}
+
+	search(request: SearchRequest, options: SearchExecutionOptions = {}): Promise<SearchResult> {
+		return this.#search(request, options, false);
+	}
+
+	searchPage(request: SearchPageRequest, options: SearchExecutionOptions = {}): Promise<SearchPageResult> {
+		return this.#search(request, options, true);
+	}
+
+	async #search(
+		request: SearchPageRequest,
+		options: SearchExecutionOptions,
+		traversal: boolean,
+	): Promise<SearchPageResult> {
+		const preparationStarted = traversal ? performance.now() : 0;
 		const expression = normalizeSearchExpression(request);
+		if (!traversal && request.continuation !== undefined) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'continuation requires searchPage');
+		}
+		if (traversal && request.offset != null && request.offset !== 0) {
+			throw new FulltextError('E_INVALID_ARGUMENT', 'searchPage requires offset zero');
+		}
+		const packed = {
+			expression,
+			candidateIds: request.candidateIds,
+			filter: request.filter === undefined ? undefined : normalizeFilterExpression(request.filter, 0, { leaves: 0 }),
+			offset: request.offset ?? 0,
+			limit: request.limit ?? 20,
+			exactTotal: request.exactTotal ?? false,
+			budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
+		};
+		const deadline = traversal ? preparationStarted + packed.budgetMilliseconds : 0;
+		let tokenBytes: Buffer | undefined;
+		let tokenDigest: Buffer | undefined;
+		let after: { snapshot: string; score: number; id: string } | undefined;
+		if (traversal && request.continuation !== undefined) {
+			const token = request.continuation;
+			if (typeof token !== 'string' || token.length > maxContinuationCharacters || !/^[A-Za-z0-9_-]+$/.test(token)) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search continuation');
+			}
+			const bytes = Buffer.from(token, 'base64url');
+			if (
+				bytes.length < continuationOffsets.id + 1 ||
+				bytes.length > maxContinuationBytes ||
+				bytes.toString('base64url') !== token ||
+				bytes[0] !== 3 ||
+				bytes.readUInt32LE(continuationOffsets.handle) !== this.#handle
+			) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'continuation does not belong to this reader and query');
+			}
+			tokenBytes = bytes;
+			tokenDigest = bytes.subarray(continuationOffsets.digest, continuationOffsets.snapshot);
+			after = {
+				snapshot: bytes.toString('ascii', continuationOffsets.snapshot, continuationOffsets.score),
+				score: bytes.readFloatLE(continuationOffsets.score),
+				id: bytes.toString('utf8', continuationOffsets.id),
+			};
+			if (!Buffer.from(after.id).equals(bytes.subarray(continuationOffsets.id))) {
+				throw new FulltextError('E_INVALID_ARGUMENT', 'continuation ID is not valid UTF-8');
+			}
+		}
+
 		if (request.mode !== undefined && request.operator !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 		}
-		const cursor = await invoke((callback) =>
-			loadAddon().__nativeSearch(
-				this.#handle,
-				encodeSearch({
-					expression,
-					candidateIds: request.candidateIds,
-					filter:
-						request.filter === undefined ? undefined : normalizeFilterExpression(request.filter, 0, { leaves: 0 }),
-					offset: request.offset ?? 0,
-					limit: request.limit ?? 20,
-					exactTotal: request.exactTotal ?? false,
-					budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
-				}),
-				callback,
-			),
+		if (traversal) {
+			this.#assertPreparationOpen();
+			this.#continuationKey ??= randomBytes(32);
+		}
+		const frame = encodeSearchFrame(
+			traversal ? { ...packed, traversal: { after } } : packed,
+			traversal && packed.candidateIds !== undefined
+				? (this.#candidateLimits ??= loadAddon().runtimeInfo().limits)
+				: undefined,
 		);
+		let digest: Buffer | undefined;
+		if (traversal) {
+			const identity = frame.bytes.subarray(0, frame.identityLength);
+			digest =
+				identity.length <= maxSynchronousIdentityBytes
+					? createHash('sha256').update(identity).digest()
+					: await this.#prepareTraversalDigest(frame.bytes, frame.identityLength);
+			this.#assertPreparationOpen();
+			const remaining = Math.floor(deadline - performance.now());
+			if (remaining <= 0) throw new FulltextError('E_TIMEOUT', 'traversal preparation exceeded its execution budget');
+			frame.bytes.writeUInt32LE(remaining, frame.bytes.length - 4);
+			if (tokenDigest) {
+				const expected = continuationMac(this.#continuationKey!, digest, tokenBytes!);
+				if (tokenDigest.length !== expected.length || !timingSafeEqual(tokenDigest, expected)) {
+					throw new FulltextError(
+						'E_INVALID_ARGUMENT',
+						'continuation does not belong to this reader, query and boundary',
+					);
+				}
+			}
+		}
+		const cursor = await invoke((callback) => loadAddon().__nativeSearch(this.#handle, frame.bytes, callback));
 		const total = safeNumber(cursor.u64(), 'search total');
 		const relation = cursor.u8();
 		const hitCount = cursor.u32();
@@ -593,6 +739,35 @@ export class NativeFullTextIndex {
 			const version = cursor.u8() === 1 ? cursor.string() : undefined;
 			return { score, id, ...(version === undefined ? {} : { version }) };
 		});
+		let continuation: string | undefined;
+		if (traversal) {
+			const snapshot = cursor.string();
+			const more = cursor.u8();
+			if (
+				snapshot.length !== snapshotHexBytes ||
+				!/^[0-9a-f]+$/.test(snapshot) ||
+				more > 1 ||
+				(more === 1 && hits.length === 0)
+			) {
+				throw new FulltextError('E_NATIVE_FAILURE', 'invalid native search continuation');
+			}
+			if (more === 1) {
+				const last = hits[hits.length - 1];
+				const bytes = Buffer.alloc(continuationOffsets.id + Buffer.byteLength(last.id));
+				bytes[0] = 3;
+				bytes.writeUInt32LE(this.#handle, continuationOffsets.handle);
+				bytes.write(
+					snapshot,
+					continuationOffsets.snapshot,
+					continuationOffsets.score - continuationOffsets.snapshot,
+					'ascii',
+				);
+				bytes.writeFloatLE(last.score, continuationOffsets.score);
+				bytes.write(last.id, continuationOffsets.id, 'utf8');
+				continuationMac(this.#continuationKey!, digest!, bytes).copy(bytes, continuationOffsets.digest);
+				continuation = bytes.toString('base64url');
+			}
+		}
 		cursor.finish();
 		if (relation !== 0 && relation !== 1) {
 			throw new FulltextError('E_NATIVE_FAILURE', `Unknown total relation ${relation}`);
@@ -601,6 +776,7 @@ export class NativeFullTextIndex {
 			total,
 			totalRelation: relation === 0 ? 'exact' : 'lower-bound',
 			hits,
+			...(continuation === undefined ? {} : { continuation }),
 		};
 	}
 
@@ -614,8 +790,11 @@ export class NativeFullTextIndex {
 		if (request.mode !== undefined && request.operator !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 		}
-		if (!Array.isArray(records) || records.length > 100) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'trace records must be an array with at most 100 entries');
+		if (!Array.isArray(records) || records.length > maxTraceRecords) {
+			throw new FulltextError(
+				'E_INVALID_ARGUMENT',
+				`trace records must be an array with at most ${maxTraceRecords} entries`,
+			);
 		}
 		const seenIds = new Set<string>();
 		const sourceById = new Map<string, Record<string, string[]>>();
@@ -812,6 +991,10 @@ export class NativeFullTextReader {
 		return this.#inner.search(request, options);
 	}
 
+	searchPage(request: SearchPageRequest, options: SearchExecutionOptions = {}): Promise<SearchPageResult> {
+		return this.#inner.searchPage(request, options);
+	}
+
 	traceMatches(
 		request: TraceSearchRequest,
 		records: TraceRecord[],
@@ -1006,6 +1189,7 @@ export async function openNativeFullTextIndex(options: NativeFullTextIndexOption
 			handle,
 			committedPayload: payload,
 			maxBatchBytes: config.limits.maxBatchBytes,
+			searchLimits: config.limits,
 			fieldNames: config.fields.map((field) => field.name),
 			filterFields: config.filterFields,
 		});
@@ -1039,6 +1223,7 @@ export async function openNativeFullTextReader(options: NativeFullTextIndexOptio
 				handle,
 				committedPayload: payload,
 				maxBatchBytes: config.limits.maxBatchBytes,
+				searchLimits: config.limits,
 				fieldNames: config.fields.map((field) => field.name),
 				filterFields: config.filterFields,
 			}),
@@ -1091,7 +1276,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			queryApiVersion: info.queryApiVersion as 3,
+			queryApiVersion: info.queryApiVersion as 4,
 			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
 			mutationBatchApiVersion: 5,
@@ -1107,7 +1292,9 @@ function asBuffer(value: Uint8Array): Buffer {
 	return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
 }
 
-function normalizeSearchExpression(request: SearchRequest): import('./codec.js').PackedSearchExpression {
+function normalizeSearchExpression(
+	request: Pick<SearchRequest, 'text' | 'query' | 'mode' | 'operator' | 'fields'>,
+): import('./codec.js').PackedSearchExpression {
 	if (!request || typeof request !== 'object' || Array.isArray(request)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'search request must be an object');
 	}
@@ -1133,7 +1320,7 @@ function normalizeSearchExpression(request: SearchRequest): import('./codec.js')
 }
 
 function normalizeExpression(expression: SearchExpression, depth: number): import('./codec.js').PackedSearchExpression {
-	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > 8) {
+	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > maxExpressionDepth) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search expression');
 	}
 	if ('text' in expression) {
@@ -1167,12 +1354,12 @@ function normalizeFilterExpression(
 	depth: number,
 	state: { leaves: number },
 ): import('./codec.js').PackedFilterExpression {
-	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > 8) {
+	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > maxExpressionDepth) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid filter expression');
 	}
 	if ('field' in expression) {
-		if (++state.leaves > 256) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'filter expression exceeds 256 clauses');
+		if (++state.leaves > maxQueryClauses) {
+			throw new FulltextError('E_INVALID_ARGUMENT', `filter expression exceeds ${maxQueryClauses} clauses`);
 		}
 		if (typeof expression.field !== 'string' || expression.field.length === 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'filter clauses require a field');
@@ -1182,7 +1369,11 @@ function normalizeFilterExpression(
 		}
 		const values = Array.isArray(expression.value) ? expression.value.slice() : [expression.value];
 		const expected = expression.comparator === 'in' ? undefined : expression.comparator === 'between' ? 2 : 1;
-		if (values.length === 0 || values.length > 256 || (expected !== undefined && values.length !== expected)) {
+		if (
+			values.length === 0 ||
+			values.length > maxQueryClauses ||
+			(expected !== undefined && values.length !== expected)
+		) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'invalid filter value count');
 		}
 		if (values.some((value) => !['string', 'number', 'boolean'].includes(typeof value))) {
@@ -1200,9 +1391,9 @@ function normalizeFilterExpression(
 		(expression.operator !== 'and' && expression.operator !== 'or') ||
 		!Array.isArray(expression.clauses) ||
 		expression.clauses.length === 0 ||
-		expression.clauses.length > 256
+		expression.clauses.length > maxQueryClauses
 	) {
-		throw new FulltextError('E_INVALID_ARGUMENT', 'filter boolean expressions require 1 to 256 clauses');
+		throw new FulltextError('E_INVALID_ARGUMENT', `filter boolean expressions require 1 to ${maxQueryClauses} clauses`);
 	}
 	return {
 		operator: expression.operator,
@@ -1239,11 +1430,11 @@ function safeNumber(value: bigint, name: string): number {
 }
 
 function searchBudget(value: number | undefined): number {
-	if (value === undefined) return 30_000;
+	if (value === undefined) return maxSearchBudgetMilliseconds;
 	if (!Number.isFinite(value) || value <= 0) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'remainingBudgetMilliseconds must be greater than zero');
 	}
-	return Math.min(30_000, Math.max(1, Math.floor(value)));
+	return Math.min(maxSearchBudgetMilliseconds, Math.max(1, Math.floor(value)));
 }
 
 function traceFragments(
@@ -1293,4 +1484,12 @@ async function canonicalSiblingPath(value: string): Promise<string> {
 		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return value;
 		throw error;
 	}
+}
+
+function continuationMac(key: Buffer, digest: Buffer, token: Buffer): Buffer {
+	return createHmac('sha256', key)
+		.update(token.subarray(0, continuationOffsets.digest))
+		.update(token.subarray(continuationOffsets.snapshot))
+		.update(digest)
+		.digest();
 }
