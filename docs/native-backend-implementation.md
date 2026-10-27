@@ -170,7 +170,7 @@ production guarantee; keep the preparation-heavy controls when revisiting full f
 The public types in [`ts/native.ts`](../ts/native.ts) define the API. Generated declarations in
 `ts/addon.d.ts` describe the private addon interface and are not consumer types.
 
-Use the [README examples](../README.md#native-usage) for opening an index, mutations, Boolean
+Use the [README examples](../README.md#quick-start) for opening an index, mutations, Boolean
 queries, structured filters, and traversal. Keeping the type definitions in one place avoids stale
 copies when the API changes. Each open requires explicit per-index thread, writer-memory, and queue
 limits; [limits and their effects](limits.md) explains their constraints.
