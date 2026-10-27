@@ -63,6 +63,16 @@ jobs:
           --queries "$QUERIES"
           --revision "$REVISION"
           --output "benchmark-multi-index-${{ matrix.target }}.json"
+      - name: Run hydration query matrix
+        env:
+          REVISION: ${{ github.event.release.tag_name || github.sha }}
+        run: |
+          node scripts/run-local.mjs benchmarks/ordinary-search.mjs . "$REVISION" --hydration > "benchmark-hydration-${{ matrix.target }}.jsonl"
+          node scripts/run-local.mjs benchmarks/ordinary-search.mjs . "$REVISION" --hydration --approximate-totals >> "benchmark-hydration-${{ matrix.target }}.jsonl"
+      - name: Run fuzzy trace matrix
+        env:
+          REVISION: ${{ github.event.release.tag_name || github.sha }}
+        run: node scripts/run-local.mjs benchmarks/trace-matching.mjs . "$REVISION" > "benchmark-trace-${{ matrix.target }}.jsonl"
       - name: Store workflow result
         uses: actions/upload-artifact@v4
         with:
@@ -70,6 +80,8 @@ jobs:
           path: |
             ${{ matrix.output }}
             benchmark-multi-index-${{ matrix.target }}.json
+            benchmark-hydration-${{ matrix.target }}.jsonl
+            benchmark-trace-${{ matrix.target }}.jsonl
           if-no-files-found: error
           retention-days: 90
 
@@ -90,4 +102,4 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" benchmark-*.json --clobber
+        run: gh release upload "$RELEASE_TAG" benchmark-*.json benchmark-*.jsonl --clobber

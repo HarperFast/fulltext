@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Bound, Range};
 use std::path::Path;
@@ -5,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
+use tantivy_fst::Automaton;
 
 use tantivy::collector::sort_key::{NaturalComparator, ReverseComparator};
 use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs, TopNComputer};
@@ -13,8 +15,8 @@ use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
 use tantivy::index::SegmentId;
 use tantivy::query::{
-	BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery,
-	Query, RangeQuery, TermQuery, TermSetQuery,
+	BooleanQuery, BoostQuery, ConstScoreQuery, DfaWrapper, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur,
+	PhraseQuery, Query, RangeQuery, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{
 	Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, FAST, INDEXED,
@@ -390,9 +392,49 @@ enum TracePlan {
 	Prefix {
 		completed: Vec<String>,
 		prefix: String,
-		fuzzy: bool,
+		matcher: Option<FuzzyPrefixMatcher>,
 	},
 	Fuzzy(Vec<(String, String)>),
+}
+
+struct FuzzyPrefixMatcher {
+	text: String,
+	field: Field,
+	automaton: OnceCell<Result<DfaWrapper>>,
+}
+
+impl FuzzyPrefixMatcher {
+	fn new(text: &str, field: Field) -> Self {
+		Self {
+			text: text.to_owned(),
+			field,
+			automaton: OnceCell::new(),
+		}
+	}
+
+	fn matches(&self, candidate: &str) -> Result<bool> {
+		if candidate.starts_with(&self.text) {
+			return Ok(true);
+		}
+
+		let automaton = self
+			.automaton
+			.get_or_init(|| {
+				let term = Term::from_field_text(self.field, &self.text);
+				let query = FuzzyTermQuery::new_prefix(term, 1, true);
+				query.automaton().map_err(index_error)
+			})
+			.as_ref()
+			.map_err(Clone::clone)?;
+		let mut state = automaton.start();
+		for byte in candidate.bytes() {
+			state = automaton.accept(&state, byte);
+			if !automaton.can_match(&state) {
+				return Ok(false);
+			}
+		}
+		Ok(automaton.is_match(&state))
+	}
 }
 
 impl TracePlan {
@@ -653,13 +695,7 @@ impl Engine {
 			check_deadline(deadline)?;
 			let more = scored_docs.len() > request.limit;
 			scored_docs.truncate(request.limit);
-			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
-			let versions = search_hit_versions(searcher, &addresses)?;
-			let hits = scored_docs
-				.into_iter()
-				.zip(versions)
-				.map(|(((score, id), _), version)| SearchHit { id, score, version })
-				.collect::<Vec<_>>();
+			let hits = search_hits(searcher, scored_docs)?;
 			let bytes = search_response_bytes(&hits, 13 + 4 + snapshot.len() + 1)?;
 			if bytes > MAX_SEARCH_RESPONSE_BYTES {
 				return Err(FulltextError::new(
@@ -689,13 +725,7 @@ impl Engine {
 				.map_err(index_error)??;
 			check_deadline(deadline)?;
 			scored_docs.truncate(request.limit);
-			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
-			let versions = search_hit_versions(searcher, &addresses)?;
-			let hits = scored_docs
-				.into_iter()
-				.zip(versions)
-				.map(|(((score, id), _), version)| SearchHit { id, score, version })
-				.collect::<Vec<_>>();
+			let hits = search_hits(searcher, scored_docs)?;
 			let (total, relation) = if retained < window_end.saturating_add(1) {
 				(retained as u64, TotalRelation::Exact)
 			} else {
@@ -719,35 +749,28 @@ impl Engine {
 						&StableScoreTieCollector::new(request.offset..window_end),
 					)
 					.map_err(index_error)??;
-				let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
-				let versions = search_hit_versions(searcher, &addresses)?;
-				let hits = scored_docs
-					.into_iter()
-					.zip(versions)
-					.map(|(((score, id), _), version)| SearchHit { id, score, version })
-					.collect::<Vec<_>>();
+				let hits = search_hits(searcher, scored_docs)?;
 				(hits, Some(match_count))
 			} else {
-				let metadata = search_hit_metadata(searcher, &scored_docs)?;
+				let ids = search_hit_ids(searcher, &scored_docs)?;
 				let mut ranked = scored_docs
 					.iter()
-					.zip(metadata)
-					.map(|((score, _), metadata)| SearchHit {
-						id: metadata.id,
-						score: *score,
-						version: metadata.version,
-					})
+					.zip(ids)
+					.map(|((score, address), id)| ((*score, id), *address))
 					.collect::<Vec<_>>();
-				ranked.sort_by(|left, right| {
-					right
-						.score
-						.total_cmp(&left.score)
-						.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+				ranked.sort_unstable_by(|((left_score, left_id), left), ((right_score, right_id), right)| {
+					right_score
+						.total_cmp(left_score)
+						.then_with(|| left_id.as_bytes().cmp(right_id.as_bytes()))
+						.then_with(|| left.cmp(right))
 				});
-				(
-					ranked.into_iter().skip(request.offset).take(request.limit).collect(),
-					None,
-				)
+				let page = ranked
+					.into_iter()
+					.skip(request.offset)
+					.take(request.limit)
+					.collect::<Vec<_>>();
+				let hits = search_hits(searcher, page)?;
+				(hits, None)
 			};
 			let (total, relation) = if scored_docs.len() <= window_end {
 				(scored_docs.len() as u64, TotalRelation::Exact)
@@ -951,10 +974,12 @@ impl Engine {
 						}
 					)));
 				}
+				let matcher = (request.mode == SearchMode::FuzzyPrefix && fuzzy_eligible(&prefix))
+					.then(|| FuzzyPrefixMatcher::new(&prefix, self.id_field));
 				Ok(TracePlan::Prefix {
 					completed,
 					prefix,
-					fuzzy: request.mode == SearchMode::FuzzyPrefix,
+					matcher,
 				})
 			}
 			SearchMode::Fuzzy => {
@@ -1058,7 +1083,7 @@ impl Engine {
 			TracePlan::Prefix {
 				completed,
 				prefix,
-				fuzzy,
+				matcher,
 			} => {
 				let (surface, surface_truncated) = Self::source_tokens(surface_source_analyzer, value, deadline)?;
 				analysis_truncated |= surface_truncated;
@@ -1084,8 +1109,10 @@ impl Engine {
 						check_deadline(deadline)?;
 					}
 					if token.text.starts_with(prefix)
-						|| (*fuzzy && fuzzy_eligible(prefix) && fuzzy_prefix_matches(prefix, &token.text))
-					{
+						|| match matcher {
+							Some(matcher) => matcher.matches(&token.text)?,
+							None => false,
+						} {
 						found.insert("__prefix".to_owned());
 						spans_truncated |= push_trace_span(
 							&mut spans,
@@ -1772,15 +1799,28 @@ fn search_response_bytes(hits: &[SearchHit], header_bytes: usize) -> Result<usiz
 	})
 }
 
-fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<Vec<Option<String>>> {
+fn search_hits(searcher: &Searcher, scored_docs: Vec<StableScoreTieHit>) -> Result<Vec<SearchHit>> {
+	let versions = search_hit_versions(searcher, scored_docs.iter().map(|(_, address)| *address))?;
+	Ok(scored_docs
+		.into_iter()
+		.zip(versions)
+		.map(|(((score, id), _), version)| SearchHit { id, score, version })
+		.collect())
+}
+
+fn search_hit_versions(
+	searcher: &Searcher,
+	addresses: impl ExactSizeIterator<Item = DocAddress>,
+) -> Result<Vec<Option<String>>> {
+	let count = addresses.len();
 	let mut hits_by_segment = HashMap::new();
-	for (index, address) in addresses.iter().enumerate() {
+	for (index, address) in addresses.enumerate() {
 		hits_by_segment
 			.entry(address.segment_ord)
 			.or_insert_with(Vec::new)
 			.push((index, address.doc_id));
 	}
-	let mut versions = vec![None; addresses.len()];
+	let mut versions = vec![None; count];
 	for (segment_ord, segment_hits) in hits_by_segment {
 		let segment = &searcher.segment_readers()[segment_ord as usize];
 		let Some(column) = segment.fast_fields().str(VERSION_FIELD_NAME).map_err(index_error)? else {
@@ -1812,18 +1852,8 @@ fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<
 	Ok(versions)
 }
 
-struct SearchHitMetadata {
-	id: String,
-	version: Option<String>,
-}
-
-fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Result<Vec<SearchHitMetadata>> {
-	let mut metadata = (0..scored_docs.len())
-		.map(|_| SearchHitMetadata {
-			id: String::new(),
-			version: None,
-		})
-		.collect::<Vec<_>>();
+fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Result<Vec<String>> {
+	let mut ids = vec![String::new(); scored_docs.len()];
 	let mut hits_by_segment = HashMap::new();
 	for (index, (_, address)) in scored_docs.iter().enumerate() {
 		hits_by_segment
@@ -1838,7 +1868,6 @@ fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -
 			.str(ID_FIELD_NAME)
 			.map_err(index_error)?
 			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no ID fast field"))?;
-		let version_column = segment.fast_fields().str(VERSION_FIELD_NAME).map_err(index_error)?;
 		let id_ordinals = segment_hits
 			.iter()
 			.enumerate()
@@ -1850,46 +1879,19 @@ fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -
 				Ok((ordinal, result_index))
 			})
 			.collect::<Result<Vec<_>>>()?;
-		let ids = resolve_string_ordinals(
+		let segment_ids = resolve_string_ordinals(
 			&id_column,
 			id_ordinals,
 			segment_hits.len(),
 			"search hit ID ordinal is missing",
 		)?;
-		for ((index, _), id) in segment_hits.iter().zip(ids) {
+		for ((index, _), id) in segment_hits.iter().zip(segment_ids) {
 			let id = id.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit ID ordinal is missing"))?;
-			metadata[*index].id = String::from_utf8(id)
+			ids[*index] = String::from_utf8(id)
 				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?;
 		}
-		if let Some(version_column) = version_column {
-			let ordinals = segment_hits
-				.iter()
-				.enumerate()
-				.filter_map(|(result_index, (_, doc_id))| {
-					version_column
-						.term_ords(*doc_id)
-						.next()
-						.map(|ordinal| (ordinal, result_index))
-				})
-				.collect();
-			let versions = resolve_string_ordinals(
-				&version_column,
-				ordinals,
-				segment_hits.len(),
-				"search hit version ordinal is missing",
-			)?;
-			for ((index, _), version) in segment_hits.into_iter().zip(versions) {
-				let Some(version) = version else {
-					continue;
-				};
-				metadata[index].version = Some(
-					String::from_utf8(version)
-						.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit version is not UTF-8"))?,
-				);
-			}
-		}
 	}
-	Ok(metadata)
+	Ok(ids)
 }
 
 fn resolve_string_ordinals(
@@ -1901,20 +1903,22 @@ fn resolve_string_ordinals(
 	ordinals.sort_unstable();
 	let mut values = vec![None; value_count];
 	let mut next_ordinal = 0;
+	let mut extra_terms = false;
+	let sorted_ordinals = ordinals.iter().map(|(ordinal, _)| *ordinal).collect::<Vec<_>>();
 	let found_all = column
 		.dictionary()
-		.sorted_ords_to_term_cb(ordinals.iter().map(|(ordinal, _)| *ordinal), |value| {
-			let Some((_, result_index)) = ordinals.get(next_ordinal) else {
-				return Err(std::io::Error::new(
-					std::io::ErrorKind::InvalidData,
-					"string dictionary returned too many terms",
-				));
-			};
+		.sorted_ords_to_term_cb(&sorted_ordinals, |value| {
+			if let Some((_, result_index)) = ordinals.get(next_ordinal) {
+				values[*result_index] = Some(value.to_vec());
+			} else {
+				extra_terms = true;
+			}
 			next_ordinal += 1;
-			values[*result_index] = Some(value.to_vec());
-			Ok(())
 		})
 		.map_err(storage_error)?;
+	if extra_terms {
+		return Err(storage_error("string dictionary returned too many terms"));
+	}
 	if !found_all || next_ordinal != ordinals.len() {
 		return Err(FulltextError::new("E_NATIVE_FAILURE", missing_message));
 	}
@@ -2031,18 +2035,6 @@ fn within_one_edit(left: &str, right: &str) -> bool {
 		longer.next();
 	}
 	true
-}
-
-fn fuzzy_prefix_matches(prefix: &str, candidate: &str) -> bool {
-	let prefix_length = prefix.chars().count();
-	(prefix_length.saturating_sub(1)..=prefix_length.saturating_add(1)).any(|length| {
-		let end = candidate
-			.char_indices()
-			.nth(length)
-			.map_or(candidate.len(), |(index, _)| index);
-		let candidate_prefix = &candidate[..end];
-		within_one_edit(prefix, candidate_prefix)
-	})
 }
 
 fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -2193,9 +2185,14 @@ fn build_schema_with_surface_record(
 		.set_tokenizer("raw")
 		.set_index_option(IndexRecordOption::Basic)
 		.set_fieldnorms(false);
-	let id_options = TextOptions::default().set_indexing_options(id_indexing).set_fast(None);
+	let id_options = TextOptions::default()
+		.set_indexing_options(id_indexing)
+		.set_fast(tantivy::tokenizer::RAW_TOKENIZER_NAME);
 	let id_field = builder.add_text_field(ID_FIELD_NAME, id_options);
-	let version_field = builder.add_text_field(VERSION_FIELD_NAME, TextOptions::default().set_fast(None));
+	let version_field = builder.add_text_field(
+		VERSION_FIELD_NAME,
+		TextOptions::default().set_fast(tantivy::tokenizer::RAW_TOKENIZER_NAME),
+	);
 	let record = if config.positions {
 		IndexRecordOption::WithFreqsAndPositions
 	} else {
@@ -2786,9 +2783,9 @@ fn canonical_synonym_term(analyzer: &mut TextAnalyzer, text: &str, label: &str) 
 
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 	let mut bytes = if config.filter_fields.is_empty() {
-		b"HTFI\x04\x00".to_vec()
+		b"HTFI\x06\x00".to_vec()
 	} else {
-		b"HTFI\x05\x00".to_vec()
+		b"HTFI\x07\x00".to_vec()
 	};
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
@@ -2829,7 +2826,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	if bytes.get(..4)? != b"HTFI"
 		|| !matches!(
 			version,
-			b"\x01\x00" | b"\x02\x00" | b"\x03\x00" | b"\x04\x00" | b"\x05\x00"
+			b"\x01\x00" | b"\x02\x00" | b"\x03\x00" | b"\x04\x00" | b"\x05\x00" | b"\x06\x00" | b"\x07\x00"
 		) {
 		return None;
 	}
@@ -2845,7 +2842,10 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 		return None;
 	}
 	offset += 3;
-	if matches!(version, b"\x03\x00" | b"\x04\x00" | b"\x05\x00") {
+	if matches!(
+		version,
+		b"\x03\x00" | b"\x04\x00" | b"\x05\x00" | b"\x06\x00" | b"\x07\x00"
+	) {
 		let synonym_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
 		for _ in 0..synonym_count {
@@ -2863,7 +2863,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	for _ in 0..field_count {
 		take_string(bytes, &mut offset)?;
 	}
-	if version == b"\x05\x00" {
+	if matches!(version, b"\x05\x00" | b"\x07\x00") {
 		let filter_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
 		for _ in 0..filter_count {
@@ -3479,8 +3479,8 @@ mod tests {
 			.unwrap();
 		let mut legacy = legacy_docs
 			.iter()
-			.zip(search_hit_metadata(&searcher, &legacy_docs).unwrap())
-			.map(|((score, _), metadata)| (metadata.id, *score))
+			.zip(search_hit_ids(&searcher, &legacy_docs).unwrap())
+			.map(|((score, _), id)| (id, *score))
 			.collect::<Vec<_>>();
 		legacy.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 		assert_eq!(
@@ -3548,16 +3548,95 @@ mod tests {
 	}
 
 	#[test]
-	fn edit_distance_helpers_handle_unicode_and_transposition_without_allocation() {
-		assert!(within_one_edit("shoe", "shoe"));
-		assert!(within_one_edit("shoe", "shoo"));
-		assert!(within_one_edit("shoe", "sohe"));
-		assert!(within_one_edit("shoe", "shoes"));
-		assert!(within_one_edit("café", "cafe"));
-		assert!(!within_one_edit("shoe", "boot"));
-		assert!(fuzzy_prefix_matches("shoe", "shoestring"));
-		assert!(fuzzy_prefix_matches("shoe", "sjoestring"));
-		assert!(!fuzzy_prefix_matches("shoe", "boots"));
+	fn fuzzy_prefix_matcher_prepares_only_after_exact_prefix_misses() {
+		let prefix = FuzzyPrefixMatcher::new("shoe", Field::from_field_id(0));
+		assert!(prefix.matches("shoestring").unwrap());
+		assert!(prefix.automaton.get().is_none());
+		assert!(prefix.matches("sjoestring").unwrap());
+		assert!(prefix.automaton.get().is_some());
+	}
+
+	#[test]
+	fn trace_fuzzy_predicates_agree_with_tantivy_dictionary_automata() {
+		for text in ["shoe", "café", "κόσμος", "e\u{301}lan", "𐐨abc"] {
+			let chars = text.chars().collect::<Vec<_>>();
+			let mut candidates = HashSet::from([text.to_owned(), "zzzzzzzzzz".to_owned(), String::new()]);
+			for index in 0..=chars.len() {
+				for replacement in ['x', 'é', '𐐨'] {
+					let mut inserted = chars.clone();
+					inserted.insert(index, replacement);
+					candidates.insert(inserted.iter().collect());
+					if index < chars.len() {
+						let mut changed = chars.clone();
+						changed[index] = replacement;
+						candidates.insert(changed.iter().collect());
+					}
+				}
+				if index < chars.len() {
+					let mut removed = chars.clone();
+					removed.remove(index);
+					candidates.insert(removed.iter().collect());
+				}
+				if index + 1 < chars.len() {
+					let mut swapped = chars.clone();
+					swapped.swap(index, index + 1);
+					candidates.insert(swapped.iter().collect());
+				}
+			}
+			let candidates = candidates
+				.into_iter()
+				.flat_map(|candidate| [candidate.clone(), format!("{candidate}tail")])
+				.collect::<BTreeSet<_>>();
+			let mut schema = Schema::builder();
+			let field = schema.add_text_field(
+				"term",
+				TextOptions::default().set_indexing_options(
+					TextFieldIndexing::default()
+						.set_tokenizer("raw")
+						.set_index_option(IndexRecordOption::Basic),
+				),
+			);
+			let index = Index::create_in_ram(schema.build());
+			let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+			for candidate in &candidates {
+				let mut document = TantivyDocument::default();
+				document.add_text(field, candidate);
+				writer.add_document(document).unwrap();
+			}
+			writer.commit().unwrap();
+			let searcher = index.reader().unwrap().searcher();
+			for prefix in [false, true] {
+				let term = Term::from_field_text(field, text);
+				let query = if prefix {
+					FuzzyTermQuery::new_prefix(term, 1, true)
+				} else {
+					FuzzyTermQuery::new(term, 1, true)
+				};
+				let mut expected = HashSet::new();
+				for segment in searcher.segment_readers() {
+					let inverted = segment.inverted_index(field).unwrap();
+					let mut stream = inverted
+						.terms()
+						.search(query.automaton().unwrap())
+						.into_stream()
+						.unwrap();
+					while stream.advance() {
+						expected.insert(String::from_utf8(stream.key().to_vec()).unwrap());
+					}
+				}
+				let matcher = prefix.then(|| FuzzyPrefixMatcher::new(text, field));
+				for candidate in &candidates {
+					assert_eq!(
+						match &matcher {
+							Some(matcher) => matcher.matches(candidate).unwrap(),
+							None => within_one_edit(text, candidate),
+						},
+						expected.contains(candidate),
+						"{text:?} {candidate:?} prefix={prefix}"
+					);
+				}
+			}
+		}
 	}
 
 	#[test]
@@ -3892,6 +3971,48 @@ mod tests {
 	}
 
 	#[test]
+	fn previous_stemmer_identities_require_rebuild_before_open_or_inspection() {
+		for filtered in [false, true] {
+			let mut config = config();
+			if filtered {
+				config.identity.filter_fields.push(FilterFieldConfig {
+					name: "category".to_owned(),
+					field_type: FilterFieldType::String,
+				});
+			}
+			let directory = RamDirectory::create();
+			let engine = Engine::open(directory.clone(), &config).unwrap();
+			let mut writer = engine.writer(&config).unwrap();
+			writer.apply(batch()).unwrap();
+			writer.commit().unwrap();
+			writer.close().unwrap();
+			drop(engine);
+			let mut identity = identity_bytes(&config.identity);
+			identity[4] = if filtered { 5 } else { 4 };
+			assert_eq!(persisted_index_id(&identity), Some("products"));
+			directory.atomic_write(Path::new(IDENTITY_PATH), &identity).unwrap();
+			assert_eq!(
+				Engine::inspect(directory.clone(), &config.identity).unwrap_err().code,
+				"E_IDENTITY_MISMATCH"
+			);
+			let error = match Engine::open(directory, &config) {
+				Ok(_) => panic!("old stemmer identity was opened"),
+				Err(error) => error,
+			};
+			assert_eq!(error.code, "E_IDENTITY_MISMATCH");
+		}
+	}
+
+	#[test]
+	fn english_stemmer_produces_frostem_tokens() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		assert_eq!(
+			engine.analyze("added acarologist", false, false).unwrap(),
+			vec!["add", "acarolog"]
+		);
+	}
+
+	#[test]
 	fn persisted_index_id_accepts_legacy_sidecars_for_reset_only() {
 		let config = config();
 		for version in [b"\x02\x00".as_slice(), b"\x03\x00".as_slice()] {
@@ -4119,6 +4240,137 @@ mod tests {
 	}
 
 	#[test]
+	fn dictionary_resolution_preserves_duplicate_ordinals_and_result_order() {
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: ["Shared-Version", "Other-Version", "Shared-Version"]
+					.into_iter()
+					.enumerate()
+					.map(|(i, version)| crate::protocol::Upsert {
+						id: i.to_string(),
+						version: Some(version.to_owned()),
+						fields: vec![("title".to_owned(), vec!["trail shoe".to_owned()])],
+						filters: Vec::new(),
+					})
+					.collect(),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		assert_eq!(searcher.segment_readers().len(), 1);
+		let column = searcher.segment_readers()[0]
+			.fast_fields()
+			.str(VERSION_FIELD_NAME)
+			.unwrap()
+			.unwrap();
+		let shared = column.dictionary().term_ord(b"Shared-Version").unwrap().unwrap();
+		let other = column.dictionary().term_ord(b"Other-Version").unwrap().unwrap();
+		assert_eq!(
+			resolve_string_ordinals(
+				&column,
+				vec![(shared, 2), (other, 0), (shared, 1)],
+				3,
+				"missing version"
+			)
+			.unwrap(),
+			vec![
+				Some(b"Other-Version".to_vec()),
+				Some(b"Shared-Version".to_vec()),
+				Some(b"Shared-Version".to_vec())
+			]
+		);
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn scorer_and_for_each_preserve_score_bits() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		let terms = [
+			"waterproof",
+			"trail",
+			"running",
+			"shoe",
+			"forest",
+			"mountain",
+			"river",
+			"stone",
+			"winter",
+			"summer",
+		];
+		for segment in 0..3 {
+			writer
+				.apply(MutationBatch {
+					upserts: (0..96)
+						.map(|doc| crate::protocol::Upsert {
+							id: format!("{segment}-{doc}"),
+							version: None,
+							fields: vec![
+								(
+									"title".to_owned(),
+									vec![terms
+										.iter()
+										.enumerate()
+										.filter(|(term, _)| (doc + term) % 4 != 0)
+										.map(|(term, text)| text.repeat((doc + term) % 3 + 1))
+										.collect::<Vec<_>>()
+										.join(" ")],
+								),
+								("description".to_owned(), vec![terms.join(" ").repeat(doc % 7 + 1)]),
+							],
+							filters: Vec::new(),
+						})
+						.collect(),
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let searcher = engine.reader().unwrap().searcher();
+		for (text, mode) in [
+			(terms.join(" "), SearchMode::Any),
+			(terms.join(" "), SearchMode::All),
+			("waterproof trail".to_owned(), SearchMode::Phrase),
+			("waterproo".to_owned(), SearchMode::Prefix),
+			("waterproff".to_owned(), SearchMode::Fuzzy),
+		] {
+			let built = engine
+				.expression_query(&searcher, &expression(&text, mode, Vec::new()))
+				.unwrap();
+			let weight = built
+				.query
+				.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
+				.unwrap();
+			for reader in searcher.segment_readers() {
+				let mut scorer = weight.scorer(reader, 1.0).unwrap();
+				let mut scored = Vec::new();
+				while scorer.doc() != tantivy::TERMINATED {
+					scored.push((scorer.doc(), scorer.score().to_bits()));
+					scorer.advance();
+				}
+				let mut enumerated = Vec::new();
+				weight
+					.for_each(reader, &mut |doc, score| enumerated.push((doc, score.to_bits())))
+					.unwrap();
+				assert!(!scored.is_empty(), "fixture must match {text}");
+				scored.sort_unstable();
+				enumerated.sort_unstable();
+				assert_eq!(scored, enumerated, "scoring topology changed for {text}");
+			}
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
 	fn orders_equal_scores_by_id_across_segments_and_pages() {
 		let directory = RamDirectory::create();
 		let config = config();
@@ -4141,6 +4393,8 @@ mod tests {
 			"catalog-0003",
 			"catalog-0006",
 			"catalog-0005",
+			"Catalog-UPPER",
+			"catalog-upper",
 			"catalog-0004",
 		];
 		for (chunk_index, ids) in inserted_ids.chunks(7).enumerate() {
@@ -4169,6 +4423,19 @@ mod tests {
 			writer.commit().unwrap();
 		}
 		let reader = engine.reader().unwrap();
+		for segment in reader.searcher().segment_readers() {
+			let column = segment.fast_fields().str(ID_FIELD_NAME).unwrap().unwrap();
+			let mut ids = Vec::new();
+			for doc in 0..segment.max_doc() {
+				let ordinal = column.ords().first(doc).unwrap();
+				let mut id = String::new();
+				assert!(column.ord_to_str(ordinal, &mut id).unwrap());
+				ids.push((ordinal, id));
+			}
+			assert!(ids.len() > 1);
+			ids.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+			assert!(ids.windows(2).all(|pair| pair[0].1.as_bytes() <= pair[1].1.as_bytes()));
+		}
 		let page = |offset, limit| {
 			engine
 				.search(
@@ -4324,7 +4591,7 @@ mod tests {
 	}
 
 	#[test]
-	fn resolves_hit_metadata_in_document_order_with_duplicate_and_missing_versions() {
+	fn resolves_hit_ids_and_versions_in_document_order_with_duplicate_and_missing_versions() {
 		let config = config();
 		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
 		let mut writer = engine.writer(&config).unwrap();
@@ -4348,22 +4615,97 @@ mod tests {
 			.into_iter()
 			.map(|doc_id| (1.0, DocAddress::new(0, doc_id)))
 			.collect::<Vec<_>>();
-		let metadata = search_hit_metadata(&searcher, &scored_docs).unwrap();
 		assert_eq!(
-			metadata
-				.iter()
-				.map(|value| (value.id.as_str(), value.version.as_deref()))
-				.collect::<Vec<_>>(),
-			vec![("three", Some("shared")), ("one", Some("shared")), ("two", None)]
+			search_hit_ids(&searcher, &scored_docs).unwrap(),
+			vec!["three", "one", "two"]
 		);
 		assert_eq!(
-			search_hit_versions(
-				&searcher,
-				&scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>()
-			)
-			.unwrap(),
+			search_hit_versions(&searcher, scored_docs.iter().map(|(_, address)| *address)).unwrap(),
 			vec![Some("shared".to_owned()), Some("shared".to_owned()), None]
 		);
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn offset_pages_preserve_versions_scores_and_totals_inside_score_ties() {
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for group in 0..3 {
+			writer
+				.apply(MutationBatch {
+					upserts: ["z", "A", "é", "a"]
+						.into_iter()
+						.enumerate()
+						.map(|(i, suffix)| crate::protocol::Upsert {
+							id: format!("{group}-{suffix}"),
+							version: match i % 3 {
+								0 => None,
+								1 => Some("shared".to_owned()),
+								_ => Some("long".repeat(512)),
+							},
+							fields: vec![(
+								"title".to_owned(),
+								vec![format!("catalog {}", "other ".repeat(group * 100))],
+							)],
+							filters: Vec::new(),
+						})
+						.collect(),
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let searcher = engine.reader().unwrap().searcher();
+		let mut request = SearchRequest {
+			expression: expression("catalog", SearchMode::All, vec!["title".to_owned()]),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 12,
+			exact_total: true,
+			budget_milliseconds: 30_000,
+			traversal: false,
+			after: None,
+		};
+		let full = engine.search(&searcher, &request).unwrap();
+		assert_eq!(
+			full.hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
+			(0..3)
+				.flat_map(|group| ["A", "a", "z", "é"].map(|suffix| format!("{group}-{suffix}")))
+				.collect::<Vec<_>>()
+		);
+		assert_eq!(full.hits[0].score.to_bits(), full.hits[3].score.to_bits());
+		assert!(full.hits[3].score > full.hits[4].score);
+		assert!(full.hits[7].score > full.hits[8].score);
+		let hits = |values: &[SearchHit]| {
+			values
+				.iter()
+				.map(|hit| (hit.id.clone(), hit.score.to_bits(), hit.version.clone()))
+				.collect::<Vec<_>>()
+		};
+		for exact in [false, true] {
+			for (offset, limit) in [(1, 7), (1, 2), (9, 5), (12, 5)] {
+				request.offset = offset;
+				request.limit = limit;
+				request.exact_total = exact;
+				let page = engine.search(&searcher, &request).unwrap();
+				assert_eq!(hits(&page.hits), hits(&full.hits[offset..12.min(offset + limit)]));
+				let lower_bound = !exact && offset + limit < 12;
+				assert_eq!(page.total, if lower_bound { (offset + limit) as u64 } else { 12 });
+				assert_eq!(
+					page.total_relation,
+					if lower_bound {
+						TotalRelation::LowerBound
+					} else {
+						TotalRelation::Exact
+					}
+				);
+			}
+		}
 		writer.close().unwrap();
 	}
 
@@ -4428,7 +4770,7 @@ mod tests {
 	fn validates_the_complete_persisted_identity() {
 		let config = config();
 		let mut identity = identity_bytes(&config.identity);
-		assert_eq!(&identity[4..6], b"\x04\x00");
+		assert_eq!(&identity[4..6], b"\x06\x00");
 		assert_eq!(persisted_index_id(&identity), Some("products"));
 
 		identity.pop();
@@ -4444,7 +4786,7 @@ mod tests {
 			field_type: FilterFieldType::String,
 		});
 		let identity = identity_bytes(&filtered);
-		assert_eq!(&identity[4..6], b"\x05\x00");
+		assert_eq!(&identity[4..6], b"\x07\x00");
 		assert_eq!(persisted_index_id(&identity), Some("products"));
 	}
 

@@ -2,9 +2,43 @@
 
 Native Tantivy full-text indexing for Node.js.
 
+**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.7.0.** The engine is compiled into
+the native addon; no separate Tantivy installation is required. Upgrading from fulltext 0.6.x
+requires an index rebuild; see [Upgrading from 0.6.x](#upgrading-from-06x) before deploying.
+
 This repository is under active development. The native entry point provides a standalone Tantivy
 index backed by `MmapDirectory`. Applications own their source records and may reuse compatible
 local index files or rebuild them from that authoritative data.
+
+## Start here
+
+- [Capabilities](#capabilities): what the wrapper can search and return.
+- [Install](#installation) and [create your first index](#quick-start).
+- [Choose an API](#choose-an-api) and [understand search results](#reading-search-results).
+- [Configure analysis](#analyzer-and-field-configuration), [filters](#structured-filters), and [highlighting](#highlighting-and-snippets).
+- [Manage writes](#mutations-and-backpressure), [recover an index](#lifecycle-and-recovery), or [upgrade from 0.6.x](#upgrading-from-06x).
+- Reference: [limits and recovery](docs/limits.md), [benchmarks](docs/benchmarks.md), and [backend internals](docs/native-backend-implementation.md).
+
+## Capabilities
+
+The wrapper stores a derived search index and returns ranked IDs. Your application owns source
+records, authorization, and fetching the current records for those IDs. It does not need to run a
+separate search server.
+
+| Capability                  | Use it for                                                                 | Configuration or limits                                                          |
+| --------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `any` (default)             | Match at least one analyzed query term; rank by relevance.                 | Field weights boost selected fields.                                             |
+| `all`                       | Require every analyzed query term to match.                                | Terms may match across selected fields.                                          |
+| `phrase`                    | Match terms in order at their analyzed positions.                          | Requires `positions: true` (the default).                                        |
+| `prefix`                    | Autocomplete: match completed terms and the final unfinished term.         | Requires `surfaceTerms: true`; expansion is bounded.                             |
+| `fuzzy`                     | Match misspelled terms with up to one edit, including transpositions.      | Eligibility and term limits apply; this is not arbitrary spelling correction.    |
+| `fuzzy-prefix` **preview**  | Combine final-term autocomplete with typo tolerance.                       | Requires `surfaceTerms: true`; catalog-scale qualification remains pending.      |
+| Boolean queries and filters | Combine text clauses, restrict candidate IDs, or filter declared metadata. | Filters narrow results without adding relevance scores.                          |
+| Ranked traversal            | Continue through a large result set in a retained snapshot.                | Use `searchPage()` with a read-only handle.                                      |
+| Highlighting and snippets   | Locate matches in current source values supplied by your application.      | Requires `surfaceTerms: true`; returns offsets and optional fragments, not HTML. |
+
+All modes use typed requests, not Tantivy query-string syntax. See [Search](#search) for examples
+and [limits and their effects](docs/limits.md) for bounds and recovery choices.
 
 ## Requirements
 
@@ -28,7 +62,7 @@ Windows x64. Additional targets are added only after their packed artifacts are 
 on the target runtime. Unsupported targets fail with `E_NATIVE_ADDON_NOT_FOUND` when the native
 entry point is first used; importing the JavaScript facade does not eagerly load an addon.
 
-## Native usage
+## Quick start
 
 ```js
 import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
@@ -43,6 +77,7 @@ const index = await openNativeFullTextIndex({
 		{ name: 'price', type: 'number' },
 	],
 	analyzer: 'english@2',
+	surfaceTerms: true,
 	limits: {
 		indexingThreads: 2,
 		searchThreads: 4,
@@ -73,22 +108,37 @@ try {
 ```
 
 The quick start uses standalone commit and reload. Applications that track an external checkpoint
-should use `publish(payload)` instead, as shown below, so mutations and that checkpoint commit
-together.
+should use [`publish(payload)`](#checkpointed-publication) instead, so mutations and that checkpoint
+commit together. `commit()` makes staged writes durable; `reload()` makes them visible to this
+handle’s searches. Search hits contain IDs and optional versions, not the original records.
+
+## Choose an API
+
+| I want to…                                          | Use                                             | Result                                                                                                                                                |
+| --------------------------------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Get a bounded result page, with an optional offset  | `index.search(request)`                         | Ranked hits and a total marked exact or lower-bound. Ordinary offset + limit is bounded to 10,000; prefix modes allow offset zero and up to 100 hits. |
+| Walk beyond that window, or continue prefix results | `reader.searchPage(request)`                    | Ranked hits, an exact total, and an optional continuation token. Each page is bounded to 10,000 hits.                                                 |
+| Highlight matches in records I already fetched      | `index.traceMatches(request, records, options)` | UTF-16 spans, optional snippets, and a completeness flag. It does not retrieve or rank records.                                                       |
+
+For a normal search UI, start with `search()`. For a long traversal, open a dedicated read-only
+handle with `openNativeFullTextReader()` and use [continuation pagination](#traversing-beyond-10000-matches).
+To display highlights, fetch the current source records and pass them to [match tracing](#highlighting-and-snippets).
+A continuation belongs to its reader instance; keep that handle open until traversal finishes.
 
 ## Examples
 
 Every example runs against the local build and the packed npm package in CI:
 
-| Example                                                                | Demonstrates                                               |
-| ---------------------------------------------------------------------- | ---------------------------------------------------------- |
-| [`examples/basic.mjs`](examples/basic.mjs)                             | Open, mutate, commit, search, and close                    |
-| [`examples/query-modes.mjs`](examples/query-modes.mjs)                 | BM25, phrase, prefix, fuzzy, and candidate filtering       |
-| [`examples/structured-filters.mjs`](examples/structured-filters.mjs)   | Exact and numeric filters combined with BM25               |
-| [`examples/checkpoint-recovery.mjs`](examples/checkpoint-recovery.mjs) | Atomic checkpoint publication, inspection, and reopen      |
-| [`examples/highlighting.mjs`](examples/highlighting.mjs)               | Match tracing, UTF-16 spans, and opt-in snippets           |
-| [`examples/multi-index.mjs`](examples/multi-index.mjs)                 | Optional process limits and concurrent independent indexes |
-| [`examples/reset-rebuild.mjs`](examples/reset-rebuild.mjs)             | Safe retirement, cleanup, and rebuilding a generation      |
+| Example                                                                | Demonstrates                                                                                     |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| [`examples/basic.mjs`](examples/basic.mjs)                             | Open, mutate, commit, search, and close                                                          |
+| [`examples/query-modes.mjs`](examples/query-modes.mjs)                 | BM25, phrase, prefix, fuzzy, and candidate filtering                                             |
+| [`examples/catalog-search.mjs`](examples/catalog-search.mjs)           | Shared catalog data, field boosts and selection, Boolean queries, synonyms, Unicode and snippets |
+| [`examples/structured-filters.mjs`](examples/structured-filters.mjs)   | Exact and numeric filters combined with BM25                                                     |
+| [`examples/checkpoint-recovery.mjs`](examples/checkpoint-recovery.mjs) | Atomic checkpoint publication, inspection, and reopen                                            |
+| [`examples/highlighting.mjs`](examples/highlighting.mjs)               | Match tracing, UTF-16 spans, and opt-in snippets                                                 |
+| [`examples/multi-index.mjs`](examples/multi-index.mjs)                 | Optional process limits and concurrent independent indexes                                       |
+| [`examples/reset-rebuild.mjs`](examples/reset-rebuild.mjs)             | Safe retirement, cleanup, and rebuilding a generation                                            |
 
 From a repository checkout, build the native addon and run any example through the local-build
 loader:
@@ -97,89 +147,6 @@ loader:
 npm run build
 node scripts/run-local.mjs examples/basic.mjs
 ```
-
-## Mutations and backpressure
-
-Mutation batches are versioned packed values, so indexing crosses Node-API once per batch rather
-than once per document. One dedicated actor owns Tantivy's single writer for each index. A bounded
-search pool shares immutable searchers and can execute reads while indexing or commit work is in
-progress. Queue limits reject overload with `E_QUEUE_FULL` rather than blocking the JavaScript
-thread. `applyMutationBatch()` is the normal logical mutation API. It partitions one logical batch
-into bounded native frames, applies them sequentially, validates native counts, and returns
-`{ processed, rejected, encodedBytes, frames }`. IDs must be distinct across the logical batch.
-By default, any rejected record fails the operation. Pass `{ rejectedUpsert: 'delete' }` when an
-unindexable replacement must delete previously searchable content for the same ID. A failure after
-native application is attempted leaves the handle incomplete: writer operations reject
-`E_BATCH_INCOMPLETE` until the handle is closed with `{ mode: 'rollback' }`. A writer operation that
-only races an in-flight logical batch rejects with `E_BATCH_ACTIVE`; wait for that batch to settle
-and retry instead of rolling it back. This prevents a later publish from exposing part of a logical
-batch. A closing or closed handle rejects every logical batch with `E_CLOSED`, including an empty
-batch, without taking the latch.
-
-`configureNativeFullTextRuntime()` is optional and idempotent for an identical configuration. It
-must be called before the first successful open when one process may host many indexes; configuring
-while an open is pending fails with retryable `E_LOCK_BUSY`; configuration after an unbudgeted open
-fails with `E_RESOURCE_LIMIT`. A failed first open that proves its native resources were released
-does not prevent later configuration. An
-unproven pre-publication teardown blocks configuration until restart. The governor bounds aggregate
-resident indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
-expensive searches. Each writer reserves twice its `maxQueuedBytes` for the writer and shared search
-queues; each read-only handle reserves it once for search. Every writer or reader also consumes one
-resident-index slot and its configured search-thread count. A conflicting second configuration or an
-open that would exceed an admission cap fails with `E_RESOURCE_LIMIT`; the library never evicts a
-live generation. Expensive searches wait off the JavaScript thread for process capacity, bounded
-by the request deadline and interrupted by close, allowing the search queues to apply backpressure.
-A flexible worker serves ordinary searches while the expensive-search budget is saturated. With a
-one-thread index, ordinary and expensive work share one FIFO, so a process-wide permit held by a
-different index can delay ordinary work queued behind an expensive request. Closing an index
-interrupts expensive requests that are waiting for a permit with `E_CLOSED`.
-A completed close has released its reservation.
-If teardown cannot prove native resources were released, the path is quarantined and its aggregate
-capacity remains reserved until process restart.
-Callers that omit this function retain the per-index limits.
-
-### Rejected records and schema errors
-
-Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
-as record-local rejection could remove many documents under the wrong schema. The option applies
-only to record-local `E_INVALID_ARGUMENT` and `E_BATCH_TOO_LARGE` rejections with usable IDs.
-Delete mode always preflights every ID as a bounded delete frame before native admission;
-`assumeDistinctIds` skips duplicate detection, not that feasibility scan. An unusable or oversized
-ID therefore fails with nothing staged. Schema drift is detected during framing and can leave the
-handle incomplete when earlier frames were already admitted.
-
-Trusted callers that already enforce distinct IDs may pass `assumeDistinctIds: true` to skip the
-whole-batch duplicate prepass. Supplying duplicates with that option violates the API contract.
-The library snapshots the two mutation arrays, but callers must not mutate record objects, field or
-filter maps, or nested field- or filter-value arrays until the returned promise settles.
-
-`encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
-`E_BATCH_TOO_LARGE`; `maxBytes` defaults to 8 MiB and is intended for low-level callers producing a
-single native frame. Low-level callers may use `index.encodeMutationBatches()`. It uses the limit from
-the index's open configuration, validates IDs and fields against that handle, and greedily emits
-admissible frames. IDs must be distinct across the logical batch. Aggregate size creates more
-frames; a single invalid or unencodable mutation is returned in `rejected` with its operation and
-zero-based index in the corresponding input array. It is never dropped automatically.
-
-Encoding is synchronous and runs on the JavaScript thread. The total encoded output of one logical
-call defaults to 64 MiB and can be lowered with `encodeMutationBatches(batch, { maxTotalBytes })`.
-The default behavior throws `E_BATCH_TOO_LARGE` when the complete logical batch exceeds that
-ceiling. Callers that pass `allowPartial: true` instead receive a leading prefix;
-`consumedUpserts` and `consumedDeletes` identify the mutations represented by the returned frames
-and rejections so they can continue with each array's remaining suffix. The low-level API validates
-distinct IDs across the full input before applying the output ceiling, so repeated suffix calls
-repeat that validation scan. Prefer `applyMutationBatch()` for large logical batches.
-Producers using the low-level API should keep logical batches comfortably below that limit.
-Applying multiple frames stages them in one Tantivy writer. Commit or publish only after every frame
-succeeds; on a later failure, close with rollback rather than publishing the partial logical batch.
-Concurrent low-level callers should leave queue-byte headroom for commit or publish.
-A successful `apply()` resolves to the number of accepted mutation commands, including deletes for
-IDs that are not currently indexed.
-
-One caller must own a handle's complete apply-and-publish sequence at a time. The high-level method
-blocks low-level writer interleaving while its logical batch is active. The low-level frame API does
-not infer logical batch boundaries, so callers using it remain responsible for excluding another
-publisher between frames. Searches may still run concurrently with either writer sequence.
 
 ## Search
 
@@ -219,18 +186,28 @@ const result = await index.search({
 Negation filters do not add to BM25 scores. A query made only of negation matches assigns every
 surviving hit a score of zero and orders ties by UTF-8 ID.
 
-`total` is bounded by default so Tantivy can retain block-max WAND pruning where the query shape
-supports it. Set `exactTotal: true` only when an exact match count is required. A separate count
-pass runs only when the result was not exhausted and the selected collector did not already visit
-and count every match. Ranking is score descending, then UTF-8 ID ascending, including ties that
-cross segment or page boundaries.
+### Reading search results
 
-Candidate-free, top-level `any` searches with more than one scoring clause use the same stable
-score-and-ID collector path for every page. Clause count is analyzed terms multiplied by selected
-fields, so one term searched across two fields takes this path. This prevents segment merges and
-different page boundaries from changing tie order, but it visits every match and checks the request
-deadline after collection. Other bounded query shapes start with Tantivy's score-pruned `TopDocs`
-path; a score tie at the requested page boundary falls back to the stable all-match collector.
+A search returns this shape (score shown for illustration):
+
+```js
+{
+  total: 1,
+  totalRelation: 'exact',
+  hits: [{ id: 'shoe-1', score: 0.86, version: '42' }]
+}
+```
+
+- `hits` contains ranked IDs, scores, and the optional versions supplied during indexing. Fetch source records in your application; compare versions if you need to reject stale indexed hits.
+- `score` expresses relevance within this query. Results sort by descending score, then ascending UTF-8 ID for ties. Do not treat scores as probabilities or compare them across engine versions.
+- `totalRelation: 'exact'` means `total` is the full match count. `'lower-bound'` means at least that many matches exist; it does not mean the returned hits are approximate.
+- Set `exactTotal: true` when a UI needs an exact count. It may require extra work across all matches. The default can still return an exact count when it is already known.
+
+For example, `index.search({ text: 'waterproof', limit: 20, exactTotal: true })` requests the top
+20 hits and an exact count. `searchPage()` always returns exact totals; it adds a `continuation`
+only while another page remains. Match tracing has a separate `complete` flag: `false` means
+some spans may have been omitted because a tracing limit was reached. Search results do not have
+that flag. See [limits and completeness](docs/limits.md) and the [collector reference](docs/native-backend-implementation.md#schema-and-query-behavior).
 
 ### Traversing beyond 10,000 matches
 
@@ -357,6 +334,12 @@ both must match. Filter definitions are part of the persisted index identity, so
 requires a new generation or a rebuild from the authoritative source. Filter terms are present in
 the local Tantivy term dictionary and should be protected like the indexed text itself.
 
+## Analyzer and field configuration
+
+Choose these settings when creating the index. Enable `surfaceTerms: true` if you need prefix
+search, fuzzy-prefix search, or highlighting. The quick start enables it so the later examples
+work with the same schema; omit it for indexes that need only ordinary text search.
+
 `positions` defaults on and is required for phrase search. `surfaceTerms` defaults off and creates
 an internal unstemmed companion term field used by prefix, fuzzy-prefix, and match tracing. It does
 not store source values or positions; it retains term frequencies for scoring. Both settings are
@@ -384,7 +367,21 @@ The public analyzer name and identity-sidecar version jointly identify persisted
 Any future filter or ordering change must use a new analyzer name or sidecar version so existing
 indexes fail closed and rebuild instead of silently changing recall.
 
-### Highlighting and snippets
+## Upgrading from 0.6.x
+
+Version 0.7.0 embeds Tantivy 0.27.0 and requires rebuilding existing indexes. The new English
+stemmer changes some terms (`added`: `ad` → `add`), so opening an old index with the same
+`english@2` configuration returns `E_IDENTITY_MISMATCH`. Inspection reports that incompatibility
+before search or mutation. The public analyzer name and query API are unchanged.
+
+Drain and close readers/writers, call `resetNativeFullTextIndex()` with the existing logical index ID,
+and rebuild from authoritative source records. Use the checkpoint-publication lifecycle to publish
+coverage only after rebuilding. Reset can retire old identity formats; do not edit sidecars to force
+an index open. Before downgrading to 0.6.x, retire the 0.7 index with the 0.7 reset API, then rebuild
+with 0.6.x; the older reset API reports `E_INDEX_CORRUPT` for the unrecognized identity. Relevance
+scores may differ between engine versions; continuation tokens remain reader-instance scoped.
+
+## Highlighting and snippets
 
 Highlighting is opt-in and operates on caller-supplied current source values, so the library never
 returns stale stored text. It returns UTF-16 half-open offsets and no HTML. Snippets are also off by
@@ -403,7 +400,7 @@ Analysis is limited to 262,144 emitted tokens per value after synonym expansion.
 ceiling, a span ceiling, or the response ceiling is reached, `complete` is false and later matches
 may be omitted.
 
-### Deadlines and query isolation
+## Deadlines and query isolation
 
 Search and tracing share a maximum 30-second queue-plus-execution budget. Applications can pass a
 shorter remaining request budget through the second method argument; larger values are clamped to
@@ -417,6 +414,91 @@ reserved for ordinary bounded `any`/`all` BM25. The remaining workers prioritize
 fuzzy, unanchored-negation, exact-total, and trace work, then steal ordinary work when that queue is
 idle. A negation intersected with a positive ordinary clause stays in the ordinary lane. A
 one-thread configuration remains valid but cannot isolate query classes.
+
+## Mutations and backpressure
+
+Mutation batches are versioned packed values, so indexing crosses Node-API once per batch rather
+than once per document. One dedicated actor owns Tantivy's single writer for each index. A bounded
+search pool shares immutable searchers and can execute reads while indexing or commit work is in
+progress. Queue limits reject overload with `E_QUEUE_FULL` rather than blocking the JavaScript
+thread. `applyMutationBatch()` is the normal logical mutation API. It partitions one logical batch
+into bounded native frames, applies them sequentially, validates native counts, and returns
+`{ processed, rejected, encodedBytes, frames }`. IDs must be distinct across the logical batch.
+By default, any rejected record fails the operation. Pass `{ rejectedUpsert: 'delete' }` when an
+unindexable replacement must delete previously searchable content for the same ID. A failure after
+native application is attempted leaves the handle incomplete: writer operations reject
+`E_BATCH_INCOMPLETE` until the handle is closed with `{ mode: 'rollback' }`. A writer operation that
+only races an in-flight logical batch rejects with `E_BATCH_ACTIVE`; wait for that batch to settle
+and retry instead of rolling it back. This prevents a later publish from exposing part of a logical
+batch. A closing or closed handle rejects every logical batch with `E_CLOSED`, including an empty
+batch, without taking the latch.
+
+### Process-wide resource limits
+
+`configureNativeFullTextRuntime()` is optional and idempotent for an identical configuration. It
+must be called before the first successful open when one process may host many indexes; configuring
+while an open is pending fails with retryable `E_LOCK_BUSY`; configuration after an unbudgeted open
+fails with `E_RESOURCE_LIMIT`. A failed first open that proves its native resources were released
+does not prevent later configuration. An
+unproven pre-publication teardown blocks configuration until restart. The governor bounds aggregate
+resident indexes, indexing and search threads, writer memory, configured queue bytes, and concurrent
+expensive searches. Each writer reserves twice its `maxQueuedBytes` for the writer and shared search
+queues; each read-only handle reserves it once for search. Every writer or reader also consumes one
+resident-index slot and its configured search-thread count. A conflicting second configuration or an
+open that would exceed an admission cap fails with `E_RESOURCE_LIMIT`; the library never evicts a
+live generation. Expensive searches wait off the JavaScript thread for process capacity, bounded
+by the request deadline and interrupted by close, allowing the search queues to apply backpressure.
+A flexible worker serves ordinary searches while the expensive-search budget is saturated. With a
+one-thread index, ordinary and expensive work share one FIFO, so a process-wide permit held by a
+different index can delay ordinary work queued behind an expensive request. Closing an index
+interrupts expensive requests that are waiting for a permit with `E_CLOSED`.
+A completed close has released its reservation.
+If teardown cannot prove native resources were released, the path is quarantined and its aggregate
+capacity remains reserved until process restart.
+Callers that omit this function retain the per-index limits.
+
+### Rejected records and schema errors
+
+Schema mismatches fail the whole call even with `{ rejectedUpsert: 'delete' }`; treating schema drift
+as record-local rejection could remove many documents under the wrong schema. The option applies
+only to record-local `E_INVALID_ARGUMENT` and `E_BATCH_TOO_LARGE` rejections with usable IDs.
+Delete mode always preflights every ID as a bounded delete frame before native admission;
+`assumeDistinctIds` skips duplicate detection, not that feasibility scan. An unusable or oversized
+ID therefore fails with nothing staged. Schema drift is detected during framing and can leave the
+handle incomplete when earlier frames were already admitted.
+
+Trusted callers that already enforce distinct IDs may pass `assumeDistinctIds: true` to skip the
+whole-batch duplicate prepass. Supplying duplicates with that option violates the API contract.
+The library snapshots the two mutation arrays, but callers must not mutate record objects, field or
+filter maps, or nested field- or filter-value arrays until the returned promise settles.
+
+`encodeMutationBatch(batch, maxBytes)` rejects output beyond its encoding bound with
+`E_BATCH_TOO_LARGE`; `maxBytes` defaults to 8 MiB and is intended for low-level callers producing a
+single native frame. Low-level callers may use `index.encodeMutationBatches()`. It uses the limit from
+the index's open configuration, validates IDs and fields against that handle, and greedily emits
+admissible frames. IDs must be distinct across the logical batch. Aggregate size creates more
+frames; a single invalid or unencodable mutation is returned in `rejected` with its operation and
+zero-based index in the corresponding input array. It is never dropped automatically.
+
+Encoding is synchronous and runs on the JavaScript thread. The total encoded output of one logical
+call defaults to 64 MiB and can be lowered with `encodeMutationBatches(batch, { maxTotalBytes })`.
+The default behavior throws `E_BATCH_TOO_LARGE` when the complete logical batch exceeds that
+ceiling. Callers that pass `allowPartial: true` instead receive a leading prefix;
+`consumedUpserts` and `consumedDeletes` identify the mutations represented by the returned frames
+and rejections so they can continue with each array's remaining suffix. The low-level API validates
+distinct IDs across the full input before applying the output ceiling, so repeated suffix calls
+repeat that validation scan. Prefer `applyMutationBatch()` for large logical batches.
+Producers using the low-level API should keep logical batches comfortably below that limit.
+Applying multiple frames stages them in one Tantivy writer. Commit or publish only after every frame
+succeeds; on a later failure, close with rollback rather than publishing the partial logical batch.
+Concurrent low-level callers should leave queue-byte headroom for commit or publish.
+A successful `apply()` resolves to the number of accepted mutation commands, including deletes for
+IDs that are not currently indexed.
+
+One caller must own a handle's complete apply-and-publish sequence at a time. The high-level method
+blocks low-level writer interleaving while its logical batch is active. The low-level frame API does
+not infer logical batch boundaries, so callers using it remain responsible for excluding another
+publisher between frames. Searches may still run concurrently with either writer sequence.
 
 ## Lifecycle and recovery
 
@@ -530,10 +612,9 @@ lock directory. The parent must permit creating this directory, and `.fulltext-l
 writable while indices are opened or reset; failures name the lock-directory path.
 
 This API uses native ABI 9 and packed protocol 5. The loader rejects older addon binaries. Native
-identity sidecar v4 remains the identity for indexes without structured filter fields. Configuring
-filter fields uses sidecar v5, which also fingerprints their names and types. Older v2 and v3
-indexes remain identifiable for safe reset but cannot be reopened; rebuild them from the
-authoritative source.
+identity sidecar v6 identifies indexes without structured filter fields. Configuring filter fields
+uses sidecar v7, which also fingerprints their names and types. Older v1–v5 indexes remain
+identifiable for safe reset but cannot be reopened; rebuild them from the authoritative source.
 
 ## Diagnostics and errors
 
@@ -557,7 +638,19 @@ try {
 ```
 
 `runtimeInfo()` reports the package, Tantivy, ABI, query API, lifecycle API, mutation API, supported
-storage backend, and hard protocol limits. It does not open an index or create files.
+storage backend, and hard protocol limits. It does not open an index or create files. To verify the
+versions in the installed native addon:
+
+```js
+import { runtimeInfo } from '@harperfast/fulltext/native';
+
+const { packageVersion, tantivyVersion } = await runtimeInfo();
+console.log({ packageVersion, tantivyVersion });
+// { packageVersion: '0.7.0', tantivyVersion: '0.27.0' }
+```
+
+The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an
+installed build; [`Cargo.toml`](Cargo.toml) records this source revision's exact engine pin.
 
 ## Storage boundary
 
@@ -573,77 +666,20 @@ npm run build:debug
 npm test
 npm run lint
 npm run format:check
-npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000
-npm run benchmark:multi-index -- --indexes 8 --documents 100000 --concurrency 16
-npm run benchmark:native -- --documents 100000 --revision v0.1.0 --output benchmark-native.json
-npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000 --mutation-driver low-level
-npm run benchmark:inspect -- --indexes 1,10,100,1000 --commits 64 --warm-rounds 10
 ```
+
+The [relevance fixtures](docs/relevance.md) turn the catalog queries into explicit matching,
+ranking, pagination and English-stemmer regressions. Run them with
+`node scripts/run-local.mjs --test test/native-relevance.test.mjs` after building.
 
 CI reports JavaScript/TypeScript and Rust coverage separately. The Node report uses the built-in
 test runner coverage and stores raw V8 coverage; the Rust report stores LCOV output. Coverage is
 reported for visibility and release-to-release comparison, not enforced as a single blended gate.
 
-The benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
-JSON record. It reports packing, apply, durable end-to-end ingestion, actor queue and execution
-time, logical-batch p50/p95/p99, frame count, commit distributions, reload cost, warm and cold query
-p50/p95/p99, per-mode term/phrase/prefix/fuzzy/candidate performance, exact-total overhead, index
-bytes, and periodically sampled process RSS. The default
-`--mutation-driver logical` exercises `applyMutationBatch()`; rerun the identical command with
-`--mutation-driver low-level` for the prior encode-plus-apply path. Compare
-`mutationDriverMilliseconds`, durable end-to-end throughput, logical-batch percentiles, and peak
-RSS. The component `packingMilliseconds` and `applyMilliseconds` fields are not comparable because
-the logical API performs both inside one call. `--commit-every` sets the target number of mutations
-between durability points; it materially affects throughput and peak memory because
-replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
-comparisons require controlled hardware.
-
-`node scripts/run-local.mjs benchmarks/traversal.mjs` qualifies traversal with large IDs/versions,
-multiple actual segments, a broader fuzzy vocabulary, concurrent writes and ordinary searches,
-and response-size recovery. Build first with `npm run build`; use `--smoke` for the smaller CI
-correctness profile. Output reports actual segment counts, workload sizes, timings and process RSS.
-It does not enforce production latency targets or claim a peak-memory bound.
-
-`node scripts/run-local.mjs benchmarks/traversal-preparation.mjs current` measures synchronous
-submission time, completion time and event-loop delay for a legal large candidate/filter identity.
-Build first; compare repeated runs on the same idle hardware. It measures encoding/copying and
-native work as well as hashing, so it does not isolate crypto cost or establish a production latency
-target.
-
-For a paired ordinary-search comparison, build baseline and current worktrees with the same optimized
-native profile, then run `FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/ordinary-search.mjs /absolute/worktree baseline`
-and repeat with the current worktree and label. The fixture checks totals and hit counts, warms each
-query, and emits timings for empty, sparse, and broad exact searches at limits 20 and 1,000.
-Alternate process order across repeated pairs on idle hardware; these observations are not a latency gate.
-
-`benchmark:multi-index` exercises independent writers in parallel under the process budget. It
-includes heavy-tail field sizes, bounded synonyms, update/delete churn, resource-cap rejection,
-warm concurrent queries, close/reopen, and cold queries. CI runs the two-index smoke profile; the
-release workflow records the larger eight-index profile per architecture. These results measure
-the library's native path, not source projection, authorization, or record retrieval performed by
-an application.
-
-`--revision` labels a result and `--output` writes the same JSON record printed to stdout. Pull
-requests keep smoke records as GitHub Actions artifacts for 30 days. After a GitHub release is
-published, the release benchmark keeps 90-day Actions artifacts and attaches native and multi-index
-JSON results for Linux x64 and Linux arm64 to that release. These assets provide a permanent
-per-architecture release-over-release history, but the post-publish workflow does not gate npm
-publication, calculate a baseline delta, or fail a build on timing. Shared-runner numbers are
-evidence that the workload still runs, not a latency gate. Compare performance only with the same
-benchmark format, workload, architecture, and controlled hardware. Record observed numbers in the
-pull request or release notes; keep this README focused on the reproducible method rather than
-environment-specific targets.
-
-The inspection benchmark compares synchronous read-only inspection with full writer reopen across
-multiple index counts. It reports equivalent first-pass and warm p50/p95/p99/max latency,
-synchronous wall time per inspection sweep, metadata size, and the actual segment count produced by
-the seed workload. It does not claim to model OS-cold storage. `--indexes` accepts configurations
-that create at most 10,000 temporary index directories across both benchmark paths.
-
-For a controlled same-query comparison of ordinary and traversal first-page overhead, run
-`npm run build && node scripts/run-local.mjs benchmarks/traversal-driver.mjs`. It alternates
-60 calls per method after warmup on one retained snapshot, with identical exact totals and
-page size. This manual benchmark has no timing assertion or CI performance threshold.
+For contributor performance work, see [Benchmarking the wrapper](docs/benchmarks.md): native and
+multi-index workloads, hydration and trace cases, traversal and inspection probes, artifact
+retention, and comparison limits. User-facing behavior is documented above; collector and native
+implementation details live in the [backend reference](docs/native-backend-implementation.md).
 
 Generated Node-API declarations in `ts/addon.d.ts` are private implementation types. Consumers use
 only the types exported from a package entry point.

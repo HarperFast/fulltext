@@ -18,6 +18,16 @@ test('every direct dependency is documented', () => {
 	}
 });
 
+test('README versions match the package and embedded engine', () => {
+	const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+	const tantivyVersion = /^tantivy = "=([^"]+)"$/m.exec(cargoManifest)?.[1];
+	assert(tantivyVersion, 'Tantivy must have an exact version pin');
+	assert(
+		readme.includes(`Embedded search engine: Tantivy ${tantivyVersion} · Wrapper version: ${packageManifest.version}.`),
+	);
+	assert(readme.includes(`// { packageVersion: '${packageManifest.version}', tantivyVersion: '${tantivyVersion}' }`));
+});
+
 test('the native dependency graph does not declare RocksDB', () => {
 	assert(!/rocksdb/i.test(cargoManifest));
 	assert(!/^name\s*=\s*"[^"]*rocksdb[^"]*"/im.test(cargoLock));

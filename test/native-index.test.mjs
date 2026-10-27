@@ -191,6 +191,46 @@ test('opens concurrent readers, reloads publications, evaluates boolean queries,
 	await Promise.all([first.close(), second.close()]);
 });
 
+test('preserves versions and score ties on offset pages across collection paths', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	try {
+		const upserts = Array.from({ length: 12 }, (_, i) => ({
+			id: `${Math.floor(i / 4)}-${['z', 'A', 'é', 'a'][i % 4]}`,
+			version: i % 3 === 0 ? undefined : i % 3 === 1 ? 'shared' : 'long'.repeat(512),
+			fields: { title: `catalog ${'other '.repeat(Math.floor(i / 4) * 100)}` },
+		}));
+		await index.applyMutationBatch({ upserts });
+		await index.commit();
+		await index.reload();
+		for (const mode of ['all', 'any']) {
+			const query = { text: mode === 'all' ? 'catalog' : 'catalog other', mode, fields: ['title'] };
+			const full = await index.search({ ...query, limit: 12, exactTotal: true });
+			assert.strictEqual(full.hits.length, 12);
+			for (const hit of full.hits) assert.strictEqual(hit.version, upserts.find(({ id }) => id === hit.id).version);
+			if (mode === 'all') {
+				assert.strictEqual(full.hits[0].score, full.hits[3].score);
+				assert(full.hits[7].score > full.hits[8].score);
+			}
+			for (const exactTotal of [false, true]) {
+				for (const [offset, limit] of [
+					[1, 7],
+					[1, 2],
+					[9, 5],
+					[12, 5],
+				]) {
+					const page = await index.search({ ...query, offset, limit, exactTotal });
+					assert.deepStrictEqual(page.hits, full.hits.slice(offset, offset + limit));
+					const lowerBound = !exactTotal && offset + limit < 12;
+					assert.strictEqual(page.total, lowerBound ? offset + limit : 12);
+					assert.strictEqual(page.totalRelation, lowerBound ? 'lower-bound' : 'exact');
+				}
+			}
+		}
+	} finally {
+		await index.close();
+	}
+});
+
 test('reports a missing read-only index as not ready', async (context) => {
 	const indexPath = temporaryIndex(context);
 	rmSync(indexPath, { recursive: true });
@@ -929,6 +969,61 @@ test('retires a closed index, preserves its checkpoint, and permits a clean rebu
 	index = await openNativeFullTextIndex(config);
 	assert.strictEqual((await index.search({ text: 'trail running', exactTotal: true })).total, 0);
 	await index.close();
+});
+
+test('rejects previous stemmer identities before open and retires them for rebuild', async (context) => {
+	for (const filtered of [false, true]) {
+		const indexPath = path.join(temporaryIndex(context), 'index');
+		const config = options(indexPath, filtered ? { filterFields: [{ name: 'category', type: 'string' }] } : {});
+		let index = await openNativeFullTextIndex(config);
+		try {
+			await index.applyMutationBatch({
+				upserts: [{ id: 'One-Case', version: 'VeRsIoN', fields: { title: 'added acarologist' } }],
+			});
+			await index.publish('old-checkpoint');
+		} finally {
+			await index.close({ mode: 'rollback' });
+		}
+		const identityPath = path.join(indexPath, '.harper-fulltext-identity');
+		const identity = readFileSync(identityPath);
+		assert.strictEqual(identity[4], filtered ? 7 : 6);
+		identity[4] = filtered ? 5 : 4;
+		writeFileSync(identityPath, identity);
+		assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+			state: 'incompatible',
+			code: 'E_IDENTITY_MISMATCH',
+		});
+		let unexpectedIndex;
+		try {
+			await assert.rejects(
+				openNativeFullTextIndex(config).then((opened) => {
+					unexpectedIndex = opened;
+				}),
+				{ code: 'E_IDENTITY_MISMATCH' },
+			);
+		} finally {
+			if (unexpectedIndex) await unexpectedIndex.close({ mode: 'rollback' });
+		}
+		const reset = await resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId });
+		assert.strictEqual(reset.state, 'reset');
+		assert.strictEqual(existsSync(reset.retiredPath), true);
+		index = await openNativeFullTextIndex(config);
+		try {
+			assert.strictEqual(index.committedPayload, undefined);
+			await index.applyMutationBatch({
+				upserts: [{ id: 'One-Case', version: 'VeRsIoN', fields: { title: 'added acarologist' } }],
+			});
+			await index.publish('new-checkpoint');
+			const result = await index.search({ text: 'add', exactTotal: true });
+			assert.deepStrictEqual(
+				result.hits.map(({ id }) => id),
+				['One-Case'],
+			);
+			assert.strictEqual(result.hits[0].version, 'VeRsIoN');
+		} finally {
+			await index.close({ mode: 'rollback' });
+		}
+	}
 });
 
 test('resets a real native directory with a legacy v2 identity and rejects a truncated sidecar', async (context) => {
@@ -2198,3 +2293,25 @@ function committedSegmentPath(directory, extension) {
 	assert(name, `expected a committed ${extension} segment`);
 	return path.join(directory, name);
 }
+
+test('native fuzzy tracing preserves current-source surface matches and UTF-16 prefix spans', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context), { surfaceTerms: true }));
+	try {
+		for (const [text, mode, source, expected] of [
+			['waterprof', 'fuzzy', 'Waterproofs', [{ start: 0, end: 11 }]],
+			['running', 'fuzzy', 'runnin', [{ start: 0, end: 6 }]],
+			['waterpro', 'fuzzy-prefix', '💧 Wáterproof', [{ start: 3, end: 13 }]],
+			['𐐨abc', 'fuzzy-prefix', '𐐨abxlong', [{ start: 0, end: 9 }]],
+		]) {
+			const result = await index.traceMatches({ text, mode }, [{ id: 'current', fields: { title: source } }]);
+			assert.strictEqual(result.complete, true);
+			assert.deepStrictEqual(result.records[0].values[0].spans, expected);
+		}
+		const absent = await index.traceMatches({ text: 'shoe1', mode: 'fuzzy' }, [
+			{ id: 'current', fields: { title: 'shoe2' } },
+		]);
+		assert.deepStrictEqual(absent, { complete: true, records: [] });
+	} finally {
+		await index.close({ mode: 'rollback' });
+	}
+});

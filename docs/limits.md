@@ -95,7 +95,7 @@ Tracing is explanation of supplied current source, not an independent proof of i
 Per-index indexing/search threads, writer memory, queued commands/bytes, and mutation-frame bytes
 are caller configuration. Optional process-wide admission additionally bounds resident handles,
 aggregate threads/writer memory/queue reservations, and simultaneous expensive searches. Configure
-the [process budget](../README.md#native-usage) before opening indexes when capacity must be bounded
+the [process budget](../README.md#process-wide-resource-limits) before opening indexes when capacity must be bounded
 across them; there is no automatic global budget if it is omitted.
 
 - Each indexing/search thread count must be 1–64. Tantivy writer memory per indexing thread must be at least 15,000,000 bytes and strictly below 4,294,967,295 bytes. Opening outside these bounds fails; increasing thread count without increasing memory can invalidate a previously sufficient memory setting.

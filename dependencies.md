@@ -5,14 +5,15 @@ reviewed before merge.
 
 ## Rust runtime and build graph
 
-| Dependency                     | Scope                           | Purpose                                                                      |
-| ------------------------------ | ------------------------------- | ---------------------------------------------------------------------------- |
-| `tantivy` 0.26.2               | runtime                         | Full-text indexing and search engine, including native filesystem storage.   |
-| `sha2` 0.10.9                  | runtime                         | SHA-256 snapshot identity over Tantivy segment IDs and deletion generations. |
-| `unicode-normalization` 0.1.24 | runtime                         | Applies the versioned English analyzer's NFKC token normalization.           |
-| `napi` 3.13.0                  | optional runtime                | Node-API values, error conversion, and addon-image retention.                |
-| `napi-derive` 3.6.9            | optional build/runtime boundary | Generates Node-API exports.                                                  |
-| `napi-build` 2.5.0             | build                           | Configures platform-specific addon linking.                                  |
+| Dependency                     | Scope                           | Purpose                                                                                                 |
+| ------------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `tantivy` 0.27.0               | runtime                         | Full-text indexing and search engine, including native filesystem storage.                              |
+| `tantivy-fst` 0.5.0            | runtime                         | Matches Tantivy fuzzy-prefix automata against current-source trace tokens; already in the engine graph. |
+| `sha2` 0.10.9                  | runtime                         | SHA-256 snapshot identity over Tantivy segment IDs and deletion generations.                            |
+| `unicode-normalization` 0.1.24 | runtime                         | Applies the versioned English analyzer's NFKC token normalization.                                      |
+| `napi` 3.13.0                  | optional runtime                | Node-API values, error conversion, and addon-image retention.                                           |
+| `napi-derive` 3.6.9            | optional build/runtime boundary | Generates Node-API exports.                                                                             |
+| `napi-build` 2.5.0             | build                           | Configures platform-specific addon linking.                                                             |
 
 Snapshot identity is computed inside the engine for both direct Rust and Node callers. The exact-pinned, no-default-features `sha2` implementation avoids hand-written cryptography and per-reader lease state; no third-party type enters the public API.
 
@@ -27,6 +28,7 @@ merging it:
 - Update `TANTIVY_VERSION` and the release-package assertion to match the bot-managed exact pin.
 - Review Tantivy's release notes for index-format, analyzer, schema, scoring, and query changes.
 - Check the manifest and CI Rust version floors and the exact-version exceptions in `deny.toml`.
+- Align the exact `tantivy-fst` pin with Tantivy's resolved version; the matcher trait must come from the same crate version.
 - Refresh the dependency table and every version-specific Tantivy citation in the design documents.
 - Run the full test suite. Manually dispatch the `Release benchmark` workflow on the update branch,
   then compare its Linux x64 and Linux arm64 results with the matching assets attached to the
@@ -36,6 +38,29 @@ Scheduled Cargo version updates are limited to Tantivy. Dependabot security upda
 for the full Cargo graph; they share the `dependencies` label used for Slack notifications. The
 per-dependency `version-update:` filters preserve that distinction and must not be replaced with a
 bare dependency-name ignore rule.
+
+### Tantivy 0.27 compatibility
+
+Tantivy 0.27 replaces the English stemmer with `frostem`. Persisted identities 6 (text only)
+and 7 (typed filters) distinguish that output from identities 4/5; the public `english@2`
+configuration remains unchanged. Older indexes must be retired and rebuilt from authoritative
+records. Reset still recognizes identities 1–7. Retire a new index with the 0.7 reset API before
+downgrading and rebuilding with 0.6; its reset parser cannot recognize identities 6/7. Never copy
+an old sidecar over a new index to bypass inspection.
+
+The exact `getrandom` 0.3.4 and `r-efi` 5.3.0 duplicate exceptions are required by
+`tantivy-columnar` 0.27 → `rand` 0.9, alongside `getrandom` 0.4 used by `tempfile`/`uuid`.
+Remove both exceptions when those upstream branches converge on one random-backend version.
+
+The locked `frostem` revision is part of persisted analyzer semantics even though it is transitive.
+The two `frostem` bans in `deny.toml` reject any revision other than 1.20260821.8.
+Review every stemmer update for token changes before updating those bounds; changed output requires another analyzer/sidecar
+revision and rebuild. The upgrade regression pins representative changed English terms, not an
+exhaustive language corpus.
+
+Metadata-hydration changes require targeted versioned/offset cases alongside generic mixed-query
+measurements. The release workflow runs both total profiles and attaches hydration JSONL assets
+to the release. Keep per-head qualification evidence in the upgrade PR and its tracking issue.
 
 ### Updating Unicode semantics
 

@@ -42,7 +42,7 @@ the consuming application. The Node package contributes canonical path handling 
 - The directory harness exercises Tantivy create, write, commit, query, and reopen behavior against
   `MmapDirectory`.
   Source: [`src/directory_harness.rs`](../src/directory_harness.rs).
-- Tantivy 0.26.2 is pinned and compiled into the addon. Its `Index::open` wraps a supplied directory
+- Tantivy 0.27.0 is pinned and compiled into the addon. Its `Index::open` wraps a supplied directory
   in `ManagedDirectory`, while `Index::writer_with_num_threads` acquires the writer lock and divides
   the supplied memory budget across the requested indexing threads.
   Sources: [`Cargo.toml`](../Cargo.toml), pinned Tantivy `src/index/index.rs`.
@@ -73,24 +73,104 @@ The wrapper composes Tantivy primitives instead of implementing a second search 
 | Highlighting and snippets                                                       | Wrapper                                                                                               | Match caller-supplied current values and return UTF-16 spans without storing source text or emitting HTML. Tantivy's snippet helper does not implement Fulltext's synonym, fuzzy/prefix, source-span, and completeness contract. |
 | Node concurrency and admission                                                  | Wrapper                                                                                               | Keep sustained native work off JavaScript, bound queues and process resources, isolate expensive queries, and settle every admitted promise during close.                                                                        |
 
-The custom stable collector is intentionally narrow, but it is wrapper-owned collection code. It
-reuses Tantivy's scorer, `TopNComputer`, segment readers, and string fast-field ordinals; it does not
-calculate relevance or read postings itself. Tantivy can compose score and string sort keys, but its
-0.26.2 `SortByString` converts each retained ordinal with an individual dictionary lookup and notes
-the repeated-decompression cost in its source. A direct comparison against that native composite
-collector on the deterministic 100,000-document benchmark kept the wrapper path only after it was
-consistently faster on the affected multi-term `any` query. The wrapper resolves retained ordinals
-in one ordered traversal per segment and also carries the fail-closed missing-ID invariant and match
-count. Re-run that comparison when Tantivy's string sorting or this collector changes; remove the
-wrapper collector if the native path reaches parity. Prefix expansion is likewise policy around
-Tantivy's dictionary and query objects, not a replacement postings implementation.
+The custom stable collector reuses Tantivy's scorer, `TopNComputer`, segment readers, and string
+fast-field ordinals; it does not calculate relevance or read postings itself. An optimized local
+macOS arm64 probe against Tantivy 0.27 used 100,000 generated documents and 40 interleaved calls
+per collector. At a 10-hit window the wrapper/native totals were 44.5/41.5 ms; at 1,000 hits they
+were 72.0/1,237.4 ms, with matching returned IDs. This is one synthetic comparison, not a universal
+speedup claim. Retain the wrapper for larger windows, batched dictionary resolution, exact match
+count and fail-closed missing-ID behavior; the native composite collector is a possible future
+small-window optimization. Re-run this comparison when string sorting or collection changes.
+Prefix expansion remains bounded policy around Tantivy's dictionary and query objects.
+
+### Final-page version hydration
+
+Ordinary sorting retains document addresses and validates IDs over the same TopDocs window, then
+resolves versions only for the returned page. Shared final hydration also serves the stable and
+traversal collectors. Optional metadata never participates in ranking; skipped version metadata is
+not proactively validated.
+
+Run the optimized [ordinary-search driver](../benchmarks/ordinary-search.mjs) against either build:
+
+```sh
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/ordinary-search.mjs /path/to/build label --hydration
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/ordinary-search.mjs /path/to/build label --hydration --approximate-totals
+```
+
+Historical measurements using the prior time-based warmup and upper-index percentile convention
+(the retained driver now uses 500 fixed warmups and nearest-rank percentiles):
+Observed on macOS arm64 / Node 24.16.0, 2026-10-27: three alternating runs per artifact, each with
+10,000 documents, one-second warmup and 1,000 measured requests per case. Values below are medians
+of the three run percentiles, comparing the
+[pre-hydration build](https://github.com/HarperFast/fulltext/commit/e1cc2c160a32a5f0bdbf97f8f547942de11f2e2b)
+with the [hydration build](https://github.com/HarperFast/fulltext/commit/b544e9c9e32ae5a80a237f5e90ec8d12be75c228).
+The table uses exact totals, including any separate count pass; the second command qualifies
+approximate totals independently. Both artifacts embed Tantivy 0.27. The shallow fixture has a score change after hit 20, exercising
+the no-boundary-tie branch. Versions have either no value or 2,048 bytes of padding plus a short ID.
+
+| Case                                    | Median before/after (ms) | p95 before/after (ms) | p99 before/after (ms) |
+| --------------------------------------- | ------------------------ | --------------------- | --------------------- |
+| Offset 9,990, ten hits, padded versions | 6.899 / 0.941            | 7.348 / 0.994         | 7.585 / 1.069         |
+| Offset 9,990, ten hits, no versions     | 0.767 / 0.786            | 0.851 / 0.882         | 0.922 / 1.024         |
+| First 20 hits, padded versions          | 0.087 / 0.082            | 0.119 / 0.096         | 0.185 / 0.136         |
+| First 20 hits, no versions              | 0.046 / 0.048            | 0.056 / 0.062         | 0.078 / 0.087         |
+
+By code trace, decoded versions fall from 10,000 to ten in the deep padded case, and from 21 to 20
+in the shallow case; these are work-model counts, not runtime instrumentation. The driver checks
+IDs, versions, totals and within-run score stability. Sub-millisecond tail variation, notably the
+no-version controls, limits general performance claims; this synthetic comparison establishes no
+production latency guarantee. Re-run on representative workloads when changing collection or
+metadata hydration. The Linux release workflow runs both total profiles and retains their JSONL
+results with its workflow artifacts; generic mixed-query results alone do not cover this path.
+
+A separate local approximate-total probe using the same fixture and run counts observed median
+latency 5.802 → 0.895 ms for deep padded versions, 0.729 → 0.717 ms for deep no-version requests,
+and 0.081 → 0.079 ms for shallow padded versions. The no-version shallow control remained about
+0.055 ms. These are additional local measurements, with the same limits as the table above.
+
+### Native fuzzy-prefix trace matching
+
+Fuzzy-prefix tracing reuses Tantivy's prefix automaton, prepared lazily after exact-prefix checks.
+UTF-16 spans, eligibility and current-source matching remain wrapper policy. Full fuzzy tracing
+retains its allocation-free predicate, checked against native dictionary automata: preparing up to
+32 analyzed/surface DFAs regressed short sixteen-term traces in three paired optimized runs
+(median p50 0.0554 → 0.1874 ms). That exceeded the preset small-request threshold of both 10% and
+0.1 ms; broader reuse is deferred rather than adding a matcher cache.
+
+```sh
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/trace-matching.mjs /path/to/build label
+```
+
+The retained driver produces eight cases: fuzzy and fuzzy-prefix requests over one matching token,
+1,000 matching tokens, sixteen terms over 10,000 nonmatching tokens, and sixteen inflected terms
+over twenty near-length nonmatching tokens. Prefix matching includes an edit inside the prefix;
+it cannot pass through the exact-prefix shortcut. Each case records its first call separately,
+then 50 fixed warmups and 200 measured calls with nearest-rank percentiles, asserting complete
+output and expected record count. First-call values include case/process initialization effects;
+they are not a portable cold-start guarantee. Linux release jobs retain JSONL and attach it to
+release assets alongside hydration measurements.
+
+Three alternating local optimized macOS arm64 / Node 24.16 runs on 2026-10-27 compared the
+pre-reuse implementation with the final prefix-only implementation. Median-of-run p50 (ms):
+
+| Case                                | Fuzzy control before / after | Fuzzy-prefix before / after |
+| ----------------------------------- | ---------------------------- | --------------------------- |
+| One token                           | 0.0206 / 0.0217              | 0.0163 / 0.0213             |
+| 1,000 matching tokens               | 0.4360 / 0.4410              | 0.3964 / 0.3699             |
+| 16 terms, 10,000 nonmatching tokens | 9.8034 / 9.9058              | 2.4623 / 1.9810             |
+| 16 inflected terms, twenty tokens   | 0.0563 / 0.0568              | 0.0285 / 0.0329             |
+
+Small prefix requests pay about 0.005 ms extra preparation in these fixtures; larger prefix inputs
+improve or stay similar. Final p50/p95 comparisons stayed within the preset threshold (over 10%
+and 0.1 ms for small requests, over 10% for large requests). These synthetic results are not a
+production guarantee; keep the preparation-heavy controls when revisiting full fuzzy reuse.
 
 ## Public API
 
 The public types in [`ts/native.ts`](../ts/native.ts) define the API. Generated declarations in
 `ts/addon.d.ts` describe the private addon interface and are not consumer types.
 
-Use the [README examples](../README.md#native-usage) for opening an index, mutations, Boolean
+Use the [README examples](../README.md#quick-start) for opening an index, mutations, Boolean
 queries, structured filters, and traversal. Keeping the type definitions in one place avoids stale
 copies when the API changes. Each open requires explicit per-index thread, writer-memory, and queue
 limits; [limits and their effects](limits.md) explains their constraints.
@@ -301,10 +381,10 @@ the source position into both analyzed and surface fields; query text is not exp
 the alternatives in BM25 field length, so enabling a rule can affect unrelated-term ranking for a
 document containing its source. Match tracing uses the same document-side expansion and maps every
 replacement to the source token span. Crossing its 262,144-token-per-value ceiling marks the trace
-incomplete instead of failing the request. Version 2 and 3 sidecars remain parseable for safe reset
+incomplete instead of failing the request. Versions 1–5 remain parseable for safe reset
 but mismatch current open/inspection so the application can retire and rebuild them. Filter-free
-indexes keep sidecar v4; indexes with structured filter fields use v5 so their field names and types
-participate in compatibility checks.
+indexes use sidecar v6; indexes with structured filter fields use v7 so their field names and types
+participate in compatibility checks alongside the current stemmer revision.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`
@@ -318,7 +398,7 @@ multi-clause `any` collector already enumerates and counts every match, so that 
 instead of executing the query twice.
 
 Single-clause `any`, `all`, phrase, prefix, fuzzy, and candidate-filtered searches use
-`TopDocs::order_by_score()`. In pinned Tantivy 0.26.2 that collector invokes
+`TopDocs::order_by_score()`. In pinned Tantivy 0.27.0 that collector invokes
 `Weight::for_each_pruning`, and Boolean term unions can select the block-WAND implementation.
 Candidate-free top-level `any` queries with multiple scoring clauses instead enumerate matches with
 one stable score-then-raw-ID collector so every page shares one scoring topology. Its per-segment
@@ -367,7 +447,7 @@ ordinary live-operation classification rather than triggering an automatic rebui
 Missing storage returns `missing` without creating the requested directory. A read-only integration
 test snapshots file names, bytes, sizes, and modification times before and after inspection.
 
-Successful `commit()` delegates to Tantivy 0.26.2's ordinary commit path and resolves only after it
+Successful `commit()` delegates to Tantivy 0.27.0's ordinary commit path and resolves only after it
 returns. The process-kill test verifies publication and process-crash recovery. A test directory
 that reports an error after applying an atomic metadata write verifies conservative checkpoint
 handling after an ambiguous commit. Checkpointed publication is implemented separately in
