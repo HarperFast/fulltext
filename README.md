@@ -394,8 +394,9 @@ before search or mutation. The public analyzer name and query API are unchanged.
 Drain and close readers/writers, call `resetNativeFullTextIndex()` with the existing logical index ID,
 and rebuild from authoritative source records. Use the checkpoint-publication lifecycle to publish
 coverage only after rebuilding. Reset can retire old identity formats; do not edit sidecars to force
-an index open. Before downgrading to 0.6.x, retire the 0.7 index with the 0.7 reset API, then rebuild with 0.6.x; the older reset API reports `E_INDEX_CORRUPT` for the unrecognized identity. Relevance scores may differ
-between engine versions; continuation tokens remain reader-instance scoped.
+an index open. Before downgrading to 0.6.x, retire the 0.7 index with the 0.7 reset API, then rebuild
+with 0.6.x; the older reset API reports `E_INDEX_CORRUPT` for the unrecognized identity. Relevance
+scores may differ between engine versions; continuation tokens remain reader-instance scoped.
 
 ### Highlighting and snippets
 
@@ -543,10 +544,9 @@ lock directory. The parent must permit creating this directory, and `.fulltext-l
 writable while indices are opened or reset; failures name the lock-directory path.
 
 This API uses native ABI 9 and packed protocol 5. The loader rejects older addon binaries. Native
-identity sidecar v4 remains the identity for indexes without structured filter fields. Configuring
-filter fields uses sidecar v5, which also fingerprints their names and types. Older v2 and v3
-indexes remain identifiable for safe reset but cannot be reopened; rebuild them from the
-authoritative source.
+identity sidecar v6 identifies indexes without structured filter fields. Configuring filter fields
+uses sidecar v7, which also fingerprints their names and types. Older v1–v5 indexes remain
+identifiable for safe reset but cannot be reopened; rebuild them from the authoritative source.
 
 ## Diagnostics and errors
 

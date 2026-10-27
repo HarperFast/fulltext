@@ -3887,7 +3887,7 @@ mod tests {
 	}
 
 	#[test]
-	fn english_stemmer_uses_the_new_revision() {
+	fn english_stemmer_produces_frostem_tokens() {
 		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
 		assert_eq!(
 			engine.analyze("added acarologist", false, false).unwrap(),

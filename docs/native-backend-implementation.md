@@ -83,6 +83,41 @@ count and fail-closed missing-ID behavior; the native composite collector is a p
 small-window optimization. Re-run this comparison when string sorting or collection changes.
 Prefix expansion remains bounded policy around Tantivy's dictionary and query objects.
 
+### Final-page version hydration
+
+Ordinary sorting retains document addresses and validates IDs over the same TopDocs window, then
+resolves versions only for the returned page. Shared final hydration also serves the stable and
+traversal collectors. Optional metadata never participates in ranking; skipped version metadata is
+not proactively validated.
+
+Run the optimized [ordinary-search driver](../benchmarks/ordinary-search.mjs) against either build:
+
+```sh
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/ordinary-search.mjs /path/to/build label --hydration
+```
+
+Observed on macOS arm64 / Node 24.16.0, 2026-10-27: three alternating runs per artifact, each with
+10,000 documents, one-second warmup and 1,000 measured requests per case. Values below are medians
+of the three run percentiles, comparing the
+[pre-hydration build](https://github.com/HarperFast/fulltext/commit/e1cc2c160a32a5f0bdbf97f8f547942de11f2e2b)
+with the [hydration build](https://github.com/HarperFast/fulltext/commit/b544e9c9e32ae5a80a237f5e90ec8d12be75c228).
+Both artifacts embed Tantivy 0.27. The shallow fixture has a score change after hit 20, exercising
+the no-boundary-tie branch. Versions have either no value or 2,048 bytes of padding plus a short ID.
+
+| Case                                    | Median before/after (ms) | p95 before/after (ms) | p99 before/after (ms) |
+| --------------------------------------- | ------------------------ | --------------------- | --------------------- |
+| Offset 9,990, ten hits, padded versions | 6.899 / 0.941            | 7.348 / 0.994         | 7.585 / 1.069         |
+| Offset 9,990, ten hits, no versions     | 0.767 / 0.786            | 0.851 / 0.882         | 0.922 / 1.024         |
+| First 20 hits, padded versions          | 0.087 / 0.082            | 0.119 / 0.096         | 0.185 / 0.136         |
+| First 20 hits, no versions              | 0.046 / 0.048            | 0.056 / 0.062         | 0.078 / 0.087         |
+
+By code trace, decoded versions fall from 10,000 to ten in the deep padded case, and from 21 to 20
+in the shallow case; these are work-model counts, not runtime instrumentation. The driver checks
+IDs, versions, totals and within-run score stability. Sub-millisecond tail variation, notably the
+no-version controls, limits general performance claims; this synthetic comparison establishes no
+production latency guarantee. Re-run on representative workloads when changing collection or
+metadata hydration.
+
 ## Public API
 
 The public types in [`ts/native.ts`](../ts/native.ts) define the API. Generated declarations in
@@ -299,10 +334,10 @@ the source position into both analyzed and surface fields; query text is not exp
 the alternatives in BM25 field length, so enabling a rule can affect unrelated-term ranking for a
 document containing its source. Match tracing uses the same document-side expansion and maps every
 replacement to the source token span. Crossing its 262,144-token-per-value ceiling marks the trace
-incomplete instead of failing the request. Version 2 and 3 sidecars remain parseable for safe reset
+incomplete instead of failing the request. Versions 1–5 remain parseable for safe reset
 but mismatch current open/inspection so the application can retire and rebuild them. Filter-free
-indexes keep sidecar v4; indexes with structured filter fields use v5 so their field names and types
-participate in compatibility checks.
+indexes use sidecar v6; indexes with structured filter fields use v7 so their field names and types
+participate in compatibility checks alongside the current stemmer revision.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`

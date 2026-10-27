@@ -42,7 +42,8 @@ bare dependency-name ignore rule.
 Tantivy 0.27 replaces the English stemmer with `frostem`. Persisted identities 6 (text only)
 and 7 (typed filters) distinguish that output from identities 4/5; the public `english@2`
 configuration remains unchanged. Older indexes must be retired and rebuilt from authoritative
-records. Reset still recognizes identities 1–7. Retire a new index with the 0.7 reset API before downgrading and rebuilding with 0.6; its reset parser cannot recognize identities 6/7. Never copy
+records. Reset still recognizes identities 1–7. Retire a new index with the 0.7 reset API before
+downgrading and rebuilding with 0.6; its reset parser cannot recognize identities 6/7. Never copy
 an old sidecar over a new index to bypass inspection.
 
 The exact `getrandom` 0.3.4 and `r-efi` 5.3.0 duplicate exceptions are required by
@@ -53,6 +54,14 @@ The locked `frostem` revision is part of persisted analyzer semantics even thoug
 Review every stemmer update for token changes; changed output requires another analyzer/sidecar
 revision and rebuild. The upgrade regression pins representative changed English terms, not an
 exhaustive language corpus.
+
+The original upgrade qualification compared successful Linux x64/arm64
+[upgrade benchmarks](https://github.com/HarperFast/fulltext/actions/runs/40444667405) against a fresh
+[v0.6.0 baseline](https://github.com/HarperFast/fulltext/actions/runs/40444670208). The
+[Qualify Tantivy 0.27 upgrade and enforce the analyzer rebuild boundary](https://github.com/HarperFast/fulltext/issues/71) and
+[Upgrade fulltext to Tantivy 0.27 with safe index rebuilds](https://github.com/HarperFast/fulltext/pull/72) retain the comparison and
+shared-runner limitations. The later hydration refactor requires fresh platform qualification before
+Ready; the prior engine comparison does not qualify an untested follow-up head.
 
 ### Updating Unicode semantics
 
