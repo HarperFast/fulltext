@@ -129,15 +129,16 @@ A continuation belongs to its reader instance; keep that handle open until trave
 
 Every example runs against the local build and the packed npm package in CI:
 
-| Example                                                                | Demonstrates                                               |
-| ---------------------------------------------------------------------- | ---------------------------------------------------------- |
-| [`examples/basic.mjs`](examples/basic.mjs)                             | Open, mutate, commit, search, and close                    |
-| [`examples/query-modes.mjs`](examples/query-modes.mjs)                 | BM25, phrase, prefix, fuzzy, and candidate filtering       |
-| [`examples/structured-filters.mjs`](examples/structured-filters.mjs)   | Exact and numeric filters combined with BM25               |
-| [`examples/checkpoint-recovery.mjs`](examples/checkpoint-recovery.mjs) | Atomic checkpoint publication, inspection, and reopen      |
-| [`examples/highlighting.mjs`](examples/highlighting.mjs)               | Match tracing, UTF-16 spans, and opt-in snippets           |
-| [`examples/multi-index.mjs`](examples/multi-index.mjs)                 | Optional process limits and concurrent independent indexes |
-| [`examples/reset-rebuild.mjs`](examples/reset-rebuild.mjs)             | Safe retirement, cleanup, and rebuilding a generation      |
+| Example                                                                | Demonstrates                                                                                     |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| [`examples/basic.mjs`](examples/basic.mjs)                             | Open, mutate, commit, search, and close                                                          |
+| [`examples/query-modes.mjs`](examples/query-modes.mjs)                 | BM25, phrase, prefix, fuzzy, and candidate filtering                                             |
+| [`examples/catalog-search.mjs`](examples/catalog-search.mjs)           | Shared catalog data, field boosts and selection, Boolean queries, synonyms, Unicode and snippets |
+| [`examples/structured-filters.mjs`](examples/structured-filters.mjs)   | Exact and numeric filters combined with BM25                                                     |
+| [`examples/checkpoint-recovery.mjs`](examples/checkpoint-recovery.mjs) | Atomic checkpoint publication, inspection, and reopen                                            |
+| [`examples/highlighting.mjs`](examples/highlighting.mjs)               | Match tracing, UTF-16 spans, and opt-in snippets                                                 |
+| [`examples/multi-index.mjs`](examples/multi-index.mjs)                 | Optional process limits and concurrent independent indexes                                       |
+| [`examples/reset-rebuild.mjs`](examples/reset-rebuild.mjs)             | Safe retirement, cleanup, and rebuilding a generation                                            |
 
 From a repository checkout, build the native addon and run any example through the local-build
 loader:
@@ -666,6 +667,10 @@ npm test
 npm run lint
 npm run format:check
 ```
+
+The [relevance fixtures](docs/relevance.md) turn the catalog queries into explicit matching,
+ranking, pagination and English-stemmer regressions. Run them with
+`node scripts/run-local.mjs --test test/native-relevance.test.mjs` after building.
 
 CI reports JavaScript/TypeScript and Rust coverage separately. The Node report uses the built-in
 test runner coverage and stores raw V8 coverage; the Rust report stores LCOV output. Coverage is

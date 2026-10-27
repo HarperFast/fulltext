@@ -1,0 +1,640 @@
+{
+	"catalog": {
+		"cases": [
+			{
+				"id": "catalog-any",
+				"request": {
+					"text": "trail shoes",
+					"mode": "any"
+				}
+			},
+			{
+				"id": "catalog-all",
+				"request": {
+					"text": "trail shoes",
+					"mode": "all"
+				}
+			},
+			{
+				"id": "phrase",
+				"request": {
+					"text": "trail running",
+					"mode": "phrase"
+				}
+			},
+			{
+				"id": "prefix",
+				"request": {
+					"text": "waterproof tra",
+					"mode": "prefix"
+				}
+			},
+			{
+				"id": "fuzzy",
+				"request": {
+					"text": "waterprof",
+					"mode": "fuzzy"
+				}
+			},
+			{
+				"id": "fuzzy-prefix",
+				"request": {
+					"text": "waterproof tral",
+					"mode": "fuzzy-prefix"
+				}
+			},
+			{
+				"id": "unicode",
+				"request": {
+					"text": "cafe resume",
+					"mode": "all"
+				}
+			},
+			{
+				"id": "possessive",
+				"request": {
+					"text": "runner's shoes",
+					"mode": "all"
+				}
+			},
+			{
+				"id": "stopword-phrase",
+				"request": {
+					"text": "trail and running",
+					"mode": "phrase"
+				}
+			},
+			{
+				"id": "stopword-prefix",
+				"request": {
+					"text": "the",
+					"mode": "prefix"
+				}
+			},
+			{
+				"id": "tags-array",
+				"request": {
+					"text": "trail running",
+					"mode": "all"
+				}
+			},
+			{
+				"id": "tv",
+				"request": {
+					"text": "television",
+					"mode": "any"
+				}
+			},
+			{
+				"id": "tv-alias",
+				"request": {
+					"text": "tv",
+					"mode": "any"
+				}
+			},
+			{
+				"id": "trainer",
+				"request": {
+					"text": "trainer",
+					"mode": "any"
+				}
+			},
+			{
+				"id": "equal-ties",
+				"request": {
+					"text": "equal waterproof shoe",
+					"mode": "all"
+				}
+			},
+			{
+				"id": "empty-result",
+				"request": {
+					"text": "quartzxyz",
+					"mode": "any"
+				}
+			},
+			{
+				"id": "title-selected",
+				"request": {
+					"text": "waterproof",
+					"mode": "any",
+					"fields": ["title"]
+				}
+			},
+			{
+				"id": "boolean-and-not",
+				"request": {
+					"query": {
+						"operator": "and",
+						"clauses": [
+							{
+								"text": "waterproof trail",
+								"mode": "all"
+							},
+							{
+								"operator": "not",
+								"clause": {
+									"text": "used"
+								}
+							}
+						]
+					}
+				}
+			},
+			{
+				"id": "boolean-or",
+				"request": {
+					"query": {
+						"operator": "or",
+						"clauses": [
+							{
+								"text": "waterproof",
+								"fields": ["title"]
+							},
+							{
+								"text": "wireless",
+								"fields": ["description"]
+							}
+						]
+					}
+				}
+			}
+		],
+		"profiles": [
+			{
+				"id": "harper-defaults",
+				"options": {
+					"fields": [
+						{
+							"name": "title",
+							"weight": 3
+						},
+						{
+							"name": "description"
+						},
+						{
+							"name": "tags"
+						}
+					]
+				},
+				"expectedIds": {
+					"catalog-any": [
+						"race-shoe",
+						"trail-title",
+						"shoe-archived",
+						"negated",
+						"possessive",
+						"phrase-gap",
+						"trail-body",
+						"A-tie",
+						"a-tie",
+						"blue-shoe",
+						"red-shoe",
+						"z-tie",
+						"é-tie",
+						"😀-tie",
+						"array",
+						"stopword"
+					],
+					"catalog-all": ["race-shoe", "trail-title", "shoe-archived", "negated", "possessive", "trail-body"],
+					"phrase": ["trail-title", "negated", "array", "trail-body"],
+					"prefix": ["trail-body", "trail-title", "shoe-archived", "negated", "possessive", "array"],
+					"fuzzy": [
+						"A-tie",
+						"a-tie",
+						"negated",
+						"possessive",
+						"trail-title",
+						"z-tie",
+						"é-tie",
+						"😀-tie",
+						"array",
+						"boot",
+						"shoe-archived",
+						"trail-body"
+					],
+					"fuzzy-prefix": ["trail-title", "negated", "possessive", "shoe-archived", "trail-body", "array"],
+					"unicode": ["cafe", "unicode"],
+					"possessive": ["possessive"],
+					"stopword-phrase": ["phrase-gap"],
+					"stopword-prefix": ["prefix-stop", "stopword"],
+					"tags-array": [
+						"trail-title",
+						"phrase-gap",
+						"race-shoe",
+						"shoe-archived",
+						"trail-body",
+						"negated",
+						"possessive",
+						"array"
+					],
+					"tv": ["television", "tv"],
+					"tv-alias": ["tv"],
+					"trainer": ["trail-body"],
+					"equal-ties": ["A-tie", "a-tie", "z-tie", "é-tie", "😀-tie"],
+					"empty-result": [],
+					"title-selected": ["A-tie", "a-tie", "negated", "possessive", "z-tie", "é-tie", "😀-tie", "trail-title"],
+					"boolean-and-not": ["trail-title", "possessive", "array", "trail-body"],
+					"boolean-or": [
+						"A-tie",
+						"a-tie",
+						"negated",
+						"possessive",
+						"z-tie",
+						"é-tie",
+						"😀-tie",
+						"trail-title",
+						"headset",
+						"television"
+					]
+				}
+			},
+			{
+				"id": "equal-field-weights",
+				"options": {
+					"fields": [
+						{
+							"name": "title"
+						},
+						{
+							"name": "description"
+						},
+						{
+							"name": "tags"
+						}
+					]
+				},
+				"expectedIds": {
+					"catalog-any": [
+						"negated",
+						"possessive",
+						"race-shoe",
+						"trail-title",
+						"trail-body",
+						"shoe-archived",
+						"phrase-gap",
+						"array",
+						"stopword",
+						"A-tie",
+						"a-tie",
+						"blue-shoe",
+						"red-shoe",
+						"z-tie",
+						"é-tie",
+						"😀-tie"
+					],
+					"catalog-all": ["negated", "possessive", "race-shoe", "trail-title", "trail-body", "shoe-archived"],
+					"phrase": ["negated", "trail-title", "array", "trail-body"],
+					"prefix": ["array", "trail-body", "shoe-archived", "trail-title", "negated", "possessive"],
+					"fuzzy": [
+						"A-tie",
+						"a-tie",
+						"array",
+						"boot",
+						"negated",
+						"possessive",
+						"shoe-archived",
+						"trail-body",
+						"trail-title",
+						"z-tie",
+						"é-tie",
+						"😀-tie"
+					],
+					"fuzzy-prefix": ["shoe-archived", "array", "trail-body", "negated", "possessive", "trail-title"],
+					"unicode": ["cafe", "unicode"],
+					"possessive": ["possessive"],
+					"stopword-phrase": ["phrase-gap"],
+					"stopword-prefix": ["prefix-stop", "stopword"],
+					"tags-array": [
+						"trail-title",
+						"race-shoe",
+						"trail-body",
+						"phrase-gap",
+						"shoe-archived",
+						"negated",
+						"possessive",
+						"array"
+					],
+					"tv": ["television", "tv"],
+					"tv-alias": ["tv"],
+					"trainer": ["trail-body"],
+					"equal-ties": ["A-tie", "a-tie", "z-tie", "é-tie", "😀-tie"],
+					"empty-result": [],
+					"title-selected": ["A-tie", "a-tie", "negated", "possessive", "z-tie", "é-tie", "😀-tie", "trail-title"],
+					"boolean-and-not": ["trail-title", "array", "possessive", "trail-body"],
+					"boolean-or": [
+						"headset",
+						"television",
+						"A-tie",
+						"a-tie",
+						"negated",
+						"possessive",
+						"z-tie",
+						"é-tie",
+						"😀-tie",
+						"trail-title"
+					]
+				}
+			},
+			{
+				"id": "stopwords-disabled",
+				"options": {
+					"fields": [
+						{
+							"name": "title",
+							"weight": 3
+						},
+						{
+							"name": "description"
+						},
+						{
+							"name": "tags"
+						}
+					],
+					"stopWords": false
+				},
+				"expectedIds": {
+					"catalog-any": [
+						"race-shoe",
+						"trail-title",
+						"shoe-archived",
+						"negated",
+						"possessive",
+						"phrase-gap",
+						"trail-body",
+						"A-tie",
+						"a-tie",
+						"blue-shoe",
+						"red-shoe",
+						"z-tie",
+						"é-tie",
+						"😀-tie",
+						"array",
+						"stopword"
+					],
+					"catalog-all": ["race-shoe", "trail-title", "shoe-archived", "negated", "possessive", "trail-body"],
+					"phrase": ["trail-title", "negated", "array", "trail-body"],
+					"prefix": ["trail-body", "trail-title", "shoe-archived", "negated", "possessive", "array"],
+					"fuzzy": [
+						"A-tie",
+						"a-tie",
+						"negated",
+						"possessive",
+						"trail-title",
+						"z-tie",
+						"é-tie",
+						"😀-tie",
+						"array",
+						"boot",
+						"shoe-archived",
+						"trail-body"
+					],
+					"fuzzy-prefix": ["trail-title", "negated", "possessive", "shoe-archived", "trail-body", "array"],
+					"unicode": ["cafe", "unicode"],
+					"possessive": ["possessive"],
+					"stopword-phrase": ["phrase-gap"],
+					"stopword-prefix": ["prefix-stop", "stopword"],
+					"tags-array": [
+						"trail-title",
+						"phrase-gap",
+						"race-shoe",
+						"shoe-archived",
+						"trail-body",
+						"negated",
+						"possessive",
+						"array"
+					],
+					"tv": ["television", "tv"],
+					"tv-alias": ["tv"],
+					"trainer": ["trail-body"],
+					"equal-ties": ["A-tie", "a-tie", "z-tie", "é-tie", "😀-tie"],
+					"empty-result": [],
+					"title-selected": ["A-tie", "a-tie", "negated", "possessive", "z-tie", "é-tie", "😀-tie", "trail-title"],
+					"boolean-and-not": ["trail-title", "possessive", "array", "trail-body"],
+					"boolean-or": [
+						"A-tie",
+						"a-tie",
+						"negated",
+						"possessive",
+						"z-tie",
+						"é-tie",
+						"😀-tie",
+						"trail-title",
+						"headset",
+						"television"
+					]
+				}
+			},
+			{
+				"id": "index-time-synonyms",
+				"options": {
+					"fields": [
+						{
+							"name": "title",
+							"weight": 3
+						},
+						{
+							"name": "description"
+						},
+						{
+							"name": "tags"
+						}
+					],
+					"synonyms": [
+						{
+							"source": "tv",
+							"replacements": ["television"]
+						},
+						{
+							"source": "trainer",
+							"replacements": ["shoe"]
+						}
+					]
+				},
+				"expectedIds": {
+					"catalog-any": [
+						"race-shoe",
+						"trail-title",
+						"shoe-archived",
+						"negated",
+						"possessive",
+						"phrase-gap",
+						"trail-body",
+						"A-tie",
+						"a-tie",
+						"blue-shoe",
+						"red-shoe",
+						"z-tie",
+						"é-tie",
+						"😀-tie",
+						"array",
+						"stopword"
+					],
+					"catalog-all": ["race-shoe", "trail-title", "shoe-archived", "negated", "possessive", "trail-body"],
+					"phrase": ["trail-title", "negated", "array", "trail-body"],
+					"prefix": ["trail-body", "trail-title", "shoe-archived", "negated", "possessive", "array"],
+					"fuzzy": [
+						"A-tie",
+						"a-tie",
+						"negated",
+						"possessive",
+						"trail-title",
+						"z-tie",
+						"é-tie",
+						"😀-tie",
+						"array",
+						"boot",
+						"shoe-archived",
+						"trail-body"
+					],
+					"fuzzy-prefix": ["trail-title", "negated", "possessive", "shoe-archived", "trail-body", "array"],
+					"unicode": ["cafe", "unicode"],
+					"possessive": ["possessive"],
+					"stopword-phrase": ["phrase-gap"],
+					"stopword-prefix": ["prefix-stop", "stopword"],
+					"tags-array": [
+						"trail-title",
+						"phrase-gap",
+						"race-shoe",
+						"shoe-archived",
+						"trail-body",
+						"negated",
+						"possessive",
+						"array"
+					],
+					"tv": ["television", "tv"],
+					"tv-alias": ["tv"],
+					"trainer": ["trail-body"],
+					"equal-ties": ["A-tie", "a-tie", "z-tie", "é-tie", "😀-tie"],
+					"empty-result": [],
+					"title-selected": ["A-tie", "a-tie", "negated", "possessive", "z-tie", "é-tie", "😀-tie", "trail-title"],
+					"boolean-and-not": ["trail-title", "possessive", "array", "trail-body"],
+					"boolean-or": [
+						"A-tie",
+						"a-tie",
+						"negated",
+						"possessive",
+						"z-tie",
+						"é-tie",
+						"😀-tie",
+						"trail-title",
+						"headset",
+						"television"
+					]
+				}
+			}
+		]
+	},
+	"stemming": {
+		"documents": [
+			{
+				"id": "word-ad",
+				"version": "1",
+				"fields": {
+					"title": "ad"
+				}
+			},
+			{
+				"id": "word-add",
+				"version": "1",
+				"fields": {
+					"title": "add"
+				}
+			},
+			{
+				"id": "word-added",
+				"version": "1",
+				"fields": {
+					"title": "added"
+				}
+			},
+			{
+				"id": "word-adding",
+				"version": "1",
+				"fields": {
+					"title": "adding"
+				}
+			},
+			{
+				"id": "word-adds",
+				"version": "1",
+				"fields": {
+					"title": "adds"
+				}
+			},
+			{
+				"id": "word-advert",
+				"version": "1",
+				"fields": {
+					"title": "advert"
+				}
+			}
+		],
+		"cases": [
+			{
+				"id": "ad",
+				"request": {
+					"text": "ad",
+					"mode": "any"
+				},
+				"expectedIds": ["word-ad"]
+			},
+			{
+				"id": "add",
+				"request": {
+					"text": "add",
+					"mode": "any"
+				},
+				"expectedIds": ["word-add", "word-added", "word-adding", "word-adds"]
+			},
+			{
+				"id": "added",
+				"request": {
+					"text": "added",
+					"mode": "any"
+				},
+				"expectedIds": ["word-add", "word-added", "word-adding", "word-adds"]
+			},
+			{
+				"id": "adding",
+				"request": {
+					"text": "adding",
+					"mode": "any"
+				},
+				"expectedIds": ["word-add", "word-added", "word-adding", "word-adds"]
+			},
+			{
+				"id": "adds",
+				"request": {
+					"text": "adds",
+					"mode": "any"
+				},
+				"expectedIds": ["word-add", "word-added", "word-adding", "word-adds"]
+			},
+			{
+				"id": "added-phrase",
+				"request": {
+					"text": "added",
+					"mode": "phrase"
+				},
+				"expectedIds": ["word-add", "word-added", "word-adding", "word-adds"]
+			},
+			{
+				"id": "added-fuzzy",
+				"request": {
+					"text": "added",
+					"mode": "fuzzy"
+				},
+				"expectedIds": ["word-add", "word-added", "word-adding", "word-adds", "word-ad"]
+			},
+			{
+				"id": "added-prefix",
+				"request": {
+					"text": "adde",
+					"mode": "prefix"
+				},
+				"expectedIds": ["word-added"]
+			}
+		]
+	}
+}

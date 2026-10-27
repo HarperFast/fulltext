@@ -1,0 +1,259 @@
+{
+	"fields": [
+		{
+			"name": "title",
+			"weight": 3
+		},
+		{
+			"name": "description"
+		},
+		{
+			"name": "tags"
+		}
+	],
+	"documents": [
+		{
+			"id": "trail-title",
+			"version": "1",
+			"fields": {
+				"title": "Waterproof trail running shoe",
+				"description": "Lightweight grip for wet trails",
+				"tags": ["outdoor", "running"]
+			}
+		},
+		{
+			"id": "trail-body",
+			"version": "1",
+			"fields": {
+				"title": "Everyday trainer",
+				"description": "Waterproof trail running shoe with lightweight grip",
+				"tags": ["running"]
+			}
+		},
+		{
+			"id": "boot",
+			"version": "1",
+			"fields": {
+				"title": "Insulated hiking boot",
+				"description": "Waterproof winter footwear",
+				"tags": ["outdoor"]
+			}
+		},
+		{
+			"id": "red-shoe",
+			"version": "1",
+			"fields": {
+				"title": "Red running shoe",
+				"description": "Comfortable road running footwear",
+				"tags": ["running"]
+			}
+		},
+		{
+			"id": "blue-shoe",
+			"version": "1",
+			"fields": {
+				"title": "Blue running shoe",
+				"description": "Comfortable road running footwear",
+				"tags": ["running"]
+			}
+		},
+		{
+			"id": "race-shoe",
+			"version": "1",
+			"fields": {
+				"title": "Trail racing shoes",
+				"description": "Lightweight running shoes for races",
+				"tags": ["running"]
+			}
+		},
+		{
+			"id": "shoe-archived",
+			"version": "1",
+			"fields": {
+				"title": "Used trail shoe",
+				"description": "Waterproof running footwear",
+				"tags": ["used"]
+			}
+		},
+		{
+			"id": "headphone",
+			"version": "1",
+			"fields": {
+				"title": "Wireless headphones",
+				"description": "Noise cancelling headphones with microphone",
+				"tags": ["audio"]
+			}
+		},
+		{
+			"id": "headset",
+			"version": "1",
+			"fields": {
+				"title": "Wireless headset",
+				"description": "Lightweight wireless audio for calls",
+				"tags": ["audio"]
+			}
+		},
+		{
+			"id": "wired",
+			"version": "1",
+			"fields": {
+				"title": "Wired headphones",
+				"description": "Studio audio with a cable",
+				"tags": ["audio"]
+			}
+		},
+		{
+			"id": "tv",
+			"version": "1",
+			"fields": {
+				"title": "Smart TV",
+				"description": "Large television display",
+				"tags": ["electronics"]
+			}
+		},
+		{
+			"id": "television",
+			"version": "1",
+			"fields": {
+				"title": "Television display",
+				"description": "Smart television with wireless audio",
+				"tags": ["electronics"]
+			}
+		},
+		{
+			"id": "display",
+			"version": "1",
+			"fields": {
+				"title": "Computer display",
+				"description": "High resolution monitor",
+				"tags": ["electronics"]
+			}
+		},
+		{
+			"id": "cafe",
+			"version": "1",
+			"fields": {
+				"title": "Café résumé notebook",
+				"description": "A notebook for cafe resumes",
+				"tags": ["stationery"]
+			}
+		},
+		{
+			"id": "unicode",
+			"version": "1",
+			"fields": {
+				"title": "Ｃａｆé stationery",
+				"description": "Résumé paper and notebooks",
+				"tags": ["stationery"]
+			}
+		},
+		{
+			"id": "possessive",
+			"version": "1",
+			"fields": {
+				"title": "Runner’s waterproof shoes",
+				"description": "A runner's trail shoe",
+				"tags": ["running"]
+			}
+		},
+		{
+			"id": "array",
+			"version": "1",
+			"fields": {
+				"title": "Outdoor pack",
+				"description": "Lightweight travel bag",
+				"tags": ["trail running", "waterproof"]
+			}
+		},
+		{
+			"id": "stopword",
+			"version": "1",
+			"fields": {
+				"title": "The outdoor guide",
+				"description": "A guide to the trail and the road",
+				"tags": ["books"]
+			}
+		},
+		{
+			"id": "phrase-gap",
+			"version": "1",
+			"fields": {
+				"title": "Trail and running guide",
+				"description": "Training and recovery",
+				"tags": ["books"]
+			}
+		},
+		{
+			"id": "prefix-stop",
+			"version": "1",
+			"fields": {
+				"title": "Theater guide",
+				"description": "Theatre events",
+				"tags": ["books"]
+			}
+		},
+		{
+			"id": "negated",
+			"version": "1",
+			"fields": {
+				"title": "Used waterproof shoe",
+				"description": "Trail running shoe",
+				"tags": ["used"]
+			}
+		},
+		{
+			"id": "empty",
+			"version": "1",
+			"fields": {
+				"title": "",
+				"description": "",
+				"tags": []
+			}
+		},
+		{
+			"id": "A-tie",
+			"version": "1",
+			"fields": {
+				"title": "Equal waterproof shoe",
+				"description": "Identical description",
+				"tags": ["tie"]
+			}
+		},
+		{
+			"id": "a-tie",
+			"version": "1",
+			"fields": {
+				"title": "Equal waterproof shoe",
+				"description": "Identical description",
+				"tags": ["tie"]
+			}
+		},
+		{
+			"id": "z-tie",
+			"version": "1",
+			"fields": {
+				"title": "Equal waterproof shoe",
+				"description": "Identical description",
+				"tags": ["tie"]
+			}
+		},
+		{
+			"id": "é-tie",
+			"version": "1",
+			"fields": {
+				"title": "Equal waterproof shoe",
+				"description": "Identical description",
+				"tags": ["tie"]
+			}
+		},
+		{
+			"id": "😀-tie",
+			"version": "1",
+			"fields": {
+				"title": "Equal waterproof shoe",
+				"description": "Identical description",
+				"tags": ["tie"]
+			}
+		}
+	]
+}
