@@ -33,10 +33,11 @@ Result collection keeps document addresses until final page selection. All four 
 validates IDs across its retained TopDocs window; skipped version metadata is not proactively
 validated, matching stable collection and traversal. Keep optional version data out of ranking.
 
-Fuzzy trace plans lazily reuse `FuzzyTermQuery::automaton()` per term, after exact-match and
-full-term length checks. Trace preserves its analyzed and current-source surface branches;
-`running` may explain a supplied `runnin` value even when the indexed stem would not match.
-Dictionary parity and public UTF-16 span tests enforce native matching without storing source text.
+Fuzzy-prefix traces lazily reuse `FuzzyTermQuery::automaton()` after exact-prefix checks. Full
+fuzzy traces retain the allocation-free predicate: preparing analyzed/surface DFAs regressed
+short sixteen-term traces in paired optimized measurements. Native dictionary parity tests cover
+both predicates. Trace preserves its current-source surface branch, including `running`/`runnin`,
+and its UTF-16 spans independently of indexed stems.
 
 ## Persisted analyzer revision
 

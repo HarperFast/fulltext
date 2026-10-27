@@ -128,34 +128,42 @@ latency 5.802 → 0.895 ms for deep padded versions, 0.729 → 0.717 ms for deep
 and 0.081 → 0.079 ms for shallow padded versions. The no-version shallow control remained about
 0.055 ms. These are additional local measurements, with the same limits as the table above.
 
-### Native fuzzy trace matching
+### Native fuzzy-prefix trace matching
 
-Tracing reuses Tantivy's fuzzy automata while preserving current-source surface matching and UTF-16
-spans. Each term prepares its automaton lazily, after exact and impossible-length checks; no global
-matcher cache or new ranking policy is introduced.
+Fuzzy-prefix tracing reuses Tantivy's prefix automaton, prepared lazily after exact-prefix checks.
+UTF-16 spans, eligibility and current-source matching remain wrapper policy. Full fuzzy tracing
+retains its allocation-free predicate, checked against native dictionary automata: preparing up to
+32 analyzed/surface DFAs regressed short sixteen-term traces in three paired optimized runs
+(median p50 0.0554 → 0.1874 ms). That exceeded the preset small-request threshold of both 10% and
+0.1 ms; broader reuse is deferred rather than adding a matcher cache.
 
 ```sh
 FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/trace-matching.mjs /path/to/build label
 ```
 
-The driver retains six fuzzy/fuzzy-prefix cases: one matching token, 1,000 matching tokens, and
-16 query terms over 10,000 nonmatching tokens. It uses 50 fixed warmups and 200 measured calls,
-nearest-rank percentiles, and asserts complete output with the expected record count. The Linux
-release jobs retain its JSONL alongside hydration measurements and attach both to release assets.
+The retained driver produces eight cases: fuzzy and fuzzy-prefix requests over one matching token,
+1,000 matching tokens, sixteen terms over 10,000 nonmatching tokens, and sixteen inflected terms
+over twenty near-length nonmatching tokens. Prefix matching includes an edit inside the prefix;
+it cannot pass through the exact-prefix shortcut. Each case records its first call separately,
+then 50 fixed warmups and 200 measured calls with nearest-rank percentiles, asserting complete
+output and expected record count. First-call values include case/process initialization effects;
+they are not a portable cold-start guarantee. Linux release jobs retain JSONL and attach it to
+release assets alongside hydration measurements.
 
 Three alternating local optimized macOS arm64 / Node 24.16 runs on 2026-10-27 compared the
-pre-reuse implementation with native automata. Median-of-run p50 (ms):
+pre-reuse implementation with the final prefix-only implementation. Median-of-run p50 (ms):
 
-| Case                                | Fuzzy before / after | Fuzzy-prefix before / after |
-| ----------------------------------- | -------------------- | --------------------------- |
-| One token                           | 0.0201 / 0.0257      | 0.0175 / 0.0165             |
-| 1,000 matching tokens               | 0.4652 / 0.4685      | 0.3743 / 0.3550             |
-| 16 terms, 10,000 nonmatching tokens | 10.0089 / 5.8719     | 2.5522 / 2.0852             |
+| Case                                | Fuzzy control before / after | Fuzzy-prefix before / after |
+| ----------------------------------- | ---------------------------- | --------------------------- |
+| One token                           | 0.0206 / 0.0217              | 0.0163 / 0.0213             |
+| 1,000 matching tokens               | 0.4360 / 0.4410              | 0.3964 / 0.3699             |
+| 16 terms, 10,000 nonmatching tokens | 9.8034 / 9.9058              | 2.4623 / 1.9810             |
+| 16 inflected terms, twenty tokens   | 0.0563 / 0.0568              | 0.0285 / 0.0329             |
 
-The small fuzzy request pays about 0.006 ms extra preparation in this fixture; larger inputs
-improve or remain similar. This qualifies the preset local threshold (over 10% and 0.1 ms for
-small requests, over 10% for large requests), not a production guarantee. Corpus shape and DFA
-preparation affect the result; keep the small controls when changing matching.
+Small prefix requests pay about 0.005 ms extra preparation in these fixtures; larger prefix inputs
+improve or stay similar. Final p50/p95 comparisons stayed within the preset threshold (over 10%
+and 0.1 ms for small requests, over 10% for large requests). These synthetic results are not a
+production guarantee; keep the preparation-heavy controls when revisiting full fuzzy reuse.
 
 ## Public API
 

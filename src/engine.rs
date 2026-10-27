@@ -392,46 +392,36 @@ enum TracePlan {
 	Prefix {
 		completed: Vec<String>,
 		prefix: String,
-		matcher: Option<FuzzyMatcher>,
+		matcher: Option<FuzzyPrefixMatcher>,
 	},
-	Fuzzy(Vec<TraceFuzzyTerm>),
+	Fuzzy(Vec<(String, String)>),
 }
 
-struct FuzzyMatcher {
+struct FuzzyPrefixMatcher {
 	text: String,
-	characters: usize,
 	field: Field,
-	prefix: bool,
 	automaton: OnceCell<Result<DfaWrapper>>,
 }
 
-impl FuzzyMatcher {
-	fn new(text: &str, field: Field, prefix: bool) -> Self {
+impl FuzzyPrefixMatcher {
+	fn new(text: &str, field: Field) -> Self {
 		Self {
 			text: text.to_owned(),
-			characters: text.chars().count(),
 			field,
-			prefix,
 			automaton: OnceCell::new(),
 		}
 	}
 
 	fn matches(&self, candidate: &str) -> Result<bool> {
-		if candidate == self.text || (self.prefix && candidate.starts_with(&self.text)) {
+		if candidate.starts_with(&self.text) {
 			return Ok(true);
 		}
-		if !self.prefix && self.characters.abs_diff(candidate.chars().count()) > 1 {
-			return Ok(false);
-		}
+
 		let automaton = self
 			.automaton
 			.get_or_init(|| {
 				let term = Term::from_field_text(self.field, &self.text);
-				let query = if self.prefix {
-					FuzzyTermQuery::new_prefix(term, 1, true)
-				} else {
-					FuzzyTermQuery::new(term, 1, true)
-				};
+				let query = FuzzyTermQuery::new_prefix(term, 1, true);
 				query.automaton().map_err(index_error)
 			})
 			.as_ref()
@@ -447,12 +437,6 @@ impl FuzzyMatcher {
 	}
 }
 
-struct TraceFuzzyTerm {
-	analyzed: String,
-	matcher: Option<FuzzyMatcher>,
-	surface_matcher: Option<FuzzyMatcher>,
-}
-
 impl TracePlan {
 	fn record_matches(&self, found: &HashSet<String>) -> bool {
 		match self {
@@ -463,7 +447,7 @@ impl TracePlan {
 			Self::Prefix { completed, prefix, .. } => {
 				!prefix.is_empty() && found.contains("__prefix") && completed.iter().all(|term| found.contains(term))
 			}
-			Self::Fuzzy(terms) => !terms.is_empty() && terms.iter().any(|term| found.contains(&term.analyzed)),
+			Self::Fuzzy(terms) => !terms.is_empty() && terms.iter().any(|(term, _)| found.contains(term)),
 		}
 	}
 }
@@ -991,7 +975,7 @@ impl Engine {
 					)));
 				}
 				let matcher = (request.mode == SearchMode::FuzzyPrefix && fuzzy_eligible(&prefix))
-					.then(|| FuzzyMatcher::new(&prefix, self.id_field, true));
+					.then(|| FuzzyPrefixMatcher::new(&prefix, self.id_field));
 				Ok(TracePlan::Prefix {
 					completed,
 					prefix,
@@ -1010,22 +994,7 @@ impl Engine {
 						"fuzzy search contains more than {MAX_FUZZY_TERMS} eligible terms"
 					)));
 				}
-				Ok(TracePlan::Fuzzy(
-					terms
-						.into_iter()
-						.map(|(analyzed, surface)| {
-							let eligible = fuzzy_eligible(&surface);
-							let matcher = eligible.then(|| FuzzyMatcher::new(&analyzed, self.id_field, false));
-							let surface_matcher = (eligible && surface != analyzed)
-								.then(|| FuzzyMatcher::new(&surface, self.id_field, false));
-							TraceFuzzyTerm {
-								analyzed,
-								matcher,
-								surface_matcher,
-							}
-						})
-						.collect(),
-				))
+				Ok(TracePlan::Fuzzy(terms))
 			}
 		}
 	}
@@ -1171,27 +1140,17 @@ impl Engine {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
-					for term in terms {
-						let mut analyzed_matches = false;
-						if let Some(tokens) = analyzed_by_position.get(&token.position) {
-							for token in tokens {
-								if *token == term.analyzed
-									|| match &term.matcher {
-										Some(matcher) => matcher.matches(token)?,
-										None => false,
-									} {
-									analyzed_matches = true;
-									break;
-								}
-							}
-						}
-						let surface_matcher = term.surface_matcher.as_ref().or(term.matcher.as_ref());
+					for (analyzed_term, surface_term) in terms {
+						let analyzed_matches = analyzed_by_position.get(&token.position).is_some_and(|tokens| {
+							tokens.iter().any(|token| {
+								*token == analyzed_term
+									|| (fuzzy_eligible(surface_term) && within_one_edit(analyzed_term, token))
+							})
+						});
 						if analyzed_matches
-							|| match surface_matcher {
-								Some(matcher) => matcher.matches(&token.text)?,
-								None => false,
-							} {
-							found.insert(term.analyzed.clone());
+							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
+						{
+							found.insert(analyzed_term.clone());
 							spans_truncated |= push_trace_span(
 								&mut spans,
 								&mut seen_spans,
@@ -2026,6 +1985,56 @@ fn push_trace_span(
 	} else {
 		true
 	}
+}
+
+fn within_one_edit(left: &str, right: &str) -> bool {
+	let left_length = left.chars().count();
+	let right_length = right.chars().count();
+	if left_length.abs_diff(right_length) > 1 {
+		return false;
+	}
+	if left == right {
+		return true;
+	}
+	if left_length == right_length {
+		let mut differences = [(0usize, '\0', '\0'); 2];
+		let mut count = 0;
+		for (index, (left, right)) in left.chars().zip(right.chars()).enumerate() {
+			if left == right {
+				continue;
+			}
+			if count == differences.len() {
+				return false;
+			}
+			differences[count] = (index, left, right);
+			count += 1;
+		}
+		return count == 1
+			|| (count == 2
+				&& differences[1].0 == differences[0].0 + 1
+				&& differences[0].1 == differences[1].2
+				&& differences[1].1 == differences[0].2);
+	}
+	let (shorter, longer) = if left_length < right_length {
+		(left, right)
+	} else {
+		(right, left)
+	};
+	let mut shorter = shorter.chars().peekable();
+	let mut longer = longer.chars().peekable();
+	let mut edits = 0;
+	while let (Some(short), Some(long)) = (shorter.peek(), longer.peek()) {
+		if short == long {
+			shorter.next();
+		} else {
+			edits += 1;
+			if edits > 1 {
+				return false;
+			}
+		}
+		longer.next();
+	}
+	true
 }
 
 fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -3539,14 +3548,8 @@ mod tests {
 	}
 
 	#[test]
-	fn fuzzy_matcher_prepares_only_when_edit_matching_is_needed() {
-		let matcher = FuzzyMatcher::new("shoe", Field::from_field_id(0), false);
-		assert!(matcher.matches("shoe").unwrap());
-		assert!(!matcher.matches("unrelated").unwrap());
-		assert!(matcher.automaton.get().is_none());
-		assert!(matcher.matches("sohe").unwrap());
-		assert!(matcher.automaton.get().is_some());
-		let prefix = FuzzyMatcher::new("shoe", Field::from_field_id(0), true);
+	fn fuzzy_prefix_matcher_prepares_only_after_exact_prefix_misses() {
+		let prefix = FuzzyPrefixMatcher::new("shoe", Field::from_field_id(0));
 		assert!(prefix.matches("shoestring").unwrap());
 		assert!(prefix.automaton.get().is_none());
 		assert!(prefix.matches("sjoestring").unwrap());
@@ -3554,7 +3557,7 @@ mod tests {
 	}
 
 	#[test]
-	fn native_fuzzy_matcher_agrees_with_dictionary_automata() {
+	fn trace_fuzzy_predicates_agree_with_tantivy_dictionary_automata() {
 		for text in ["shoe", "café", "κόσμος", "e\u{301}lan", "𐐨abc"] {
 			let chars = text.chars().collect::<Vec<_>>();
 			let mut candidates = HashSet::from([text.to_owned(), "zzzzzzzzzz".to_owned(), String::new()]);
@@ -3621,10 +3624,13 @@ mod tests {
 						expected.insert(String::from_utf8(stream.key().to_vec()).unwrap());
 					}
 				}
-				let matcher = FuzzyMatcher::new(text, field, prefix);
+				let matcher = prefix.then(|| FuzzyPrefixMatcher::new(text, field));
 				for candidate in &candidates {
 					assert_eq!(
-						matcher.matches(candidate).unwrap(),
+						match &matcher {
+							Some(matcher) => matcher.matches(candidate).unwrap(),
+							None => within_one_edit(text, candidate),
+						},
 						expected.contains(candidate),
 						"{text:?} {candidate:?} prefix={prefix}"
 					);

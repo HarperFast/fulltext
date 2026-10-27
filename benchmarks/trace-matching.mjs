@@ -1,76 +1,93 @@
-import { pathToFileURL } from 'node:url';
+import assert from 'node:assert';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import assert from 'node:assert';
+import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
-const root = path.resolve(process.argv[2] ?? '.'),
-	label = process.argv[3] ?? 'current';
+
+const root = path.resolve(process.argv[2] ?? '.');
+const label = process.argv[3] ?? 'current';
 const { openNativeFullTextIndex } = await import(pathToFileURL(path.join(root, 'dist/native.js')));
-const dir = await mkdtemp(path.join(tmpdir(), 'trace-reuse-'));
-const index = await openNativeFullTextIndex({
-	path: dir,
-	indexId: 'probe',
-	generation: 'one',
-	analyzer: 'english@2',
-	surfaceTerms: true,
-	fields: [{ name: 'title' }],
-	limits: {
-		indexingThreads: 1,
-		searchThreads: 2,
-		writerMemoryBytes: 15000000,
-		maxQueuedCommands: 32,
-		maxQueuedBytes: 8388608,
-		maxBatchBytes: 8388608,
-	},
-});
+const directory = await mkdtemp(path.join(tmpdir(), 'fulltext-trace-matching-'));
+let index;
 try {
-	for (const mode of ['fuzzy', 'fuzzy-prefix'])
-		for (const [words, queryTerms, matched] of [
-			[1, 1, true],
-			[1000, 1, true],
-			[10000, 16, false],
+	index = await openNativeFullTextIndex({
+		path: directory,
+		indexId: 'trace-benchmark',
+		generation: 'one',
+		analyzer: 'english@2',
+		surfaceTerms: true,
+		fields: [{ name: 'title' }],
+		limits: {
+			indexingThreads: 1,
+			searchThreads: 2,
+			writerMemoryBytes: 15000000,
+			maxQueuedCommands: 32,
+			maxQueuedBytes: 8388608,
+			maxBatchBytes: 8388608,
+		},
+	});
+	for (const mode of ['fuzzy', 'fuzzy-prefix']) {
+		for (const [words, queryTerms, inflected, matched] of [
+			[1, 1, false, true],
+			[1000, 1, false, true],
+			[10000, 16, false, false],
+			[20, 16, true, false],
 		]) {
 			const text =
 				queryTerms === 1
 					? mode === 'fuzzy'
 						? 'waterprof'
-						: 'waterpro'
-					: Array.from({ length: 16 }, (_, i) => 'catalog' + String.fromCharCode(97 + i)).join(' ');
-			const req = { text, mode };
-			const records = [{ id: 'one', fields: { title: (matched ? 'waterproof ' : 'zzzzzzzz ').repeat(words) } }];
-			for (let i = 0; i < 50; i++) await index.traceMatches(req, records);
-			const times = [];
+						: 'watrepro'
+					: Array.from(
+							{ length: 16 },
+							(_, i) => 'catalog' + String.fromCharCode(97 + i) + (inflected ? 'ing' : ''),
+						).join(' ');
+			const request = { text, mode };
+			const source = matched ? 'waterproof ' : inflected ? 'zzazzzzzing ' : 'zzzzzzzz ';
+			const records = [{ id: 'one', fields: { title: source.repeat(words) } }];
+			const check = (result) => {
+				assert.strictEqual(result.complete, true);
+				assert.strictEqual(result.records.length, Number(matched));
+			};
+			const firstStarted = performance.now();
+			const first = await index.traceMatches(request, records);
+			const firstCallMilliseconds = performance.now() - firstStarted;
+			check(first);
+			for (let i = 0; i < 50; i++) await index.traceMatches(request, records);
+			const samples = [];
 			for (let i = 0; i < 200; i++) {
-				const start = performance.now();
-				const r = await index.traceMatches(req, records);
-				times.push(performance.now() - start);
-				assert.equal(r.complete, true);
-				assert.equal(r.records.length, Number(matched));
+				const started = performance.now();
+				const result = await index.traceMatches(request, records);
+				samples.push(performance.now() - started);
+				check(result);
 			}
-			times.sort((a, b) => a - b);
+			samples.sort((a, b) => a - b);
 			console.log(
 				JSON.stringify({
 					label,
-					node: process.version,
-					platform: process.platform,
-					arch: process.arch,
 					mode,
 					words,
 					queryTerms,
+					inflected,
+					firstCallMilliseconds,
 					iterations: 200,
 					warmupIterations: 50,
 					percentileMethod: 'nearest-rank',
-					p50: times[99],
-					p95: times[189],
-					p99: times[197],
+					p50: samples[99],
+					p95: samples[189],
+					p99: samples[197],
+					node: process.version,
+					platform: process.platform,
+					arch: process.arch,
 				}),
 			);
 		}
+	}
 } finally {
 	try {
-		await index.close({ mode: 'rollback' });
+		if (index) await index.close({ mode: 'rollback' });
 	} finally {
-		await rm(dir, { recursive: true, force: true });
+		await rm(directory, { recursive: true, force: true });
 	}
 }
