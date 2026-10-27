@@ -73,17 +73,15 @@ The wrapper composes Tantivy primitives instead of implementing a second search 
 | Highlighting and snippets                                                       | Wrapper                                                                                               | Match caller-supplied current values and return UTF-16 spans without storing source text or emitting HTML. Tantivy's snippet helper does not implement Fulltext's synonym, fuzzy/prefix, source-span, and completeness contract. |
 | Node concurrency and admission                                                  | Wrapper                                                                                               | Keep sustained native work off JavaScript, bound queues and process resources, isolate expensive queries, and settle every admitted promise during close.                                                                        |
 
-The custom stable collector is intentionally narrow, but it is wrapper-owned collection code. It
-reuses Tantivy's scorer, `TopNComputer`, segment readers, and string fast-field ordinals; it does not
-calculate relevance or read postings itself. Tantivy can compose score and string sort keys, but its
-historically benchmarked 0.26.2 `SortByString` converts each retained ordinal with an individual dictionary lookup and notes
-the repeated-decompression cost in its source. A direct comparison against that native composite
-collector on the deterministic 100,000-document benchmark kept the wrapper path only after it was
-consistently faster on the affected multi-term `any` query. The wrapper resolves retained ordinals
-in one ordered traversal per segment and also carries the fail-closed missing-ID invariant and match
-count. Re-run that comparison when Tantivy's string sorting or this collector changes; remove the
-wrapper collector if the native path reaches parity. Prefix expansion is likewise policy around
-Tantivy's dictionary and query objects, not a replacement postings implementation.
+The custom stable collector reuses Tantivy's scorer, `TopNComputer`, segment readers, and string
+fast-field ordinals; it does not calculate relevance or read postings itself. An optimized local
+macOS arm64 probe against Tantivy 0.27 used 100,000 generated documents and 40 interleaved calls
+per collector. At a 10-hit window the wrapper/native totals were 44.5/41.5 ms; at 1,000 hits they
+were 72.0/1,237.4 ms, with matching returned IDs. This is one synthetic comparison, not a universal
+speedup claim. Retain the wrapper for larger windows, batched dictionary resolution, exact match
+count and fail-closed missing-ID behavior; the native composite collector is a possible future
+small-window optimization. Re-run this comparison when string sorting or collection changes.
+Prefix expansion remains bounded policy around Tantivy's dictionary and query objects.
 
 ## Public API
 

@@ -4171,6 +4171,53 @@ mod tests {
 	}
 
 	#[test]
+	fn dictionary_resolution_preserves_duplicate_ordinals_and_result_order() {
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: ["Shared-Version", "Other-Version", "Shared-Version"]
+					.into_iter()
+					.enumerate()
+					.map(|(i, version)| crate::protocol::Upsert {
+						id: i.to_string(),
+						version: Some(version.to_owned()),
+						fields: vec![("title".to_owned(), vec!["trail shoe".to_owned()])],
+						filters: Vec::new(),
+					})
+					.collect(),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		assert_eq!(searcher.segment_readers().len(), 1);
+		let column = searcher.segment_readers()[0]
+			.fast_fields()
+			.str(VERSION_FIELD_NAME)
+			.unwrap()
+			.unwrap();
+		let shared = column.dictionary().term_ord(b"Shared-Version").unwrap().unwrap();
+		let other = column.dictionary().term_ord(b"Other-Version").unwrap().unwrap();
+		assert_eq!(
+			resolve_string_ordinals(
+				&column,
+				vec![(shared, 2), (other, 0), (shared, 1)],
+				3,
+				"missing version"
+			)
+			.unwrap(),
+			vec![
+				Some(b"Other-Version".to_vec()),
+				Some(b"Shared-Version".to_vec()),
+				Some(b"Shared-Version".to_vec())
+			]
+		);
+		writer.close().unwrap();
+	}
+
+	#[test]
 	fn scorer_and_for_each_preserve_score_bits() {
 		let mut config = config();
 		config.identity.surface_terms = true;
