@@ -60,8 +60,8 @@ The original upgrade qualification compared successful Linux x64/arm64
 [v0.6.0 baseline](https://github.com/HarperFast/fulltext/actions/runs/40444670208). The
 [Qualify Tantivy 0.27 upgrade and enforce the analyzer rebuild boundary](https://github.com/HarperFast/fulltext/issues/71) and
 [Upgrade fulltext to Tantivy 0.27 with safe index rebuilds](https://github.com/HarperFast/fulltext/pull/72) retain the comparison and
-shared-runner limitations. The later hydration refactor requires fresh platform qualification before
-Ready; the prior engine comparison does not qualify an untested follow-up head.
+shared-runner limitations. Metadata-hydration changes also require targeted versioned/offset cases;
+the release workflow retains that matrix separately from its generic mixed-query measurements.
 
 ### Updating Unicode semantics
 

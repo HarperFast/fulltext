@@ -94,6 +94,7 @@ Run the optimized [ordinary-search driver](../benchmarks/ordinary-search.mjs) ag
 
 ```sh
 FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/ordinary-search.mjs /path/to/build label --hydration
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/ordinary-search.mjs /path/to/build label --hydration --approximate-totals
 ```
 
 Observed on macOS arm64 / Node 24.16.0, 2026-10-27: three alternating runs per artifact, each with
@@ -101,7 +102,8 @@ Observed on macOS arm64 / Node 24.16.0, 2026-10-27: three alternating runs per a
 of the three run percentiles, comparing the
 [pre-hydration build](https://github.com/HarperFast/fulltext/commit/e1cc2c160a32a5f0bdbf97f8f547942de11f2e2b)
 with the [hydration build](https://github.com/HarperFast/fulltext/commit/b544e9c9e32ae5a80a237f5e90ec8d12be75c228).
-Both artifacts embed Tantivy 0.27. The shallow fixture has a score change after hit 20, exercising
+The table uses exact totals, including any separate count pass; the second command qualifies
+approximate totals independently. Both artifacts embed Tantivy 0.27. The shallow fixture has a score change after hit 20, exercising
 the no-boundary-tie branch. Versions have either no value or 2,048 bytes of padding plus a short ID.
 
 | Case                                    | Median before/after (ms) | p95 before/after (ms) | p99 before/after (ms) |
@@ -116,7 +118,13 @@ in the shallow case; these are work-model counts, not runtime instrumentation. T
 IDs, versions, totals and within-run score stability. Sub-millisecond tail variation, notably the
 no-version controls, limits general performance claims; this synthetic comparison establishes no
 production latency guarantee. Re-run on representative workloads when changing collection or
-metadata hydration.
+metadata hydration. The Linux release workflow runs both total profiles and retains their JSONL
+results with its workflow artifacts; generic mixed-query results alone do not cover this path.
+
+A separate local approximate-total probe using the same fixture and run counts observed median
+latency 5.802 → 0.895 ms for deep padded versions, 0.729 → 0.717 ms for deep no-version requests,
+and 0.081 → 0.079 ms for shallow padded versions. The no-version shallow control remained about
+0.055 ms. These are additional local measurements, with the same limits as the table above.
 
 ## Public API
 

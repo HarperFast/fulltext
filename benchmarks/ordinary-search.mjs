@@ -72,6 +72,7 @@ function options(directory) {
 }
 
 async function hydrationCases() {
+	const exactTotal = !process.argv.includes('--approximate-totals');
 	for (const versionBytes of [0, 2048]) {
 		const directory = await mkdtemp(path.join(tmpdir(), 'fulltext-hydration-'));
 		let index;
@@ -90,11 +91,11 @@ async function hydrationCases() {
 				[0, 20],
 				[9990, 10],
 			]) {
-				const request = { text: 'widget', mode: 'all', offset, limit, exactTotal: true };
+				const request = { text: 'widget', mode: 'all', offset, limit, exactTotal };
 				const expectedIds = Array.from({ length: limit }, (_, i) => String(offset + i).padStart(5, '0'));
 				const check = (result) => {
-					assert.equal(result.total, 10000);
-					assert.equal(result.totalRelation, 'exact');
+					assert.equal(result.total, !exactTotal && offset === 0 ? limit : 10000);
+					assert.equal(result.totalRelation, !exactTotal && offset === 0 ? 'lower-bound' : 'exact');
 					assert.deepStrictEqual(
 						result.hits.map(({ id }) => id),
 						expectedIds,
@@ -124,6 +125,7 @@ async function hydrationCases() {
 						limit,
 						documents: 10000,
 						versionPaddingBytes: versionBytes,
+						exactTotal,
 						iterations: samples.length,
 						hits: expected.hits.map(({ id, score }) => ({ id, score })),
 						modeledVersionDecodes: {
