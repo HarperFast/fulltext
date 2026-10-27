@@ -2,6 +2,10 @@
 
 Native Tantivy full-text indexing for Node.js.
 
+**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.7.0.** The engine is compiled into
+the native addon; no separate Tantivy installation is required. Upgrading from fulltext 0.6.x
+requires an index rebuild; see [Upgrading from 0.6.x](#upgrading-from-06x) before deploying.
+
 This repository is under active development. The native entry point provides a standalone Tantivy
 index backed by `MmapDirectory`. Applications own their source records and may reuse compatible
 local index files or rebuild them from that authoritative data.
@@ -570,7 +574,19 @@ try {
 ```
 
 `runtimeInfo()` reports the package, Tantivy, ABI, query API, lifecycle API, mutation API, supported
-storage backend, and hard protocol limits. It does not open an index or create files.
+storage backend, and hard protocol limits. It does not open an index or create files. To verify the
+versions in the installed native addon:
+
+```js
+import { runtimeInfo } from '@harperfast/fulltext/native';
+
+const { packageVersion, tantivyVersion } = await runtimeInfo();
+console.log({ packageVersion, tantivyVersion });
+// { packageVersion: '0.7.0', tantivyVersion: '0.27.0' }
+```
+
+The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an
+installed build; [`Cargo.toml`](Cargo.toml) records this source revision's exact engine pin.
 
 ## Storage boundary
 
@@ -592,6 +608,22 @@ npm run benchmark:native -- --documents 100000 --revision v0.1.0 --output benchm
 npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25000 --mutation-driver low-level
 npm run benchmark:inspect -- --indexes 1,10,100,1000 --commits 64 --warm-rounds 10
 ```
+
+After an optimized `npm run build`, run the targeted hydration and trace benchmarks:
+
+```bash
+node scripts/run-local.mjs benchmarks/ordinary-search.mjs . current --hydration
+node scripts/run-local.mjs benchmarks/ordinary-search.mjs . current --hydration --approximate-totals
+node scripts/run-local.mjs benchmarks/trace-matching.mjs . current
+```
+
+Hydration covers shallow/deep pages with and without padded versions under exact and approximate
+totals. Tracing covers small and large fuzzy/fuzzy-prefix inputs, including preparation-heavy
+requests. The Release benchmark workflow retains eight hydration and eight trace JSONL records
+per Linux architecture. See [implementation and measurement limits](docs/native-backend-implementation.md#tantivy-ownership-boundary)
+for final-page version decoding, lazy native fuzzy-prefix matching, the retained full-fuzzy predicate,
+and the benchmark methodology. These implementation changes preserve the public matching and
+pagination contracts; synthetic timings do not establish a general production speedup.
 
 CI reports JavaScript/TypeScript and Rust coverage separately. The Node report uses the built-in
 test runner coverage and stores raw V8 coverage; the Rust report stores LCOV output. Coverage is
