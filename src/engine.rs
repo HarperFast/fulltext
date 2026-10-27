@@ -4119,6 +4119,89 @@ mod tests {
 	}
 
 	#[test]
+	fn scorer_and_for_each_preserve_score_bits() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		let terms = [
+			"waterproof",
+			"trail",
+			"running",
+			"shoe",
+			"forest",
+			"mountain",
+			"river",
+			"stone",
+			"winter",
+			"summer",
+		];
+		for segment in 0..3 {
+			writer
+				.apply(MutationBatch {
+					upserts: (0..96)
+						.map(|doc| crate::protocol::Upsert {
+							id: format!("{segment}-{doc}"),
+							version: None,
+							fields: vec![
+								(
+									"title".to_owned(),
+									vec![terms
+										.iter()
+										.enumerate()
+										.filter(|(term, _)| (doc + term) % 4 != 0)
+										.map(|(term, text)| text.repeat((doc + term) % 3 + 1))
+										.collect::<Vec<_>>()
+										.join(" ")],
+								),
+								("description".to_owned(), vec![terms.join(" ").repeat(doc % 7 + 1)]),
+							],
+							filters: Vec::new(),
+						})
+						.collect(),
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let searcher = engine.reader().unwrap().searcher();
+		for (text, mode) in [
+			(terms.join(" "), SearchMode::Any),
+			(terms.join(" "), SearchMode::All),
+			("waterproof trail".to_owned(), SearchMode::Phrase),
+			("waterproo".to_owned(), SearchMode::Prefix),
+			("waterproff".to_owned(), SearchMode::Fuzzy),
+		] {
+			let built = engine
+				.expression_query(&searcher, &expression(&text, mode, Vec::new()))
+				.unwrap();
+			let weight = built
+				.query
+				.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
+				.unwrap();
+			for reader in searcher.segment_readers() {
+				let mut scorer = weight.scorer(reader, 1.0).unwrap();
+				let mut scored = Vec::new();
+				while scorer.doc() != tantivy::TERMINATED {
+					scored.push((scorer.doc(), scorer.score().to_bits()));
+					scorer.advance();
+				}
+				let mut enumerated = Vec::new();
+				weight
+					.for_each(reader, &mut |doc, score| enumerated.push((doc, score.to_bits())))
+					.unwrap();
+				scored.sort_unstable();
+				enumerated.sort_unstable();
+				assert_eq!(scored, enumerated, "scoring topology changed for {text}");
+			}
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
 	fn orders_equal_scores_by_id_across_segments_and_pages() {
 		let directory = RamDirectory::create();
 		let config = config();
@@ -4169,6 +4252,18 @@ mod tests {
 			writer.commit().unwrap();
 		}
 		let reader = engine.reader().unwrap();
+		for segment in reader.searcher().segment_readers() {
+			let column = segment.fast_fields().str(ID_FIELD_NAME).unwrap().unwrap();
+			let mut ids = Vec::new();
+			for doc in 0..segment.max_doc() {
+				let ordinal = column.ords().first(doc).unwrap();
+				let mut id = String::new();
+				assert!(column.ord_to_str(ordinal, &mut id).unwrap());
+				ids.push((ordinal, id));
+			}
+			ids.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+			assert!(ids.windows(2).all(|pair| pair[0].1.as_bytes() <= pair[1].1.as_bytes()));
+		}
 		let page = |offset, limit| {
 			engine
 				.search(
