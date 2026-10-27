@@ -728,26 +728,30 @@ impl Engine {
 					.collect::<Vec<_>>();
 				(hits, Some(match_count))
 			} else {
-				let metadata = search_hit_metadata(searcher, &scored_docs)?;
+				let ids = search_hit_ids(searcher, &scored_docs)?;
 				let mut ranked = scored_docs
 					.iter()
-					.zip(metadata)
-					.map(|((score, _), metadata)| SearchHit {
-						id: metadata.id,
-						score: *score,
-						version: metadata.version,
-					})
+					.zip(ids)
+					.map(|((score, address), id)| ((*score, id), *address))
 					.collect::<Vec<_>>();
-				ranked.sort_by(|left, right| {
-					right
-						.score
-						.total_cmp(&left.score)
-						.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+				ranked.sort_by(|((left_score, left_id), _), ((right_score, right_id), _)| {
+					right_score
+						.total_cmp(left_score)
+						.then_with(|| left_id.as_bytes().cmp(right_id.as_bytes()))
 				});
-				(
-					ranked.into_iter().skip(request.offset).take(request.limit).collect(),
-					None,
-				)
+				let page = ranked
+					.into_iter()
+					.skip(request.offset)
+					.take(request.limit)
+					.collect::<Vec<_>>();
+				let addresses = page.iter().map(|(_, address)| *address).collect::<Vec<_>>();
+				let versions = search_hit_versions(searcher, &addresses)?;
+				let hits = page
+					.into_iter()
+					.zip(versions)
+					.map(|(((score, id), _), version)| SearchHit { id, score, version })
+					.collect();
+				(hits, None)
 			};
 			let (total, relation) = if scored_docs.len() <= window_end {
 				(scored_docs.len() as u64, TotalRelation::Exact)
@@ -1812,18 +1816,8 @@ fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<
 	Ok(versions)
 }
 
-struct SearchHitMetadata {
-	id: String,
-	version: Option<String>,
-}
-
-fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Result<Vec<SearchHitMetadata>> {
-	let mut metadata = (0..scored_docs.len())
-		.map(|_| SearchHitMetadata {
-			id: String::new(),
-			version: None,
-		})
-		.collect::<Vec<_>>();
+fn search_hit_ids(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -> Result<Vec<String>> {
+	let mut ids = vec![String::new(); scored_docs.len()];
 	let mut hits_by_segment = HashMap::new();
 	for (index, (_, address)) in scored_docs.iter().enumerate() {
 		hits_by_segment
@@ -1838,7 +1832,6 @@ fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -
 			.str(ID_FIELD_NAME)
 			.map_err(index_error)?
 			.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search segment has no ID fast field"))?;
-		let version_column = segment.fast_fields().str(VERSION_FIELD_NAME).map_err(index_error)?;
 		let id_ordinals = segment_hits
 			.iter()
 			.enumerate()
@@ -1850,46 +1843,19 @@ fn search_hit_metadata(searcher: &Searcher, scored_docs: &[(f32, DocAddress)]) -
 				Ok((ordinal, result_index))
 			})
 			.collect::<Result<Vec<_>>>()?;
-		let ids = resolve_string_ordinals(
+		let segment_ids = resolve_string_ordinals(
 			&id_column,
 			id_ordinals,
 			segment_hits.len(),
 			"search hit ID ordinal is missing",
 		)?;
-		for ((index, _), id) in segment_hits.iter().zip(ids) {
+		for ((index, _), id) in segment_hits.iter().zip(segment_ids) {
 			let id = id.ok_or_else(|| FulltextError::new("E_NATIVE_FAILURE", "search hit ID ordinal is missing"))?;
-			metadata[*index].id = String::from_utf8(id)
+			ids[*index] = String::from_utf8(id)
 				.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit ID is not UTF-8"))?;
 		}
-		if let Some(version_column) = version_column {
-			let ordinals = segment_hits
-				.iter()
-				.enumerate()
-				.filter_map(|(result_index, (_, doc_id))| {
-					version_column
-						.term_ords(*doc_id)
-						.next()
-						.map(|ordinal| (ordinal, result_index))
-				})
-				.collect();
-			let versions = resolve_string_ordinals(
-				&version_column,
-				ordinals,
-				segment_hits.len(),
-				"search hit version ordinal is missing",
-			)?;
-			for ((index, _), version) in segment_hits.into_iter().zip(versions) {
-				let Some(version) = version else {
-					continue;
-				};
-				metadata[index].version = Some(
-					String::from_utf8(version)
-						.map_err(|_| FulltextError::new("E_NATIVE_FAILURE", "search hit version is not UTF-8"))?,
-				);
-			}
-		}
 	}
-	Ok(metadata)
+	Ok(ids)
 }
 
 fn resolve_string_ordinals(
@@ -3489,8 +3455,8 @@ mod tests {
 			.unwrap();
 		let mut legacy = legacy_docs
 			.iter()
-			.zip(search_hit_metadata(&searcher, &legacy_docs).unwrap())
-			.map(|((score, _), metadata)| (metadata.id, *score))
+			.zip(search_hit_ids(&searcher, &legacy_docs).unwrap())
+			.map(|((score, _), id)| (id, *score))
 			.collect::<Vec<_>>();
 		legacy.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 		assert_eq!(
@@ -4522,7 +4488,7 @@ mod tests {
 	}
 
 	#[test]
-	fn resolves_hit_metadata_in_document_order_with_duplicate_and_missing_versions() {
+	fn resolves_hit_ids_and_versions_in_document_order_with_duplicate_and_missing_versions() {
 		let config = config();
 		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
 		let mut writer = engine.writer(&config).unwrap();
@@ -4546,13 +4512,9 @@ mod tests {
 			.into_iter()
 			.map(|doc_id| (1.0, DocAddress::new(0, doc_id)))
 			.collect::<Vec<_>>();
-		let metadata = search_hit_metadata(&searcher, &scored_docs).unwrap();
 		assert_eq!(
-			metadata
-				.iter()
-				.map(|value| (value.id.as_str(), value.version.as_deref()))
-				.collect::<Vec<_>>(),
-			vec![("three", Some("shared")), ("one", Some("shared")), ("two", None)]
+			search_hit_ids(&searcher, &scored_docs).unwrap(),
+			vec!["three", "one", "two"]
 		);
 		assert_eq!(
 			search_hit_versions(
@@ -4562,6 +4524,89 @@ mod tests {
 			.unwrap(),
 			vec![Some("shared".to_owned()), Some("shared".to_owned()), None]
 		);
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn offset_pages_preserve_versions_scores_and_totals_inside_score_ties() {
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for group in 0..3 {
+			writer
+				.apply(MutationBatch {
+					upserts: ["z", "A", "é", "a"]
+						.into_iter()
+						.enumerate()
+						.map(|(i, suffix)| crate::protocol::Upsert {
+							id: format!("{group}-{suffix}"),
+							version: match i % 3 {
+								0 => None,
+								1 => Some("shared".to_owned()),
+								_ => Some("long".repeat(512)),
+							},
+							fields: vec![(
+								"title".to_owned(),
+								vec![format!("catalog {}", "other ".repeat(group * 100))],
+							)],
+							filters: Vec::new(),
+						})
+						.collect(),
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let searcher = engine.reader().unwrap().searcher();
+		let mut request = SearchRequest {
+			expression: expression("catalog", SearchMode::All, vec!["title".to_owned()]),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 12,
+			exact_total: true,
+			budget_milliseconds: 30_000,
+			traversal: false,
+			after: None,
+		};
+		let full = engine.search(&searcher, &request).unwrap();
+		assert_eq!(
+			full.hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
+			(0..3)
+				.flat_map(|group| ["A", "a", "z", "é"].map(|suffix| format!("{group}-{suffix}")))
+				.collect::<Vec<_>>()
+		);
+		assert_eq!(full.hits[0].score.to_bits(), full.hits[3].score.to_bits());
+		assert!(full.hits[3].score > full.hits[4].score);
+		assert!(full.hits[7].score > full.hits[8].score);
+		let hits = |values: &[SearchHit]| {
+			values
+				.iter()
+				.map(|hit| (hit.id.clone(), hit.score.to_bits(), hit.version.clone()))
+				.collect::<Vec<_>>()
+		};
+		for exact in [false, true] {
+			for (offset, limit) in [(1, 7), (1, 2), (9, 5), (12, 5)] {
+				request.offset = offset;
+				request.limit = limit;
+				request.exact_total = exact;
+				let page = engine.search(&searcher, &request).unwrap();
+				assert_eq!(hits(&page.hits), hits(&full.hits[offset..12.min(offset + limit)]));
+				let lower_bound = !exact && offset + limit < 12;
+				assert_eq!(page.total, if lower_bound { (offset + limit) as u64 } else { 12 });
+				assert_eq!(
+					page.total_relation,
+					if lower_bound {
+						TotalRelation::LowerBound
+					} else {
+						TotalRelation::Exact
+					}
+				);
+			}
+		}
 		writer.close().unwrap();
 	}
 

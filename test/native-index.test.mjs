@@ -191,6 +191,46 @@ test('opens concurrent readers, reloads publications, evaluates boolean queries,
 	await Promise.all([first.close(), second.close()]);
 });
 
+test('preserves versions and score ties on offset pages across collection paths', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context)));
+	try {
+		const upserts = Array.from({ length: 12 }, (_, i) => ({
+			id: `${Math.floor(i / 4)}-${['z', 'A', 'é', 'a'][i % 4]}`,
+			version: i % 3 === 0 ? undefined : i % 3 === 1 ? 'shared' : 'long'.repeat(512),
+			fields: { title: `catalog ${'other '.repeat(Math.floor(i / 4) * 100)}` },
+		}));
+		await index.applyMutationBatch({ upserts });
+		await index.commit();
+		await index.reload();
+		for (const mode of ['all', 'any']) {
+			const query = { text: mode === 'all' ? 'catalog' : 'catalog other', mode, fields: ['title'] };
+			const full = await index.search({ ...query, limit: 12, exactTotal: true });
+			assert.strictEqual(full.hits.length, 12);
+			for (const hit of full.hits) assert.strictEqual(hit.version, upserts.find(({ id }) => id === hit.id).version);
+			if (mode === 'all') {
+				assert.strictEqual(full.hits[0].score, full.hits[3].score);
+				assert(full.hits[7].score > full.hits[8].score);
+			}
+			for (const exactTotal of [false, true]) {
+				for (const [offset, limit] of [
+					[1, 7],
+					[1, 2],
+					[9, 5],
+					[12, 5],
+				]) {
+					const page = await index.search({ ...query, offset, limit, exactTotal });
+					assert.deepStrictEqual(page.hits, full.hits.slice(offset, offset + limit));
+					const lowerBound = !exactTotal && offset + limit < 12;
+					assert.strictEqual(page.total, lowerBound ? offset + limit : 12);
+					assert.strictEqual(page.totalRelation, lowerBound ? 'lower-bound' : 'exact');
+				}
+			}
+		}
+	} finally {
+		await index.close();
+	}
+});
+
 test('reports a missing read-only index as not ready', async (context) => {
 	const indexPath = temporaryIndex(context);
 	rmSync(indexPath, { recursive: true });
