@@ -97,4 +97,4 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" benchmark-*.json --clobber
+        run: gh release upload "$RELEASE_TAG" benchmark-*.json benchmark-*.jsonl --clobber

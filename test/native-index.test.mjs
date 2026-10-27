@@ -990,7 +990,17 @@ test('rejects previous stemmer identities before open and retires them for rebui
 			state: 'incompatible',
 			code: 'E_IDENTITY_MISMATCH',
 		});
-		await assert.rejects(openNativeFullTextIndex(config), { code: 'E_IDENTITY_MISMATCH' });
+		let unexpectedIndex;
+		try {
+			await assert.rejects(
+				openNativeFullTextIndex(config).then((opened) => {
+					unexpectedIndex = opened;
+				}),
+				{ code: 'E_IDENTITY_MISMATCH' },
+			);
+		} finally {
+			if (unexpectedIndex) await unexpectedIndex.close({ mode: 'rollback' });
+		}
 		const reset = await resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId });
 		assert.strictEqual(reset.state, 'reset');
 		assert.strictEqual(existsSync(reset.retiredPath), true);
