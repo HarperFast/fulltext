@@ -158,6 +158,20 @@
 						]
 					}
 				}
+			},
+			{
+				"id": "stopword-guide",
+				"request": {
+					"text": "the guide",
+					"mode": "all"
+				}
+			},
+			{
+				"id": "title-television",
+				"request": {
+					"text": "television",
+					"fields": ["title"]
+				}
 			}
 		],
 		"profiles": [
@@ -246,7 +260,9 @@
 						"trail-title",
 						"headset",
 						"television"
-					]
+					],
+					"stopword-guide": ["stopword", "prefix-stop", "phrase-gap"],
+					"title-television": ["television"]
 				}
 			},
 			{
@@ -333,7 +349,9 @@
 						"é-tie",
 						"😀-tie",
 						"trail-title"
-					]
+					],
+					"stopword-guide": ["stopword", "prefix-stop", "phrase-gap"],
+					"title-television": ["television"]
 				}
 			},
 			{
@@ -422,7 +440,9 @@
 						"trail-title",
 						"headset",
 						"television"
-					]
+					],
+					"stopword-guide": ["stopword"],
+					"title-television": ["television"]
 				}
 			},
 			{
@@ -520,7 +540,9 @@
 						"trail-title",
 						"headset",
 						"television"
-					]
+					],
+					"stopword-guide": ["stopword", "prefix-stop", "phrase-gap"],
+					"title-television": ["television", "tv"]
 				}
 			}
 		]

@@ -85,11 +85,8 @@ for (const profile of profiles) {
 					});
 				}
 			} finally {
-				try {
-					await index?.close({ mode: 'rollback' });
-				} finally {
-					await rm(directory, { recursive: true, force: true });
-				}
+				await index?.close({ mode: 'rollback' });
+				await rm(directory, { recursive: true, force: true });
 			}
 		});
 	}

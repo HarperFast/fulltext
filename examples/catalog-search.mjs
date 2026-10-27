@@ -42,7 +42,7 @@ try {
 			},
 		},
 		{ text: 'cafe resume', mode: 'all' },
-		{ text: 'television' },
+		{ text: 'television', fields: ['title'] },
 	]) {
 		const result = await index.search({ ...request, exactTotal: true, limit: 10 });
 		console.log({ request, total: result.total, hits: result.hits });
@@ -58,9 +58,6 @@ try {
 		console.log(JSON.stringify(traced, null, 2));
 	}
 } finally {
-	try {
-		await index?.close({ mode: 'rollback' });
-	} finally {
-		await rm(directory, { recursive: true, force: true });
-	}
+	await index?.close({ mode: 'rollback' });
+	await rm(directory, { recursive: true, force: true });
 }

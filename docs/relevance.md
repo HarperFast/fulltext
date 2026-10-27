@@ -19,12 +19,14 @@ source values. It does not fetch records, enforce authorization or call Harper A
 ## What the fixtures protect
 
 The [regression fixture](../test/fixtures/relevance.json) defines expected ordered IDs rather than
-numeric score snapshots. The [public-API test](../test/native-relevance.test.mjs) runs 19 catalog
+numeric score snapshots. The [public-API test](../test/native-relevance.test.mjs) runs 21 catalog
 queries under four configurations: title boost, equal field weights, stop words disabled and
-index-time synonyms. Eight focused stemming queries bring the total to 84 cases. Each runs with
+index-time synonyms. Eight focused stemming queries bring the total to 92 cases. Each runs with
 forward and reverse insertion order; selected cases also compare complete continuation pages
 with ordinary results. Exact counts, versions, finite descending scores and UTF-8 tie ordering
-are checked alongside the expected IDs.
+are checked alongside the expected IDs. `the guide` distinguishes stop-word removal from
+keeping stop words; title-only `television` distinguishes index-time synonym expansion from
+matching a term already present in another field.
 
 The corpus covers term/phrase/prefix/fuzzy modes, Boolean clauses, source-field selection, arrays,
 accent and width folding, possessives, no matches and tied IDs. The stemming cases intentionally
