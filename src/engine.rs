@@ -653,13 +653,7 @@ impl Engine {
 			check_deadline(deadline)?;
 			let more = scored_docs.len() > request.limit;
 			scored_docs.truncate(request.limit);
-			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
-			let versions = search_hit_versions(searcher, &addresses)?;
-			let hits = scored_docs
-				.into_iter()
-				.zip(versions)
-				.map(|(((score, id), _), version)| SearchHit { id, score, version })
-				.collect::<Vec<_>>();
+			let hits = search_hits(searcher, scored_docs)?;
 			let bytes = search_response_bytes(&hits, 13 + 4 + snapshot.len() + 1)?;
 			if bytes > MAX_SEARCH_RESPONSE_BYTES {
 				return Err(FulltextError::new(
@@ -689,13 +683,7 @@ impl Engine {
 				.map_err(index_error)??;
 			check_deadline(deadline)?;
 			scored_docs.truncate(request.limit);
-			let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
-			let versions = search_hit_versions(searcher, &addresses)?;
-			let hits = scored_docs
-				.into_iter()
-				.zip(versions)
-				.map(|(((score, id), _), version)| SearchHit { id, score, version })
-				.collect::<Vec<_>>();
+			let hits = search_hits(searcher, scored_docs)?;
 			let (total, relation) = if retained < window_end.saturating_add(1) {
 				(retained as u64, TotalRelation::Exact)
 			} else {
@@ -719,13 +707,7 @@ impl Engine {
 						&StableScoreTieCollector::new(request.offset..window_end),
 					)
 					.map_err(index_error)??;
-				let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
-				let versions = search_hit_versions(searcher, &addresses)?;
-				let hits = scored_docs
-					.into_iter()
-					.zip(versions)
-					.map(|(((score, id), _), version)| SearchHit { id, score, version })
-					.collect::<Vec<_>>();
+				let hits = search_hits(searcher, scored_docs)?;
 				(hits, Some(match_count))
 			} else {
 				let ids = search_hit_ids(searcher, &scored_docs)?;
@@ -744,13 +726,7 @@ impl Engine {
 					.skip(request.offset)
 					.take(request.limit)
 					.collect::<Vec<_>>();
-				let addresses = page.iter().map(|(_, address)| *address).collect::<Vec<_>>();
-				let versions = search_hit_versions(searcher, &addresses)?;
-				let hits = page
-					.into_iter()
-					.zip(versions)
-					.map(|(((score, id), _), version)| SearchHit { id, score, version })
-					.collect();
+				let hits = search_hits(searcher, page)?;
 				(hits, None)
 			};
 			let (total, relation) = if scored_docs.len() <= window_end {
@@ -1774,6 +1750,16 @@ fn search_response_bytes(hits: &[SearchHit], header_bytes: usize) -> Result<usiz
 			.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, |version| 4 + version.len()))
 			.ok_or_else(|| FulltextError::new("E_RESULT_TOO_LARGE", "search response size overflow"))
 	})
+}
+
+fn search_hits(searcher: &Searcher, scored_docs: Vec<StableScoreTieHit>) -> Result<Vec<SearchHit>> {
+	let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
+	let versions = search_hit_versions(searcher, &addresses)?;
+	Ok(scored_docs
+		.into_iter()
+		.zip(versions)
+		.map(|(((score, id), _), version)| SearchHit { id, score, version })
+		.collect())
 }
 
 fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<Vec<Option<String>>> {

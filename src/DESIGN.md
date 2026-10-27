@@ -28,6 +28,11 @@ The scorer/`for_each` bit-equivalence regression covers multi-clause unions, int
 phrase, prefix and fuzzy queries across segments. The equal-score paging fixture also checks
 ordinal ordering against raw UTF-8 IDs. Retain both gates across engine upgrades.
 
+Result collection keeps document addresses until final page selection. All four search paths use
+`search_hits` to decode versions only for returned hits. Ordinary score sorting still resolves and
+validates IDs across its retained TopDocs window; skipped version metadata is not proactively
+validated, matching stable collection and traversal. Keep optional version data out of ranking.
+
 ## Persisted analyzer revision
 
 Identities 6/7 preserve the layouts of 4/5 while marking Tantivy 0.27's changed English stemmer.
