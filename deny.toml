@@ -19,6 +19,8 @@ allow = [
 multiple-versions = "deny"
 wildcards = "deny"
 skip = [
+	{ name = "getrandom", version = "0.3.4" },
+	{ name = "r-efi", version = "5.3.0" },
 	{ name = "syn", version = "2.0.119" },
 	{ name = "windows-sys", version = "0.59.0" },
 ]

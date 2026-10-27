@@ -168,7 +168,7 @@ remediation rather than falling back to in-place deletion.
 - `E_LOCK_BUSY` is a retryable ownership/quiescence result, not corruption and not permission to
   rebuild through a live owner.
 - A close rejected with `E_DIRTY_CLOSE` leaves the handle open so the caller can publish or close
-  with rollback. `E_QUIESCENCE_FAILED` means native resources may still be in use. Tantivy 0.26.2 can return early from
+  with rollback. `E_QUIESCENCE_FAILED` means native resources may still be in use. Tantivy 0.27.0 can return early from
   `wait_merging_threads()` after an indexing-worker failure without joining every remaining worker.
   The wrapper therefore removes the unusable handle and quarantines its canonical path until process
   restart. The quarantine is path-scoped so another index using the same logical ID is

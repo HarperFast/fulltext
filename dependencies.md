@@ -7,7 +7,7 @@ reviewed before merge.
 
 | Dependency                     | Scope                           | Purpose                                                                      |
 | ------------------------------ | ------------------------------- | ---------------------------------------------------------------------------- |
-| `tantivy` 0.26.2               | runtime                         | Full-text indexing and search engine, including native filesystem storage.   |
+| `tantivy` 0.27.0               | runtime                         | Full-text indexing and search engine, including native filesystem storage.   |
 | `sha2` 0.10.9                  | runtime                         | SHA-256 snapshot identity over Tantivy segment IDs and deletion generations. |
 | `unicode-normalization` 0.1.24 | runtime                         | Applies the versioned English analyzer's NFKC token normalization.           |
 | `napi` 3.13.0                  | optional runtime                | Node-API values, error conversion, and addon-image retention.                |
@@ -36,6 +36,18 @@ Scheduled Cargo version updates are limited to Tantivy. Dependabot security upda
 for the full Cargo graph; they share the `dependencies` label used for Slack notifications. The
 per-dependency `version-update:` filters preserve that distinction and must not be replaced with a
 bare dependency-name ignore rule.
+
+### Tantivy 0.27 compatibility
+
+Tantivy 0.27 replaces the English stemmer with `frostem`. Persisted identities 6 (text only)
+and 7 (typed filters) distinguish that output from identities 4/5; the public `english@2`
+configuration remains unchanged. Older indexes must be retired and rebuilt from authoritative
+records. Reset still recognizes identities 1–5. Retire a new index with the 0.7 reset API before downgrading and rebuilding with 0.6; its reset parser cannot recognize identities 6/7. Never copy
+an old sidecar over a new index to bypass inspection.
+
+The exact `getrandom` 0.3.4 and `r-efi` 5.3.0 duplicate exceptions are required by
+`tantivy-columnar` 0.27 → `rand` 0.9, alongside `getrandom` 0.4 used by `tempfile`/`uuid`.
+Remove both exceptions when those upstream branches converge on one random-backend version.
 
 ### Updating Unicode semantics
 

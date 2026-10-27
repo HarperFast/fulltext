@@ -42,7 +42,7 @@ the consuming application. The Node package contributes canonical path handling 
 - The directory harness exercises Tantivy create, write, commit, query, and reopen behavior against
   `MmapDirectory`.
   Source: [`src/directory_harness.rs`](../src/directory_harness.rs).
-- Tantivy 0.26.2 is pinned and compiled into the addon. Its `Index::open` wraps a supplied directory
+- Tantivy 0.27.0 is pinned and compiled into the addon. Its `Index::open` wraps a supplied directory
   in `ManagedDirectory`, while `Index::writer_with_num_threads` acquires the writer lock and divides
   the supplied memory budget across the requested indexing threads.
   Sources: [`Cargo.toml`](../Cargo.toml), pinned Tantivy `src/index/index.rs`.
@@ -76,7 +76,7 @@ The wrapper composes Tantivy primitives instead of implementing a second search 
 The custom stable collector is intentionally narrow, but it is wrapper-owned collection code. It
 reuses Tantivy's scorer, `TopNComputer`, segment readers, and string fast-field ordinals; it does not
 calculate relevance or read postings itself. Tantivy can compose score and string sort keys, but its
-0.26.2 `SortByString` converts each retained ordinal with an individual dictionary lookup and notes
+historically benchmarked 0.26.2 `SortByString` converts each retained ordinal with an individual dictionary lookup and notes
 the repeated-decompression cost in its source. A direct comparison against that native composite
 collector on the deterministic 100,000-document benchmark kept the wrapper path only after it was
 consistently faster on the affected multi-term `any` query. The wrapper resolves retained ordinals
@@ -318,7 +318,7 @@ multi-clause `any` collector already enumerates and counts every match, so that 
 instead of executing the query twice.
 
 Single-clause `any`, `all`, phrase, prefix, fuzzy, and candidate-filtered searches use
-`TopDocs::order_by_score()`. In pinned Tantivy 0.26.2 that collector invokes
+`TopDocs::order_by_score()`. In pinned Tantivy 0.27.0 that collector invokes
 `Weight::for_each_pruning`, and Boolean term unions can select the block-WAND implementation.
 Candidate-free top-level `any` queries with multiple scoring clauses instead enumerate matches with
 one stable score-then-raw-ID collector so every page shares one scoring topology. Its per-segment
@@ -367,7 +367,7 @@ ordinary live-operation classification rather than triggering an automatic rebui
 Missing storage returns `missing` without creating the requested directory. A read-only integration
 test snapshots file names, bytes, sizes, and modification times before and after inspection.
 
-Successful `commit()` delegates to Tantivy 0.26.2's ordinary commit path and resolves only after it
+Successful `commit()` delegates to Tantivy 0.27.0's ordinary commit path and resolves only after it
 returns. The process-kill test verifies publication and process-crash recovery. A test directory
 that reports an error after applying an atomic metadata write verifies conservative checkpoint
 handling after an ambiguous commit. Checkpointed publication is implemented separately in

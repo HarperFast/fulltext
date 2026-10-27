@@ -1901,20 +1901,22 @@ fn resolve_string_ordinals(
 	ordinals.sort_unstable();
 	let mut values = vec![None; value_count];
 	let mut next_ordinal = 0;
+	let mut extra_terms = false;
+	let sorted_ordinals = ordinals.iter().map(|(ordinal, _)| *ordinal).collect::<Vec<_>>();
 	let found_all = column
 		.dictionary()
-		.sorted_ords_to_term_cb(ordinals.iter().map(|(ordinal, _)| *ordinal), |value| {
-			let Some((_, result_index)) = ordinals.get(next_ordinal) else {
-				return Err(std::io::Error::new(
-					std::io::ErrorKind::InvalidData,
-					"string dictionary returned too many terms",
-				));
-			};
+		.sorted_ords_to_term_cb(&sorted_ordinals, |value| {
+			if let Some((_, result_index)) = ordinals.get(next_ordinal) {
+				values[*result_index] = Some(value.to_vec());
+			} else {
+				extra_terms = true;
+			}
 			next_ordinal += 1;
-			values[*result_index] = Some(value.to_vec());
-			Ok(())
 		})
 		.map_err(storage_error)?;
+	if extra_terms {
+		return Err(storage_error("string dictionary returned too many terms"));
+	}
 	if !found_all || next_ordinal != ordinals.len() {
 		return Err(FulltextError::new("E_NATIVE_FAILURE", missing_message));
 	}
@@ -2193,9 +2195,14 @@ fn build_schema_with_surface_record(
 		.set_tokenizer("raw")
 		.set_index_option(IndexRecordOption::Basic)
 		.set_fieldnorms(false);
-	let id_options = TextOptions::default().set_indexing_options(id_indexing).set_fast(None);
+	let id_options = TextOptions::default()
+		.set_indexing_options(id_indexing)
+		.set_fast(tantivy::tokenizer::RAW_TOKENIZER_NAME);
 	let id_field = builder.add_text_field(ID_FIELD_NAME, id_options);
-	let version_field = builder.add_text_field(VERSION_FIELD_NAME, TextOptions::default().set_fast(None));
+	let version_field = builder.add_text_field(
+		VERSION_FIELD_NAME,
+		TextOptions::default().set_fast(tantivy::tokenizer::RAW_TOKENIZER_NAME),
+	);
 	let record = if config.positions {
 		IndexRecordOption::WithFreqsAndPositions
 	} else {
@@ -2786,9 +2793,9 @@ fn canonical_synonym_term(analyzer: &mut TextAnalyzer, text: &str, label: &str) 
 
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 	let mut bytes = if config.filter_fields.is_empty() {
-		b"HTFI\x04\x00".to_vec()
+		b"HTFI\x06\x00".to_vec()
 	} else {
-		b"HTFI\x05\x00".to_vec()
+		b"HTFI\x07\x00".to_vec()
 	};
 	push_string(&mut bytes, &config.index_id);
 	push_string(&mut bytes, &config.generation);
@@ -2829,7 +2836,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	if bytes.get(..4)? != b"HTFI"
 		|| !matches!(
 			version,
-			b"\x01\x00" | b"\x02\x00" | b"\x03\x00" | b"\x04\x00" | b"\x05\x00"
+			b"\x01\x00" | b"\x02\x00" | b"\x03\x00" | b"\x04\x00" | b"\x05\x00" | b"\x06\x00" | b"\x07\x00"
 		) {
 		return None;
 	}
@@ -2845,7 +2852,10 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 		return None;
 	}
 	offset += 3;
-	if matches!(version, b"\x03\x00" | b"\x04\x00" | b"\x05\x00") {
+	if matches!(
+		version,
+		b"\x03\x00" | b"\x04\x00" | b"\x05\x00" | b"\x06\x00" | b"\x07\x00"
+	) {
 		let synonym_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
 		for _ in 0..synonym_count {
@@ -2863,7 +2873,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	for _ in 0..field_count {
 		take_string(bytes, &mut offset)?;
 	}
-	if version == b"\x05\x00" {
+	if matches!(version, b"\x05\x00" | b"\x07\x00") {
 		let filter_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
 		for _ in 0..filter_count {
@@ -3892,6 +3902,48 @@ mod tests {
 	}
 
 	#[test]
+	fn previous_stemmer_identities_require_rebuild_before_open_or_inspection() {
+		for filtered in [false, true] {
+			let mut config = config();
+			if filtered {
+				config.identity.filter_fields.push(FilterFieldConfig {
+					name: "category".to_owned(),
+					field_type: FilterFieldType::String,
+				});
+			}
+			let directory = RamDirectory::create();
+			let engine = Engine::open(directory.clone(), &config).unwrap();
+			let mut writer = engine.writer(&config).unwrap();
+			writer.apply(batch()).unwrap();
+			writer.commit().unwrap();
+			writer.close().unwrap();
+			drop(engine);
+			let mut identity = identity_bytes(&config.identity);
+			identity[4] = if filtered { 5 } else { 4 };
+			assert_eq!(persisted_index_id(&identity), Some("products"));
+			directory.atomic_write(Path::new(IDENTITY_PATH), &identity).unwrap();
+			assert_eq!(
+				Engine::inspect(directory.clone(), &config.identity).unwrap_err().code,
+				"E_IDENTITY_MISMATCH"
+			);
+			let error = match Engine::open(directory, &config) {
+				Ok(_) => panic!("old stemmer identity was opened"),
+				Err(error) => error,
+			};
+			assert_eq!(error.code, "E_IDENTITY_MISMATCH");
+		}
+	}
+
+	#[test]
+	fn english_stemmer_revision_is_part_of_persisted_identity() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		assert_eq!(
+			engine.analyze("added acarologist", false, false).unwrap(),
+			vec!["add", "acarolog"]
+		);
+	}
+
+	#[test]
 	fn persisted_index_id_accepts_legacy_sidecars_for_reset_only() {
 		let config = config();
 		for version in [b"\x02\x00".as_slice(), b"\x03\x00".as_slice()] {
@@ -4523,7 +4575,7 @@ mod tests {
 	fn validates_the_complete_persisted_identity() {
 		let config = config();
 		let mut identity = identity_bytes(&config.identity);
-		assert_eq!(&identity[4..6], b"\x04\x00");
+		assert_eq!(&identity[4..6], b"\x06\x00");
 		assert_eq!(persisted_index_id(&identity), Some("products"));
 
 		identity.pop();
@@ -4539,7 +4591,7 @@ mod tests {
 			field_type: FilterFieldType::String,
 		});
 		let identity = identity_bytes(&filtered);
-		assert_eq!(&identity[4..6], b"\x05\x00");
+		assert_eq!(&identity[4..6], b"\x07\x00");
 		assert_eq!(persisted_index_id(&identity), Some("products"));
 	}
 

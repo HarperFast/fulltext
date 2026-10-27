@@ -1,13 +1,13 @@
 # Native search collection
 
-Status: verified against Tantivy 0.26.2 source and local macOS arm64 tests · Owner: Harper
-Engineering · Last verified: 2026-10-18
+Status: verified against Tantivy 0.27.0 source and local macOS arm64 tests · Owner: Harper
+Engineering · Last verified: 2026-10-26
 
 `TraversalScoreTieCollector` owns its scorer loop so it can return `E_TIMEOUT` between document
 batches. Keep the ordinary `StableScoreTieCollector` independent: traversal-only boundary and
 deadline checks must not enter its per-match path.
 
-Traversal must use the same scoring path on every page. In pinned Tantivy 0.26.2,
+Traversal must use the same scoring path on every page. In pinned Tantivy 0.27.0,
 `BooleanWeight::for_each` and `BooleanWeight::scorer` both construct `BufferedUnionScorer` for term
 unions; `into_box_scorer` performs that construction for the latter. Preserve this equivalence when
 upgrading Tantivy: a different floating-point summation order can change score ties and continuation
@@ -23,6 +23,17 @@ using HMAC-SHA256 and an object-local 32-byte key minted before asynchronous wor
 reject boundary edits and splicing. Native handle numbers restart in a new process, so the number
 and segment fingerprint alone cannot enforce reader/process binding; the cross-process replay test
 uses handle 1 in both processes.
+
+The scorer/`for_each` bit-equivalence regression covers multi-clause unions, intersections,
+phrase, prefix and fuzzy queries across segments. The equal-score paging fixture also checks
+ordinal ordering against raw UTF-8 IDs. Retain both gates across engine upgrades.
+
+## Persisted analyzer revision
+
+Identities 6/7 preserve the layouts of 4/5 while marking Tantivy 0.27's changed English stemmer.
+Open and inspection compare the complete identity before opening Tantivy. Reset parses both old
+and new identities, allowing retirement without serving old tokens. `english@2` plus the sidecar
+revision is the persisted analysis contract; never rewrite the sidecar to reuse an incompatible index.
 
 ## Request preparation
 

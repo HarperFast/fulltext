@@ -931,6 +931,42 @@ test('retires a closed index, preserves its checkpoint, and permits a clean rebu
 	await index.close();
 });
 
+test('rejects previous stemmer identities before open and retires them for rebuild', async (context) => {
+	for (const filtered of [false, true]) {
+		const indexPath = path.join(temporaryIndex(context), 'index');
+		const config = options(indexPath, filtered ? { filterFields: [{ name: 'category', type: 'string' }] } : {});
+		let index = await openNativeFullTextIndex(config);
+		await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'added acarologist' } }] });
+		await index.publish('old-checkpoint');
+		await index.close();
+		const identityPath = path.join(indexPath, '.harper-fulltext-identity');
+		const identity = readFileSync(identityPath);
+		assert.strictEqual(identity[4], filtered ? 7 : 6);
+		identity[4] = filtered ? 5 : 4;
+		writeFileSync(identityPath, identity);
+		assert.deepStrictEqual(inspectNativeFullTextIndex(config), {
+			state: 'incompatible',
+			code: 'E_IDENTITY_MISMATCH',
+		});
+		await assert.rejects(openNativeFullTextIndex(config), { code: 'E_IDENTITY_MISMATCH' });
+		const reset = await resetNativeFullTextIndex({ path: indexPath, indexId: config.indexId });
+		assert.strictEqual(reset.state, 'reset');
+		assert.strictEqual(existsSync(reset.retiredPath), true);
+		index = await openNativeFullTextIndex(config);
+		try {
+			assert.strictEqual(index.committedPayload, undefined);
+			await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'added acarologist' } }] });
+			await index.publish('new-checkpoint');
+			assert.deepStrictEqual(
+				(await index.search({ text: 'add', exactTotal: true })).hits.map(({ id }) => id),
+				['one'],
+			);
+		} finally {
+			await index.close({ mode: 'rollback' });
+		}
+	}
+});
+
 test('resets a real native directory with a legacy v2 identity and rejects a truncated sidecar', async (context) => {
 	const indexPath = temporaryIndex(context);
 	const config = options(indexPath);
