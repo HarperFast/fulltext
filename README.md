@@ -394,7 +394,7 @@ before search or mutation. The public analyzer name and query API are unchanged.
 Drain and close readers/writers, call `resetNativeFullTextIndex()` with the existing logical index ID,
 and rebuild from authoritative source records. Use the checkpoint-publication lifecycle to publish
 coverage only after rebuilding. Reset can retire old identity formats; do not edit sidecars to force
-an index open. Before downgrading to 0.6.x, retire the 0.7 index with the 0.7 reset API, then rebuild with 0.6.x; the older reset API cannot recognize the new identity. Relevance scores may differ
+an index open. Before downgrading to 0.6.x, retire the 0.7 index with the 0.7 reset API, then rebuild with 0.6.x; the older reset API reports `E_INDEX_CORRUPT` for the unrecognized identity. Relevance scores may differ
 between engine versions; continuation tokens remain reader-instance scoped.
 
 ### Highlighting and snippets

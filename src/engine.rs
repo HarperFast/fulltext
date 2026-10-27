@@ -3935,7 +3935,7 @@ mod tests {
 	}
 
 	#[test]
-	fn english_stemmer_revision_is_part_of_persisted_identity() {
+	fn english_stemmer_uses_the_new_revision() {
 		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
 		assert_eq!(
 			engine.analyze("added acarologist", false, false).unwrap(),
@@ -4245,6 +4245,7 @@ mod tests {
 				weight
 					.for_each(reader, &mut |doc, score| enumerated.push((doc, score.to_bits())))
 					.unwrap();
+				assert!(!scored.is_empty(), "fixture must match {text}");
 				scored.sort_unstable();
 				enumerated.sort_unstable();
 				assert_eq!(scored, enumerated, "scoring topology changed for {text}");
@@ -4276,6 +4277,8 @@ mod tests {
 			"catalog-0003",
 			"catalog-0006",
 			"catalog-0005",
+			"Catalog-UPPER",
+			"catalog-upper",
 			"catalog-0004",
 		];
 		for (chunk_index, ids) in inserted_ids.chunks(7).enumerate() {
@@ -4313,6 +4316,7 @@ mod tests {
 				assert!(column.ord_to_str(ordinal, &mut id).unwrap());
 				ids.push((ordinal, id));
 			}
+			assert!(ids.len() > 1);
 			ids.sort_unstable_by_key(|(ordinal, _)| *ordinal);
 			assert!(ids.windows(2).all(|pair| pair[0].1.as_bytes() <= pair[1].1.as_bytes()));
 		}

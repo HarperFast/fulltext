@@ -936,7 +936,9 @@ test('rejects previous stemmer identities before open and retires them for rebui
 		const indexPath = path.join(temporaryIndex(context), 'index');
 		const config = options(indexPath, filtered ? { filterFields: [{ name: 'category', type: 'string' }] } : {});
 		let index = await openNativeFullTextIndex(config);
-		await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'added acarologist' } }] });
+		await index.applyMutationBatch({
+			upserts: [{ id: 'One-Case', version: 'VeRsIoN', fields: { title: 'added acarologist' } }],
+		});
 		await index.publish('old-checkpoint');
 		await index.close();
 		const identityPath = path.join(indexPath, '.harper-fulltext-identity');
@@ -955,12 +957,16 @@ test('rejects previous stemmer identities before open and retires them for rebui
 		index = await openNativeFullTextIndex(config);
 		try {
 			assert.strictEqual(index.committedPayload, undefined);
-			await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'added acarologist' } }] });
+			await index.applyMutationBatch({
+				upserts: [{ id: 'One-Case', version: 'VeRsIoN', fields: { title: 'added acarologist' } }],
+			});
 			await index.publish('new-checkpoint');
+			const result = await index.search({ text: 'add', exactTotal: true });
 			assert.deepStrictEqual(
-				(await index.search({ text: 'add', exactTotal: true })).hits.map(({ id }) => id),
-				['one'],
+				result.hits.map(({ id }) => id),
+				['One-Case'],
 			);
+			assert.strictEqual(result.hits[0].version, 'VeRsIoN');
 		} finally {
 			await index.close({ mode: 'rollback' });
 		}
