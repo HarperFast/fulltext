@@ -48,8 +48,11 @@ if (process.argv.includes('--hydration')) {
 			}
 		}
 	} finally {
-		if (index) await index.close({ mode: 'rollback' });
-		await rm(directory, { recursive: true, force: true });
+		try {
+			if (index) await index.close({ mode: 'rollback' });
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
 	}
 }
 
@@ -108,8 +111,7 @@ async function hydrationCases() {
 					const boundary = await index.search({ ...request, limit: 21 });
 					assert(boundary.hits[19].score > boundary.hits[20].score);
 				}
-				const warmUntil = performance.now() + 1000;
-				while (performance.now() < warmUntil) await index.search(request);
+				for (let i = 0; i < 500; i++) await index.search(request);
 				const samples = [];
 				for (let i = 0; i < 1000; i++) {
 					const start = performance.now();
@@ -127,21 +129,26 @@ async function hydrationCases() {
 						versionPaddingBytes: versionBytes,
 						exactTotal,
 						iterations: samples.length,
+						warmupIterations: 500,
+						percentileMethod: 'nearest-rank',
 						hits: expected.hits.map(({ id, score }) => ({ id, score })),
 						modeledVersionDecodes: {
 							eagerWindow: versionBytes ? Math.min(10000, offset + limit + 1) : 0,
 							finalPage: versionBytes ? limit : 0,
 						},
-						p50: samples[500],
-						p95: samples[950],
-						p99: samples[990],
+						p50: samples[499],
+						p95: samples[949],
+						p99: samples[989],
 						node: process.version,
 					}),
 				);
 			}
 		} finally {
-			if (index) await index.close({ mode: 'rollback' });
-			await rm(directory, { recursive: true, force: true });
+			try {
+				if (index) await index.close({ mode: 'rollback' });
+			} finally {
+				await rm(directory, { recursive: true, force: true });
+			}
 		}
 	}
 }

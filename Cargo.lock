@@ -477,6 +477,7 @@ dependencies = [
  "napi-derive",
  "sha2",
  "tantivy",
+ "tantivy-fst",
  "unicode-normalization",
 ]
 

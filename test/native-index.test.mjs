@@ -976,11 +976,14 @@ test('rejects previous stemmer identities before open and retires them for rebui
 		const indexPath = path.join(temporaryIndex(context), 'index');
 		const config = options(indexPath, filtered ? { filterFields: [{ name: 'category', type: 'string' }] } : {});
 		let index = await openNativeFullTextIndex(config);
-		await index.applyMutationBatch({
-			upserts: [{ id: 'One-Case', version: 'VeRsIoN', fields: { title: 'added acarologist' } }],
-		});
-		await index.publish('old-checkpoint');
-		await index.close();
+		try {
+			await index.applyMutationBatch({
+				upserts: [{ id: 'One-Case', version: 'VeRsIoN', fields: { title: 'added acarologist' } }],
+			});
+			await index.publish('old-checkpoint');
+		} finally {
+			await index.close({ mode: 'rollback' });
+		}
 		const identityPath = path.join(indexPath, '.harper-fulltext-identity');
 		const identity = readFileSync(identityPath);
 		assert.strictEqual(identity[4], filtered ? 7 : 6);
@@ -2290,3 +2293,25 @@ function committedSegmentPath(directory, extension) {
 	assert(name, `expected a committed ${extension} segment`);
 	return path.join(directory, name);
 }
+
+test('native fuzzy tracing preserves current-source surface matches and UTF-16 prefix spans', async (context) => {
+	const index = await openNativeFullTextIndex(options(temporaryIndex(context), { surfaceTerms: true }));
+	try {
+		for (const [text, mode, source, expected] of [
+			['waterprof', 'fuzzy', 'Waterproofs', [{ start: 0, end: 11 }]],
+			['running', 'fuzzy', 'runnin', [{ start: 0, end: 6 }]],
+			['waterpro', 'fuzzy-prefix', '💧 Wáterproof', [{ start: 3, end: 13 }]],
+			['𐐨abc', 'fuzzy-prefix', '𐐨abxlong', [{ start: 0, end: 9 }]],
+		]) {
+			const result = await index.traceMatches({ text, mode }, [{ id: 'current', fields: { title: source } }]);
+			assert.strictEqual(result.complete, true);
+			assert.deepStrictEqual(result.records[0].values[0].spans, expected);
+		}
+		const absent = await index.traceMatches({ text: 'shoe1', mode: 'fuzzy' }, [
+			{ id: 'current', fields: { title: 'shoe2' } },
+		]);
+		assert.deepStrictEqual(absent, { complete: true, records: [] });
+	} finally {
+		await index.close({ mode: 'rollback' });
+	}
+});

@@ -18,6 +18,10 @@ allow = [
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
+deny = [
+	{ name = "frostem", version = "<1.20260821.8" },
+	{ name = "frostem", version = ">1.20260821.8" },
+]
 skip = [
 	{ name = "getrandom", version = "0.3.4" },
 	{ name = "r-efi", version = "5.3.0" },

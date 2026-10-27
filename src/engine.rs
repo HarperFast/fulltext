@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Bound, Range};
 use std::path::Path;
@@ -5,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
+use tantivy_fst::Automaton;
 
 use tantivy::collector::sort_key::{NaturalComparator, ReverseComparator};
 use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs, TopNComputer};
@@ -13,8 +15,8 @@ use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
 use tantivy::index::SegmentId;
 use tantivy::query::{
-	BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery,
-	Query, RangeQuery, TermQuery, TermSetQuery,
+	BooleanQuery, BoostQuery, ConstScoreQuery, DfaWrapper, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur,
+	PhraseQuery, Query, RangeQuery, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{
 	Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, FAST, INDEXED,
@@ -390,9 +392,65 @@ enum TracePlan {
 	Prefix {
 		completed: Vec<String>,
 		prefix: String,
-		fuzzy: bool,
+		matcher: Option<FuzzyMatcher>,
 	},
-	Fuzzy(Vec<(String, String)>),
+	Fuzzy(Vec<TraceFuzzyTerm>),
+}
+
+struct FuzzyMatcher {
+	text: String,
+	characters: usize,
+	field: Field,
+	prefix: bool,
+	automaton: OnceCell<Result<DfaWrapper>>,
+}
+
+impl FuzzyMatcher {
+	fn new(text: &str, field: Field, prefix: bool) -> Self {
+		Self {
+			text: text.to_owned(),
+			characters: text.chars().count(),
+			field,
+			prefix,
+			automaton: OnceCell::new(),
+		}
+	}
+
+	fn matches(&self, candidate: &str) -> Result<bool> {
+		if candidate == self.text || (self.prefix && candidate.starts_with(&self.text)) {
+			return Ok(true);
+		}
+		if !self.prefix && self.characters.abs_diff(candidate.chars().count()) > 1 {
+			return Ok(false);
+		}
+		let automaton = self
+			.automaton
+			.get_or_init(|| {
+				let term = Term::from_field_text(self.field, &self.text);
+				let query = if self.prefix {
+					FuzzyTermQuery::new_prefix(term, 1, true)
+				} else {
+					FuzzyTermQuery::new(term, 1, true)
+				};
+				query.automaton().map_err(index_error)
+			})
+			.as_ref()
+			.map_err(Clone::clone)?;
+		let mut state = automaton.start();
+		for byte in candidate.bytes() {
+			state = automaton.accept(&state, byte);
+			if !automaton.can_match(&state) {
+				return Ok(false);
+			}
+		}
+		Ok(automaton.is_match(&state))
+	}
+}
+
+struct TraceFuzzyTerm {
+	analyzed: String,
+	matcher: Option<FuzzyMatcher>,
+	surface_matcher: Option<FuzzyMatcher>,
 }
 
 impl TracePlan {
@@ -405,7 +463,7 @@ impl TracePlan {
 			Self::Prefix { completed, prefix, .. } => {
 				!prefix.is_empty() && found.contains("__prefix") && completed.iter().all(|term| found.contains(term))
 			}
-			Self::Fuzzy(terms) => !terms.is_empty() && terms.iter().any(|(term, _)| found.contains(term)),
+			Self::Fuzzy(terms) => !terms.is_empty() && terms.iter().any(|term| found.contains(&term.analyzed)),
 		}
 	}
 }
@@ -716,10 +774,11 @@ impl Engine {
 					.zip(ids)
 					.map(|((score, address), id)| ((*score, id), *address))
 					.collect::<Vec<_>>();
-				ranked.sort_by(|((left_score, left_id), _), ((right_score, right_id), _)| {
+				ranked.sort_unstable_by(|((left_score, left_id), left), ((right_score, right_id), right)| {
 					right_score
 						.total_cmp(left_score)
 						.then_with(|| left_id.as_bytes().cmp(right_id.as_bytes()))
+						.then_with(|| left.cmp(right))
 				});
 				let page = ranked
 					.into_iter()
@@ -931,10 +990,12 @@ impl Engine {
 						}
 					)));
 				}
+				let matcher = (request.mode == SearchMode::FuzzyPrefix && fuzzy_eligible(&prefix))
+					.then(|| FuzzyMatcher::new(&prefix, self.id_field, true));
 				Ok(TracePlan::Prefix {
 					completed,
 					prefix,
-					fuzzy: request.mode == SearchMode::FuzzyPrefix,
+					matcher,
 				})
 			}
 			SearchMode::Fuzzy => {
@@ -949,7 +1010,22 @@ impl Engine {
 						"fuzzy search contains more than {MAX_FUZZY_TERMS} eligible terms"
 					)));
 				}
-				Ok(TracePlan::Fuzzy(terms))
+				Ok(TracePlan::Fuzzy(
+					terms
+						.into_iter()
+						.map(|(analyzed, surface)| {
+							let eligible = fuzzy_eligible(&surface);
+							let matcher = eligible.then(|| FuzzyMatcher::new(&analyzed, self.id_field, false));
+							let surface_matcher = (eligible && surface != analyzed)
+								.then(|| FuzzyMatcher::new(&surface, self.id_field, false));
+							TraceFuzzyTerm {
+								analyzed,
+								matcher,
+								surface_matcher,
+							}
+						})
+						.collect(),
+				))
 			}
 		}
 	}
@@ -1038,7 +1114,7 @@ impl Engine {
 			TracePlan::Prefix {
 				completed,
 				prefix,
-				fuzzy,
+				matcher,
 			} => {
 				let (surface, surface_truncated) = Self::source_tokens(surface_source_analyzer, value, deadline)?;
 				analysis_truncated |= surface_truncated;
@@ -1064,8 +1140,10 @@ impl Engine {
 						check_deadline(deadline)?;
 					}
 					if token.text.starts_with(prefix)
-						|| (*fuzzy && fuzzy_eligible(prefix) && fuzzy_prefix_matches(prefix, &token.text))
-					{
+						|| match matcher {
+							Some(matcher) => matcher.matches(&token.text)?,
+							None => false,
+						} {
 						found.insert("__prefix".to_owned());
 						spans_truncated |= push_trace_span(
 							&mut spans,
@@ -1093,17 +1171,27 @@ impl Engine {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
-					for (analyzed_term, surface_term) in terms {
-						let analyzed_matches = analyzed_by_position.get(&token.position).is_some_and(|tokens| {
-							tokens.iter().any(|token| {
-								*token == analyzed_term
-									|| (fuzzy_eligible(surface_term) && within_one_edit(analyzed_term, token))
-							})
-						});
+					for term in terms {
+						let mut analyzed_matches = false;
+						if let Some(tokens) = analyzed_by_position.get(&token.position) {
+							for token in tokens {
+								if *token == term.analyzed
+									|| match &term.matcher {
+										Some(matcher) => matcher.matches(token)?,
+										None => false,
+									} {
+									analyzed_matches = true;
+									break;
+								}
+							}
+						}
+						let surface_matcher = term.surface_matcher.as_ref().or(term.matcher.as_ref());
 						if analyzed_matches
-							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
-						{
-							found.insert(analyzed_term.clone());
+							|| match surface_matcher {
+								Some(matcher) => matcher.matches(&token.text)?,
+								None => false,
+							} {
+							found.insert(term.analyzed.clone());
 							spans_truncated |= push_trace_span(
 								&mut spans,
 								&mut seen_spans,
@@ -1753,8 +1841,7 @@ fn search_response_bytes(hits: &[SearchHit], header_bytes: usize) -> Result<usiz
 }
 
 fn search_hits(searcher: &Searcher, scored_docs: Vec<StableScoreTieHit>) -> Result<Vec<SearchHit>> {
-	let addresses = scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>();
-	let versions = search_hit_versions(searcher, &addresses)?;
+	let versions = search_hit_versions(searcher, scored_docs.iter().map(|(_, address)| *address))?;
 	Ok(scored_docs
 		.into_iter()
 		.zip(versions)
@@ -1762,15 +1849,19 @@ fn search_hits(searcher: &Searcher, scored_docs: Vec<StableScoreTieHit>) -> Resu
 		.collect())
 }
 
-fn search_hit_versions(searcher: &Searcher, addresses: &[DocAddress]) -> Result<Vec<Option<String>>> {
+fn search_hit_versions(
+	searcher: &Searcher,
+	addresses: impl ExactSizeIterator<Item = DocAddress>,
+) -> Result<Vec<Option<String>>> {
+	let count = addresses.len();
 	let mut hits_by_segment = HashMap::new();
-	for (index, address) in addresses.iter().enumerate() {
+	for (index, address) in addresses.enumerate() {
 		hits_by_segment
 			.entry(address.segment_ord)
 			.or_insert_with(Vec::new)
 			.push((index, address.doc_id));
 	}
-	let mut versions = vec![None; addresses.len()];
+	let mut versions = vec![None; count];
 	for (segment_ord, segment_hits) in hits_by_segment {
 		let segment = &searcher.segment_readers()[segment_ord as usize];
 		let Some(column) = segment.fast_fields().str(VERSION_FIELD_NAME).map_err(index_error)? else {
@@ -1935,68 +2026,6 @@ fn push_trace_span(
 	} else {
 		true
 	}
-}
-
-fn within_one_edit(left: &str, right: &str) -> bool {
-	let left_length = left.chars().count();
-	let right_length = right.chars().count();
-	if left_length.abs_diff(right_length) > 1 {
-		return false;
-	}
-	if left == right {
-		return true;
-	}
-	if left_length == right_length {
-		let mut differences = [(0usize, '\0', '\0'); 2];
-		let mut count = 0;
-		for (index, (left, right)) in left.chars().zip(right.chars()).enumerate() {
-			if left == right {
-				continue;
-			}
-			if count == differences.len() {
-				return false;
-			}
-			differences[count] = (index, left, right);
-			count += 1;
-		}
-		return count == 1
-			|| (count == 2
-				&& differences[1].0 == differences[0].0 + 1
-				&& differences[0].1 == differences[1].2
-				&& differences[1].1 == differences[0].2);
-	}
-	let (shorter, longer) = if left_length < right_length {
-		(left, right)
-	} else {
-		(right, left)
-	};
-	let mut shorter = shorter.chars().peekable();
-	let mut longer = longer.chars().peekable();
-	let mut edits = 0;
-	while let (Some(short), Some(long)) = (shorter.peek(), longer.peek()) {
-		if short == long {
-			shorter.next();
-		} else {
-			edits += 1;
-			if edits > 1 {
-				return false;
-			}
-		}
-		longer.next();
-	}
-	true
-}
-
-fn fuzzy_prefix_matches(prefix: &str, candidate: &str) -> bool {
-	let prefix_length = prefix.chars().count();
-	(prefix_length.saturating_sub(1)..=prefix_length.saturating_add(1)).any(|length| {
-		let end = candidate
-			.char_indices()
-			.nth(length)
-			.map_or(candidate.len(), |(index, _)| index);
-		let candidate_prefix = &candidate[..end];
-		within_one_edit(prefix, candidate_prefix)
-	})
 }
 
 fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -3510,16 +3539,98 @@ mod tests {
 	}
 
 	#[test]
-	fn edit_distance_helpers_handle_unicode_and_transposition_without_allocation() {
-		assert!(within_one_edit("shoe", "shoe"));
-		assert!(within_one_edit("shoe", "shoo"));
-		assert!(within_one_edit("shoe", "sohe"));
-		assert!(within_one_edit("shoe", "shoes"));
-		assert!(within_one_edit("café", "cafe"));
-		assert!(!within_one_edit("shoe", "boot"));
-		assert!(fuzzy_prefix_matches("shoe", "shoestring"));
-		assert!(fuzzy_prefix_matches("shoe", "sjoestring"));
-		assert!(!fuzzy_prefix_matches("shoe", "boots"));
+	fn fuzzy_matcher_prepares_only_when_edit_matching_is_needed() {
+		let matcher = FuzzyMatcher::new("shoe", Field::from_field_id(0), false);
+		assert!(matcher.matches("shoe").unwrap());
+		assert!(!matcher.matches("unrelated").unwrap());
+		assert!(matcher.automaton.get().is_none());
+		assert!(matcher.matches("sohe").unwrap());
+		assert!(matcher.automaton.get().is_some());
+		let prefix = FuzzyMatcher::new("shoe", Field::from_field_id(0), true);
+		assert!(prefix.matches("shoestring").unwrap());
+		assert!(prefix.automaton.get().is_none());
+		assert!(prefix.matches("sjoestring").unwrap());
+		assert!(prefix.automaton.get().is_some());
+	}
+
+	#[test]
+	fn native_fuzzy_matcher_agrees_with_dictionary_automata() {
+		for text in ["shoe", "café", "κόσμος", "e\u{301}lan", "𐐨abc"] {
+			let chars = text.chars().collect::<Vec<_>>();
+			let mut candidates = HashSet::from([text.to_owned(), "zzzzzzzzzz".to_owned(), String::new()]);
+			for index in 0..=chars.len() {
+				for replacement in ['x', 'é', '𐐨'] {
+					let mut inserted = chars.clone();
+					inserted.insert(index, replacement);
+					candidates.insert(inserted.iter().collect());
+					if index < chars.len() {
+						let mut changed = chars.clone();
+						changed[index] = replacement;
+						candidates.insert(changed.iter().collect());
+					}
+				}
+				if index < chars.len() {
+					let mut removed = chars.clone();
+					removed.remove(index);
+					candidates.insert(removed.iter().collect());
+				}
+				if index + 1 < chars.len() {
+					let mut swapped = chars.clone();
+					swapped.swap(index, index + 1);
+					candidates.insert(swapped.iter().collect());
+				}
+			}
+			let candidates = candidates
+				.into_iter()
+				.flat_map(|candidate| [candidate.clone(), format!("{candidate}tail")])
+				.collect::<BTreeSet<_>>();
+			let mut schema = Schema::builder();
+			let field = schema.add_text_field(
+				"term",
+				TextOptions::default().set_indexing_options(
+					TextFieldIndexing::default()
+						.set_tokenizer("raw")
+						.set_index_option(IndexRecordOption::Basic),
+				),
+			);
+			let index = Index::create_in_ram(schema.build());
+			let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+			for candidate in &candidates {
+				let mut document = TantivyDocument::default();
+				document.add_text(field, candidate);
+				writer.add_document(document).unwrap();
+			}
+			writer.commit().unwrap();
+			let searcher = index.reader().unwrap().searcher();
+			for prefix in [false, true] {
+				let term = Term::from_field_text(field, text);
+				let query = if prefix {
+					FuzzyTermQuery::new_prefix(term, 1, true)
+				} else {
+					FuzzyTermQuery::new(term, 1, true)
+				};
+				let mut expected = HashSet::new();
+				for segment in searcher.segment_readers() {
+					let inverted = segment.inverted_index(field).unwrap();
+					let mut stream = inverted
+						.terms()
+						.search(query.automaton().unwrap())
+						.into_stream()
+						.unwrap();
+					while stream.advance() {
+						expected.insert(String::from_utf8(stream.key().to_vec()).unwrap());
+					}
+				}
+				let matcher = FuzzyMatcher::new(text, field, prefix);
+				for candidate in &candidates {
+					assert_eq!(
+						matcher.matches(candidate).unwrap(),
+						expected.contains(candidate),
+						"{text:?} {candidate:?} prefix={prefix}"
+					);
+				}
+			}
+		}
 	}
 
 	#[test]
@@ -4503,11 +4614,7 @@ mod tests {
 			vec!["three", "one", "two"]
 		);
 		assert_eq!(
-			search_hit_versions(
-				&searcher,
-				&scored_docs.iter().map(|(_, address)| *address).collect::<Vec<_>>()
-			)
-			.unwrap(),
+			search_hit_versions(&searcher, scored_docs.iter().map(|(_, address)| *address)).unwrap(),
 			vec![Some("shared".to_owned()), Some("shared".to_owned()), None]
 		);
 		writer.close().unwrap();

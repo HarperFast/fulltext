@@ -10,6 +10,11 @@ updates:
       time: '09:00'
       timezone: America/Denver
     ignore:
+      - dependency-name: tantivy-fst
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
       - dependency-name: napi
         update-types:
           - version-update:semver-major

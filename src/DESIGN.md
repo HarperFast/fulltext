@@ -33,6 +33,11 @@ Result collection keeps document addresses until final page selection. All four 
 validates IDs across its retained TopDocs window; skipped version metadata is not proactively
 validated, matching stable collection and traversal. Keep optional version data out of ranking.
 
+Fuzzy trace plans lazily reuse `FuzzyTermQuery::automaton()` per term, after exact-match and
+full-term length checks. Trace preserves its analyzed and current-source surface branches;
+`running` may explain a supplied `runnin` value even when the indexed stem would not match.
+Dictionary parity and public UTF-16 span tests enforce native matching without storing source text.
+
 ## Persisted analyzer revision
 
 Identities 6/7 preserve the layouts of 4/5 while marking Tantivy 0.27's changed English stemmer.
