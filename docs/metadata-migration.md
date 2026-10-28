@@ -1,6 +1,7 @@
 # Metadata index migration
 
-Status: draft; procedure awaiting human API/migration review.
+Status: draft release; Kyle approved the API/migration direction on 2026-10-28. Local procedure
+qualification passed; application-specific cutover remains untested.
 
 The branch is unreleased. Its manifests still use the previous package version. Before publishing,
 release preparation must choose a new version and align the root package, Cargo package and exact
@@ -100,9 +101,15 @@ the previous build, checkpoint `source-checkpoint-3`, all three text hits, activ
 and `brand = cedar` records `a`, `c` passed. This exercises downgrade reconstruction; it does not
 qualify live application rollback or checkpoint catch-up.
 
+The qualification was repeated on 2026-10-28 against the
+[expanded metadata implementation](https://github.com/HarperFast/fulltext/commit/5c502fb1318e92d97d0c9347d2d5e092655fce90)
+(query API 6, native ABI 11), using the same genuine previous base build. Numeric compatibility,
+reverse numeric writes, nonmutating string rejection, rebuild/publication/reopen, and downgrade
+reconstruction all passed again. Multi-field sorting and nested aggregations add no stored-schema
+change beyond the string fast-column migration described here.
+
 ## Open items
 
-- Human approval of API semantics and the application rebuild requirement.
 - Application-specific cutover, checkpoint catch-up, and rollback qualification.
 - The installed optional-platform-package loading route is supported by the script but was not run;
   the recorded executions used the compiled previous-base wrapper/addon pair, not an installed

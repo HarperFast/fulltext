@@ -108,7 +108,7 @@ preserves installation without lifecycle scripts or a Rust toolchain.
 
 ### Metadata collectors
 
-Sorting reuses Tantivy's composable `TopDocs` sort keys. Flat aggregations use its typed
+Sorting reuses Tantivy's composable `TopDocs` sort keys. Nested aggregations use its typed
 `AggregationCollector` API without another dependency or public upstream request types.
 String-metadata configurations use identity 8 for raw fast columns; numeric/Boolean-only configurations
 retain identity 7. Native terms aggregation counts each distinct string once per document;

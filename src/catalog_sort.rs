@@ -34,38 +34,13 @@ pub(super) fn comparator(sort: &SortRequest) -> ComparatorEnum {
 		(SortDirection::Desc, MissingOrder::Last) => ComparatorEnum::Natural,
 	}
 }
-pub(super) fn native_columns_available(
-	searcher: &Searcher,
-	sorts: &[SortRequest],
-	fields: &[FilterFieldConfig],
-	deadline: Option<Instant>,
-) -> Result<bool> {
-	for sort in sorts {
-		let (index, config) = field(&sort.field, fields)?;
-		if config.field_type == FilterFieldType::Number {
-			let name = format!("__fulltext_filter_{index}");
-			for segment in searcher.segment_readers() {
-				check_deadline(deadline).map_err(native_error)?;
-				if segment
-					.fast_fields()
-					.u64_lenient(&name)
-					.map_err(native_error)?
-					.is_none()
-				{
-					return Ok(false);
-				}
-			}
-		}
-	}
-	Ok(true)
-}
 pub(super) fn collect_pair(
 	searcher: &Searcher,
 	query: &dyn Query,
 	catalog: ValidatedCatalog<'_>,
 	end: usize,
 	aggregations: Option<AggregationCollector>,
-	histograms: Vec<(String, f64)>,
+	histograms: Vec<HistogramCheck>,
 	deadline: Option<Instant>,
 ) -> Result<CollectedSortedCatalog> {
 	let sorts = catalog
@@ -126,13 +101,13 @@ where
 }
 enum NativeChild {
 	String(StringChild),
-	Number(Option<NumberChild>),
+	Number(NumberChild),
 }
 impl NativeChild {
 	fn key(&mut self, doc: u32, score: Score) -> Option<u64> {
 		match self {
 			Self::String(child) => child.segment_sort_key(doc, score),
-			Self::Number(child) => child.as_mut().and_then(|child| child.segment_sort_key(doc, score)),
+			Self::Number(child) => child.segment_sort_key(doc, score),
 		}
 	}
 	fn convert(&self, key: Option<u64>) -> OwnedValue {
@@ -142,8 +117,7 @@ impl NativeChild {
 				.map(OwnedValue::Str)
 				.unwrap_or(OwnedValue::Null),
 			Self::Number(child) => child
-				.as_ref()
-				.and_then(|child| child.convert_segment_sort_key(key))
+				.convert_segment_sort_key(key)
 				.map(OwnedValue::F64)
 				.unwrap_or(OwnedValue::Null),
 		}
@@ -152,6 +126,7 @@ impl NativeChild {
 pub(super) struct DynamicSegmentKeys {
 	children: Vec<NativeChild>,
 	comparator: DynamicComparator,
+	scratch: Vec<Option<u64>>,
 }
 impl SortKeyComputer for DynamicSortKeys {
 	type SortKey = Vec<OwnedValue>;
@@ -179,13 +154,9 @@ impl SortKeyComputer for DynamicSortKeys {
 					FilterFieldType::String => {
 						NativeChild::String(SortByString::for_field(name).segment_sort_key_computer(reader)?)
 					}
-					FilterFieldType::Number => {
-						NativeChild::Number(if reader.fast_fields().u64_lenient(name)?.is_some() {
-							Some(SortByStaticFastValue::<f64>::for_field(name).segment_sort_key_computer(reader)?)
-						} else {
-							None
-						})
-					}
+					FilterFieldType::Number => NativeChild::Number(
+						SortByStaticFastValue::<f64>::for_field(name).segment_sort_key_computer(reader)?,
+					),
 					FilterFieldType::Boolean => unreachable!(),
 				})
 			})
@@ -193,6 +164,7 @@ impl SortKeyComputer for DynamicSortKeys {
 		Ok(DynamicSegmentKeys {
 			children,
 			comparator: self.comparator(),
+			scratch: vec![None; self.fields.len()],
 		})
 	}
 }
@@ -213,16 +185,21 @@ impl SegmentSortKeyComputer for DynamicSegmentKeys {
 		threshold: &Self::SegmentSortKey,
 	) -> Option<(Ordering, Self::SegmentSortKey)> {
 		let mut order = Ordering::Equal;
-		for ((child, threshold), comparator) in self.children.iter_mut().zip(threshold).zip(&self.comparator.0) {
-			order = comparator.compare(&child.key(doc, score), threshold);
+		for (position, threshold) in threshold.iter().enumerate() {
+			let key = self.children[position].key(doc, score);
+			self.scratch[position] = key;
+			order = self.comparator.0[position].compare(&key, threshold);
 			if order == Ordering::Less {
 				return None;
 			}
 			if order == Ordering::Greater {
+				for position in position + 1..self.children.len() {
+					self.scratch[position] = self.children[position].key(doc, score);
+				}
 				break;
 			}
 		}
-		Some((order, self.segment_sort_key(doc, score)))
+		Some((order, self.scratch.clone()))
 	}
 	fn convert_segment_sort_key(&self, key: Self::SegmentSortKey) -> Self::SortKey {
 		self.children
@@ -231,6 +208,40 @@ impl SegmentSortKeyComputer for DynamicSegmentKeys {
 			.map(|(child, key)| child.convert(key))
 			.collect()
 	}
+}
+fn global_key_bytes(key_count: usize) -> Result<usize> {
+	let global_header = std::mem::size_of::<
+		tantivy::collector::ComparableDoc<(Vec<OwnedValue>, (Option<String>, Score)), DocAddress>,
+	>();
+	let bytes = key_count
+		.checked_mul(std::mem::size_of::<OwnedValue>())
+		.and_then(|n| n.checked_add(global_header))
+		.ok_or_else(|| resource("Sort key size overflow"))?;
+
+	Ok(bytes)
+}
+pub(super) fn buffer_bytes(end: usize, segments: usize, parallelism: usize, key_count: usize) -> Result<usize> {
+	let segment_header =
+		std::mem::size_of::<tantivy::collector::ComparableDoc<(Vec<Option<u64>>, (Option<u64>, Score)), u32>>();
+	let segment_bytes = key_count
+		.checked_mul(std::mem::size_of::<Option<u64>>())
+		.and_then(|n| n.checked_add(segment_header))
+		.ok_or_else(|| resource("Sort key size overflow"))?;
+	let global_bytes = global_key_bytes(key_count)?;
+	let fixed = end
+		.checked_mul(2)
+		.and_then(|n| n.checked_mul(segment_bytes))
+		.and_then(|n| n.checked_mul(segments.min(parallelism)))
+		.and_then(|n| n.checked_add(end.checked_mul(2)?.checked_mul(global_bytes)?))
+		.and_then(|n| {
+			n.checked_add(
+				key_count
+					.checked_mul(std::mem::size_of::<Option<u64>>())?
+					.checked_mul(segments.min(parallelism))?,
+			)
+		})
+		.ok_or_else(|| resource("Sort buffer memory overflow"))?;
+	Ok(fixed)
 }
 pub(super) fn check_budget(
 	searcher: &Searcher,
@@ -245,27 +256,8 @@ pub(super) fn check_budget(
 		tantivy::Executor::SingleThread => 1,
 		tantivy::Executor::ThreadPool(pool) => pool.current_num_threads(),
 	};
-	let segment_header =
-		std::mem::size_of::<tantivy::collector::ComparableDoc<(Vec<Option<u64>>, (Option<u64>, Score)), u32>>();
-	let global_header = std::mem::size_of::<
-		tantivy::collector::ComparableDoc<(Vec<OwnedValue>, (Option<String>, Score)), DocAddress>,
-	>();
-	let segment_bytes = sorts
-		.len()
-		.checked_mul(std::mem::size_of::<Option<u64>>())
-		.and_then(|n| n.checked_add(segment_header))
-		.ok_or_else(|| resource("Sort key size overflow"))?;
-	let global_bytes = sorts
-		.len()
-		.checked_mul(std::mem::size_of::<OwnedValue>())
-		.and_then(|n| n.checked_add(global_header))
-		.ok_or_else(|| resource("Sort key size overflow"))?;
-	let fixed = end
-		.checked_mul(2)
-		.and_then(|n| n.checked_mul(segment_bytes))
-		.and_then(|n| n.checked_mul(segments.len().min(parallelism)))
-		.and_then(|n| n.checked_add(end.checked_mul(2)?.checked_mul(global_bytes)?))
-		.ok_or_else(|| resource("Sort buffer memory overflow"))?;
+	let global_bytes = global_key_bytes(sorts.len())?;
+	let fixed = buffer_bytes(end, segments.len(), parallelism, sorts.len())?;
 	if fixed > MAX_SORT_MEMORY_BYTES {
 		return Err(resource("Sort buffers exceed memory budget"));
 	}
@@ -393,7 +385,7 @@ mod tests {
 			let value = if monotone { row as u64 } else { random % 1000 };
 			writer
 				.add_document(
-					doc!(id => format!("{row:08}"), group => format!("g{:04}", if monotone { value } else { value % 100 }), price => value as f64, label => format!("l{:04}", value % 37), rating => (value % 19) as f64),
+					doc!(id => format!("{row:08}"), group => format!("g{:08}", if monotone { value } else { value % 100 }), price => value as f64, label => format!("l{:04}", value % 37), rating => (value % 19) as f64),
 				)
 				.unwrap();
 			if row % 1000 == 999 {
@@ -493,7 +485,7 @@ mod tests {
 		}
 	}
 	#[test]
-	fn runtime_sort_handles_columns_missing_from_entire_segments() {
+	fn runtime_sort_handles_missing_values_in_entire_segments() {
 		let mut schema = Schema::builder();
 		let id = schema.add_text_field("__fulltext_id", STRING | FAST);
 		let group = schema.add_text_field("__fulltext_filter_0", STRING | FAST);
@@ -580,29 +572,127 @@ mod tests {
 		for monotone in [true, false] {
 			let index = fixture(50000, monotone);
 			let searcher = index.reader().unwrap().searcher();
-			let sorts = sorts();
+			let mut sorts = sorts();
+			if monotone {
+				sorts[0].direction = SortDirection::Desc;
+			}
 			let mut elapsed = Vec::new();
-			for _ in 0..5 {
-				let started = Instant::now();
-				let native = collect(
-					&searcher,
-					(
-						(SortByString::for_field("__fulltext_filter_0"), comparator(&sorts[0])),
+			for sample in 0..5 {
+				let native = || {
+					let started = Instant::now();
+					let hits = collect(
+						&searcher,
 						(
+							(SortByString::for_field("__fulltext_filter_0"), comparator(&sorts[0])),
+							(
+								SortByStaticFastValue::<f64>::for_field("__fulltext_filter_1"),
+								comparator(&sorts[1]),
+							),
+						),
+						10,
+					);
+					(hits, started.elapsed().as_secs_f64() * 1000.)
+				};
+				let dynamic = || {
+					let started = Instant::now();
+					let hits = collect(&searcher, DynamicSortKeys::new(&sorts, &fields()).unwrap(), 10);
+					(hits, started.elapsed().as_secs_f64() * 1000.)
+				};
+				let (native, dynamic) = if sample % 2 == 0 {
+					(native(), dynamic())
+				} else {
+					let dynamic = dynamic();
+					(native(), dynamic)
+				};
+				assert_eq!(native.0, dynamic.0);
+				elapsed.push((native.1, dynamic.1));
+			}
+			println!("runtime_sort_qualification adversarial={monotone} native_dynamic_ms={elapsed:?}");
+		}
+	}
+	#[test]
+	#[ignore = "manual production sort collector qualification"]
+	fn runtime_production_sort_qualification() {
+		for key_count in [2, 3] {
+			for adversarial in [true, false] {
+				let index = fixture(50000, adversarial);
+				let searcher = index.reader().unwrap().searcher();
+				let mut sorts = sorts();
+				let mut fields = fields();
+				fields.push(FilterFieldConfig {
+					name: "label".into(),
+					field_type: FilterFieldType::String,
+				});
+				if adversarial {
+					sorts[0].direction = SortDirection::Desc;
+				}
+				if key_count == 3 {
+					sorts.push(SortRequest {
+						field: "label".into(),
+						direction: SortDirection::Asc,
+						missing: MissingOrder::Last,
+					});
+				}
+				let catalog = validate_requests(Some(&sorts), &[], &fields).unwrap();
+				let mut elapsed = Vec::new();
+				for sample in 0..5 {
+					let native = || {
+						let started = Instant::now();
+						let first = (SortByString::for_field("__fulltext_filter_0"), comparator(&sorts[0]));
+						let second = (
 							SortByStaticFastValue::<f64>::for_field("__fulltext_filter_1"),
 							comparator(&sorts[1]),
-						),
-					),
-					10,
-				);
-				let native_ms = started.elapsed().as_secs_f64() * 1000.;
-				let started = Instant::now();
-				let dynamic = collect(&searcher, DynamicSortKeys::new(&sorts, &fields()).unwrap(), 10);
-				let dynamic_ms = started.elapsed().as_secs_f64() * 1000.;
-				assert_eq!(native, dynamic);
-				elapsed.push((native_ms, dynamic_ms));
+						);
+						let hits = if key_count == 2 {
+							collect_sorted(&searcher, &AllQuery, (first, second), 10, None, Vec::new(), None)
+						} else {
+							collect_sorted(
+								&searcher,
+								&AllQuery,
+								(
+									first,
+									second,
+									(SortByString::for_field("__fulltext_filter_2"), comparator(&sorts[2])),
+								),
+								10,
+								None,
+								Vec::new(),
+								None,
+							)
+						}
+						.unwrap();
+						(hits, started.elapsed().as_secs_f64() * 1000.)
+					};
+					let production = || {
+						let started = Instant::now();
+						let hits = if key_count == 2 {
+							collect_pair(&searcher, &AllQuery, catalog, 10, None, Vec::new(), None)
+						} else {
+							collect_sorted(
+								&searcher,
+								&AllQuery,
+								DynamicSortKeys::new(&sorts, &fields).unwrap(),
+								10,
+								None,
+								Vec::new(),
+								None,
+							)
+						}
+						.unwrap();
+						(hits, started.elapsed().as_secs_f64() * 1000.)
+					};
+					let (native, production) = if sample % 2 == 0 {
+						(native(), production())
+					} else {
+						let production = production();
+						(native(), production)
+					};
+					assert_eq!(native.0.hits, production.0.hits);
+					assert_eq!(native.0.total, production.0.total);
+					elapsed.push((native.1, production.1));
+				}
+				println!("runtime_production_sort_qualification keys={key_count} adversarial={adversarial} native_production_ms={elapsed:?}");
 			}
-			println!("runtime_sort_qualification monotone={monotone} native_dynamic_ms={elapsed:?}");
 		}
 	}
 }

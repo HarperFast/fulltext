@@ -170,7 +170,15 @@ fn metadata_collector_qualification() {
 			let deadline = Some(Instant::now() + Duration::from_secs(30));
 			let collector = (
 				Count,
-				prepare_aggregations(&searcher, &requests, &fields, index.tokenizers().clone(), deadline).unwrap(),
+				prepare_aggregations(
+					&searcher,
+					&query,
+					&requests,
+					&fields,
+					index.tokenizers().clone(),
+					deadline,
+				)
+				.unwrap(),
 			);
 			let (count, result) = if wrapped {
 				searcher
@@ -349,7 +357,15 @@ fn metadata_collector_qualification() {
 			let deadline = Some(Instant::now() + Duration::from_secs(30));
 			let collector = (
 				Count,
-				prepare_aggregations(&searcher, &requests, &fields, index.tokenizers().clone(), deadline).unwrap(),
+				prepare_aggregations(
+					&searcher,
+					query,
+					&requests,
+					&fields,
+					index.tokenizers().clone(),
+					deadline,
+				)
+				.unwrap(),
 			);
 			let (count, result) = if wrapped {
 				searcher
@@ -428,7 +444,15 @@ fn dictionary_cache_concurrency_qualification() {
 			writer.wait_merging_threads().unwrap();
 			let searcher = index.reader().unwrap().searcher();
 			assert_eq!(searcher.segment_readers().len(), SEGMENTS_PER_INDEX);
-			check_terms_budget(&searcher, &requests, &fields, None).unwrap();
+			check_terms_budget(
+				&searcher,
+				&tantivy::query::AllQuery,
+				&requests,
+				&fields,
+				None,
+				TokenizerManager::default(),
+			)
+			.unwrap();
 			searcher
 		})
 		.collect::<Vec<_>>();
@@ -469,7 +493,15 @@ fn dictionary_cache_concurrency_qualification() {
 									let start = Instant::now();
 									let deadline = Some(start + Duration::from_secs(30));
 									if preflight_only {
-										check_terms_budget(searcher, requests, fields, deadline).unwrap();
+										check_terms_budget(
+											searcher,
+											&tantivy::query::AllQuery,
+											requests,
+											fields,
+											deadline,
+											TokenizerManager::default(),
+										)
+										.unwrap();
 									} else {
 										let (count, results) = aggregate_count(
 											searcher,

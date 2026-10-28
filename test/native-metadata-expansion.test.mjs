@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
 
-const key = (field, direction = 'asc', missing = 'last') => ({ field, direction, missing });
+const key = (field, direction = 'asc', missing = 'last') => ({
+	field,
+	direction,
+	missing,
+});
 const bounded = (promise) => {
 	let timer;
 	return Promise.race([
@@ -28,6 +32,9 @@ async function fixture(context, batches) {
 				{ name: 'category', type: 'string' },
 				{ name: 'brand', type: 'string' },
 				{ name: 'price', type: 'number' },
+				{ name: 'rating', type: 'number' },
+				{ name: 'stock', type: 'number' },
+				{ name: 'weight', type: 'number' },
 			],
 			analyzer: 'english@2',
 			limits: {
@@ -44,7 +51,11 @@ async function fixture(context, batches) {
 	for (const batch of batches) {
 		await bounded(
 			index.applyMutationBatch({
-				upserts: batch.map(({ id, ...filters }) => ({ id, fields: { title: 'running shoe' }, filters })),
+				upserts: batch.map(({ id, ...filters }) => ({
+					id,
+					fields: { title: 'running shoe' },
+					filters,
+				})),
 			}),
 		);
 		await bounded(index.commit());
@@ -78,7 +89,12 @@ test(
 	async (context) => {
 		const batches = [
 			[
-				{ id: 'a', category: 'outdoor', brand: ['zeta', 'alpha'], price: [7, 1] },
+				{
+					id: 'a',
+					category: 'outdoor',
+					brand: ['zeta', 'alpha'],
+					price: [7, 1],
+				},
 				{ id: 'é', category: 'outdoor', brand: 'same', price: 3 },
 				{ id: 'z', category: 'outdoor', brand: 'same', price: 3 },
 			],
@@ -108,7 +124,15 @@ test(
 			const expected = oracle(records, sorts);
 			const actual = [];
 			for (let offset = 0; offset < records.length; offset += 2) {
-				const result = await bounded(index.search({ text: 'shoe', sort: sorts, offset, limit: 2, exactTotal: true }));
+				const result = await bounded(
+					index.search({
+						text: 'shoe',
+						sort: sorts,
+						offset,
+						limit: 2,
+						exactTotal: true,
+					}),
+				);
 				assert.strictEqual(result.total, records.length);
 				for (const hit of result.hits) {
 					actual.push(hit.id);
@@ -125,7 +149,12 @@ test(
 	{ timeout: 60_000 },
 	async (context) => {
 		const records = [
-			{ id: 'a', category: ['outdoor', 'outdoor'], brand: ['cedar', 'cedar'], price: 5 },
+			{
+				id: 'a',
+				category: ['outdoor', 'outdoor'],
+				brand: ['cedar', 'cedar'],
+				price: 5,
+			},
 			{ id: 'b', category: 'outdoor', brand: 'pine', price: 15 },
 			{ id: 'c', category: 'indoor', brand: 'cedar', price: 25 },
 			{ id: 'd', category: 'outdoor', brand: 'cedar', price: 35 },
@@ -220,7 +249,11 @@ test(
 			price: index,
 		}));
 		const index = await fixture(context, [records]);
-		const siblings = Array.from({ length: 12 }, (_, i) => ({ name: `stats-${i}`, field: 'price', type: 'stats' }));
+		const siblings = Array.from({ length: 12 }, (_, i) => ({
+			name: `stats-${i}`,
+			field: 'price',
+			type: 'stats',
+		}));
 		const result = await bounded(
 			index.search({
 				text: 'shoe',
@@ -232,7 +265,10 @@ test(
 						name: 'ranges',
 						field: 'price',
 						type: 'range',
-						ranges: Array.from({ length: 120 }, (_, i) => ({ from: i, to: i + 1 })),
+						ranges: Array.from({ length: 120 }, (_, i) => ({
+							from: i,
+							to: i + 1,
+						})),
 					},
 				],
 			}),
@@ -257,16 +293,177 @@ test(
 		cyclic.aggregations = [cyclic];
 		let deep = { name: 'leaf', field: 'price', type: 'stats' };
 		for (let i = 0; i < 32; i++)
-			deep = { name: 'branch', field: 'brand', type: 'terms', size: 1, aggregations: [deep] };
+			deep = {
+				name: 'branch',
+				field: 'brand',
+				type: 'terms',
+				size: 1,
+				aggregations: [deep],
+			};
 		for (const aggregations of [
 			[cyclic],
 			[deep],
-			Array.from({ length: 50_000 }, (_, i) => ({ name: String(i), field: 'price', type: 'stats' })),
+			Array.from({ length: 50_000 }, (_, i) => ({
+				name: String(i),
+				field: 'price',
+				type: 'stats',
+			})),
 		]) {
 			await assert.rejects(bounded(index.search({ text: 'shoe', aggregations })), (error) =>
 				['E_INVALID_ARGUMENT', 'E_RESOURCE_LIMIT'].includes(error.code),
 			);
 			assert.strictEqual((await bounded(index.search({ text: 'shoe', limit: 1, exactTotal: true }))).total, 3);
 		}
+	},
+);
+
+test(
+	'six sort keys retain whole-fixture ordering after native top-k thresholds engage',
+	{ timeout: 60_000 },
+	async (context) => {
+		const records = Array.from({ length: 300 }, (_, index) => ({
+			id: `record-${String(index).padStart(3, '0')}`,
+			category: `category-${index % 3}`,
+			brand: `brand-${index % 4}`,
+			price: index % 5,
+			rating: index % 2,
+			...(index >= 100 && index < 200 ? {} : { stock: index % 7 }),
+			weight: (index * 73) % 301,
+		}));
+		const zeros = [
+			{
+				id: 'zero-a',
+				category: 'same',
+				brand: 'same',
+				price: 0,
+				rating: 0,
+				stock: 0,
+				weight: +0,
+			},
+			{
+				id: 'zero-z',
+				category: 'same',
+				brand: 'same',
+				price: 0,
+				rating: 0,
+				stock: 0,
+				weight: -0,
+			},
+		];
+		records.push(...zeros);
+		const index = await fixture(context, [records.slice(0, 100), records.slice(100, 200), records.slice(200)]);
+		const baseline = await bounded(index.search({ text: 'shoe', limit: records.length, exactTotal: true }));
+		const scores = new Map(baseline.hits.map((hit) => [hit.id, hit.score]));
+		for (const sorts of [
+			[
+				key('category'),
+				key('brand', 'desc'),
+				key('price'),
+				key('rating', 'desc'),
+				key('stock', 'asc', 'first'),
+				key('weight', 'desc'),
+			],
+			[
+				key('stock', 'desc', 'last'),
+				key('category', 'desc'),
+				key('brand'),
+				key('price', 'desc'),
+				key('rating'),
+				key('weight'),
+			],
+		]) {
+			const expected = oracle(records, sorts);
+			for (const offset of [0, 2, 20, 100, 200, 300]) {
+				const result = await bounded(
+					index.search({
+						text: 'shoe',
+						sort: sorts,
+						offset,
+						limit: 2,
+						exactTotal: true,
+					}),
+				);
+				assert.strictEqual(result.total, records.length);
+				assert.deepStrictEqual(
+					result.hits.map((hit) => hit.id),
+					expected.slice(offset, offset + 2),
+				);
+				for (const hit of result.hits) assert.strictEqual(hit.score, scores.get(hit.id));
+			}
+			const full = await bounded(index.search({ text: 'shoe', sort: sorts, limit: records.length }));
+			assert.deepStrictEqual(
+				full.hits.map((hit) => hit.id),
+				expected,
+			);
+			assert.deepStrictEqual(
+				full.hits.filter((hit) => hit.id.startsWith('zero-')).map((hit) => hit.id),
+				['zero-a', 'zero-z'],
+			);
+		}
+	},
+);
+
+test(
+	'a large requested terms size remains bounded by actual low-cardinality results',
+	{ timeout: 60_000 },
+	async (context) => {
+		const index = await fixture(context, [
+			[{ id: 'a', brand: 'cedar', price: 1 }],
+			[{ id: 'b', brand: 'pine', price: 2 }],
+			[{ id: 'c', brand: 'birch', price: 3 }],
+		]);
+		const result = await bounded(
+			index.search({
+				text: 'shoe',
+				limit: 1,
+				aggregations: [{ name: 'brands', field: 'brand', type: 'terms', size: 1_000_000 }],
+			}),
+		);
+		assert.strictEqual(result.aggregations[0].buckets.length, 3);
+		assert.deepStrictEqual(
+			new Set(result.aggregations[0].buckets.map((bucket) => bucket.key)),
+			new Set(['cedar', 'pine', 'birch']),
+		);
+		assert.strictEqual(result.aggregations[0].sumOtherDocCount, 0);
+		assert.strictEqual((await bounded(index.search({ text: 'shoe', limit: 1, exactTotal: true }))).total, 3);
+	},
+);
+
+test(
+	'actual aggregation output bytes reject oversized matches without imposing static request caps',
+	{ timeout: 60_000 },
+	async (context) => {
+		const records = Array.from({ length: 900 }, (_, index) => ({
+			id: String(index),
+			brand: `${String(index).padStart(4, '0')}${'x'.repeat(11_000)}`,
+		}));
+		const index = await fixture(context, [records.slice(0, 300), records.slice(300, 600), records.slice(600)]);
+		const aggregations = [{ name: 'brands', field: 'brand', type: 'terms', size: 900 }];
+		await assert.rejects(bounded(index.search({ text: 'shoe', limit: 1, aggregations })), {
+			code: 'E_RESULT_TOO_LARGE',
+		});
+		const empty = await bounded(index.search({ text: 'unmatched', limit: 1, aggregations }));
+		assert.deepStrictEqual(empty.aggregations[0].buckets, []);
+		assert.strictEqual((await bounded(index.search({ text: 'shoe', limit: 1, exactTotal: true }))).total, 900);
+	},
+);
+
+test(
+	'native global bucket limits depend on matching results and preserve handle recovery',
+	{ timeout: 60_000 },
+	async (context) => {
+		const records = Array.from({ length: 1200 }, (_, index) => ({
+			id: String(index),
+			brand: `brand-${String(index).padStart(4, '0')}`,
+		}));
+		const index = await fixture(context, [records]);
+		const aggregations = [{ name: 'brands', field: 'brand', type: 'terms', size: 1200 }];
+		await assert.rejects(bounded(index.search({ text: 'shoe', limit: 1, aggregations })), { code: 'E_RESOURCE_LIMIT' });
+		const empty = await bounded(index.search({ text: 'unmatched', limit: 1, aggregations }));
+		assert.deepStrictEqual(empty.aggregations[0].buckets, []);
+		const missing = await bounded(
+			index.search({ text: 'shoe', filter: { field: 'price', comparator: 'missing' }, limit: 1, exactTotal: true }),
+		);
+		assert.strictEqual(missing.total, 1200);
 	},
 );

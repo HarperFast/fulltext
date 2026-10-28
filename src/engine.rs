@@ -696,6 +696,9 @@ impl Engine {
 			.as_deref()
 			.map(|fields| catalog::validate_requests(request.sort.as_deref(), &request.aggregations, fields))
 			.transpose()?;
+		if catalog.is_some() {
+			catalog::check_aggregation_shape(&request.aggregations, searcher.segment_readers().len())?;
+		}
 		check_deadline(deadline)?;
 		let snapshot = if request.traversal {
 			let snapshot = search_snapshot(searcher.generation().segments());

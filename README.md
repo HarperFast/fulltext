@@ -401,6 +401,7 @@ named array in request order. Missing metadata contributes no value. Each bucket
 
 Bucket requests (`terms`, `histogram`, `range`) accept child `aggregations`. Tantivy collects children
 within each parent bucket; the corresponding result bucket includes its named `aggregations` array.
+Buckets without children omit that property, preserving the flat result shape.
 Stats are leaves. Names must be unique among siblings; separate branches may reuse names.
 
 ```js
@@ -421,7 +422,9 @@ oversampling uses checked arithmetic. There are at most 1,024 returned buckets a
 tree, a 16 MiB native aggregation guard, a separate 16 MiB decoded-term-key budget, a 64 MiB
 sort-key budget, and an 8 MiB response budget. Construction costs are checked before opening
 collectors. Nested parent buckets multiply intermediate costs, so a small final result can still
-exceed a budget. Reduce the request shape or terms size after `E_RESOURCE_LIMIT`; splitting global
+exceed a budget. Histogram bounds may use an additional bounded native query pass to qualify
+selective requests. Actual bucket/output overflow is checked during collection/encoding.
+Reduce the request shape or terms size after `E_RESOURCE_LIMIT`; splitting global
 top-k requests is not equivalent. See [metadata resource policy](docs/limits.md#metadata-collectors).
 Non-finite aggregate results reject. Search never silently truncates histograms or ranges; terms
 retain Tantivy's explicitly approximate candidate-selection policy.

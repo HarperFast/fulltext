@@ -158,6 +158,17 @@ increment. Production latency, process-memory residency, and Harper integration 
 Local verification covers macOS arm64; use the platform CI results for Linux and Windows. Individual
 Tantivy operations and query construction remain uninterruptible.
 
+One- and two-field sorts use native typed computers. Larger lists compose native per-field
+computers into a runtime list as the head of Tantivy's native ID/score tuple. Lazy threshold
+comparison avoids allocating rejected keys. TopDocs owns collection and merging. All paths share
+conservative admission, including decoded global merge copies and list-storage estimates. Bucket
+aggregation children map directly to native `sub_aggregation` trees. Resource admission accounts
+for collector construction and possible parent instances before collection. Histogram parents use
+position spans, with native query-scoped probes when conservative admission fails. Histogram safety
+checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
+checks protect each recursive wire/API walker. Packed protocol 7, ABI 11 and query API 6 change
+in lockstep; this expansion does not change persisted identity v8.
+
 ## Sources
 
 - [Metadata collectors and native tests](catalog.rs)
@@ -167,11 +178,3 @@ Tantivy operations and query construction remain uninterruptible.
 - [Facade and token identity](../ts/native.ts)
 - [Public API tests](../test/native-traversal.test.mjs)
 - [Pinned Tantivy version](../Cargo.toml)
-
-Multi-field sorting composes native per-field sort-key computers into a runtime list as the head
-of Tantivy's native ID/score tuple. Lazy threshold comparison avoids allocating rejected keys;
-TopDocs still owns collection and merging. One-field requests retain the typed path. Bucket
-aggregation children map directly to native `sub_aggregation` trees. Resource admission accounts
-for collector construction and possible parent instances before collection; independent depth
-checks protect each recursive wire/API walker. Packed protocol 7, ABI 11 and query API 6 change
-in lockstep; this expansion does not change persisted identity v8.

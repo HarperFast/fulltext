@@ -320,3 +320,32 @@ provides no evidence that scan coordination would improve the release materially
 reproducing workload if first-search latency, CPU, or recovery violates a consuming application's
 budget. Linux/Windows, larger dictionaries/segment counts, disk-cold startup and sustained memory
 behavior remain unqualified; see [Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
+
+## Runtime sort-list qualification
+
+The ignored `runtime_production_sort_qualification` test compares native typed tuples with the
+production one/two-field dispatch or runtime-length adapter. Both paths use the production Count,
+deadline and ID/score collectors on 50,000 documents, 50 segments and a top-10 window. Run:
+
+```bash
+cargo test --locked --release runtime_production_sort_qualification -- --ignored --nocapture
+```
+
+Observed locally on 2026-10-28: three processes ran five alternating native/candidate pairs for
+each case. Increasing keys with descending ordering force accepted replacements after the
+threshold fills; the randomized case exercises rejection and ties. All hits, scores, addresses
+and totals matched. Pooled 15-sample medians:
+
+| Metadata keys | Data        | Native tuple | Production path | Change |
+| ------------- | ----------- | ------------ | --------------- | ------ |
+| 2             | Adversarial | 4.534 ms     | 4.551 ms        | +0.4%  |
+| 2             | Random      | 1.473 ms     | 1.477 ms        | +0.3%  |
+| 3             | Adversarial | 4.702 ms     | 5.976 ms        | +27.1% |
+| 3             | Random      | 1.601 ms     | 1.843 ms        | +15.1% |
+
+Two-field dispatch stayed within local measurement variation. Dynamic lists retain a measured
+allocation/comparison cost at the native key-ownership boundary. The adapter computes accepted
+keys once using per-segment scratch storage and allocates no vector for threshold rejections.
+Scratch, key vectors and decoded merge copies are charged to the shared sort budget. These are
+collector-path samples, not public API latency, a production service guarantee or cross-platform
+qualification. Larger key lists and sustained concurrent loads remain unqualified.

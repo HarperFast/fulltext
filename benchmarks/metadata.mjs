@@ -92,7 +92,7 @@ try {
 	const measurements = {};
 	for (const { name, request } of cases) {
 		if (ordinaryOnly && !name.startsWith('ordinary')) continue;
-		if (native.queryApiVersion < 6 && !name.startsWith('ordinary')) {
+		if (native.queryApiVersion < 5 && !name.startsWith('ordinary')) {
 			measurements[name] = { skipped: `query API ${native.queryApiVersion} does not support metadata collectors` };
 			continue;
 		}

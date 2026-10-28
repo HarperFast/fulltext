@@ -334,12 +334,26 @@ independent top-k requests do not produce a globally equivalent answer.
 | Aggregation depth                  | 32 levels                                               | Independent facade, wire, validation, collector and result walkers reject deeper trees.                                                                                                                                                                         |
 | Terms size / explicit range count  | Positive u32 size; nonempty ranges within request bytes | Checked tenfold native candidate oversampling; terms remain approximate across segments. Large requested sizes can succeed on low-cardinality fields.                                                                                                           |
 | Returned aggregation buckets       | 1,024 across the entire tree                            | Native global bucket guard; overflow rejects with `E_RESOURCE_LIMIT`. No partial histogram/range response.                                                                                                                                                      |
-| Collector construction             | 16 MiB conservative admission estimate                  | Charges request nodes, range setup and segment count before constructing collectors. Stats nodes are charged even though they return no buckets.                                                                                                                |
+| Collector construction             | 16 MiB conservative admission estimate                  | Charges request nodes, range setup and segment count before constructing collectors. Nested state also charges possible parent instances, including stats vectors that Tantivy does not charge to its native guard.                                             |
 | Native aggregation structures      | 16 MiB estimated, shared across segment collectors      | Tantivy guard; not total process memory and not every decoded key.                                                                                                                                                                                              |
 | Decoded term keys                  | 16 MiB conservative preflight                           | Per-segment candidates are bounded by oversampling, dictionary size and observed values. Descendants multiply by possible parent instances; each candidate charges maximum key bytes plus overhead. Dictionary scans refine maximum lengths under the deadline. |
 | Retained metadata sort keys        | 64 MiB conservative preflight                           | Charges every requested key, vector storage, native top-k buffers, IDs and global decoded keys across segments. Existing 10,000-window and prefix limits apply.                                                                                                 |
 | Request / response                 | Existing 8 MiB each                                     | Input normalization charges bytes incrementally; result encoding charges all descendants. Minimum output and construction cost are checked before collection. Oversized output rejects with `E_RESULT_TOO_LARGE`.                                               |
 | Numeric arithmetic                 | Finite input/output; representable histogram positions  | Invalid intervals/ranges reject with `E_INVALID_ARGUMENT`; arithmetic/capacity overflow rejects with `E_RESOURCE_LIMIT`.                                                                                                                                        |
+
+Histogram-parent admission first bounds actual possible bucket positions rather than charging every
+numeric value as a separate bucket. If dictionary and column bounds still cannot qualify a tree,
+bounded native histogram probes can refine those bounds using the original query and native
+ancestor-presence predicates. Probes share the deadline and native memory/bucket guards; they add
+collection work only on this admission fallback. An inconclusive probe retains the conservative
+bound. Nested histogram validation ignores documents missing an ancestor bucket field.
+
+Static construction costs, minimum result bytes and known range-only bucket counts are checked
+before query construction or ranking. Actual bucket cardinality and serialized key bytes depend
+on matching data: native guards and encoding enforce those limits during/after collection. A high
+requested terms size is not itself a rejection reason; it can return a few categories or none.
+Pre-rejecting every possible oversized output would reinstate feature caps or reject empty/selective
+queries. These are bounded failures, not a promise that every rejected request avoids collection.
 
 The metadata collector checks the original request deadline before setup, at segment boundaries,
 every 1,024 visited matches, and around final merge. Native scorer setup, individual dictionary

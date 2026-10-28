@@ -250,10 +250,24 @@ fn histogram_position_safe(value: f64, interval: f64) -> bool {
 	let position = (value / interval).floor();
 	position.is_finite() && position >= i64::MIN as f64 && position < i64::MAX as f64
 }
-fn validate_histogram_doc(histograms: &[(tantivy::fastfield::Column<f64>, f64)], doc: u32) -> tantivy::Result<()> {
-	for (column, interval) in histograms {
-		for value in column.values_for_doc(doc) {
-			if !histogram_position_safe(value, *interval) {
+#[derive(Clone, Debug, PartialEq)]
+struct HistogramCheck {
+	field: String,
+	interval: f64,
+	ancestors: Vec<String>,
+}
+struct HistogramColumns {
+	column: tantivy::fastfield::Column<f64>,
+	interval: f64,
+	ancestors: Vec<tantivy::fastfield::Column<u64>>,
+}
+fn validate_histogram_doc(histograms: &[HistogramColumns], doc: u32) -> tantivy::Result<()> {
+	for check in histograms {
+		if check.ancestors.iter().any(|column| column.first(doc).is_none()) {
+			continue;
+		}
+		for value in check.column.values_for_doc(doc) {
+			if !histogram_position_safe(value, check.interval) {
 				return Err(TantivyError::InvalidArgument(
 					"Histogram values exceed representable bucket positions".into(),
 				));
@@ -263,7 +277,7 @@ fn validate_histogram_doc(histograms: &[(tantivy::fastfield::Column<f64>, f64)],
 	Ok(())
 }
 struct DeadlineCollector<C> {
-	histograms: Vec<(String, f64)>,
+	histograms: Vec<HistogramCheck>,
 	inner: C,
 	deadline: Option<Instant>,
 }
@@ -300,15 +314,35 @@ impl<C: Collector> Collector for DeadlineCollector<C> {
 		let histograms = self
 			.histograms
 			.iter()
-			.map(|(name, interval)| Ok((reader.fast_fields().f64(name)?, *interval)))
+			.map(|check| {
+				let column = reader.fast_fields().f64(&check.field)?;
+				if column.values.num_vals() == 0
+					|| [column.min_value(), column.max_value()]
+						.into_iter()
+						.all(|value| histogram_position_safe(value, check.interval))
+				{
+					return Ok(None);
+				}
+				let ancestors = check
+					.ancestors
+					.iter()
+					.map(|name| {
+						Ok(reader
+							.fast_fields()
+							.u64_lenient(name)?
+							.map(|(column, _)| column)
+							.unwrap_or_else(|| tantivy::fastfield::Column::build_empty_column(reader.max_doc())))
+					})
+					.collect::<tantivy::Result<Vec<_>>>()?;
+				Ok(Some(HistogramColumns {
+					column,
+					interval: check.interval,
+					ancestors,
+				}))
+			})
 			.collect::<tantivy::Result<Vec<_>>>()?
 			.into_iter()
-			.filter(|(column, interval)| {
-				column.values.num_vals() > 0
-					&& [column.min_value(), column.max_value()]
-						.into_iter()
-						.any(|value| !histogram_position_safe(value, *interval))
-			})
+			.flatten()
 			.collect::<Vec<_>>();
 		let mut scorer = weight.scorer(reader, 1.0)?;
 		let alive = reader.alive_bitset();
@@ -468,85 +502,6 @@ fn add_key_budget(total: &mut usize, count: usize, bytes: usize, limit: usize) -
 	}
 	Ok(())
 }
-fn sort_buffer_bytes(end: usize, segments: usize, parallelism: usize) -> Result<usize> {
-	let segment_key_bytes =
-		std::mem::size_of::<tantivy::collector::ComparableDoc<(Option<u64>, (Option<u64>, Score)), u32>>();
-	let global_key_bytes =
-		std::mem::size_of::<tantivy::collector::ComparableDoc<(Option<String>, (Option<String>, Score)), DocAddress>>();
-	end.checked_mul(2)
-		.and_then(|n| n.checked_mul(segment_key_bytes))
-		.and_then(|n| n.checked_mul(segments.min(parallelism)))
-		.and_then(|n| n.checked_add(end.checked_mul(2)?.checked_mul(global_key_bytes)?))
-		.ok_or_else(|| resource("Sort buffer memory overflow"))
-}
-fn check_sort_budget(
-	searcher: &Searcher,
-	query: &dyn Query,
-	end: usize,
-	index: usize,
-	is_string: bool,
-	deadline: Option<Instant>,
-) -> Result<()> {
-	let segments = searcher.segment_readers().len();
-	let parallelism = match searcher.index().search_executor() {
-		tantivy::Executor::SingleThread => 1,
-		tantivy::Executor::ThreadPool(pool) => pool.current_num_threads(),
-	};
-	let fixed = sort_buffer_bytes(end, segments, parallelism)?;
-	if fixed > MAX_SORT_MEMORY_BYTES {
-		return Err(resource("Sort buffers exceed memory budget"));
-	}
-	let worst = crate::protocol::MAX_RECORD_ID_BYTES + 128 + if is_string { 65530 } else { 8 };
-	let cheap = searcher.segment_readers().iter().try_fold(fixed, |total, s| {
-		total.checked_add(end.min(s.num_docs() as usize).checked_mul(worst)?)
-	});
-	if cheap.is_some_and(|total| total <= MAX_SORT_MEMORY_BYTES) {
-		return Ok(());
-	}
-	let name = format!("__fulltext_filter_{index}");
-	let mut values = Vec::with_capacity(searcher.segment_readers().len());
-	let mut total = Some(fixed);
-	for segment in searcher.segment_readers() {
-		let value = if is_string {
-			max_dictionary_key(segment, &name, deadline)?
-		} else {
-			8
-		};
-		values.push(value);
-		total = total.and_then(|total| {
-			total.checked_add(
-				end.min(segment.num_docs() as usize)
-					.checked_mul(crate::protocol::MAX_RECORD_ID_BYTES + value + 128)?,
-			)
-		});
-	}
-	if total.is_some_and(|total| total <= MAX_SORT_MEMORY_BYTES) {
-		return Ok(());
-	}
-	let mut total = Some(fixed);
-	let mut retained = 0usize;
-	let mut maximum = 0usize;
-	for (segment, value) in searcher.segment_readers().iter().zip(values) {
-		let ids = max_dictionary_key(segment, "__fulltext_id", deadline)?;
-		let bytes = ids
-			.checked_add(value)
-			.and_then(|n| n.checked_add(128))
-			.ok_or_else(|| resource("Sort key size overflow"))?;
-		let count = end.min(segment.num_docs() as usize);
-		maximum = maximum.max(bytes);
-		retained = retained
-			.checked_add(count)
-			.ok_or_else(|| resource("Retained key count overflow"))?;
-		total = total.and_then(|total| total.checked_add(count.checked_mul(bytes)?));
-	}
-	if total.is_some_and(|total| total <= MAX_SORT_MEMORY_BYTES) {
-		return Ok(());
-	}
-	let matching = count_matches(searcher, query, deadline).map_err(native_error)?;
-	let matching = usize::try_from(matching).unwrap_or(usize::MAX);
-	let mut total = fixed;
-	add_key_budget(&mut total, retained.min(matching), maximum, MAX_SORT_MEMORY_BYTES)
-}
 fn range_bucket_bound(ranges: &[(Option<f64>, Option<f64>)]) -> Result<usize> {
 	ranges
 		.len()
@@ -554,7 +509,7 @@ fn range_bucket_bound(ranges: &[(Option<f64>, Option<f64>)]) -> Result<usize> {
 		.and_then(|n| n.checked_add(usize::from(ranges.last().is_some_and(|range| range.1.is_some()))))
 		.ok_or_else(|| resource("Aggregation bucket budget exceeded"))
 }
-fn check_aggregation_shape(requests: &[AggregationRequest], segments: usize) -> Result<usize> {
+pub(crate) fn check_aggregation_shape(requests: &[AggregationRequest], segments: usize) -> Result<usize> {
 	fn walk(requests: &[AggregationRequest], depth: usize, memory: &mut usize, response: &mut usize) -> Result<()> {
 		if requests.is_empty() {
 			return Ok(());
@@ -616,14 +571,142 @@ fn check_aggregation_shape(requests: &[AggregationRequest], segments: usize) -> 
 	known_buckets(requests, 1, 1, &mut 0)?;
 	Ok(memory * segments.max(1))
 }
+fn histogram_bucket_bound(column: &tantivy::fastfield::Column<f64>, interval: f64) -> usize {
+	let values = column.values.num_vals() as usize;
+	if values == 0 {
+		return 0;
+	}
+	let min = column.min_value();
+	let max = column.max_value();
+	if histogram_position_safe(min, interval) && histogram_position_safe(max, interval) {
+		let first = (min / interval).floor() as i64;
+		let last = (max / interval).floor() as i64;
+		let positions = i128::from(last) - i128::from(first) + 1;
+		if let Ok(positions) = usize::try_from(positions) {
+			return values.min(positions);
+		}
+	}
+	values
+}
+type HistogramBoundKey = (usize, u64, Vec<String>);
+fn query_histogram_bounds(
+	searcher: &Searcher,
+	query: &dyn Query,
+	requests: &[AggregationRequest],
+	fields: &[FilterFieldConfig],
+	tokenizers: TokenizerManager,
+	deadline: Option<Instant>,
+) -> Result<HashMap<HistogramBoundKey, usize>> {
+	fn walk(
+		requests: &[AggregationRequest],
+		fields: &[FilterFieldConfig],
+		deadline: Option<Instant>,
+		depth: usize,
+		histograms: &mut HashMap<HistogramBoundKey, f64>,
+		ancestors: &mut Vec<String>,
+	) -> Result<()> {
+		if requests.is_empty() {
+			return Ok(());
+		}
+		check_aggregation_depth(depth)?;
+		for request in requests {
+			check_deadline(deadline).map_err(native_error)?;
+			if !request.aggregations.is_empty() {
+				if let AggregationKind::Histogram { interval } = request.kind {
+					histograms.insert(
+						(field(&request.field, fields)?.0, interval.to_bits(), ancestors.clone()),
+						interval,
+					);
+				}
+				ancestors.push(format!("__fulltext_filter_{}", field(&request.field, fields)?.0));
+				walk(
+					&request.aggregations,
+					fields,
+					deadline,
+					depth + 1,
+					histograms,
+					ancestors,
+				)?;
+				ancestors.pop();
+			}
+		}
+		Ok(())
+	}
+	let mut histograms = HashMap::new();
+	walk(requests, fields, deadline, 1, &mut histograms, &mut Vec::new())?;
+	let mut bounds = HashMap::new();
+	for ((index, bits, ancestors), interval) in histograms {
+		check_deadline(deadline).map_err(native_error)?;
+		let name = format!("__fulltext_filter_{index}");
+		let request = Aggregation {
+			agg: AggregationVariants::Histogram(HistogramAggregation {
+				field: name.clone(),
+				interval,
+				offset: None,
+				min_doc_count: Some(1),
+				hard_bounds: None,
+				extended_bounds: None,
+				keyed: false,
+				is_normalized_to_ns: false,
+			}),
+			sub_aggregation: Default::default(),
+		};
+		let context = AggContextParams::new(
+			AggregationLimitsGuard::new(Some(MAX_AGGREGATION_MEMORY_BYTES), Some(MAX_AGGREGATION_BUCKETS as u32)),
+			tokenizers.clone(),
+		);
+		let collector =
+			AggregationCollector::from_aggs([(String::from("histogram"), request)].into_iter().collect(), context);
+		let mut predicates = vec![(tantivy::query::Occur::Must, query.box_clone())];
+		for ancestor in &ancestors {
+			predicates.push((
+				tantivy::query::Occur::Must,
+				Box::new(tantivy::query::ExistsQuery::new(ancestor.clone(), false)) as Box<dyn Query>,
+			));
+		}
+		let scoped_query = tantivy::query::BooleanQuery::new(predicates);
+		let result = searcher.search(
+			&scoped_query,
+			&DeadlineCollector {
+				inner: collector,
+				deadline,
+				histograms: vec![HistogramCheck {
+					field: name,
+					interval,
+					ancestors: Vec::new(),
+				}],
+			},
+		);
+		match result {
+			Ok(mut result) => {
+				let Some(NativeResult::BucketResult(BucketResult::Histogram { buckets })) =
+					result.0.remove("histogram")
+				else {
+					return Err(FulltextError::native("Missing histogram admission result"));
+				};
+				bounds.insert((index, bits, ancestors), buckets.iter().count());
+			}
+			Err(error) => {
+				let error = native_error(error);
+				if error.code != "E_RESOURCE_LIMIT" && error.code != "E_INVALID_ARGUMENT" {
+					return Err(error);
+				}
+			}
+		}
+	}
+	Ok(bounds)
+}
 fn check_terms_budget(
 	searcher: &Searcher,
+	query: &dyn Query,
 	requests: &[AggregationRequest],
 	fields: &[FilterFieldConfig],
 	deadline: Option<Instant>,
+	tokenizers: TokenizerManager,
 ) -> Result<()> {
 	struct BudgetWalk<'a> {
 		fields: &'a [FilterFieldConfig],
+		histograms: &'a HashMap<HistogramBoundKey, usize>,
 		deadline: Option<Instant>,
 		exact: bool,
 		keys: usize,
@@ -637,6 +720,7 @@ fn check_terms_budget(
 			depth: usize,
 			parents: usize,
 			collected_parents: usize,
+			ancestors: &mut Vec<String>,
 		) -> Result<()> {
 			if requests.is_empty() || collected_parents == 0 {
 				return Ok(());
@@ -672,13 +756,16 @@ fn check_terms_budget(
 						add_key_budget(&mut self.keys, instances, maximum + 128, MAX_TERM_KEY_BYTES)?;
 						(retained, count)
 					}
-					AggregationKind::Histogram { .. } => {
-						let count = segment
-							.fast_fields()
-							.f64(&name)
-							.map_err(native_error)?
-							.values
-							.num_vals() as usize;
+					AggregationKind::Histogram { interval } => {
+						let count = if request.aggregations.is_empty() {
+							0
+						} else {
+							let column = segment.fast_fields().f64(&name).map_err(native_error)?;
+							let bound = histogram_bucket_bound(&column, *interval);
+							self.histograms
+								.get(&(index, interval.to_bits(), ancestors.clone()))
+								.map_or(bound, |count| bound.min(*count))
+						};
 						(count, count)
 					}
 					AggregationKind::Range { ranges } => {
@@ -694,38 +781,53 @@ fn check_terms_budget(
 					let collected_instances = collected_parents
 						.checked_mul(collected_buckets)
 						.ok_or_else(|| resource("Nested aggregation intermediate collector memory budget exceeded"))?;
+					ancestors.push(name);
 					self.walk(
 						segment,
 						&request.aggregations,
 						depth + 1,
 						instances,
 						collected_instances,
+						ancestors,
 					)?;
+					ancestors.pop();
 				}
 			}
 			Ok(())
 		}
 	}
 	let construction = check_aggregation_shape(requests, searcher.segment_readers().len())?;
-	for exact in [false, true] {
+	let estimate = |exact: bool, histograms: &HashMap<HistogramBoundKey, usize>| {
 		let mut walk = BudgetWalk {
 			fields,
+			histograms,
 			deadline,
 			exact,
 			keys: 0,
 			memory: construction,
 		};
-		let result = searcher
+		searcher
 			.segment_readers()
 			.iter()
-			.try_for_each(|segment| walk.walk(segment, requests, 1, 1, 1));
-		match result {
-			Ok(()) => return Ok(()),
-			Err(error) if !exact && error.code == "E_RESOURCE_LIMIT" => {}
-			Err(error) => return Err(error),
-		}
+			.try_for_each(|segment| walk.walk(segment, requests, 1, 1, 1, &mut Vec::new()))
+	};
+	let empty = HashMap::new();
+	let approximate = estimate(false, &empty);
+	if !matches!(&approximate,Err(error) if error.code=="E_RESOURCE_LIMIT") {
+		return approximate;
 	}
-	Ok(())
+	let exact = estimate(true, &empty);
+	let Err(original) = exact else {
+		return Ok(());
+	};
+	if original.code != "E_RESOURCE_LIMIT" {
+		return Err(original);
+	}
+	let bounds = query_histogram_bounds(searcher, query, requests, fields, tokenizers, deadline)?;
+	if bounds.is_empty() {
+		return Err(original);
+	}
+	estimate(true, &bounds)
 }
 
 #[cfg(test)]
@@ -781,26 +883,13 @@ impl ValidatedCatalog<'_> {
 		let requests = self.requests;
 		let fields = self.fields;
 		check_deadline(deadline).map_err(native_error)?;
-		let native_available = sort.len() <= 2 && sorting::native_columns_available(searcher, sort, fields, deadline)?;
-		let native_single = sort.len() == 1 && native_available;
+		let native_single = sort.len() == 1;
 		let end = offset
 			.checked_add(limit)
 			.ok_or_else(|| resource("Sort window overflow"))?
 			.min(searcher.num_docs().max(1) as usize);
-		if native_single {
-			let (index, config) = field(&sort[0].field, fields)?;
-			check_sort_budget(
-				searcher,
-				query,
-				end,
-				index,
-				config.field_type == FilterFieldType::String,
-				deadline,
-			)?;
-		} else {
-			sorting::check_budget(searcher, query, end, sort, fields, deadline)?;
-		}
-		let aggregation_collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
+		sorting::check_budget(searcher, query, end, sort, fields, deadline)?;
+		let aggregation_collector = prepare_aggregations(searcher, query, requests, fields, tokenizers, deadline)?;
 		let histograms = histogram_checks(requests, fields)?;
 		let collected = if native_single {
 			let (index, config) = field(&sort[0].field, fields)?;
@@ -827,16 +916,8 @@ impl ValidatedCatalog<'_> {
 					deadline,
 				)?
 			}
-		} else if sort.len() == 2 && native_available {
-			sorting::collect_pair(
-				searcher,
-				query,
-				*self,
-				end,
-				aggregation_collector,
-				histograms,
-				deadline,
-			)?
+		} else if sort.len() == 2 {
+			sorting::collect_pair(searcher, query, *self, end, aggregation_collector, histograms, deadline)?
 		} else {
 			collect_sorted(
 				searcher,
@@ -879,7 +960,7 @@ impl ValidatedCatalog<'_> {
 		let requests = self.requests;
 		let fields = self.fields;
 		check_deadline(deadline).map_err(native_error)?;
-		let collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
+		let collector = prepare_aggregations(searcher, query, requests, fields, tokenizers, deadline)?;
 		let (count, aggregations) = searcher
 			.search(
 				query,
@@ -905,7 +986,7 @@ impl ValidatedCatalog<'_> {
 		if requests.is_empty() {
 			return Ok(Vec::new());
 		}
-		let collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
+		let collector = prepare_aggregations(searcher, query, requests, fields, tokenizers, deadline)?;
 		let results = searcher
 			.search(
 				query,
@@ -971,7 +1052,7 @@ fn collect_sorted<S: SortKeyComputer + Send + 'static>(
 	primary: S,
 	end: usize,
 	aggregations: Option<AggregationCollector>,
-	histograms: Vec<(String, f64)>,
+	histograms: Vec<HistogramCheck>,
 	deadline: Option<Instant>,
 ) -> Result<CollectedSortedCatalog> {
 	let collector = TopDocs::for_doc_range(0..end).order_by((
@@ -1001,12 +1082,13 @@ fn collect_sorted<S: SortKeyComputer + Send + 'static>(
 	})
 }
 
-fn histogram_checks(requests: &[AggregationRequest], fields: &[FilterFieldConfig]) -> Result<Vec<(String, f64)>> {
+fn histogram_checks(requests: &[AggregationRequest], fields: &[FilterFieldConfig]) -> Result<Vec<HistogramCheck>> {
 	fn walk(
 		requests: &[AggregationRequest],
 		fields: &[FilterFieldConfig],
-		seen: &mut HashSet<(usize, u64)>,
-		checks: &mut Vec<(String, f64)>,
+		seen: &mut HashSet<(usize, u64, Vec<String>)>,
+		checks: &mut Vec<HistogramCheck>,
+		ancestors: &mut Vec<String>,
 		depth: usize,
 	) -> Result<()> {
 		if requests.is_empty() {
@@ -1014,21 +1096,29 @@ fn histogram_checks(requests: &[AggregationRequest], fields: &[FilterFieldConfig
 		}
 		check_aggregation_depth(depth)?;
 		for request in requests {
+			let (index, _) = field(&request.field, fields)?;
+			let name = format!("__fulltext_filter_{index}");
 			if let AggregationKind::Histogram { interval } = request.kind {
-				let (index, _) = field(&request.field, fields)?;
-				if seen.insert((index, interval.to_bits())) {
-					checks.push((format!("__fulltext_filter_{index}"), interval));
+				if seen.insert((index, interval.to_bits(), ancestors.clone())) {
+					checks.push(HistogramCheck {
+						field: name.clone(),
+						interval,
+						ancestors: ancestors.clone(),
+					});
 				}
 			}
-			walk(&request.aggregations, fields, seen, checks, depth + 1)?;
+			if !request.aggregations.is_empty() {
+				ancestors.push(name);
+				walk(&request.aggregations, fields, seen, checks, ancestors, depth + 1)?;
+				ancestors.pop();
+			}
 		}
 		Ok(())
 	}
 	let mut checks = Vec::new();
-	walk(requests, fields, &mut HashSet::new(), &mut checks, 1)?;
+	walk(requests, fields, &mut HashSet::new(), &mut checks, &mut Vec::new(), 1)?;
 	Ok(checks)
 }
-
 fn build_native_aggregations(
 	requests: &[AggregationRequest],
 	fields: &[FilterFieldConfig],
@@ -1092,6 +1182,7 @@ fn build_native_aggregations(
 }
 fn prepare_aggregations(
 	searcher: &Searcher,
+	query: &dyn Query,
 	requests: &[AggregationRequest],
 	fields: &[FilterFieldConfig],
 	tokenizers: TokenizerManager,
@@ -1100,7 +1191,7 @@ fn prepare_aggregations(
 	if requests.is_empty() {
 		return Ok(None);
 	}
-	check_terms_budget(searcher, requests, fields, deadline)?;
+	check_terms_budget(searcher, query, requests, fields, deadline, tokenizers.clone())?;
 	let native = build_native_aggregations(requests, fields, deadline, 1)?;
 	let context = AggContextParams::new(
 		AggregationLimitsGuard::new(Some(MAX_AGGREGATION_MEMORY_BYTES), Some(MAX_AGGREGATION_BUCKETS as u32)),
@@ -2276,9 +2367,9 @@ mod tests {
 	}
 	#[test]
 	fn sort_buffer_budget_counts_active_executor_threads() {
-		let mut single = sort_buffer_bytes(10000, 40, 1).unwrap();
+		let mut single = sorting::buffer_bytes(10000, 40, 1, 1).unwrap();
 		add_key_budget(&mut single, 400000, 128 + 20 + 8, MAX_SORT_MEMORY_BYTES).unwrap();
-		let mut concurrent = sort_buffer_bytes(10000, 40, 40).unwrap();
+		let mut concurrent = sorting::buffer_bytes(10000, 40, 40, 1).unwrap();
 		assert_eq!(
 			add_key_budget(&mut concurrent, 400000, 128 + 20 + 8, MAX_SORT_MEMORY_BYTES)
 				.unwrap_err()
@@ -2286,8 +2377,8 @@ mod tests {
 			"E_RESOURCE_LIMIT"
 		);
 		assert_eq!(
-			sort_buffer_bytes(10000, 40, 2).unwrap(),
-			sort_buffer_bytes(10000, 2, 40).unwrap()
+			sorting::buffer_bytes(10000, 40, 2, 1).unwrap(),
+			sorting::buffer_bytes(10000, 2, 40, 1).unwrap()
 		);
 	}
 	#[test]
@@ -2326,7 +2417,7 @@ mod tests {
 				.writer_with_num_threads::<TantivyDocument>(1, 100_000_000)
 				.unwrap();
 			writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
-			let value = "v".repeat(30000);
+			let value = "v".repeat(15000);
 			for segment in 0..2 {
 				for record in 0..1000 {
 					let prefix = format!("{segment:01}-{record:04}");
@@ -2394,7 +2485,28 @@ mod tests {
 	}
 	#[test]
 	fn selective_fragmented_sort_uses_matching_rows_and_survives_merge() {
+		use std::sync::{
+			atomic::{AtomicUsize, Ordering},
+			Arc,
+		};
 		use tantivy::{query::TermQuery, schema::IndexRecordOption};
+		#[derive(Clone, Debug)]
+		struct CountWitness {
+			inner: TermQuery,
+			calls: Arc<AtomicUsize>,
+		}
+		impl Query for CountWitness {
+			fn weight(&self, scoring: tantivy::query::EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+				if !scoring.is_scoring_enabled() {
+					self.calls.fetch_add(1, Ordering::SeqCst);
+				}
+				self.inner.weight(scoring)
+			}
+			fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+				self.inner.query_terms(visitor);
+			}
+		}
+
 		let mut schema = Schema::builder();
 		let id = schema.add_text_field("__fulltext_id", STRING | FAST);
 		let category = schema.add_text_field("__fulltext_filter_0", STRING | FAST);
@@ -2405,7 +2517,7 @@ mod tests {
 		for segment in 0..40 {
 			for record in 0..10000 {
 				let prefix = format!("{segment:02}-{record:05}");
-				let key = format!("{prefix}{}", "x".repeat(36 - prefix.len()));
+				let key = format!("{prefix}{}", "x".repeat(64 - prefix.len()));
 				writer
 					.add_document(
 						doc!(id=>key,category=>if segment==0&&record<50{"match"}else{"other"},price=>record as f64),
@@ -2417,7 +2529,11 @@ mod tests {
 		let reader = index.reader().unwrap();
 		let before = reader.searcher();
 		assert_eq!(before.segment_readers().len(), 40);
-		let query = TermQuery::new(Term::from_field_text(category, "match"), IndexRecordOption::Basic);
+		let count_calls = Arc::new(AtomicUsize::new(0));
+		let query = CountWitness {
+			inner: TermQuery::new(Term::from_field_text(category, "match"), IndexRecordOption::Basic),
+			calls: count_calls.clone(),
+		};
 		let sort = SortRequest {
 			field: "price".into(),
 			direction: SortDirection::Asc,
@@ -2425,6 +2541,7 @@ mod tests {
 		};
 		let selected = sorted_hits(&before, &query, &sort, &fields(), 0, 10000, None).unwrap();
 		assert_eq!(selected.len(), 50);
+		assert_eq!(count_calls.load(Ordering::SeqCst), 1);
 		assert_eq!(
 			sorted_hits(&before, &AllQuery, &sort, &fields(), 0, 10000, None)
 				.unwrap_err()
@@ -2436,6 +2553,7 @@ mod tests {
 		let after = reader.searcher();
 		assert_eq!(after.segment_readers().len(), 1);
 		let merged = sorted_hits(&after, &query, &sort, &fields(), 0, 10000, None).unwrap();
+		assert_eq!(count_calls.load(Ordering::SeqCst), 1);
 		assert_eq!(
 			selected.iter().map(|hit| &hit.0).collect::<Vec<_>>(),
 			merged.iter().map(|hit| &hit.0).collect::<Vec<_>>()
@@ -2496,7 +2614,11 @@ mod tests {
 		second.name = "second".into();
 		assert_eq!(
 			histogram_checks(&[request, second], &fields()).unwrap(),
-			vec![("__fulltext_filter_1".into(), 10.0)]
+			vec![HistogramCheck {
+				field: "__fulltext_filter_1".into(),
+				interval: 10.0,
+				ancestors: Vec::new()
+			}]
 		);
 	}
 	#[test]
@@ -2860,7 +2982,15 @@ mod tests {
 			}],
 		};
 		let searcher = index.reader().unwrap().searcher();
-		let error = check_terms_budget(&searcher, &[request], &fields, None).unwrap_err();
+		let error = check_terms_budget(
+			&searcher,
+			&AllQuery,
+			&[request],
+			&fields,
+			None,
+			index.tokenizers().clone(),
+		)
+		.unwrap_err();
 		assert_eq!(error.code, "E_RESOURCE_LIMIT");
 		assert_eq!(count_matches(&searcher, &AllQuery, None).unwrap(), 1);
 	}
@@ -2962,6 +3092,162 @@ mod tests {
 			recovered[0].value,
 			AggregationValue::Stats { count: 2000, .. }
 		));
+	}
+	#[test]
+	fn nested_histogram_admission_counts_bins_instead_of_rows() {
+		let mut schema = Schema::builder();
+		let price = schema.add_f64_field("__fulltext_filter_1", INDEXED | FAST);
+		let index = Index::create_in_ram(schema.build());
+		let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 20_000_000).unwrap();
+		for n in 0..100000 {
+			writer.add_document(doc!(price=>(n%100) as f64)).unwrap();
+		}
+		writer.commit().unwrap();
+		drop(writer);
+		let request = AggregationRequest {
+			name: "prices".into(),
+			field: "price".into(),
+			kind: AggregationKind::Histogram { interval: 1.0 },
+			aggregations: vec![stats_request("stats")],
+		};
+		let result = aggregate(
+			&index.reader().unwrap().searcher(),
+			&AllQuery,
+			&[request],
+			&fields(),
+			index.tokenizers().clone(),
+			None,
+		)
+		.unwrap();
+		let AggregationValue::Histogram { buckets } = &result[0].value else {
+			panic!()
+		};
+		assert_eq!(buckets.len(), 100);
+		assert!(buckets.iter().all(|bucket| bucket.count == 1000
+			&& matches!(
+				bucket.aggregations[0].value,
+				AggregationValue::Stats { count: 1000, .. }
+			)));
+	}
+	#[test]
+	fn nested_histogram_admission_refines_wide_indexes_using_native_query_results() {
+		use tantivy::query::TermQuery;
+		use tantivy::schema::IndexRecordOption;
+		let mut schema = Schema::builder();
+		let category = schema.add_text_field("__fulltext_filter_0", STRING | FAST);
+		let price = schema.add_f64_field("__fulltext_filter_1", INDEXED | FAST);
+		let index = Index::create_in_ram(schema.build());
+		let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 20_000_000).unwrap();
+		for n in 0..100000 {
+			let selected = n < 50000;
+			writer
+				.add_document(
+					doc!(category=>if selected {"selected"}else{"other"},price=>if selected {(n%10) as f64}else{n as f64*1000.0}),
+				)
+				.unwrap();
+		}
+		writer.add_document(doc!(category=>"other",price=>f64::MAX)).unwrap();
+		writer.commit().unwrap();
+		drop(writer);
+		let request = AggregationRequest {
+			name: "prices".into(),
+			field: "price".into(),
+			kind: AggregationKind::Histogram { interval: 1.0 },
+			aggregations: vec![stats_request("stats")],
+		};
+		let query = TermQuery::new(Term::from_field_text(category, "selected"), IndexRecordOption::Basic);
+		let result = aggregate(
+			&index.reader().unwrap().searcher(),
+			&query,
+			&[request],
+			&fields(),
+			index.tokenizers().clone(),
+			Some(Instant::now() + std::time::Duration::from_secs(10)),
+		)
+		.unwrap();
+		let AggregationValue::Histogram { buckets } = &result[0].value else {
+			panic!()
+		};
+		assert_eq!(buckets.len(), 10);
+		assert!(buckets.iter().all(|bucket| bucket.count == 5000
+			&& matches!(
+				bucket.aggregations[0].value,
+				AggregationValue::Stats { count: 5000, .. }
+			)));
+		assert_eq!(
+			count_matches(&index.reader().unwrap().searcher(), &AllQuery, None).unwrap(),
+			100001
+		);
+	}
+	#[test]
+	fn nested_histogram_position_checks_follow_ancestor_presence() {
+		let mut schema = Schema::builder();
+		let category = schema.add_text_field("__fulltext_filter_0", STRING | FAST);
+		let price = schema.add_f64_field("__fulltext_filter_1", INDEXED | FAST);
+		let index = Index::create_in_ram(schema.build());
+		let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 20_000_000).unwrap();
+		writer.add_document(doc!(category=>"present",price=>1.0)).unwrap();
+		writer.add_document(doc!(price=>f64::MAX)).unwrap();
+		writer.commit().unwrap();
+		drop(writer);
+		let histogram = AggregationRequest {
+			name: "prices".into(),
+			field: "price".into(),
+			kind: AggregationKind::Histogram { interval: 1.0 },
+			aggregations: vec![stats_request("stats")],
+		};
+		let nested = AggregationRequest {
+			name: "categories".into(),
+			field: "category".into(),
+			kind: AggregationKind::Terms { size: 10 },
+			aggregations: vec![histogram.clone()],
+		};
+		let searcher = index.reader().unwrap().searcher();
+		let result = aggregate(
+			&searcher,
+			&AllQuery,
+			std::slice::from_ref(&nested),
+			&fields(),
+			index.tokenizers().clone(),
+			None,
+		)
+		.unwrap();
+		let bounds = query_histogram_bounds(
+			&searcher,
+			&AllQuery,
+			&[nested],
+			&fields(),
+			index.tokenizers().clone(),
+			None,
+		)
+		.unwrap();
+		assert_eq!(
+			bounds.get(&(1, 1.0f64.to_bits(), vec!["__fulltext_filter_0".into()])),
+			Some(&1)
+		);
+		let AggregationValue::Terms { buckets, .. } = &result[0].value else {
+			panic!()
+		};
+		assert_eq!(buckets.len(), 1);
+		let AggregationValue::Histogram { buckets } = &buckets[0].aggregations[0].value else {
+			panic!()
+		};
+		assert_eq!(buckets[0].key, 1.0);
+		assert_eq!(buckets[0].count, 1);
+		assert_eq!(
+			aggregate(
+				&searcher,
+				&AllQuery,
+				&[histogram],
+				&fields(),
+				index.tokenizers().clone(),
+				None
+			)
+			.unwrap_err()
+			.code,
+			"E_RESOURCE_LIMIT"
+		);
+		assert_eq!(count_matches(&searcher, &AllQuery, None).unwrap(), 2);
 	}
 }
 
