@@ -318,7 +318,7 @@ test(
 );
 
 test(
-	'six sort keys retain whole-fixture ordering after native top-k thresholds engage',
+	'native tuple and runtime sort keys retain ordering after top-k thresholds engage',
 	{ timeout: 60_000 },
 	async (context) => {
 		const records = Array.from({ length: 300 }, (_, index) => ({
@@ -371,7 +371,7 @@ test(
 				key('rating'),
 				key('weight'),
 			],
-		]) {
+		].flatMap((sorts) => [sorts.slice(0, 3), sorts.slice(0, 4), sorts])) {
 			const expected = oracle(records, sorts);
 			for (const offset of [0, 2, 20, 100, 200, 300]) {
 				const result = await bounded(

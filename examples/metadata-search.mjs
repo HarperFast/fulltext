@@ -115,6 +115,25 @@ try {
 		['c', 'a', 'b', 'e', 'd'],
 	);
 	assert.strictEqual(byBrand.aggregations[0].buckets.find(({ key }) => key === 'cedar').aggregations[0].sum, 50);
+	await assert.rejects(
+		index.searchPage({ text: 'trail', sort: { field: 'price', direction: 'asc', missing: 'last' } }),
+		{
+			code: 'E_INVALID_ARGUMENT',
+		},
+	);
+	const oversized = [
+		{
+			name: 'ranges',
+			field: 'price',
+			type: 'range',
+			ranges: Array.from({ length: 1_025 }, (_, value) => ({ from: value, to: value + 1 })),
+		},
+	];
+	await assert.rejects(index.search({ text: 'trail', aggregations: oversized }), {
+		code: 'E_RESOURCE_LIMIT',
+	});
+	const recovered = await index.search({ text: 'trail', exactTotal: true });
+	assert.strictEqual(recovered.total, records.length);
 	console.log(
 		JSON.stringify(
 			{ result, missingBrandIds: missing.hits.map(({ id }) => id), sortedBrandIds: byBrand.hits.map(({ id }) => id) },

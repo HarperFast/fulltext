@@ -37,6 +37,8 @@
 		"clean:typescript": "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
 		"benchmark:native": "npm run build && node scripts/run-local.mjs benchmarks/native.mjs",
 		"benchmark:metadata": "npm run build && node scripts/run-local.mjs benchmarks/metadata.mjs",
+		"benchmark:metadata:workload": "node scripts/run-local.mjs benchmarks/metadata-workload.mjs",
+		"qualify:metadata:harper": "node scripts/qualify-harper-metadata.mjs",
 		"benchmark:metadata:smoke": "node scripts/run-local.mjs benchmarks/metadata.mjs --smoke",
 		"benchmark:multi-index": "npm run build && node scripts/run-local.mjs benchmarks/multi-index.mjs",
 		"benchmark:inspect": "npm run build && node scripts/run-local.mjs benchmarks/inspect.mjs",

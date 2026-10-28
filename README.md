@@ -427,7 +427,8 @@ selective requests. Actual bucket/output overflow is checked during collection/e
 Reduce the request shape or terms size after `E_RESOURCE_LIMIT`; splitting global
 top-k requests is not equivalent. See [metadata resource policy](docs/limits.md#metadata-collectors).
 Non-finite aggregate results reject. Search never silently truncates histograms or ranges; terms
-retain Tantivy's explicitly approximate candidate-selection policy.
+retain Tantivy's explicitly approximate candidate-selection policy. Exact hit totals do not make
+terms an exact category census; do not use top-term counts for billing or reconciliation.
 
 `sort` and `aggregations` are supported by `search()`, including dedicated readers. `searchPage()`
 rejects both: its score/ID continuation cannot represent a metadata boundary. Use ordinary bounded
@@ -437,7 +438,8 @@ use the expensive-search lane and the original shared deadline.
 
 Permissions for aggregate contributions must be expressed in `filter` or `candidateIds` before
 collection. Removing unauthorized hits afterward cannot remove their bucket or numeric contribution.
-See the executable [metadata example](examples/metadata-search.mjs).
+See the executable [metadata example](examples/metadata-search.mjs), including typed resource-error
+recovery and rejected metadata continuation, and the [premerge qualification](docs/metadata-premerge.md).
 
 ## Analyzer and field configuration
 
