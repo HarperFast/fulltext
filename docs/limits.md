@@ -338,8 +338,17 @@ independent top-k requests do not produce a globally equivalent answer.
 | Native aggregation structures      | 16 MiB estimated, shared across segment collectors      | Tantivy guard; not total process memory and not every decoded key.                                                                                                                                                                                              |
 | Decoded term keys                  | 16 MiB conservative preflight                           | Per-segment candidates are bounded by oversampling, dictionary size and observed values. Descendants multiply by possible parent instances; each candidate charges maximum key bytes plus overhead. Dictionary scans refine maximum lengths under the deadline. |
 | Retained metadata sort keys        | 64 MiB conservative preflight                           | Charges every requested key, vector storage, native top-k buffers, IDs and global decoded keys across segments. Existing 10,000-window and prefix limits apply.                                                                                                 |
-| Request / response                 | Existing 8 MiB each                                     | Input normalization charges bytes incrementally; result encoding charges all descendants. Minimum output and construction cost are checked before collection. Oversized output rejects with `E_RESULT_TOO_LARGE`.                                               |
+| Request / response                 | Existing 8 MiB each                                     | Input normalization charges bytes incrementally; result encoding charges all descendants. A conservative per-node output estimate and construction cost are checked before collection. Oversized output rejects with `E_RESULT_TOO_LARGE`.                      |
 | Numeric arithmetic                 | Finite input/output; representable histogram positions  | Invalid intervals/ranges reject with `E_INVALID_ARGUMENT`; arithmetic/capacity overflow rejects with `E_RESOURCE_LIMIT`.                                                                                                                                        |
+
+Sort dispatch uses native typed computers for one/two fields, native erased-type tuples for
+three/four fields, and runtime lists for five or more. Four-field native keys use nested pairs
+to retain configured comparators. All paths share the 64 MiB sort budget. Admission charges
+retained decoded keys across segments, fixed top-k/merge slots at actual executor concurrency,
+and dynamic scratch/key-vector storage. Global merging moves retained payloads; only up to two
+additional threshold payload copies are charged, independently of the result window. Dynamic
+scratch and threshold vectors are charged per active segment. This is a conservative admission
+estimate, not a process-residency bound.
 
 Histogram-parent admission first bounds actual possible bucket positions rather than charging every
 numeric value as a separate bucket. If dictionary and column bounds still cannot qualify a tree,
@@ -348,7 +357,7 @@ ancestor-presence predicates. Probes share the deadline and native memory/bucket
 collection work only on this admission fallback. An inconclusive probe retains the conservative
 bound. Nested histogram validation ignores documents missing an ancestor bucket field.
 
-Static construction costs, minimum result bytes and known range-only bucket counts are checked
+Static construction costs, conservative per-node result estimates and known range-only bucket counts are checked
 before query construction or ranking. Actual bucket cardinality and serialized key bytes depend
 on matching data: native guards and encoding enforce those limits during/after collection. A high
 requested terms size is not itself a rejection reason; it can return a few categories or none.

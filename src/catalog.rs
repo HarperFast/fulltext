@@ -31,6 +31,7 @@ pub const MAX_AGGREGATION_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_SORT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_TERM_KEY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AGGREGATION_RESULT_BYTES: usize = 8 * 1024 * 1024;
+const INTERMEDIATE_COLLECTOR_MEMORY_ERROR: &str = "Nested aggregation intermediate collector memory budget exceeded";
 #[derive(Clone, Debug, PartialEq)]
 pub enum SortDirection {
 	Asc,
@@ -696,6 +697,13 @@ fn query_histogram_bounds(
 	}
 	Ok(bounds)
 }
+fn has_refinable_histogram(requests: &[AggregationRequest]) -> bool {
+	requests.iter().any(|request| {
+		!request.aggregations.is_empty()
+			&& (matches!(request.kind, AggregationKind::Histogram { .. })
+				|| has_refinable_histogram(&request.aggregations))
+	})
+}
 fn check_terms_budget(
 	searcher: &Searcher,
 	query: &dyn Query,
@@ -735,7 +743,7 @@ fn check_terms_budget(
 					512 + request.name.len(),
 					MAX_AGGREGATION_MEMORY_BYTES as usize,
 				)
-				.map_err(|_| resource("Nested aggregation intermediate collector memory budget exceeded"))?;
+				.map_err(|_| resource(INTERMEDIATE_COLLECTOR_MEMORY_ERROR))?;
 				let (index, _) = field(&request.field, self.fields)?;
 				let name = format!("__fulltext_filter_{index}");
 				let (buckets, collected_buckets) = match &request.kind {
@@ -780,7 +788,7 @@ fn check_terms_budget(
 						.ok_or_else(|| resource("Nested aggregation decoded term-key byte budget exceeded"))?;
 					let collected_instances = collected_parents
 						.checked_mul(collected_buckets)
-						.ok_or_else(|| resource("Nested aggregation intermediate collector memory budget exceeded"))?;
+						.ok_or_else(|| resource(INTERMEDIATE_COLLECTOR_MEMORY_ERROR))?;
 					ancestors.push(name);
 					self.walk(
 						segment,
@@ -814,6 +822,11 @@ fn check_terms_budget(
 	let empty = HashMap::new();
 	let approximate = estimate(false, &empty);
 	if !matches!(&approximate,Err(error) if error.code=="E_RESOURCE_LIMIT") {
+		return approximate;
+	}
+	if !has_refinable_histogram(requests)
+		&& matches!(&approximate,Err(error) if error.message==INTERMEDIATE_COLLECTOR_MEMORY_ERROR)
+	{
 		return approximate;
 	}
 	let exact = estimate(true, &empty);
@@ -916,8 +929,8 @@ impl ValidatedCatalog<'_> {
 					deadline,
 				)?
 			}
-		} else if sort.len() == 2 {
-			sorting::collect_pair(searcher, query, *self, end, aggregation_collector, histograms, deadline)?
+		} else if sort.len() <= 4 {
+			sorting::collect_native(searcher, query, *self, end, aggregation_collector, histograms, deadline)?
 		} else {
 			collect_sorted(
 				searcher,
@@ -2417,7 +2430,7 @@ mod tests {
 				.writer_with_num_threads::<TantivyDocument>(1, 100_000_000)
 				.unwrap();
 			writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
-			let value = "v".repeat(15000);
+			let value = "v".repeat(30000);
 			for segment in 0..2 {
 				for record in 0..1000 {
 					let prefix = format!("{segment:01}-{record:04}");
@@ -3068,6 +3081,8 @@ mod tests {
 			aggregations: (0..100).map(|n| stats_request(&format!("stats{n}"))).collect(),
 		};
 		let searcher = index.reader().unwrap().searcher();
+		let cache_key = (searcher.segment_readers()[0].segment_id(), category);
+		assert!(!dictionary_cache().lock().unwrap().maxima.contains_key(&cache_key));
 		let error = aggregate(
 			&searcher,
 			&AllQuery,
@@ -3079,6 +3094,10 @@ mod tests {
 		.unwrap_err();
 		assert_eq!(error.code, "E_RESOURCE_LIMIT");
 		assert!(error.message.contains("intermediate collector memory"));
+		assert!(
+			!dictionary_cache().lock().unwrap().maxima.contains_key(&cache_key),
+			"memory-only rejection must not scan term dictionaries"
+		);
 		let recovered = aggregate(
 			&searcher,
 			&AllQuery,
@@ -3247,6 +3266,42 @@ mod tests {
 			.code,
 			"E_RESOURCE_LIMIT"
 		);
+		assert_eq!(count_matches(&searcher, &AllQuery, None).unwrap(), 2);
+	}
+	#[test]
+	fn nested_histogram_rejects_unsafe_values_when_ancestor_is_present() {
+		let mut schema = Schema::builder();
+		let category = schema.add_text_field("__fulltext_filter_0", STRING | FAST);
+		let price = schema.add_f64_field("__fulltext_filter_1", INDEXED | FAST);
+		let index = Index::create_in_ram(schema.build());
+		let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 20_000_000).unwrap();
+		writer.add_document(doc!(category=>"present",price=>1.0)).unwrap();
+		writer.add_document(doc!(category=>"present",price=>f64::MAX)).unwrap();
+		writer.commit().unwrap();
+		drop(writer);
+		let request = AggregationRequest {
+			name: "categories".into(),
+			field: "category".into(),
+			kind: AggregationKind::Terms { size: 10 },
+			aggregations: vec![AggregationRequest {
+				name: "prices".into(),
+				field: "price".into(),
+				kind: AggregationKind::Histogram { interval: 1.0 },
+				aggregations: Vec::new(),
+			}],
+		};
+		let searcher = index.reader().unwrap().searcher();
+		let error = aggregate(
+			&searcher,
+			&AllQuery,
+			&[request],
+			&fields(),
+			index.tokenizers().clone(),
+			None,
+		)
+		.unwrap_err();
+		assert_eq!(error.code, "E_RESOURCE_LIMIT");
+		assert!(error.message.contains("representable bucket positions"));
 		assert_eq!(count_matches(&searcher, &AllQuery, None).unwrap(), 2);
 	}
 }

@@ -150,6 +150,19 @@ including its success envelope finishes inside the request permit/deadline;
 `encode_results` bounds the response. Catalog resource tests pin rejection rather than
 partial output. See [metadata resource policy](../docs/limits.md#metadata-collectors).
 
+One- and two-field sorts use native typed computers; three and four fields use native
+erased-type tuples. Four fields use nested pairs because the pinned native flat four-tuple
+does not forward per-field comparators. Larger lists compose native per-field computers into a runtime list as the head of Tantivy's native ID/score tuple. Lazy threshold
+comparison avoids allocating rejected keys. TopDocs owns collection and merging. All paths share
+conservative admission, including retained decoded keys, at most two global threshold-key copies, and list-storage estimates.
+Global merging moves segment keys rather than cloning a second full window. Bucket
+aggregation children map directly to native `sub_aggregation` trees. Resource admission accounts
+for collector construction and possible parent instances before collection. Histogram parents use
+position spans, with native query-scoped probes when conservative admission fails. Histogram safety
+checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
+checks protect each recursive wire/API walker. Packed protocol 7, ABI 11 and query API 6 change
+in lockstep; this expansion does not change persisted identity v8.
+
 Sorted snapshot continuation and metadata-derived score adjustment remain outside this
 increment. Production latency, process-memory residency, and Harper integration are untested.
 
@@ -157,17 +170,6 @@ increment. Production latency, process-memory residency, and Harper integration 
 
 Local verification covers macOS arm64; use the platform CI results for Linux and Windows. Individual
 Tantivy operations and query construction remain uninterruptible.
-
-One- and two-field sorts use native typed computers. Larger lists compose native per-field
-computers into a runtime list as the head of Tantivy's native ID/score tuple. Lazy threshold
-comparison avoids allocating rejected keys. TopDocs owns collection and merging. All paths share
-conservative admission, including decoded global merge copies and list-storage estimates. Bucket
-aggregation children map directly to native `sub_aggregation` trees. Resource admission accounts
-for collector construction and possible parent instances before collection. Histogram parents use
-position spans, with native query-scoped probes when conservative admission fails. Histogram safety
-checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
-checks protect each recursive wire/API walker. Packed protocol 7, ABI 11 and query API 6 change
-in lockstep; this expansion does not change persisted identity v8.
 
 ## Sources
 

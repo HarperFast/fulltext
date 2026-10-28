@@ -323,29 +323,41 @@ behavior remain unqualified; see [Qualify remaining native metadata collector re
 
 ## Runtime sort-list qualification
 
-The ignored `runtime_production_sort_qualification` test compares native typed tuples with the
-production one/two-field dispatch or runtime-length adapter. Both paths use the production Count,
-deadline and ID/score collectors on 50,000 documents, 50 segments and a top-10 window. Run:
+The ignored `runtime_production_sort_qualification` test compares native statically typed tuples
+with production dispatch: typed computers for one/two fields, native erased-type tuples for
+three/four fields, and a runtime-length adapter for five or more. Four fields use nested pairs
+to preserve each configured comparator. Both measured paths use production Count, ID/score
+collectors and an active 30-second cooperative deadline on 50,000 documents, 50 segments and a
+top-10 window. Run:
 
 ```bash
 cargo test --locked --release runtime_production_sort_qualification -- --ignored --nocapture
 ```
 
-Observed locally on 2026-10-28: three processes ran five alternating native/candidate pairs for
-each case. Increasing keys with descending ordering force accepted replacements after the
+Observed locally on 2026-10-28: three fresh processes ran nine alternating native/candidate pairs
+for each case. Increasing keys with descending ordering force accepted replacements after the
 threshold fills; the randomized case exercises rejection and ties. All hits, scores, addresses
-and totals matched. Pooled 15-sample medians:
+and totals matched. Pooled 27-sample medians:
 
 | Metadata keys | Data        | Native tuple | Production path | Change |
 | ------------- | ----------- | ------------ | --------------- | ------ |
-| 2             | Adversarial | 4.534 ms     | 4.551 ms        | +0.4%  |
-| 2             | Random      | 1.473 ms     | 1.477 ms        | +0.3%  |
-| 3             | Adversarial | 4.702 ms     | 5.976 ms        | +27.1% |
-| 3             | Random      | 1.601 ms     | 1.843 ms        | +15.1% |
+| 2             | Adversarial | 4.848 ms     | 4.831 ms        | -0.3%  |
+| 2             | Random      | 1.678 ms     | 1.671 ms        | -0.4%  |
+| 3             | Adversarial | 5.051 ms     | 5.341 ms        | +5.7%  |
+| 3             | Random      | 1.780 ms     | 1.985 ms        | +11.5% |
+| 4             | Adversarial | 5.261 ms     | 5.463 ms        | +3.8%  |
+| 4             | Random      | 1.837 ms     | 1.956 ms        | +6.5%  |
+| 6             | Adversarial | 5.923 ms     | 6.629 ms        | +11.9% |
+| 6             | Random      | 1.951 ms     | 2.182 ms        | +11.8% |
 
-Two-field dispatch stayed within local measurement variation. Dynamic lists retain a measured
-allocation/comparison cost at the native key-ownership boundary. The adapter computes accepted
-keys once using per-segment scratch storage and allocates no vector for threshold rejections.
-Scratch, key vectors and decoded merge copies are charged to the shared sort budget. These are
-collector-path samples, not public API latency, a production service guarantee or cross-platform
-qualification. Larger key lists and sustained concurrent loads remain unqualified.
+Two-field dispatch stayed within local measurement variation. Erased native tuples and dynamic
+lists retain measured conversion/comparison costs. The dynamic adapter computes accepted keys
+once using per-segment scratch storage and allocates no vector for threshold rejections.
+Native TopDocs owns every heap and merge. Global merging moves retained key payloads; admission
+charges at most two additional threshold payload copies, independently of the result window,
+alongside fixed merge slots, scratch storage and retained key vectors.
+
+These timings include collector construction, scoring, Count, deadline checks and merging; they
+exclude index creation, admission and the JavaScript/native boundary. They are collector-path
+samples, not public API latency, a production service guarantee or cross-platform qualification.
+Larger key lists and sustained concurrent loads remain unqualified.
