@@ -3,7 +3,8 @@ use crate::{
 	protocol::{FilterFieldConfig, FilterFieldType},
 };
 use std::{
-	collections::{HashMap, HashSet},
+	collections::{HashMap, HashSet, VecDeque},
+	sync::{Mutex, OnceLock},
 	time::Instant,
 };
 use tantivy::aggregation::{
@@ -26,8 +27,6 @@ pub const MAX_TERMS_SIZE: u32 = 100;
 pub const MAX_AGGREGATION_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_SORT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_TERM_KEY_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_DICTIONARY_SCAN_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_DICTIONARY_SCAN_TERMS: usize = 100_000;
 const MAX_AGGREGATION_RESULT_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq)]
 pub enum SortDirection {
@@ -201,6 +200,10 @@ fn check_deadline(deadline: Option<Instant>) -> tantivy::Result<()> {
 	}
 	Ok(())
 }
+fn histogram_position_safe(value: f64, interval: f64) -> bool {
+	let position = (value / interval).floor();
+	position.is_finite() && position >= i64::MIN as f64 && position < i64::MAX as f64
+}
 struct DeadlineCollector<C> {
 	histograms: Vec<(String, f64)>,
 	inner: C,
@@ -240,7 +243,15 @@ impl<C: Collector> Collector for DeadlineCollector<C> {
 			.histograms
 			.iter()
 			.map(|(name, interval)| Ok((reader.fast_fields().f64(name)?, *interval)))
-			.collect::<tantivy::Result<Vec<_>>>()?;
+			.collect::<tantivy::Result<Vec<_>>>()?
+			.into_iter()
+			.filter(|(column, interval)| {
+				column.values.num_vals() > 0
+					&& [column.min_value(), column.max_value()]
+						.into_iter()
+						.any(|value| !histogram_position_safe(value, *interval))
+			})
+			.collect::<Vec<_>>();
 		let mut scorer = weight.scorer(reader, 1.0)?;
 		let alive = reader.alive_bitset();
 		let scoring = self.requires_scoring();
@@ -254,8 +265,7 @@ impl<C: Collector> Collector for DeadlineCollector<C> {
 			if alive.is_none_or(|a| a.is_alive(doc)) {
 				for (column, interval) in &histograms {
 					for value in column.values_for_doc(doc) {
-						let position = (value / interval).floor();
-						if !position.is_finite() || position < i64::MIN as f64 || position >= i64::MAX as f64 {
+						if !histogram_position_safe(value, *interval) {
 							return Err(TantivyError::InvalidArgument(
 								"Histogram values exceed representable bucket positions".into(),
 							));
@@ -282,6 +292,7 @@ impl<C: Collector> Collector for DeadlineCollector<C> {
 		Ok(collector.harvest())
 	}
 }
+#[cfg(test)]
 pub fn count_matches(searcher: &Searcher, query: &dyn Query, deadline: Option<Instant>) -> Result<u64> {
 	check_deadline(deadline).map_err(native_error)?;
 	searcher
@@ -297,35 +308,58 @@ pub fn count_matches(searcher: &Searcher, query: &dyn Query, deadline: Option<In
 		.map_err(native_error)
 }
 
+const MAX_DICTIONARY_CACHE_ENTRIES: usize = 1024;
+type DictionaryCacheKey = (tantivy::index::SegmentId, tantivy::schema::Field);
 #[derive(Default)]
-struct DictionaryBudget {
-	terms: usize,
-	bytes: usize,
+struct DictionaryCache {
+	maxima: HashMap<DictionaryCacheKey, usize>,
+	insertion_order: VecDeque<DictionaryCacheKey>,
 }
-impl DictionaryBudget {
-	fn max_key(&mut self, segment: &SegmentReader, name: &str, deadline: Option<Instant>) -> Result<usize> {
-		let Some(column) = segment.fast_fields().str(name).map_err(native_error)? else {
-			return Ok(0);
-		};
+impl DictionaryCache {
+	fn insert(&mut self, key: DictionaryCacheKey, maximum: usize) {
+		if self.maxima.contains_key(&key) {
+			return;
+		}
+		if self.maxima.len() == MAX_DICTIONARY_CACHE_ENTRIES {
+			if let Some(oldest) = self.insertion_order.pop_front() {
+				self.maxima.remove(&oldest);
+			}
+		}
+		self.insertion_order.push_back(key);
+		self.maxima.insert(key, maximum);
+	}
+}
+fn dictionary_cache() -> &'static Mutex<DictionaryCache> {
+	static CACHE: OnceLock<Mutex<DictionaryCache>> = OnceLock::new();
+	CACHE.get_or_init(|| Mutex::new(DictionaryCache::default()))
+}
+fn max_dictionary_key(segment: &SegmentReader, name: &str, deadline: Option<Instant>) -> Result<usize> {
+	check_deadline(deadline).map_err(native_error)?;
+	let key = (
+		segment.segment_id(),
+		segment.schema().get_field(name).map_err(native_error)?,
+	);
+	if let Ok(cache) = dictionary_cache().lock() {
+		if let Some(maximum) = cache.maxima.get(&key) {
+			return Ok(*maximum);
+		}
+	}
+	let maximum = if let Some(column) = segment.fast_fields().str(name).map_err(native_error)? {
 		let mut stream = column.dictionary().stream().map_err(FulltextError::native)?;
 		let mut maximum = 0;
 		while stream.advance() {
 			check_deadline(deadline).map_err(native_error)?;
-			self.terms = self
-				.terms
-				.checked_add(1)
-				.ok_or_else(|| resource("Dictionary qualification term overflow"))?;
-			self.bytes = self
-				.bytes
-				.checked_add(stream.key().len())
-				.ok_or_else(|| resource("Dictionary qualification byte overflow"))?;
-			if self.terms > MAX_DICTIONARY_SCAN_TERMS || self.bytes > MAX_DICTIONARY_SCAN_BYTES {
-				return Err(resource("Dictionary qualification exceeded bounded scan budget"));
-			}
 			maximum = maximum.max(stream.key().len());
 		}
-		Ok(maximum)
+		maximum
+	} else {
+		0
+	};
+	check_deadline(deadline).map_err(native_error)?;
+	if let Ok(mut cache) = dictionary_cache().lock() {
+		cache.insert(key, maximum);
 	}
+	Ok(maximum)
 }
 fn add_key_budget(total: &mut usize, count: usize, bytes: usize, limit: usize) -> Result<()> {
 	*total = total
@@ -365,16 +399,29 @@ fn check_sort_budget(
 	if cheap.is_some_and(|total| total <= MAX_SORT_MEMORY_BYTES) {
 		return Ok(());
 	}
-	let mut scan = DictionaryBudget::default();
-	let mut total = fixed;
+	let name = format!("__fulltext_filter_{index}");
+	let mut values = Vec::with_capacity(searcher.segment_readers().len());
+	let mut total = Some(fixed);
 	for segment in searcher.segment_readers() {
-		check_deadline(deadline).map_err(native_error)?;
-		let ids = scan.max_key(segment, "__fulltext_id", deadline)?;
 		let value = if is_string {
-			scan.max_key(segment, &format!("__fulltext_filter_{index}"), deadline)?
+			max_dictionary_key(segment, &name, deadline)?
 		} else {
 			8
 		};
+		values.push(value);
+		total = total.and_then(|total| {
+			total.checked_add(
+				end.min(segment.num_docs() as usize)
+					.checked_mul(crate::protocol::MAX_RECORD_ID_BYTES + value + 128)?,
+			)
+		});
+	}
+	if total.is_some_and(|total| total <= MAX_SORT_MEMORY_BYTES) {
+		return Ok(());
+	}
+	let mut total = fixed;
+	for (segment, value) in searcher.segment_readers().iter().zip(values) {
+		let ids = max_dictionary_key(segment, "__fulltext_id", deadline)?;
 		add_key_budget(
 			&mut total,
 			end.min(segment.num_docs() as usize),
@@ -412,26 +459,18 @@ fn check_terms_budget(
 	if cheap.is_some_and(|total| total <= MAX_TERM_KEY_BYTES) {
 		return Ok(());
 	}
-	let mut scan = DictionaryBudget::default();
-	let mut measured = HashMap::new();
 	let mut total = 0;
 	for request in requests {
 		if let AggregationKind::Terms { size } = request.kind {
 			let (index, _) = field(&request.field, fields)?;
 			let name = format!("__fulltext_filter_{index}");
-			for (ordinal, segment) in searcher.segment_readers().iter().enumerate() {
+			for segment in searcher.segment_readers() {
 				let count = segment
 					.fast_fields()
 					.str(&name)
 					.map_err(native_error)?
 					.map_or(0, |column| column.num_terms());
-				let maximum = if let Some(maximum) = measured.get(&(ordinal, index)) {
-					*maximum
-				} else {
-					let maximum = scan.max_key(segment, &name, deadline)?;
-					measured.insert((ordinal, index), maximum);
-					maximum
-				};
+				let maximum = max_dictionary_key(segment, &name, deadline)?;
 				add_key_budget(
 					&mut total,
 					(size as usize * 10).min(count),
@@ -454,6 +493,7 @@ pub struct SortedCatalogResult {
 	pub total: u64,
 	pub aggregations: Vec<AggregationResult>,
 }
+#[cfg(test)]
 pub fn sorted_hits(
 	searcher: &Searcher,
 	query: &dyn Query,
@@ -1611,5 +1651,85 @@ mod tests {
 				buckets: vec![NumericBucket { key: 1.0, count: 1 }]
 			}
 		);
+	}
+	#[test]
+	fn large_short_key_catalogs_qualify_without_scanning_ids() {
+		let mut schema = Schema::builder();
+		let id = schema.add_text_field("__fulltext_id", STRING | FAST);
+		let category = schema.add_text_field("__fulltext_filter_0", STRING | FAST);
+		schema.add_f64_field("__fulltext_filter_1", INDEXED | FAST);
+		let index = Index::create_in_ram(schema.build());
+		let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 50_000_000).unwrap();
+		writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+		for segment in 0..2 {
+			for value in 0..75001 {
+				let ordinal = segment * 75001 + value;
+				writer
+					.add_document(doc!(id=>format!("record-{ordinal:06}"),category=>format!("term-{ordinal:06}")))
+					.unwrap();
+			}
+			writer.commit().unwrap();
+		}
+		drop(writer);
+		let searcher = index.reader().unwrap().searcher();
+		assert_eq!(searcher.segment_readers().len(), 2);
+		let sort = SortRequest {
+			field: "category".into(),
+			direction: SortDirection::Asc,
+			missing: MissingOrder::Last,
+		};
+		let hits = sorted_hits(&searcher, &AllQuery, &sort, &fields(), 980, 20, None).unwrap();
+		assert_eq!(hits.len(), 20);
+		assert_eq!(hits[0].0 .1, "record-000980");
+		for segment in searcher.segment_readers() {
+			let id_key = (segment.segment_id(), id);
+			assert!(!dictionary_cache().lock().unwrap().maxima.contains_key(&id_key));
+			assert_eq!(max_dictionary_key(segment, "__fulltext_filter_0", None).unwrap(), 11);
+		}
+		let request = AggregationRequest {
+			name: "terms".into(),
+			field: "category".into(),
+			kind: AggregationKind::Terms { size: 100 },
+		};
+		let result = aggregate(
+			&searcher,
+			&AllQuery,
+			&[request],
+			&fields(),
+			index.tokenizers().clone(),
+			None,
+		)
+		.unwrap();
+		match &result[0].value {
+			AggregationValue::Terms { buckets, .. } => assert_eq!(buckets.len(), 100),
+			_ => panic!(),
+		}
+		assert_eq!(
+			max_dictionary_key(
+				&searcher.segment_readers()[0],
+				"__fulltext_filter_0",
+				Some(Instant::now())
+			)
+			.unwrap_err()
+			.code,
+			"E_TIMEOUT"
+		);
+	}
+	#[test]
+	fn dictionary_maxima_cache_is_bounded_and_fifo() {
+		let mut cache = DictionaryCache::default();
+		let field = tantivy::schema::Field::from_field_id(0);
+		let first = (tantivy::index::SegmentId::generate_random(), field);
+		cache.insert(first, 7);
+		for _ in 0..MAX_DICTIONARY_CACHE_ENTRIES {
+			cache.insert((tantivy::index::SegmentId::generate_random(), field), 11);
+		}
+		assert_eq!(cache.maxima.len(), MAX_DICTIONARY_CACHE_ENTRIES);
+		assert_eq!(cache.insertion_order.len(), MAX_DICTIONARY_CACHE_ENTRIES);
+		assert!(!cache.maxima.contains_key(&first));
+		let newest = *cache.insertion_order.back().unwrap();
+		cache.insert(newest, 99);
+		assert_eq!(cache.maxima[&newest], 11);
+		assert_eq!(cache.insertion_order.len(), MAX_DICTIONARY_CACHE_ENTRIES);
 	}
 }

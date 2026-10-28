@@ -114,11 +114,14 @@ native top-k/aggregation ownership and checks the shared deadline every 1,024 vi
 
 Native aggregation structure accounting excludes some decoded keys. `sorted_catalog` and
 `aggregate` bound retained keys before creating collectors. Counts use segment live documents
-or dictionary cardinality; a capped dictionary scan can qualify actual maximum key lengths when
-the supported-length estimate fails. Terms retain native tenfold candidate oversampling.
+or dictionary cardinality; a deadline-bound streaming scan can qualify actual maximum key lengths when
+the supported-length estimate fails. Completed maxima use a 1,024-entry FIFO cache keyed by
+immutable segment ID and field. Merges create new segment IDs; deletes leave a conservative
+dictionary maximum, so neither invalidates a cached bound. Sorting retains the ID contract first,
+measuring IDs only when necessary. Terms retain native tenfold candidate oversampling.
 Sorted hits, count and aggregates share a native tuple collector; unsorted aggregates preserve
 the ordinary ranked-hits path. Engine encodes bounded aggregates once, and native wire encoding
-finishes inside the request permit/deadline;
+including its success envelope finishes inside the request permit/deadline;
 `encode_results` bounds the response. Catalog resource tests pin rejection rather than
 partial output. See [metadata resource policy](../docs/limits.md#metadata-collectors).
 

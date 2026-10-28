@@ -2156,7 +2156,10 @@ fn execute_search_command(
 	runtime
 		.search_queue_nanoseconds
 		.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
-	let SearchCommand { operation, completion } = queued.value;
+	let SearchCommand {
+		operation,
+		mut completion,
+	} = queued.value;
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
 		SearchOperation::Search { bytes, expensive } => {
 			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
@@ -2185,10 +2188,11 @@ fn execute_search_command(
 					.search_with_deadline(&reader.searcher(), &request, deadline)
 					.and_then(search_body)
 					.and_then(|body| {
+						let response = success_envelope(body);
 						if Instant::now() >= deadline {
 							return Err(search_timeout());
 						}
-						Ok(SearchOutcome::Search(body))
+						Ok(response)
 					})
 			});
 			runtime
@@ -2218,7 +2222,11 @@ fn execute_search_command(
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
 				}
-				Ok(SearchOutcome::Trace(result))
+				let response = success_envelope(trace_body(result));
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				Ok(response)
 			});
 			runtime
 				.search_execution_nanoseconds
@@ -2227,8 +2235,7 @@ fn execute_search_command(
 		}
 	}));
 	match result {
-		Ok(Ok(SearchOutcome::Search(body))) => completion.success(body),
-		Ok(Ok(SearchOutcome::Trace(result))) => completion.success(trace_body(result)),
+		Ok(Ok(response)) => completion.send(response),
 		Ok(Err(error)) => completion.failure(error),
 		Err(_) => {
 			completion.failure(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
@@ -2237,11 +2244,6 @@ fn execute_search_command(
 		}
 	}
 	true
-}
-
-enum SearchOutcome {
-	Search(Vec<u8>),
-	Trace(TraceResult),
 }
 
 fn operation_deadline(budget_milliseconds: u32, queued_for: Duration) -> Result<Instant> {
