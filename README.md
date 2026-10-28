@@ -206,6 +206,11 @@ A search returns this shape (score shown for illustration):
 - `totalRelation: 'exact'` means `total` is the full match count. `'lower-bound'` means at least that many matches exist; it does not mean the returned hits are approximate.
 - Set `exactTotal: true` when a UI needs an exact count. It may require extra work across all matches. The default can still return an exact count when it is already known.
 
+Exact counting now checks the execution budget during collection, including requests without
+metadata. Local qualification observed **+6.3% p50** for public exact-total queries and **+37%** for
+the dense-OR count stage. These synthetic results are not production latency bounds; see the
+[paired count measurements](docs/benchmarks.md#paired-native-collector-qualification).
+
 For example, `index.search({ text: 'waterproof', limit: 20, exactTotal: true })` requests the top
 20 hits and an exact count. `searchPage()` always returns exact totals; it adds a `continuation`
 only while another page remains. Match tracing has a separate `complete` flag: `false` means

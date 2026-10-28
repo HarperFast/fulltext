@@ -331,8 +331,8 @@ impl<C: Collector> Collector for DeadlineCollector<C> {
 		Ok(collector.harvest())
 	}
 }
-pub(crate) fn count_matches(searcher: &Searcher, query: &dyn Query, deadline: Option<Instant>) -> Result<u64> {
-	check_deadline(deadline).map_err(native_error)?;
+pub(crate) fn count_matches(searcher: &Searcher, query: &dyn Query, deadline: Option<Instant>) -> tantivy::Result<u64> {
+	check_deadline(deadline)?;
 	searcher
 		.search(
 			query,
@@ -343,7 +343,6 @@ pub(crate) fn count_matches(searcher: &Searcher, query: &dyn Query, deadline: Op
 			},
 		)
 		.map(|n| n as u64)
-		.map_err(native_error)
 }
 
 const MAX_DICTIONARY_CACHE_ENTRIES: usize = 1024;
@@ -506,7 +505,7 @@ fn check_sort_budget(
 	if total.is_some_and(|total| total <= MAX_SORT_MEMORY_BYTES) {
 		return Ok(());
 	}
-	let matching = count_matches(searcher, query, deadline)?;
+	let matching = count_matches(searcher, query, deadline).map_err(native_error)?;
 	let matching = usize::try_from(matching).unwrap_or(usize::MAX);
 	let mut total = fixed;
 	add_key_budget(&mut total, retained.min(matching), maximum, MAX_SORT_MEMORY_BYTES)
@@ -1303,9 +1302,7 @@ mod tests {
 			"E_RESOURCE_LIMIT"
 		);
 		assert_eq!(
-			count_matches(&searcher, &AllQuery, Some(Instant::now()))
-				.unwrap_err()
-				.code,
+			native_error(count_matches(&searcher, &AllQuery, Some(Instant::now())).unwrap_err()).code,
 			"E_TIMEOUT"
 		);
 		let bad = AggregationRequest {
@@ -2215,7 +2212,7 @@ mod tests {
 			visited > 0 && visited <= 1024,
 			"count advanced {visited} matches before returning"
 		);
-		assert_eq!(result.unwrap_err().code, "E_TIMEOUT");
+		assert_eq!(native_error(result.unwrap_err()).code, "E_TIMEOUT");
 		assert_eq!(count_matches(&searcher, &AllQuery, None).unwrap(), 2048);
 	}
 }

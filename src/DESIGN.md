@@ -119,6 +119,9 @@ compatible. The public identity-migration regression checks open, inspection, an
 `catalog::DeadlineCollector` wraps metadata collectors and ordinary exact-total Count passes. Its deletion-aware loop keeps
 native top-k/aggregation ownership and checks the shared deadline every 1,024 visited matches.
 `deadline_interrupts_an_active_collection` verifies expiry after collection starts.
+`count_matches` returns native errors so each caller retains its error policy;
+`ordinary_exact_count_preserves_native_error_classification` pins ordinary storage, internal-query
+and timeout codes through the production count branch.
 
 Native aggregation structure accounting excludes some decoded keys. `sorted_catalog` and
 `aggregate` bound retained keys before creating collectors. Counts use segment live documents

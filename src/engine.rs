@@ -893,7 +893,7 @@ impl Engine {
 				None => {
 					check_deadline(deadline)?;
 					(
-						catalog::count_matches(searcher, query.query.as_ref(), deadline)?,
+						catalog::count_matches(searcher, query.query.as_ref(), deadline).map_err(count_error)?,
 						TotalRelation::Exact,
 					)
 				}
@@ -3086,6 +3086,15 @@ fn push_string(bytes: &mut Vec<u8>, value: &str) {
 
 fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 	FulltextError::new("E_STORAGE", error.to_string())
+}
+
+fn count_error(error: tantivy::TantivyError) -> FulltextError {
+	match &error {
+		tantivy::TantivyError::InvalidArgument(message) if message == crate::error::SEARCH_TIMEOUT_MESSAGE => {
+			FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE)
+		}
+		_ => index_error(error),
+	}
 }
 
 fn index_error(error: tantivy::TantivyError) -> FulltextError {
@@ -5344,6 +5353,99 @@ mod tests {
 			Err(error) => error,
 		};
 		assert_eq!(error.code, "E_INCOMPLETE_CREATE");
+	}
+	#[test]
+	fn ordinary_exact_count_preserves_native_error_classification() {
+		use tantivy::query::{EnableScoring, Weight};
+		#[derive(Clone, Copy, Debug)]
+		enum FailureKind {
+			Storage,
+			Query,
+			Timeout,
+		}
+		#[derive(Debug)]
+		struct CountFailure {
+			inner: Box<dyn Query>,
+			kind: FailureKind,
+		}
+		impl Clone for CountFailure {
+			fn clone(&self) -> Self {
+				Self {
+					inner: self.inner.box_clone(),
+					kind: self.kind,
+				}
+			}
+		}
+		impl Query for CountFailure {
+			fn weight(&self, scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+				if scoring.is_scoring_enabled() {
+					return self.inner.weight(scoring);
+				}
+				Err(match self.kind {
+					FailureKind::Storage => {
+						tantivy::TantivyError::IoError(std::sync::Arc::new(std::io::Error::other("count read failed")))
+					}
+					FailureKind::Query => tantivy::TantivyError::InvalidArgument("count query failed".into()),
+					FailureKind::Timeout => {
+						tantivy::TantivyError::InvalidArgument(crate::error::SEARCH_TIMEOUT_MESSAGE.into())
+					}
+				})
+			}
+		}
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		let mut mutation = batch();
+		mutation.upserts[0].fields = vec![("title".into(), vec!["shoe".into()])];
+		mutation.upserts[1].fields = vec![(
+			"title".into(),
+			vec!["shoe padding padding padding padding padding".into()],
+		)];
+		writer.apply(mutation).unwrap();
+		writer.commit().unwrap();
+		let reader = engine.reader().unwrap();
+		reader.reload().unwrap();
+		let searcher = reader.searcher();
+		let request = SearchRequest {
+			sort: None,
+			aggregations: vec![],
+			expression: expression("shoe", SearchMode::Any, vec!["title".into()]),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 1,
+			exact_total: true,
+			budget_milliseconds: 30000,
+			traversal: false,
+			after: None,
+		};
+		let real = engine.query(&searcher, &request).unwrap();
+		let scores = searcher
+			.search(real.query.as_ref(), &TopDocs::with_limit(2).order_by_score())
+			.unwrap();
+		assert_ne!(scores[0].0, scores[1].0);
+		for (kind, expected) in [
+			(FailureKind::Storage, "E_STORAGE"),
+			(FailureKind::Query, "E_NATIVE_FAILURE"),
+			(FailureKind::Timeout, "E_TIMEOUT"),
+		] {
+			let result = engine.collect_search(
+				&searcher,
+				&request,
+				None,
+				None,
+				None,
+				BuiltQuery {
+					query: Box::new(CountFailure {
+						inner: real.query.box_clone(),
+						kind,
+					}),
+					clauses: real.clauses,
+				},
+			);
+			assert_eq!(result.unwrap_err().code, expected);
+		}
+		assert_eq!(engine.search(&searcher, &request).unwrap().total, 2);
 	}
 	#[test]
 	fn exact_total_with_aggregations_uses_two_native_query_passes() {
