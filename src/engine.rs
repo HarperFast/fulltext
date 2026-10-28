@@ -5577,4 +5577,177 @@ mod tests {
 		assert_eq!(control_total, result.total);
 		assert_eq!(control_aggregations, result.aggregations);
 	}
+	#[cfg(feature = "node-api")]
+	mod close_quiescence {
+		use super::*;
+		use std::sync::{mpsc, Condvar, Mutex};
+		use std::time::Duration;
+		#[derive(Debug, Default)]
+		struct GateState {
+			armed: bool,
+			entered: bool,
+			released: bool,
+		}
+		#[derive(Debug, Default)]
+		struct MergeGate {
+			state: Mutex<GateState>,
+			changed: Condvar,
+		}
+		impl MergeGate {
+			fn arm(&self) {
+				self.state.lock().unwrap().armed = true;
+			}
+			fn block(&self) {
+				let mut state = self.state.lock().unwrap();
+				if !state.armed {
+					return;
+				}
+				state.entered = true;
+				self.changed.notify_all();
+				while !state.released {
+					state = self.changed.wait(state).unwrap();
+				}
+			}
+			fn wait_entered(&self) {
+				let state = self.state.lock().unwrap();
+				let (state, _) = self
+					.changed
+					.wait_timeout_while(state, Duration::from_secs(5), |state| !state.entered)
+					.unwrap();
+				assert!(state.entered, "native merge did not reach the directory gate");
+			}
+			fn release(&self) {
+				self.state.lock().unwrap().released = true;
+				self.changed.notify_all();
+			}
+		}
+		struct ReleaseGate(Arc<MergeGate>);
+		impl Drop for ReleaseGate {
+			fn drop(&mut self) {
+				self.0.release();
+			}
+		}
+		#[derive(Clone, Debug)]
+		struct MergeGateDirectory {
+			inner: RamDirectory,
+			gate: Arc<MergeGate>,
+		}
+		impl Directory for MergeGateDirectory {
+			fn get_file_handle(&self, path: &Path) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
+				self.inner.get_file_handle(path)
+			}
+			fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> {
+				self.inner.delete(path)
+			}
+			fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
+				self.inner.exists(path)
+			}
+			fn open_write(&self, path: &Path) -> std::result::Result<WritePtr, OpenWriteError> {
+				if std::thread::current()
+					.name()
+					.is_some_and(|name| name.starts_with("merge_thread"))
+				{
+					self.gate.block();
+				}
+				self.inner.open_write(path)
+			}
+			fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
+				self.inner.atomic_read(path)
+			}
+			fn atomic_write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+				self.inner.atomic_write(path, bytes)
+			}
+			fn sync_directory(&self) -> io::Result<()> {
+				self.inner.sync_directory()
+			}
+			fn acquire_lock(&self, lock: &tantivy::directory::Lock) -> std::result::Result<DirectoryLock, LockError> {
+				self.inner.acquire_lock(lock)
+			}
+			fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+				self.inner.watch(callback)
+			}
+		}
+		#[test]
+		fn discard_close_waits_for_original_merge_and_preserves_checkpoint() {
+			let gate = Arc::new(MergeGate::default());
+			let _release = ReleaseGate(gate.clone());
+			let directory = MergeGateDirectory {
+				inner: RamDirectory::create(),
+				gate: gate.clone(),
+			};
+			let config = config();
+			let engine = Engine::open(directory.clone(), &config).unwrap();
+			let mut writer = engine.writer(&config).unwrap();
+			writer
+				.inner
+				.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+			writer.apply(batch()).unwrap();
+			writer.commit_with_payload(Some("published")).unwrap();
+			let upsert = |id: &str| crate::protocol::Upsert {
+				id: id.to_owned(),
+				version: None,
+				fields: vec![("title".to_owned(), vec!["shoe".to_owned()])],
+				filters: Vec::new(),
+			};
+			writer
+				.apply(MutationBatch {
+					upserts: vec![upsert("three")],
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit_with_payload(Some("published")).unwrap();
+			let segments = engine.index.searchable_segment_ids().unwrap();
+			assert_eq!(segments.len(), 2);
+			gate.arm();
+			let merging = writer.inner.merge(&segments);
+			gate.wait_entered();
+			writer
+				.apply(MutationBatch {
+					upserts: vec![upsert("pending")],
+					deletes: vec!["one".to_owned()],
+				})
+				.unwrap();
+			let (finished, completion) = mpsc::channel();
+			let (started, start) = mpsc::channel();
+			let closer = std::thread::spawn(move || {
+				let mut writer = Some(writer);
+				started.send(()).unwrap();
+				let result = crate::native::finish_writer_close(&mut writer, false);
+				finished.send((result.quiesced, result.error)).unwrap();
+			});
+			start.recv_timeout(Duration::from_secs(5)).unwrap();
+			let premature = completion.recv_timeout(Duration::from_millis(250)).ok();
+			gate.release();
+			closer.join().unwrap();
+			let merged = merging.wait();
+			assert!(
+				premature.is_none(),
+				"discard close completed while its original native merge was blocked"
+			);
+			assert!(merged.is_ok());
+			let (quiesced, error) = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+			assert!(quiesced);
+			assert!(error.is_none());
+			let reopened = Engine::open(directory, &config).unwrap();
+			let searcher = reopened.reader().unwrap().searcher();
+			assert_eq!(searcher.num_docs(), 3);
+			let count = |id| {
+				searcher
+					.search(
+						&tantivy::query::TermQuery::new(
+							Term::from_field_text(reopened.id_field, id),
+							IndexRecordOption::Basic,
+						),
+						&tantivy::collector::Count,
+					)
+					.unwrap()
+			};
+			assert_eq!(count("one"), 1);
+			assert_eq!(count("pending"), 0);
+			assert_eq!(reopened.committed_payload().unwrap().as_deref(), Some("published"));
+			let mut writer = reopened.writer(&config).unwrap();
+			assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
+			writer.close().unwrap();
+		}
+	}
 }

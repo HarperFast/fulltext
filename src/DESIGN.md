@@ -46,6 +46,18 @@ Open and inspection compare the complete identity before opening Tantivy. Reset 
 and new identities, allowing retirement without serving old tokens. `english@2` plus the sidecar
 revision is the persisted analysis contract; never rewrite the sidecar to reuse an incompatible index.
 
+## Writer close ownership
+
+Close must retain the original writer until its indexing and merge threads have joined. In pinned
+Tantivy 0.27, `IndexWriter::rollback` replaces the writer; dropping the old writer joins indexing
+workers but does not join its old merges. Waiting on the replacement cannot establish quiescence
+for the original generation. Close therefore consumes the original writer through
+`wait_merging_threads`, which does not publish uncommitted mutations. Dispatch still requires
+explicit discard authorization for dirty handles. Reopen tests preserve committed records and
+payloads while discarding pending upserts and deletes; the gated merge regression holds close
+until the original merge can finish. Do not substitute delayed filesystem cleanup for this ownership
+invariant: reset and retirement depend on completed native I/O.
+
 ## Request preparation
 
 Query identities up to 64 KiB hash synchronously; larger ones use WebCrypto. This threshold changes

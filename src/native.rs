@@ -257,9 +257,9 @@ enum WriterOutcome {
 	Poison(Result<Vec<u8>>, FulltextError),
 }
 
-struct WriterCloseOutcome {
-	quiesced: bool,
-	error: Option<FulltextError>,
+pub(crate) struct WriterCloseOutcome {
+	pub(crate) quiesced: bool,
+	pub(crate) error: Option<FulltextError>,
 }
 
 struct SearchCommand {
@@ -1801,8 +1801,7 @@ fn writer_loop_inner(
 						"index has uncommitted mutations; publish (or commit if uncheckpointed), or close with rollback",
 					)))
 				} else {
-					let rollback = rollback || dirty || runtime.state.load(Ordering::Acquire) == STATE_POISONED;
-					WriterOutcome::Stop(close_writer(&runtime, &mut writer, rollback))
+					WriterOutcome::Stop(close_writer(&runtime, &mut writer))
 				}
 			}
 		}));
@@ -1836,7 +1835,7 @@ fn writer_loop_inner(
 				runtime.poison(panic_error.clone());
 				let cleanup_runtime = runtime.clone();
 				match catch_unwind(AssertUnwindSafe(move || {
-					let close = close_writer(&cleanup_runtime, &mut writer, true);
+					let close = close_writer(&cleanup_runtime, &mut writer);
 					finish_runtime(&cleanup_runtime, engine, reader, close)
 				})) {
 					Ok(outcome) => {
@@ -1862,7 +1861,7 @@ fn writer_loop_inner(
 	}
 	let cleanup_runtime = runtime.clone();
 	if catch_unwind(AssertUnwindSafe(move || {
-		let outcome = close_writer(&cleanup_runtime, &mut writer, true);
+		let outcome = close_writer(&cleanup_runtime, &mut writer);
 		finish_runtime(&cleanup_runtime, engine, reader, outcome)
 	}))
 	.is_err()
@@ -1871,9 +1870,9 @@ fn writer_loop_inner(
 	}
 }
 
-fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool) -> WriterCloseOutcome {
-	let Some(mut writer) = writer.take() else {
-		if _runtime.read_only {
+pub(crate) fn finish_writer_close(writer: &mut Option<Writer>, read_only: bool) -> WriterCloseOutcome {
+	let Some(writer) = writer.take() else {
+		if read_only {
 			return WriterCloseOutcome {
 				quiesced: true,
 				error: None,
@@ -1884,17 +1883,20 @@ fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool)
 			error: Some(FulltextError::new("E_POISONED", "writer is unavailable")),
 		};
 	};
-	let rollback_error = if rollback { writer.rollback().err() } else { None };
-	let outcome = match writer.close() {
+	match writer.close() {
 		Ok(()) => WriterCloseOutcome {
 			quiesced: true,
-			error: rollback_error,
+			error: None,
 		},
 		Err(error) => WriterCloseOutcome {
 			quiesced: false,
-			error: rollback_error.or(Some(error)),
+			error: Some(error),
 		},
-	};
+	}
+}
+
+fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>) -> WriterCloseOutcome {
+	let outcome = finish_writer_close(writer, _runtime.read_only);
 	#[cfg(feature = "test-panic")]
 	let outcome = {
 		let mut outcome = outcome;
