@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tantivy_fst::Automaton;
 
 use tantivy::collector::sort_key::{NaturalComparator, ReverseComparator};
-use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs, TopNComputer};
+use tantivy::collector::{Collector, SegmentCollector, TopDocs, TopNComputer};
 use tantivy::columnar::StrColumn;
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
@@ -889,7 +889,7 @@ impl Engine {
 				None => {
 					check_deadline(deadline)?;
 					(
-						searcher.search(query.query.as_ref(), &Count).map_err(index_error)? as u64,
+						catalog::count_matches(searcher, query.query.as_ref(), deadline)?,
 						TotalRelation::Exact,
 					)
 				}

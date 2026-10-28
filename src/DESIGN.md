@@ -104,11 +104,13 @@ Observed: Rust and public Node tests pass locally on macOS arm64, 2026-10-27.
 aggregation reuse that query; aggregation never runs over the returned hit page.
 `native-metadata.test.mjs` pins filtered/candidate counts and retained-reader behavior.
 
-Only string metadata gains a fast column and per-document deduplication. `identity_bytes`
+Only string metadata gains a fast column. The writer removes repeated strings per document
+as a storage optimization, preserving first occurrence. Native terms aggregation independently
+deduplicates document contributions; the writer set is not required for correct facet counts. `identity_bytes`
 emits v8 only for string configurations; numeric/Boolean-only v7 and text-only v6 remain
 compatible. The public identity-migration regression checks open, inspection, and reset.
 
-`catalog::DeadlineCollector` wraps only metadata collectors. Its deletion-aware loop keeps
+`catalog::DeadlineCollector` wraps metadata collectors and ordinary exact-total Count passes. Its deletion-aware loop keeps
 native top-k/aggregation ownership and checks the shared deadline every 1,024 visited matches.
 `deadline_interrupts_an_active_collection` verifies expiry after collection starts.
 
@@ -117,8 +119,12 @@ Native aggregation structure accounting excludes some decoded keys. `sorted_cata
 or dictionary cardinality; a deadline-bound streaming scan can qualify actual maximum key lengths when
 the supported-length estimate fails. Completed maxima use a 1,024-entry FIFO cache keyed by
 immutable segment ID and field. Merges create new segment IDs; deletes leave a conservative
-dictionary maximum, so neither invalidates a cached bound. Sorting retains the ID contract first,
-measuring IDs only when necessary. Terms retain native tenfold candidate oversampling.
+dictionary maximum, so neither invalidates a cached bound. A completed scan is cached before
+the final timeout check; interrupted scans never populate the cache. Sorting retains the ID contract first,
+measuring IDs only when necessary. If that segment-wide estimate still fails, a deadline-aware
+native Count pass supplies a global matching count that bounds total retained hits across
+segments; the fallback combines it with maximum measured key lengths for the sort budget. Native Searcher and
+TopDocs still own collection. Terms retain native tenfold candidate oversampling.
 Sorted hits, count and aggregates share a native tuple collector; unsorted aggregates preserve
 the ordinary ranked-hits path; their exact totals share that aggregation pass. Segment buffer
 accounting follows the actual executor concurrency while decoded fruits remain budgeted across

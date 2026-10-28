@@ -38,10 +38,11 @@ pagination contracts; synthetic timings do not establish a general production sp
 driver with 10,000 documents and 100 measured requests per case. For a correctness smoke run,
 build first with `npm run build`, then run `npm run benchmark:metadata:smoke` (300 documents,
 10 requests per case). The driver itself never builds. Override workload sizes with
-`--documents` and `--queries`:
+`--documents` and `--queries`. Select scalar strings, eight distinct strings, or eight repeated
+strings with `--string-values scalar|unique|repeated` (default `scalar`):
 
 ```bash
-npm run benchmark:metadata -- --documents 10000 --queries 100
+npm run benchmark:metadata -- --documents 10000 --queries 100 --string-values repeated
 ```
 
 The JSON report includes Node, platform, architecture and native versions, the complete index
@@ -71,8 +72,8 @@ latency guarantees.
 
 Three alternating optimized arm64 pairs compared [the baseline](https://github.com/HarperFast/fulltext/commit/0b5608778b2d80ed2a8dfbea79565d509837e7ff)
 with [the metadata writer](https://github.com/HarperFast/fulltext/commit/1adb7511a587521bf581f65b01de35f03aba89b3), using 10,000 documents,
-32 brands and 1,000 queries per case on the same host. Later collector fixes leave this writer and
-schema unchanged. Median persisted bytes increased **7.0%**; median durable ingestion throughput
+32 brands and 1,000 queries per case on the same host. Later changes preserve the writer behavior and
+schema for this scalar-string workload; repeated-string array ingestion was not measured. Median persisted bytes increased **7.0%**; median durable ingestion throughput
 was flat at the reported precision. Ordinary exact-total p50 increased **0.6%** and p99 **1.5%**.
 These small local samples varied and do not establish a production latency or throughput bound.
 They measure the complete branch, not the fast column in isolation; raw host-specific reports
@@ -82,6 +83,20 @@ Every configured string filter gains the fast column so the same metadata suppor
 sorting and facets without another capability flag. This deliberately makes equality-only string
 indexes pay the rebuild and storage cost too. Numeric/Boolean-only indexes retain their existing
 schema and identity.
+
+### Writer string deduplication experiment
+
+Three alternating optimized pairs used 10,000 documents and 30 measured queries per case to
+compare the retained writer set with an experimental build that removed it. Repeat the paired
+worktree commands above with identical `--string-values scalar`, `unique`, or `repeated` arguments.
+The same driver loads each build's matching native addon.
+
+With eight repeated strings per document, removing the set increased median persisted bytes by
+**16.6%** and terms p50 by about **2.12×**. Durable ingestion changed by **−0.6%**. Scalar and unique-array
+footprints were unchanged; ingestion showed no consistent gain across the three workloads.
+The removal was rejected: the set reduces redundant stored values and downstream work, while
+native aggregation already deduplicates facet contributions. These local synthetic observations
+are not production latency or throughput guarantees.
 
 ## Native search and ingestion
 
@@ -113,6 +128,12 @@ checks matching values when segment extrema are unsafe. Completed dictionary qua
 are reported separately rather than treated as a production latency target. Unscored collection uses native block reads; deadline checkpoints occur
 at most 1,024 documents apart. The extreme-value fallback deliberately pays for validating live
 matches so unrelated or deleted extremes do not reject an otherwise valid request.
+
+The expanded fixture then deletes half the documents, reloads the retained ten segments, and
+compares Boolean AND/OR/NOT sorting and aggregation plus fuzzy aggregation over multivalue
+numeric fields. Independent assertions check live counts, value-based statistics and per-document
+bucket deduplication. Five alternating pairs observed deadline/native ratios of **0.94–0.99×**
+for these additional cases; small apparent improvements are local timing noise, not a speedup claim.
 
 Dictionary results are cached only after a complete scan. Concurrent cold misses may duplicate
 that bounded-memory scan: avoiding an in-flight lock keeps one request's deadline from blocking

@@ -1,10 +1,10 @@
 import { FulltextError } from './errors.js';
 
-export const maxAggregations = 8;
-export const maxAggregationNameBytes = 128;
-export const maxTermsSize = 100;
-export const maxAggregationRanges = 100;
-export const maxAggregationResponseBuckets = 1_024;
+const maxAggregations = 8;
+const maxAggregationNameBytes = 128;
+const maxTermsSize = 100;
+const maxAggregationRanges = 100;
+const maxAggregationResponseBuckets = 1_024;
 const maxCatalogFieldBytes = 1 << 20;
 const invalidSurrogate = /[\uD800-\uDFFF]/u;
 
@@ -133,7 +133,7 @@ export function normalizeCatalog(
 export function encodeCatalog(
 	writer: CatalogWriter,
 	sort: SortRequest | undefined,
-	aggregations: AggregationRequest[],
+	aggregations: AggregationRequest[] | undefined,
 ): void {
 	writer.boolean(sort !== undefined);
 	if (sort) {
@@ -141,7 +141,8 @@ export function encodeCatalog(
 		writer.u8(sort.direction === 'asc' ? 0 : 1, 'sort direction');
 		writer.u8(sort.missing === 'first' ? 0 : 1, 'sort missing');
 	}
-	writer.u8(aggregations.length, 'aggregation count');
+	writer.u8(aggregations?.length ?? 0, 'aggregation count');
+	if (!aggregations) return;
 	for (const aggregation of aggregations) {
 		writer.string(aggregation.name);
 		writer.string(aggregation.field);
@@ -173,6 +174,7 @@ export function encodeCatalog(
 export function decodeAggregations(cursor: CatalogCursor): AggregationResult[] {
 	const count = cursor.u8();
 	if (count > maxAggregations) nativeFailure('Native aggregation count exceeds its limit');
+	if (count === 0) return [];
 	const results: AggregationResult[] = [];
 	const names = new Set<string>();
 	let totalBuckets = 0;

@@ -314,7 +314,7 @@ Declare only fields commonly combined with text search. Filter metadata increase
 mutation work, and changing its definition requires a new generation or rebuild. Filter fields are
 separate from analyzed text fields and may reuse the same logical name. String filters are exact
 and case-sensitive; number filters support exact and range comparisons; Boolean filters support
-exact comparison. Arrays add one value per element; duplicate string values are indexed once, preserving first occurrence. Missing fields and empty arrays add no value. String values are
+exact comparison. Arrays add one value per element; repeated string values are stored once, preserving first occurrence. This storage optimization avoids redundant fast-column values; native terms aggregation independently counts each distinct string once per document. Missing fields and empty arrays add no value. String values are
 limited to 65,530 UTF-8 bytes. Number fields are stored as Tantivy fast fields to keep broad
 range filters from materializing term bitsets. String fields have raw fast columns for sorting and facets; these columns increase indexing work and disk usage.
 
@@ -705,7 +705,7 @@ writable while indices are opened or reset; failures name the lock-directory pat
 This API uses native ABI 10, query API 5, and packed protocol 6. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
-columns and per-document string deduplication. Previously released string-metadata indexes must
+columns. Previously released string-metadata indexes must
 be retired and rebuilt from authoritative records; open and inspection reject their old identity.
 Reset recognizes v1–v8. Retire a v8 index with this version before downgrading: the 0.7.0 reset
 parser cannot recognize v8. Never rewrite a sidecar to bypass the rebuild boundary.

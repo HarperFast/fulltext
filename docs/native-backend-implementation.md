@@ -384,8 +384,10 @@ replacement to the source token span. Crossing its 262,144-token-per-value ceili
 incomplete instead of failing the request. Versions 1–5 remain parseable for safe reset
 but mismatch current open/inspection so the application can retire and rebuild them. Filter-free
 indexes use sidecar v6; numeric/Boolean-only metadata retains v7. Configurations with string metadata
-use v8 for raw fast columns and per-document string deduplication, requiring a rebuild of older
-string-metadata indexes. Names and types remain fingerprinted alongside the current stemmer revision.
+use v8 for raw fast columns, requiring a rebuild of older
+string-metadata indexes. The writer removes repeated strings per document to reduce stored
+fast-column values, preserving first occurrence; native terms aggregation independently deduplicates
+document contributions. Names and types remain fingerprinted alongside the current stemmer revision.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`

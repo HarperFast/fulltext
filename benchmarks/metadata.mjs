@@ -9,6 +9,9 @@ const smoke = process.argv.includes('--smoke');
 const documentCount = integerArgument('--documents', smoke ? 300 : 10_000);
 const queryCount = integerArgument('--queries', smoke ? 10 : 100);
 const modulePath = stringArgument('--module');
+const stringValues = stringArgument('--string-values') ?? 'scalar';
+if (!['scalar', 'unique', 'repeated'].includes(stringValues))
+	throw new Error('--string-values must be scalar, unique, or repeated');
 const { openNativeFullTextIndex, runtimeInfo } = await import(
 	modulePath ? pathToFileURL(path.resolve(modulePath)).href : new URL('../dist/native.js', import.meta.url).href
 );
@@ -89,6 +92,7 @@ try {
 					path: '<temporary-index>',
 					documents: documentCount,
 					queriesPerCase: queryCount,
+					stringValues,
 					batchSize: 300,
 					concurrency: 1,
 				},
@@ -119,11 +123,17 @@ function record(index) {
 		id: `product-${String(index).padStart(9, '0')}`,
 		fields: { title: `Trail shoe model ${index % 100}`, description: `Outdoor running equipment ${index % 7}` },
 		filters: {
-			...(index % 17 ? { brand: `brand-${String(index % 32).padStart(2, '0')}` } : {}),
+			...(index % 17 ? { brand: brandValues(index) } : {}),
 			...(index % 19 ? { price: index % 1000 } : {}),
 			active: index % 3 !== 0,
 		},
 	};
+}
+
+function brandValues(index) {
+	const brand = `brand-${String(index % 32).padStart(2, '0')}`;
+	if (stringValues === 'scalar') return brand;
+	return Array.from({ length: 8 }, (_, value) => (stringValues === 'unique' ? `${brand}-${value}` : brand));
 }
 
 async function measure(index, name, request) {

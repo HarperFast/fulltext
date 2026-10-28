@@ -676,8 +676,12 @@ export class NativeFullTextIndex {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'searchPage requires offset zero');
 		}
 
-		const catalog = normalizeCatalog((request as SearchRequest).sort, (request as SearchRequest).aggregations);
-		if (traversal && (catalog.sort !== undefined || catalog.aggregations.length > 0))
+		const metadata = request as SearchRequest;
+		const catalog =
+			metadata.sort === undefined && metadata.aggregations === undefined
+				? undefined
+				: normalizeCatalog(metadata.sort, metadata.aggregations);
+		if (traversal && catalog && (catalog.sort !== undefined || catalog.aggregations.length > 0))
 			throw new FulltextError('E_INVALID_ARGUMENT', 'sort and aggregations are not supported by searchPage');
 		const packed = {
 			...catalog,

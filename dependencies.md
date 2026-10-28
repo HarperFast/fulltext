@@ -41,12 +41,14 @@ bare dependency-name ignore rule.
 
 ### Tantivy 0.27 compatibility
 
-Tantivy 0.27 replaces the English stemmer with `frostem`. Persisted identities 6 (text only)
-and 7 (typed filters) distinguish that output from identities 4/5; the public `english@2`
-configuration remains unchanged. Older indexes must be retired and rebuilt from authoritative
-records. Reset still recognizes identities 1–8. Retire a new index with the 0.7 reset API before
-downgrading and rebuilding with 0.6; its reset parser cannot recognize identities 6/7. Never copy
-an old sidecar over a new index to bypass inspection.
+Tantivy 0.27 replaces the English stemmer with `frostem`. Persisted identities 6 (text only),
+7 (numeric/Boolean-only filters), and 8 (string filters) distinguish that output from identities
+4/5; identity 8 also records raw string fast columns. The public `english@2` configuration remains
+unchanged. Older incompatible indexes must be retired and rebuilt from authoritative records.
+This build recognizes identities 1–8 for reset. Retire a string-metadata index with this build
+before downgrading: released 0.7.x reset parsers do not recognize identity 8. Before downgrading
+to 0.6, retire identities 6–8 with this build too; its reset parser cannot recognize them.
+Never copy an old sidecar over a new index to bypass inspection.
 
 The exact `getrandom` 0.3.4 and `r-efi` 5.3.0 duplicate exceptions are required by
 `tantivy-columnar` 0.27 → `rand` 0.9, alongside `getrandom` 0.4 used by `tempfile`/`uuid`.
@@ -108,6 +110,8 @@ preserves installation without lifecycle scripts or a Rust toolchain.
 
 Sorting reuses Tantivy's composable `TopDocs` sort keys. Flat aggregations use its typed
 `AggregationCollector` API without another dependency or public upstream request types.
-String-metadata configurations use identity8 for raw fast columns and per-document string
-value deduplication; numeric/Boolean-only configurations retain identity7. The library guards
+String-metadata configurations use identity 8 for raw fast columns; numeric/Boolean-only configurations
+retain identity 7. Native terms aggregation counts each distinct string once per document;
+the writer additionally removes repeated strings as a storage optimization, preserving the
+caller’s first value for sorting. The library guards
 decoded sort/term keys separately from Tantivy's estimated aggregation structure memory.

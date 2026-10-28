@@ -757,7 +757,7 @@ export function encodeSearchFrame(
 	}
 	writer.boolean(request.filter !== undefined);
 	if (request.filter !== undefined) encodeFilterExpression(writer, request.filter, 0);
-	encodeCatalog(writer, request.sort, request.aggregations ?? []);
+	encodeCatalog(writer, request.sort, request.aggregations);
 	if (request.traversal && (request.sort !== undefined || (request.aggregations?.length ?? 0) > 0))
 		throw new FulltextError('E_INVALID_ARGUMENT', 'sort and aggregations are not supported by searchPage');
 	const identityLength = writer.length;

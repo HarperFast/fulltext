@@ -11,6 +11,7 @@ import {
 } from '@harperfast/fulltext/native';
 import { encodeSearch, encodeOpen, decodeResponse } from '../dist/codec.js';
 import { loadAddon } from '../dist/load-addon.js';
+import { decodeAggregations } from '../dist/catalog.js';
 
 function config(
 	context,
@@ -99,6 +100,64 @@ test('metadata sorting is global, deterministic, preserves scores, and selects f
 	const paged = await index.search({ text: 'shoe', sort: sort('price'), offset: 2, limit: 2 });
 	assert.deepStrictEqual(ids(paged), ['b', 'c']);
 	assert.deepStrictEqual(ids(await index.search({ text: 'shoe', sort: sort('price'), offset: 8, limit: 2 })), []);
+});
+
+test('equal metadata uses ID order before distinct BM25 scores and exact aggregations span the ranked window', async (context) => {
+	const options = config(context);
+	const index = await openNativeFullTextIndex(options);
+	context.after(() => index.close({ mode: 'rollback' }));
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'a', fields: { title: `shoe ${'padding '.repeat(100)}` }, filters: { price: 7, brand: 'same' } },
+			{ id: 'm', fields: { title: `shoe ${'padding '.repeat(10)}` }, filters: { price: 7, brand: 'same' } },
+			{ id: 'z', fields: { title: 'shoe' }, filters: { price: 7, brand: 'same' } },
+			{ id: 'unmatched', fields: { title: 'boots' }, filters: { price: 999, brand: 'other' } },
+		],
+	});
+	await index.commit();
+	await index.reload();
+	const ordinary = await index.search({ text: 'shoe', limit: 10, exactTotal: true });
+	assert.deepStrictEqual(ids(ordinary), ['z', 'm', 'a']);
+	const scores = new Map(ordinary.hits.map(({ id, score }) => [id, score]));
+	assert(scores.get('z') > scores.get('m'));
+	assert(scores.get('m') > scores.get('a'));
+	for (const field of ['price', 'brand']) {
+		for (const direction of ['asc', 'desc']) {
+			const result = await index.search({ text: 'shoe', sort: sort(field, direction), limit: 10 });
+			assert.deepStrictEqual(ids(result), ['a', 'm', 'z']);
+			for (const hit of result.hits) assert.strictEqual(hit.score, scores.get(hit.id));
+			const paged = [];
+			for (let offset = 0; offset < 3; offset++) {
+				const page = await index.search({ text: 'shoe', sort: sort(field, direction), offset, limit: 1 });
+				assert.strictEqual(page.total, 3);
+				assert.strictEqual(page.totalRelation, 'exact');
+				assert.strictEqual(page.hits[0].score, scores.get(page.hits[0].id));
+				paged.push(...ids(page));
+			}
+			assert.deepStrictEqual(paged, ['a', 'm', 'z']);
+		}
+	}
+	const requests = [
+		{ name: 'prices', field: 'price', type: 'stats' },
+		{ name: 'brands', field: 'brand', type: 'terms', size: 10 },
+	];
+	const complete = await index.search({ text: 'shoe', limit: 10, exactTotal: true, aggregations: requests });
+	const window = await index.search({ text: 'shoe', limit: 1, offset: 1, exactTotal: true, aggregations: requests });
+	assert.deepStrictEqual(ids(window), ['m']);
+	assert.strictEqual(window.hits[0].score, scores.get('m'));
+	assert.strictEqual(window.total, 3);
+	assert.strictEqual(window.totalRelation, 'exact');
+	assert.deepStrictEqual(window.aggregations, complete.aggregations);
+	assert.deepStrictEqual(window.aggregations, [
+		{ name: 'prices', type: 'stats', count: 3, sum: 21, min: 7, max: 7, avg: 7 },
+		{
+			name: 'brands',
+			type: 'terms',
+			buckets: [{ key: 'same', count: 3 }],
+			sumOtherDocCount: 0,
+			docCountErrorUpperBound: 0,
+		},
+	]);
 });
 
 test('aggregations cover the full matching snapshot and deduplicate string values per document', async (context) => {
@@ -297,8 +356,19 @@ test('raw packed catalog requests use the same native contract', async (context)
 	assert.strictEqual(result.u64(), 6n);
 	assert.strictEqual(result.u8(), 0);
 	assert.strictEqual(result.u32(), 1);
-	result.f32();
+	const expected = await index.search({
+		text: 'shoe',
+		sort: sort('price'),
+		limit: 1,
+		exactTotal: true,
+		aggregations: [aggregations[1]],
+	});
+	assert.strictEqual(result.f32(), expected.hits[0].score);
 	assert.strictEqual(result.string(), 'd');
+	assert.strictEqual(result.u8(), 1);
+	assert.strictEqual(result.string(), 'v-d');
+	assert.deepStrictEqual(decodeAggregations(result), expected.aggregations);
+	result.finish();
 	const packed = encodeSearch(request);
 	packed[4] = 5;
 	await assert.rejects(

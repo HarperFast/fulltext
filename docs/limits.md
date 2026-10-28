@@ -316,10 +316,14 @@ memory, sort-key bytes, and term-key bytes. All are fixed library safety limits.
 first use supported maximum lengths and per-segment document/dictionary counts. When that estimate
 exceeds its budget, a streaming dictionary scan measures maximum key lengths and retries the bound.
 Completed measurements are cached by immutable segment and field, with at most 1,024 entries per
-process. Cache eviction affects performance, not results. Cold scans check the request deadline every 1,024 keys and at completion,
+process. A completed scan populates the cache before its final deadline check, so a request that
+times out at that check can still help a later request. Cache eviction affects performance, not results. Cold scans check the request deadline every 1,024 keys and at completion,
 and retain only a maximum length; high cardinality alone does not exceed a qualification-count
 limit. Sorting first tries the contractual ID bound, measuring IDs only if that still cannot
-qualify the request. Reduce the window or terms size when retained keys exceed their budget;
+qualify the request. If the full-segment sort estimate still fails, a deadline-aware native Count
+pass measures the global matching count and uses it as an upper bound on retained hits across
+segments, together with maximum measured key lengths, to retry the sort budget.
+The sort continues to use native TopDocs. Reduce the window or terms size when retained keys exceed their budget;
 independent top-k requests do not produce a globally equivalent answer.
 
 | Resource                          | Bound                                                         | Enforcement                                                                                                                                                                                                                                                                                                                              |
@@ -341,8 +345,9 @@ the ordinary ranked-hits path and use a separate full-set pass. When exact total
 that pass also counts matches instead of running a third pass. Wire encoding, including the success envelope, stays inside the
 deadline and expensive-search permit, with a final deadline check before returning. This is a
 cooperative deadline, not a hard wall-clock or memory-residency guarantee. Deleted documents are
-excluded using the snapshot's deletion mask. Existing ordinary requests do not use this wrapper.
+excluded using the snapshot's deletion mask. Ordinary exact-total Count passes also use the deadline wrapper.
 
-String metadata adds a raw fast column and deduplicates repeated strings within a document,
-preserving first occurrence. Upgrading a released index containing string metadata requires a
+String metadata adds a raw fast column. The writer stores repeated strings once per document
+to avoid redundant fast-column values, preserving first occurrence for sorting. Native terms
+aggregation independently counts each distinct string once per document. Upgrading a released index containing string metadata requires a
 rebuild to sidecar v8. Numeric/Boolean-only metadata keeps sidecar v7; text-only keeps v6.

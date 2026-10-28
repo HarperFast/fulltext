@@ -319,7 +319,6 @@ impl<C: Collector> Collector for DeadlineCollector<C> {
 		Ok(collector.harvest())
 	}
 }
-#[cfg(test)]
 pub(crate) fn count_matches(searcher: &Searcher, query: &dyn Query, deadline: Option<Instant>) -> Result<u64> {
 	check_deadline(deadline).map_err(native_error)?;
 	searcher
@@ -376,11 +375,17 @@ fn scan_dictionary_max(
 		maximum = maximum.max(length);
 		visited += 1;
 	}
-	check()?;
 	Ok(maximum)
 }
 fn max_dictionary_key(segment: &SegmentReader, name: &str, deadline: Option<Instant>) -> Result<usize> {
-	check_deadline(deadline).map_err(native_error)?;
+	max_dictionary_key_with_check(segment, name, || check_deadline(deadline).map_err(native_error))
+}
+fn max_dictionary_key_with_check(
+	segment: &SegmentReader,
+	name: &str,
+	mut check: impl FnMut() -> Result<()>,
+) -> Result<usize> {
+	check()?;
 	let key = (
 		segment.segment_id(),
 		segment.schema().get_field(name).map_err(native_error)?,
@@ -392,17 +397,14 @@ fn max_dictionary_key(segment: &SegmentReader, name: &str, deadline: Option<Inst
 	}
 	let maximum = if let Some(column) = segment.fast_fields().str(name).map_err(native_error)? {
 		let mut stream = column.dictionary().stream().map_err(FulltextError::native)?;
-		scan_dictionary_max(
-			|| stream.advance().then(|| stream.key().len()),
-			|| check_deadline(deadline).map_err(native_error),
-		)?
+		scan_dictionary_max(|| stream.advance().then(|| stream.key().len()), &mut check)?
 	} else {
 		0
 	};
-	check_deadline(deadline).map_err(native_error)?;
 	if let Ok(mut cache) = dictionary_cache().lock() {
 		cache.insert(key, maximum);
 	}
+	check()?;
 	Ok(maximum)
 }
 fn add_key_budget(total: &mut usize, count: usize, bytes: usize, limit: usize) -> Result<()> {
@@ -419,8 +421,10 @@ fn add_key_budget(total: &mut usize, count: usize, bytes: usize, limit: usize) -
 	Ok(())
 }
 fn sort_buffer_bytes(end: usize, segments: usize, parallelism: usize) -> Result<usize> {
-	let segment_key_bytes = std::mem::size_of::<((Option<u64>, (Option<u64>, Score)), u32)>();
-	let global_key_bytes = std::mem::size_of::<((Option<String>, (Option<String>, Score)), DocAddress)>();
+	let segment_key_bytes =
+		std::mem::size_of::<tantivy::collector::ComparableDoc<(Option<u64>, (Option<u64>, Score)), u32>>();
+	let global_key_bytes =
+		std::mem::size_of::<tantivy::collector::ComparableDoc<(Option<String>, (Option<String>, Score)), DocAddress>>();
 	end.checked_mul(2)
 		.and_then(|n| n.checked_mul(segment_key_bytes))
 		.and_then(|n| n.checked_mul(segments.min(parallelism)))
@@ -429,6 +433,7 @@ fn sort_buffer_bytes(end: usize, segments: usize, parallelism: usize) -> Result<
 }
 fn check_sort_budget(
 	searcher: &Searcher,
+	query: &dyn Query,
 	end: usize,
 	index: usize,
 	is_string: bool,
@@ -470,19 +475,29 @@ fn check_sort_budget(
 	if total.is_some_and(|total| total <= MAX_SORT_MEMORY_BYTES) {
 		return Ok(());
 	}
-	let mut total = fixed;
+	let mut total = Some(fixed);
+	let mut retained = 0usize;
+	let mut maximum = 0usize;
 	for (segment, value) in searcher.segment_readers().iter().zip(values) {
 		let ids = max_dictionary_key(segment, "__fulltext_id", deadline)?;
-		add_key_budget(
-			&mut total,
-			end.min(segment.num_docs() as usize),
-			ids.checked_add(value)
-				.and_then(|n| n.checked_add(128))
-				.ok_or_else(|| resource("Sort key size overflow"))?,
-			MAX_SORT_MEMORY_BYTES,
-		)?;
+		let bytes = ids
+			.checked_add(value)
+			.and_then(|n| n.checked_add(128))
+			.ok_or_else(|| resource("Sort key size overflow"))?;
+		let count = end.min(segment.num_docs() as usize);
+		maximum = maximum.max(bytes);
+		retained = retained
+			.checked_add(count)
+			.ok_or_else(|| resource("Retained key count overflow"))?;
+		total = total.and_then(|total| total.checked_add(count.checked_mul(bytes)?));
 	}
-	Ok(())
+	if total.is_some_and(|total| total <= MAX_SORT_MEMORY_BYTES) {
+		return Ok(());
+	}
+	let matching = count_matches(searcher, query, deadline)?;
+	let matching = usize::try_from(matching).unwrap_or(usize::MAX);
+	let mut total = fixed;
+	add_key_budget(&mut total, retained.min(matching), maximum, MAX_SORT_MEMORY_BYTES)
 }
 fn check_terms_budget(
 	searcher: &Searcher,
@@ -593,6 +608,7 @@ pub(crate) fn sorted_catalog(
 		.min(searcher.num_docs().max(1) as usize);
 	check_sort_budget(
 		searcher,
+		query,
 		end,
 		index,
 		config.field_type == FilterFieldType::String,
@@ -714,16 +730,17 @@ pub(crate) fn aggregate(
 	finish_aggregations(results, requests, deadline)
 }
 fn histogram_checks(requests: &[AggregationRequest], fields: &[FilterFieldConfig]) -> Result<Vec<(String, f64)>> {
-	requests
-		.iter()
-		.filter_map(|request| {
-			if let AggregationKind::Histogram { interval } = request.kind {
-				Some(field(&request.field, fields).map(|(index, _)| (format!("__fulltext_filter_{index}"), interval)))
-			} else {
-				None
+	let mut seen = HashSet::new();
+	let mut checks = Vec::new();
+	for request in requests {
+		if let AggregationKind::Histogram { interval } = request.kind {
+			let (index, _) = field(&request.field, fields)?;
+			if seen.insert((index, interval.to_bits())) {
+				checks.push((format!("__fulltext_filter_{index}"), interval));
 			}
-		})
-		.collect()
+		}
+	}
+	Ok(checks)
 }
 fn prepare_aggregations(
 	searcher: &Searcher,
@@ -1264,6 +1281,7 @@ mod tests {
 			Arc,
 		};
 		struct Probe {
+			scoring: bool,
 			calls: Arc<AtomicUsize>,
 			deadline: Instant,
 		}
@@ -1291,7 +1309,7 @@ mod tests {
 				})
 			}
 			fn requires_scoring(&self) -> bool {
-				false
+				self.scoring
 			}
 			fn merge_fruits(&self, _: Vec<()>) -> tantivy::Result<()> {
 				Ok(())
@@ -1307,20 +1325,24 @@ mod tests {
 		writer.commit().unwrap();
 		drop(writer);
 		let searcher = index.reader().unwrap().searcher();
-		let calls = Arc::new(AtomicUsize::new(0));
-		let deadline = Instant::now() + std::time::Duration::from_secs(1);
-		let collector = DeadlineCollector {
-			histograms: vec![],
-			inner: Probe {
-				calls: calls.clone(),
-				deadline,
-			},
-			deadline: Some(deadline),
-		};
-		let error = searcher.search(&AllQuery, &collector).unwrap_err();
-		assert_eq!(native_error(error).code, "E_TIMEOUT");
-		assert!(calls.load(Ordering::Relaxed) > 0);
-		assert!(calls.load(Ordering::Relaxed) <= 1024);
+		for scoring in [false, true] {
+			let calls = Arc::new(AtomicUsize::new(0));
+			let deadline = Instant::now() + std::time::Duration::from_secs(1);
+			let collector = DeadlineCollector {
+				histograms: vec![],
+				inner: Probe {
+					scoring,
+					calls: calls.clone(),
+					deadline,
+				},
+				deadline: Some(deadline),
+			};
+			let error = searcher.search(&AllQuery, &collector).unwrap_err();
+			assert_eq!(native_error(error).code, "E_TIMEOUT");
+			assert!(calls.load(Ordering::Relaxed) > 0);
+			assert!(calls.load(Ordering::Relaxed) <= 1024);
+			assert_eq!(count_matches(&searcher, &AllQuery, None).unwrap(), 2048);
+		}
 	}
 	#[test]
 	fn missing_metadata_segments_and_empty_indexes_are_supported() {
@@ -1905,6 +1927,204 @@ mod tests {
 			)
 			.unwrap()
 		);
+	}
+	#[test]
+	fn selective_fragmented_sort_uses_matching_rows_and_survives_merge() {
+		use tantivy::{query::TermQuery, schema::IndexRecordOption};
+		let mut schema = Schema::builder();
+		let id = schema.add_text_field("__fulltext_id", STRING | FAST);
+		let category = schema.add_text_field("__fulltext_filter_0", STRING | FAST);
+		let price = schema.add_f64_field("__fulltext_filter_1", INDEXED | FAST);
+		let index = Index::create_in_ram(schema.build());
+		let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 50_000_000).unwrap();
+		writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+		for segment in 0..40 {
+			for record in 0..10000 {
+				let prefix = format!("{segment:02}-{record:05}");
+				let key = format!("{prefix}{}", "x".repeat(36 - prefix.len()));
+				writer
+					.add_document(
+						doc!(id=>key,category=>if segment==0&&record<50{"match"}else{"other"},price=>record as f64),
+					)
+					.unwrap();
+			}
+			writer.commit().unwrap();
+		}
+		let reader = index.reader().unwrap();
+		let before = reader.searcher();
+		assert_eq!(before.segment_readers().len(), 40);
+		let query = TermQuery::new(Term::from_field_text(category, "match"), IndexRecordOption::Basic);
+		let sort = SortRequest {
+			field: "price".into(),
+			direction: SortDirection::Asc,
+			missing: MissingOrder::Last,
+		};
+		let selected = sorted_hits(&before, &query, &sort, &fields(), 0, 10000, None).unwrap();
+		assert_eq!(selected.len(), 50);
+		assert_eq!(
+			sorted_hits(&before, &AllQuery, &sort, &fields(), 0, 10000, None)
+				.unwrap_err()
+				.code,
+			"E_RESOURCE_LIMIT"
+		);
+		writer.merge(&index.searchable_segment_ids().unwrap()).wait().unwrap();
+		reader.reload().unwrap();
+		let after = reader.searcher();
+		assert_eq!(after.segment_readers().len(), 1);
+		let merged = sorted_hits(&after, &query, &sort, &fields(), 0, 10000, None).unwrap();
+		assert_eq!(
+			selected.iter().map(|hit| &hit.0).collect::<Vec<_>>(),
+			merged.iter().map(|hit| &hit.0).collect::<Vec<_>>()
+		);
+		assert_eq!(
+			sorted_hits(&after, &AllQuery, &sort, &fields(), 0, 10000, None)
+				.unwrap()
+				.len(),
+			10000
+		);
+	}
+	#[test]
+	fn dictionary_cache_keeps_completed_scans_but_discards_partial_scans_on_timeout() {
+		use std::cell::Cell;
+		for partial in [false, true] {
+			let mut schema = Schema::builder();
+			let category = schema.add_text_field("__fulltext_filter_0", STRING | FAST);
+			let index = Index::create_in_ram(schema.build());
+			let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 20_000_000).unwrap();
+			for value in 0..1500 {
+				writer.add_document(doc!(category=>format!("key-{value:04}"))).unwrap();
+			}
+			writer.commit().unwrap();
+			drop(writer);
+			let searcher = index.reader().unwrap().searcher();
+			let segment = &searcher.segment_readers()[0];
+			let checks = Cell::new(0usize);
+			let fail_at = if partial { 3 } else { 4 };
+			let error = max_dictionary_key_with_check(segment, "__fulltext_filter_0", || {
+				checks.set(checks.get() + 1);
+				if checks.get() == fail_at {
+					Err(FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE))
+				} else {
+					Ok(())
+				}
+			})
+			.unwrap_err();
+			assert_eq!(error.code, "E_TIMEOUT");
+			assert_eq!(
+				dictionary_cache()
+					.lock()
+					.unwrap()
+					.maxima
+					.contains_key(&(segment.segment_id(), category)),
+				!partial
+			);
+		}
+	}
+	#[test]
+	fn identical_histogram_requests_share_validation_checks() {
+		let request = AggregationRequest {
+			name: "first".into(),
+			field: "price".into(),
+			kind: AggregationKind::Histogram { interval: 10.0 },
+		};
+		let mut second = request.clone();
+		second.name = "second".into();
+		assert_eq!(
+			histogram_checks(&[request, second], &fields()).unwrap(),
+			vec![("__fulltext_filter_1".into(), 10.0)]
+		);
+	}
+	#[test]
+	fn production_count_interrupts_advancing_matches_and_remains_reusable() {
+		use std::sync::{
+			atomic::{AtomicUsize, Ordering},
+			Arc,
+		};
+		use tantivy::{
+			query::{EnableScoring, Explanation, Scorer},
+			DocSet,
+		};
+		#[derive(Clone, Debug)]
+		struct SlowQuery {
+			advances: Arc<AtomicUsize>,
+			deadline: Instant,
+		}
+		struct SlowWeight {
+			inner: Box<dyn Weight>,
+			advances: Arc<AtomicUsize>,
+			deadline: Instant,
+		}
+		struct SlowScorer {
+			inner: Box<dyn Scorer>,
+			advances: Arc<AtomicUsize>,
+			deadline: Instant,
+		}
+		impl Query for SlowQuery {
+			fn weight(&self, scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+				Ok(Box::new(SlowWeight {
+					inner: AllQuery.weight(scoring)?,
+					advances: self.advances.clone(),
+					deadline: self.deadline,
+				}))
+			}
+		}
+		impl Weight for SlowWeight {
+			fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+				Ok(Box::new(SlowScorer {
+					inner: self.inner.scorer(reader, boost)?,
+					advances: self.advances.clone(),
+					deadline: self.deadline,
+				}))
+			}
+			fn explain(&self, reader: &SegmentReader, doc: u32) -> tantivy::Result<Explanation> {
+				self.inner.explain(reader, doc)
+			}
+		}
+		impl DocSet for SlowScorer {
+			fn advance(&mut self) -> u32 {
+				if self.advances.fetch_add(1, Ordering::Relaxed) == 0 {
+					while Instant::now() < self.deadline {
+						std::thread::yield_now();
+					}
+				}
+				self.inner.advance()
+			}
+			fn doc(&self) -> u32 {
+				self.inner.doc()
+			}
+			fn size_hint(&self) -> u32 {
+				self.inner.size_hint()
+			}
+		}
+		impl Scorer for SlowScorer {
+			fn score(&mut self) -> Score {
+				self.inner.score()
+			}
+		}
+		let mut schema = Schema::builder();
+		let id = schema.add_u64_field("id", FAST);
+		let index = Index::create_in_ram(schema.build());
+		let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 20_000_000).unwrap();
+		for id_value in 0..2048u64 {
+			writer.add_document(doc!(id=>id_value)).unwrap();
+		}
+		writer.commit().unwrap();
+		drop(writer);
+		let searcher = index.reader().unwrap().searcher();
+		let advances = Arc::new(AtomicUsize::new(0));
+		let deadline = Instant::now() + std::time::Duration::from_secs(1);
+		let query = SlowQuery {
+			advances: advances.clone(),
+			deadline,
+		};
+		let result = count_matches(&searcher, &query, Some(deadline));
+		let visited = advances.load(Ordering::Relaxed);
+		assert!(
+			visited > 0 && visited <= 1024,
+			"count advanced {visited} matches before returning"
+		);
+		assert_eq!(result.unwrap_err().code, "E_TIMEOUT");
+		assert_eq!(count_matches(&searcher, &AllQuery, None).unwrap(), 2048);
 	}
 }
 
