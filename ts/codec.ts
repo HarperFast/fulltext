@@ -1,7 +1,7 @@
 import { encodeCatalog, type SortRequest, type AggregationRequest } from './catalog.js';
 import { FulltextError, type FulltextErrorCode } from './errors.js';
 
-const protocolVersion = 6;
+const protocolVersion = 7;
 export const maxStringBytes = 1 << 20;
 export const maxFilterStringBytes = 65_530;
 export const maxCommitPayloadBytes = 64 * 1024;
@@ -415,7 +415,7 @@ export type PackedFilterExpression =
 	| { operator: 'and' | 'or'; clauses: PackedFilterExpression[] };
 
 export interface PackedSearchRequest {
-	sort?: SortRequest;
+	sort?: SortRequest | SortRequest[];
 	aggregations?: AggregationRequest[];
 	expression: PackedSearchExpression;
 	candidateIds?: string[];
@@ -946,6 +946,10 @@ export class Cursor {
 
 	text(length: number): string {
 		return this.take(length).toString('utf8');
+	}
+
+	remaining(): number {
+		return this.#buffer.length - this.#offset;
 	}
 
 	finish(): void {

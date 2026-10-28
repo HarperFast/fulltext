@@ -10,7 +10,7 @@ import {
 	inspectNativeFullTextIndex,
 	resetNativeFullTextIndex,
 } from '@harperfast/fulltext/native';
-import { encodeSearch, encodeOpen, decodeResponse } from '../dist/codec.js';
+import { encodeSearch, encodeSearchFrame, encodeOpen, decodeResponse } from '../dist/codec.js';
 import { loadAddon } from '../dist/load-addon.js';
 import { decodeAggregations } from '../dist/catalog.js';
 
@@ -449,7 +449,7 @@ test('raw packed catalog requests use the same native contract', async (context)
 		limit: 1,
 		exactTotal: true,
 		budgetMilliseconds: 30_000,
-		sort: sort('price'),
+		sort: [sort('price')],
 		aggregations: [aggregations[1]],
 	};
 	const result = await invoke((callback) => addon.__nativeSearch(handle, encodeSearch(request), callback));
@@ -469,6 +469,34 @@ test('raw packed catalog requests use the same native contract', async (context)
 	assert.strictEqual(result.string(), 'v-d');
 	assert.deepStrictEqual(decodeAggregations(result), expected.aggregations);
 	result.finish();
+	const empty = encodeSearchFrame({ ...request, sort: undefined, aggregations: undefined });
+	const catalogStart = empty.identityLength - 8;
+	const u32 = (value) => {
+		const bytes = Buffer.alloc(4);
+		bytes.writeUInt32LE(value);
+		return bytes;
+	};
+	const string = (value) => Buffer.concat([u32(Buffer.byteLength(value)), Buffer.from(value)]);
+	const tree = (depth) =>
+		depth === 0
+			? u32(0)
+			: Buffer.concat([u32(1), string('nested'), string('brand'), Buffer.from([0]), u32(1), tree(depth - 1)]);
+	for (const catalog of [
+		u32(0xffffffff),
+		Buffer.concat([u32(0), u32(0xffffffff)]),
+		Buffer.concat([u32(0), tree(33)]),
+	]) {
+		const malformed = Buffer.concat([
+			empty.bytes.subarray(0, catalogStart),
+			catalog,
+			empty.bytes.subarray(empty.identityLength),
+		]);
+		await assert.rejects(
+			invoke((callback) => addon.__nativeSearch(handle, malformed, callback)),
+			{ code: 'E_INVALID_ARGUMENT' },
+		);
+		assert.strictEqual((await index.search({ text: 'shoe', limit: 1 })).hits.length, 1);
+	}
 	const packed = encodeSearch(request);
 	packed[4] = 5;
 	await assert.rejects(
@@ -476,7 +504,7 @@ test('raw packed catalog requests use the same native contract', async (context)
 		{ code: 'E_INVALID_ARGUMENT' },
 	);
 	await assert.rejects(
-		invoke((callback) => addon.__nativeSearch(handle, encodeSearch({ ...request, sort: sort('active') }), callback)),
+		invoke((callback) => addon.__nativeSearch(handle, encodeSearch({ ...request, sort: [sort('active')] }), callback)),
 		{ code: 'E_INVALID_ARGUMENT' },
 	);
 	assert.strictEqual((await index.search({ text: 'shoe', sort: sort('price'), limit: 1 })).hits[0].id, 'd');

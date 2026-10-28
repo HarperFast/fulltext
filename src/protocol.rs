@@ -1,7 +1,9 @@
-use crate::catalog::{AggregationKind, AggregationRequest, MissingOrder, SortDirection, SortRequest, MAX_AGGREGATIONS};
+use crate::catalog::{
+	AggregationKind, AggregationRequest, MissingOrder, SortDirection, SortRequest, MAX_AGGREGATION_DEPTH,
+};
 use crate::error::{FulltextError, Result};
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 const MAX_STRING_BYTES: usize = 1 << 20;
 pub const MAX_RECORD_ID_BYTES: usize = 4 << 10;
 pub const MAX_RECORD_VERSION_BYTES: usize = 4 << 10;
@@ -233,7 +235,7 @@ pub struct SearchBoundary {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchRequest {
-	pub sort: Option<SortRequest>,
+	pub sort: Option<Vec<SortRequest>>,
 	pub aggregations: Vec<AggregationRequest>,
 	pub expression: SearchExpression,
 	pub candidate_ids: Option<Vec<String>>,
@@ -779,17 +781,30 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	})
 }
 
+fn catalog_count(cursor: &mut Cursor<'_>, minimum_bytes: usize) -> Result<usize> {
+	let count = cursor.u32()? as usize;
+	if count > cursor.remaining() / minimum_bytes {
+		return Err(FulltextError::invalid("catalog count exceeds remaining request bytes"));
+	}
+	Ok(count)
+}
+
 fn scan_catalog(cursor: &mut Cursor<'_>) -> Result<bool> {
-	let sort = cursor.boolean()?;
-	if sort {
+	let sorts = catalog_count(cursor, 6)?;
+	for _ in 0..sorts {
 		let _ = cursor.bytes()?;
 		if cursor.u8()? > 1 || cursor.u8()? > 1 {
 			return Err(FulltextError::invalid("invalid sort ordering"));
 		}
 	}
-	let count = cursor.u8()? as usize;
-	if count > MAX_AGGREGATIONS {
-		return Err(FulltextError::invalid("too many aggregations"));
+	let count = scan_aggregations(cursor, 1)?;
+	Ok(sorts > 0 || count > 0)
+}
+
+fn scan_aggregations(cursor: &mut Cursor<'_>, depth: usize) -> Result<usize> {
+	let count = catalog_count(cursor, 13)?;
+	if count > 0 && depth > MAX_AGGREGATION_DEPTH {
+		return Err(FulltextError::invalid("aggregation nesting exceeds its depth limit"));
 	}
 	for _ in 0..count {
 		let name = cursor.bytes()?;
@@ -797,7 +812,8 @@ fn scan_catalog(cursor: &mut Cursor<'_>) -> Result<bool> {
 			return Err(FulltextError::invalid("aggregation names require 1 to 128 UTF-8 bytes"));
 		}
 		let _ = cursor.bytes()?;
-		match cursor.u8()? {
+		let kind = cursor.u8()?;
+		match kind {
 			0 => {
 				let _ = cursor.u32()?;
 			}
@@ -806,11 +822,11 @@ fn scan_catalog(cursor: &mut Cursor<'_>) -> Result<bool> {
 				let _ = cursor.f64()?;
 			}
 			3 => {
-				let count = cursor.u8()? as usize;
-				if count == 0 || count > 100 {
-					return Err(FulltextError::invalid("range aggregation requires 1 to 100 ranges"));
+				let ranges = catalog_count(cursor, 2)?;
+				if ranges == 0 {
+					return Err(FulltextError::invalid("range aggregation requires ranges"));
 				}
-				for _ in 0..count {
+				for _ in 0..ranges {
 					if cursor.boolean()? {
 						let _ = cursor.f64()?;
 					}
@@ -821,12 +837,18 @@ fn scan_catalog(cursor: &mut Cursor<'_>) -> Result<bool> {
 			}
 			_ => return Err(FulltextError::invalid("unknown aggregation kind")),
 		}
+		let children = scan_aggregations(cursor, depth + 1)?;
+		if kind == 1 && children > 0 {
+			return Err(FulltextError::invalid("stats aggregations cannot have children"));
+		}
 	}
-	Ok(sort || count > 0)
+	Ok(count)
 }
 
-fn decode_catalog(cursor: &mut Cursor<'_>) -> Result<(Option<SortRequest>, Vec<AggregationRequest>)> {
-	let sort = if cursor.boolean()? {
+fn decode_catalog(cursor: &mut Cursor<'_>) -> Result<(Option<Vec<SortRequest>>, Vec<AggregationRequest>)> {
+	let count = catalog_count(cursor, 6)?;
+	let mut sorts = Vec::with_capacity(count);
+	for _ in 0..count {
 		let field = cursor.string()?;
 		let direction = match cursor.u8()? {
 			0 => SortDirection::Asc,
@@ -838,19 +860,21 @@ fn decode_catalog(cursor: &mut Cursor<'_>) -> Result<(Option<SortRequest>, Vec<A
 			1 => MissingOrder::Last,
 			_ => return Err(FulltextError::invalid("unknown missing sort order")),
 		};
-		Some(SortRequest {
+		sorts.push(SortRequest {
 			field,
 			direction,
 			missing,
-		})
-	} else {
-		None
-	};
-	let count = cursor.u8()? as usize;
-	if count > MAX_AGGREGATIONS {
-		return Err(FulltextError::invalid("too many aggregations"));
+		});
 	}
-	let mut aggregations = Vec::with_capacity(count);
+	Ok(((!sorts.is_empty()).then_some(sorts), decode_aggregations(cursor, 1)?))
+}
+
+fn decode_aggregations(cursor: &mut Cursor<'_>, depth: usize) -> Result<Vec<AggregationRequest>> {
+	let count = catalog_count(cursor, 13)?;
+	if count > 0 && depth > MAX_AGGREGATION_DEPTH {
+		return Err(FulltextError::invalid("aggregation nesting exceeds its depth limit"));
+	}
+	let mut results = Vec::with_capacity(count);
 	for _ in 0..count {
 		let name = cursor.string()?;
 		let field = cursor.string()?;
@@ -861,9 +885,9 @@ fn decode_catalog(cursor: &mut Cursor<'_>) -> Result<(Option<SortRequest>, Vec<A
 				interval: cursor.f64()?,
 			},
 			3 => {
-				let count = cursor.u8()? as usize;
-				if count == 0 || count > 100 {
-					return Err(FulltextError::invalid("range aggregation requires 1 to 100 ranges"));
+				let count = catalog_count(cursor, 2)?;
+				if count == 0 {
+					return Err(FulltextError::invalid("range aggregation requires ranges"));
 				}
 				let mut ranges = Vec::with_capacity(count);
 				for _ in 0..count {
@@ -875,9 +899,18 @@ fn decode_catalog(cursor: &mut Cursor<'_>) -> Result<(Option<SortRequest>, Vec<A
 			}
 			_ => return Err(FulltextError::invalid("unknown aggregation kind")),
 		};
-		aggregations.push(AggregationRequest { name, field, kind });
+		let aggregations = decode_aggregations(cursor, depth + 1)?;
+		if matches!(kind, AggregationKind::Stats) && !aggregations.is_empty() {
+			return Err(FulltextError::invalid("stats aggregations cannot have children"));
+		}
+		results.push(AggregationRequest {
+			name,
+			field,
+			kind,
+			aggregations,
+		});
 	}
-	Ok((sort, aggregations))
+	Ok(results)
 }
 
 fn decode_search_traversal(cursor: &mut Cursor<'_>) -> Result<(bool, Option<SearchBoundary>)> {
@@ -1393,6 +1426,62 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn catalog_counts_and_depth_are_checked_before_allocation() {
+		fn u32_bytes(value: u32, bytes: &mut Vec<u8>) {
+			bytes.extend_from_slice(&value.to_le_bytes());
+		}
+		fn tree(depth: usize, bytes: &mut Vec<u8>) {
+			u32_bytes(u32::from(depth > 0), bytes);
+			if depth == 0 {
+				return;
+			}
+			for value in ["n", "brand"] {
+				u32_bytes(value.len() as u32, bytes);
+				bytes.extend_from_slice(value.as_bytes());
+			}
+			bytes.push(0);
+			u32_bytes(1, bytes);
+			tree(depth - 1, bytes);
+		}
+		for depth in [32, 33] {
+			let mut bytes = Vec::new();
+			u32_bytes(0, &mut bytes);
+			tree(depth, &mut bytes);
+			assert_eq!(
+				scan_catalog(&mut Cursor {
+					bytes: &bytes,
+					offset: 0
+				})
+				.is_ok(),
+				depth == 32
+			);
+			assert_eq!(
+				decode_catalog(&mut Cursor {
+					bytes: &bytes,
+					offset: 0
+				})
+				.is_ok(),
+				depth == 32
+			);
+		}
+		for bytes in [
+			u32::MAX.to_le_bytes().to_vec(),
+			[0u32.to_le_bytes(), u32::MAX.to_le_bytes()].concat(),
+		] {
+			assert!(scan_catalog(&mut Cursor {
+				bytes: &bytes,
+				offset: 0
+			})
+			.is_err());
+			assert!(decode_catalog(&mut Cursor {
+				bytes: &bytes,
+				offset: 0
+			})
+			.is_err());
+		}
+	}
+
+	#[test]
 	fn filter_presence_and_negation_scanner_matches_decoder() {
 		let leaf = |comparator: u8, count: u16| {
 			let mut bytes = vec![0, 1, 0, 0, 0, b'x', comparator];
@@ -1487,7 +1576,7 @@ mod tests {
 
 	#[test]
 	fn reset_frame_contains_only_path_and_logical_index_id() {
-		let mut bytes = b"FTRX\x06\x00".to_vec();
+		let mut bytes = b"FTRX\x07\x00".to_vec();
 		for value in ["/tmp/index", "products"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -1508,7 +1597,7 @@ mod tests {
 
 	#[test]
 	fn inspection_frame_is_distinct_and_rejects_trailing_limits() {
-		let mut bytes = b"FTIP\x06\x00".to_vec();
+		let mut bytes = b"FTIP\x07\x00".to_vec();
 		for value in ["/tmp/index", "products", "one", "english@2"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -1532,7 +1621,7 @@ mod tests {
 
 	#[test]
 	fn rejects_counts_before_allocating() {
-		let mut bytes = b"FTMB\x06\x00".to_vec();
+		let mut bytes = b"FTMB\x07\x00".to_vec();
 		bytes.extend_from_slice(&u32::MAX.to_le_bytes());
 		bytes.extend_from_slice(&0u32.to_le_bytes());
 		assert_eq!(decode_batch(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
@@ -1576,7 +1665,7 @@ mod tests {
 
 	#[test]
 	fn distinguishes_batch_size_from_invalid_encoding() {
-		let bytes = b"FTMB\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+		let bytes = b"FTMB\x07\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 		assert_eq!(
 			validate_batch_header(bytes, bytes.len() - 1).unwrap_err().code,
 			"E_BATCH_TOO_LARGE"
@@ -1641,11 +1730,11 @@ mod tests {
 	#[test]
 	fn classifies_negation_and_exact_totals_as_expensive() {
 		fn request(expression: &[u8], exact_total: bool) -> Vec<u8> {
-			let mut bytes = b"FTSQ\x06\x00".to_vec();
+			let mut bytes = b"FTSQ\x07\x00".to_vec();
 			bytes.extend_from_slice(expression);
 			bytes.push(0);
 			bytes.push(0);
-			bytes.extend_from_slice(&[0, 0]);
+			bytes.extend_from_slice(&[0; 8]);
 			bytes.extend_from_slice(&0u32.to_le_bytes());
 			bytes.extend_from_slice(&1u32.to_le_bytes());
 			bytes.push(u8::from(exact_total));
@@ -1668,7 +1757,7 @@ mod tests {
 		assert!(search_is_expensive(&request(&unanchored_or, false)).unwrap());
 
 		let filtered_request = |comparator: u8| {
-			let mut bytes = b"FTSQ\x06\x00".to_vec();
+			let mut bytes = b"FTSQ\x07\x00".to_vec();
 			bytes.extend_from_slice(&leaf);
 			bytes.push(0);
 			bytes.push(1);
@@ -1679,7 +1768,7 @@ mod tests {
 			bytes.extend_from_slice(&1u16.to_le_bytes());
 			bytes.push(1);
 			bytes.extend_from_slice(&50f64.to_le_bytes());
-			bytes.extend_from_slice(&[0, 0]);
+			bytes.extend_from_slice(&[0; 8]);
 			bytes.extend_from_slice(&0u32.to_le_bytes());
 			bytes.extend_from_slice(&1u32.to_le_bytes());
 			bytes.push(0);
@@ -1689,7 +1778,7 @@ mod tests {
 		assert!(!search_is_expensive(&filtered_request(0)).unwrap());
 		assert!(search_is_expensive(&filtered_request(2)).unwrap());
 
-		let mut many_exact_filters = b"FTSQ\x06\x00".to_vec();
+		let mut many_exact_filters = b"FTSQ\x07\x00".to_vec();
 		many_exact_filters.extend_from_slice(&leaf);
 		many_exact_filters.push(0);
 		many_exact_filters.push(1);
@@ -1704,7 +1793,7 @@ mod tests {
 			many_exact_filters.push(1);
 			many_exact_filters.extend_from_slice(&50f64.to_le_bytes());
 		}
-		many_exact_filters.extend_from_slice(&[0, 0]);
+		many_exact_filters.extend_from_slice(&[0; 8]);
 		many_exact_filters.extend_from_slice(&0u32.to_le_bytes());
 		many_exact_filters.extend_from_slice(&1u32.to_le_bytes());
 		many_exact_filters.push(0);
@@ -1714,14 +1803,14 @@ mod tests {
 
 	#[test]
 	fn rejects_nested_counts_before_allocating() {
-		let mut fields = b"FTMB\x06\x00".to_vec();
+		let mut fields = b"FTMB\x07\x00".to_vec();
 		fields.extend_from_slice(&1u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&u16::MAX.to_le_bytes());
 		assert_eq!(decode_batch(&fields).unwrap_err().code, "E_INVALID_ARGUMENT");
 
-		let mut values = b"FTMB\x06\x00".to_vec();
+		let mut values = b"FTMB\x07\x00".to_vec();
 		values.extend_from_slice(&1u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());

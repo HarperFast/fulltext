@@ -5,8 +5,8 @@ import { decodeAggregations, encodeCatalog, normalizeCatalog } from '../dist/cat
 const invalid = (error) => error.code === 'E_INVALID_ARGUMENT';
 const nativeFailure = (error) => error.code === 'E_NATIVE_FAILURE';
 
-test('an absent aggregation payload needs only its count byte', () => {
-	assert.strictEqual(decodeAggregations({ u8: () => 0 }), undefined);
+test('an absent aggregation payload needs only its count word', () => {
+	assert.strictEqual(decodeAggregations({ u32: () => 0 }), undefined);
 });
 
 test('catalog normalization snapshots all mutable request containers', () => {
@@ -17,7 +17,7 @@ test('catalog normalization snapshots all mutable request containers', () => {
 		{ name: 'prices', field: 'price', type: 'histogram', interval: 5 },
 		{ name: 'bands', field: 'price', type: 'range', ranges: [{ to: 10 }, { from: 10 }] },
 	];
-	const expected = structuredClone({ sort, aggregations: requests });
+	const expected = structuredClone({ sort: [sort], aggregations: requests });
 	const normalized = normalizeCatalog(sort, requests);
 	sort.field = 'changed';
 	requests[0].size = 20;
@@ -42,13 +42,12 @@ test('catalog normalization rejects malformed requests and respects UTF-8 bounds
 		null,
 		{},
 		Array(1),
-		Array.from({ length: 9 }, (_, index) => ({ ...base, name: String(index) })),
 		[base, base],
 		[{ ...base, name: 'é'.repeat(65) }],
 		[{ ...base, name: '\ud800' }],
 		[{ ...base, field: 'a'.repeat((1 << 20) + 1) }],
 		[{ ...base, type: 'unknown' }],
-		...[0, 101, 1.5, NaN, Infinity].map((size) => [{ ...base, size }]),
+		...[0, 0x100000000, 1.5, NaN, Infinity].map((size) => [{ ...base, size }]),
 		...[0, -1, NaN, Infinity].map((interval) => [{ ...base, type: 'histogram', interval }]),
 	]) {
 		assert.throws(() => normalizeCatalog(undefined, requests), invalid);
@@ -91,46 +90,53 @@ test('catalog encoding uses the agreed packed field order', () => {
 	]);
 	encodeCatalog(writer, normalized.sort, normalized.aggregations);
 	assert.deepStrictEqual(calls, [
-		['boolean', true],
+		['u32', 1],
 		['string', 'price'],
 		['u8', 1],
 		['u8', 0],
-		['u8', 4],
+		['u32', 4],
 		['string', 'terms'],
 		['string', 'category'],
 		['u8', 0],
 		['u32', 2],
+		['u32', 0],
 		['string', 'stats'],
 		['string', 'price'],
 		['u8', 1],
+		['u32', 0],
 		['string', 'hist'],
 		['string', 'price'],
 		['u8', 2],
 		['f64', 2.5],
+		['u32', 0],
 		['string', 'range'],
 		['string', 'price'],
 		['u8', 3],
-		['u8', 2],
+		['u32', 2],
 		['boolean', false],
 		['boolean', true],
 		['f64', 5],
 		['boolean', true],
 		['f64', 5],
 		['boolean', false],
+		['u32', 0],
 	]);
 });
 
 function cursor(values) {
 	let offset = 0;
-	return Object.fromEntries(
-		['u8', 'u16', 'u64', 'f64', 'string'].map((method) => [
-			method,
-			() => {
-				if (offset === values.length) throw new Error('truncated fixture');
-				return values[offset++];
-			},
-		]),
-	);
+	return {
+		remaining: () => 8 * 1024 * 1024,
+		...Object.fromEntries(
+			['u8', 'u32', 'u64', 'f64', 'string'].map((method) => [
+				method,
+				() => {
+					if (offset === values.length) throw new Error('truncated fixture');
+					return values[offset++];
+				},
+			]),
+		),
+	};
 }
 
 test('catalog decoding preserves typed buckets, approximation metadata and empty stats', () => {
@@ -143,6 +149,7 @@ test('catalog decoding preserves typed buckets, approximation metadata and empty
 				1,
 				'café',
 				3n,
+				0,
 				2n,
 				1,
 				1n,
@@ -168,6 +175,7 @@ test('catalog decoding preserves typed buckets, approximation metadata and empty
 				1,
 				10,
 				2n,
+				0,
 				'bands',
 				3,
 				2,
@@ -176,11 +184,13 @@ test('catalog decoding preserves typed buckets, approximation metadata and empty
 				1,
 				5,
 				1n,
+				0,
 				'5-*',
 				1,
 				5,
 				0,
 				2n,
+				0,
 			]),
 		),
 		[
@@ -211,7 +221,7 @@ test('catalog decoding preserves typed buckets, approximation metadata and empty
 
 test('catalog decoding rejects invalid native tags, counts and numeric results', () => {
 	for (const values of [
-		[9],
+		[0xffffffff],
 		[1, '', 1],
 		[1, 'x', 9],
 		[1, 'x', 0, 1025],
@@ -224,4 +234,100 @@ test('catalog decoding rejects invalid native tags, counts and numeric results',
 	]) {
 		assert.throws(() => decodeAggregations(cursor(values)), nativeFailure);
 	}
+});
+
+test('catalog supports ordered keys and nested trees above the old shape caps', () => {
+	const sort = [
+		{ field: 'brand', direction: 'asc', missing: 'last' },
+		{ field: 'price', direction: 'desc', missing: 'first' },
+	];
+	const aggregations = Array.from({ length: 9 }, (_, index) => ({
+		name: String(index),
+		field: 'brand',
+		type: 'terms',
+		size: 101,
+		aggregations: [{ name: 'summary', field: 'price', type: 'stats' }],
+	}));
+	const normalized = normalizeCatalog(sort, aggregations);
+	assert.deepStrictEqual(normalized, { sort, aggregations });
+	aggregations[0].aggregations[0].field = 'changed';
+	assert.strictEqual(normalized.aggregations[0].aggregations[0].field, 'price');
+	const ranges = Array.from({ length: 101 }, (_, index) => ({ from: index, to: index + 1 }));
+	assert.strictEqual(
+		normalizeCatalog(undefined, [{ name: 'ranges', field: 'price', type: 'range', ranges }]).aggregations[0].ranges
+			.length,
+		101,
+	);
+	assert.throws(() => normalizeCatalog([sort[0], sort[0]], undefined), invalid);
+});
+
+test('catalog rejects cycles, excessive depth and oversized requests before unbounded cloning', () => {
+	const cyclic = { name: 'cycle', field: 'brand', type: 'terms', size: 1 };
+	cyclic.aggregations = [cyclic];
+	assert.throws(() => normalizeCatalog(undefined, [cyclic]), invalid);
+	assert.throws(
+		() => normalizeCatalog(undefined, [{ name: 'stats', field: 'price', type: 'stats', aggregations: [] }]),
+		invalid,
+	);
+	let tree = { name: 'leaf', field: 'price', type: 'stats' };
+	for (let index = 0; index < 31; index++)
+		tree = { name: 'node', field: 'brand', type: 'terms', size: 1, aggregations: [tree] };
+	assert.doesNotThrow(() => normalizeCatalog(undefined, [tree]));
+	tree = { name: 'too-deep', field: 'brand', type: 'terms', size: 1, aggregations: [tree] };
+	assert.throws(() => normalizeCatalog(undefined, [tree]), invalid);
+	const large = Array.from({ length: 9 }, (_, index) => ({
+		name: String(index),
+		field: 'a'.repeat(1 << 20),
+		type: 'stats',
+	}));
+	assert.throws(() => normalizeCatalog(undefined, large), invalid);
+});
+
+test('catalog decoding retains nested stats and shares the bucket budget across branches', () => {
+	const result = decodeAggregations(
+		cursor([1, 'brands', 0, 1, 'cedar', 2n, 1, 'price', 1, 2n, 10, 1, 4, 1, 6, 1, 5, 0n, 0]),
+	);
+	assert.deepStrictEqual(result[0].buckets[0], {
+		key: 'cedar',
+		count: 2,
+		aggregations: [{ name: 'price', type: 'stats', count: 2, sum: 10, min: 4, max: 6, avg: 5 }],
+	});
+	assert.throws(
+		() => decodeAggregations(cursor([1, 'brands', 0, 1, 'cedar', 2n, 1, 'nested', 2, 1024])),
+		nativeFailure,
+	);
+	assert.throws(() => decodeAggregations({ u32: () => 100, remaining: () => 10 }), nativeFailure);
+});
+
+test('catalog encoding writes children after each request payload and decoding rejects deep responses', () => {
+	const calls = [];
+	const writer = Object.fromEntries(
+		['boolean', 'string', 'u8', 'u32', 'f64'].map((method) => [method, (value) => calls.push([method, value])]),
+	);
+	const request = normalizeCatalog(undefined, [
+		{
+			name: 'brands',
+			field: 'brand',
+			type: 'terms',
+			size: 101,
+			aggregations: [{ name: 'summary', field: 'price', type: 'stats' }],
+		},
+	]);
+	encodeCatalog(writer, request.sort, request.aggregations);
+	assert.deepStrictEqual(calls, [
+		['u32', 0],
+		['u32', 1],
+		['string', 'brands'],
+		['string', 'brand'],
+		['u8', 0],
+		['u32', 101],
+		['u32', 1],
+		['string', 'summary'],
+		['string', 'price'],
+		['u8', 1],
+		['u32', 0],
+	]);
+	const values = [];
+	for (let index = 0; index < 33; index++) values.push(1, 'branch', 0, 1, 'key', 1n);
+	assert.throws(() => decodeAggregations(cursor(values)), nativeFailure);
 });

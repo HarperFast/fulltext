@@ -56,15 +56,14 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	queryApiVersion: 5;
+	queryApiVersion: 6;
 	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
 	mutationBatchApiVersion: 5;
 	storageBackends: ReadonlyArray<'native'>;
 	limits: {
-		maxAggregations: number;
+		maxAggregationDepth: number;
 		maxAggregationBuckets: number;
-		maxTermsSize: number;
 		maxAggregationMemoryBytes: number;
 		maxSortKeyBytes: number;
 		maxTermKeyBytes: number;
@@ -243,7 +242,7 @@ export type FilterExpression =
 	| { operator: 'and' | 'or'; clauses: FilterExpression[] };
 
 export interface SearchRequest {
-	sort?: SortRequest;
+	sort?: SortRequest | SortRequest[];
 	aggregations?: AggregationRequest[];
 	text?: string;
 	query?: SearchExpression;
@@ -1307,7 +1306,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			queryApiVersion: info.queryApiVersion as 5,
+			queryApiVersion: info.queryApiVersion as 6,
 			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
 			mutationBatchApiVersion: 5,

@@ -3125,7 +3125,7 @@ fn search_body(result: SearchResult) -> Vec<u8> {
 	if let Some(aggregations) = result.encoded_aggregations {
 		bytes.extend_from_slice(&aggregations);
 	} else {
-		bytes.push(0);
+		bytes.extend_from_slice(&0u32.to_le_bytes());
 	}
 	if let Some((snapshot, more)) = result.traversal {
 		push_string(&mut bytes, &snapshot);

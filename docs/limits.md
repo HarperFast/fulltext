@@ -293,14 +293,15 @@ accompany the pre-1.0 package change from 0.5 to 0.6; they do not introduce a `s
 
 When migrating from released 0.7.x, ordinary `protocol::SearchRequest` literals add `sort: None`
 and `aggregations: Vec::new()`. Catalog callers use `catalog::SortRequest` and
-`catalog::AggregationRequest`; `Engine::search` returns named results in
+`catalog::AggregationRequest` (with child `aggregations: Vec::new()` for leaves). Sorted requests
+use `sort: Some(vec![sort_request, ...])`; `Engine::search` returns named results in
 `SearchResult.aggregations`. Obtain `SearchResult` through the engine rather than constructing
 it: its cached wire representation is crate-private.
 
 Exhaustive matches must handle `FilterExpression::Not(Box<FilterExpression>)` and
 `FilterComparator::{Exists, Missing}`. Presence clauses carry `values: Vec::new()`.
 `SearchResult` and the filter enums are source changes to the pre-1.0 Rust API; the JavaScript
-facade uses packed protocol 6, native ABI 10, and query API 5 with its matching addon.
+facade uses packed protocol 7, native ABI 11, and query API 6 with its matching addon.
 
 ## Source reference
 
@@ -311,8 +312,9 @@ facade uses packed protocol 6, native ABI 10, and query API 5 with its matching 
 
 ## Metadata collectors
 
-`runtimeInfo().limits` exposes aggregation counts, bucket count, terms size, native aggregation
-memory, sort-key bytes, and term-key bytes. All are fixed library safety limits. Key preflights
+`runtimeInfo().limits` exposes aggregation depth, bucket count, native aggregation memory, sort-key
+bytes, and term-key bytes. The unreleased `maxAggregations` and `maxTermsSize` fields are removed
+with query API 6; request shape is governed by resource budgets rather than those fixed counts. Key preflights
 first use supported maximum lengths and per-segment document/dictionary counts. When that estimate
 exceeds its budget, a streaming dictionary scan measures maximum key lengths and retries the bound.
 Completed measurements are cached by immutable segment and field, with at most 1,024 entries per
@@ -326,16 +328,18 @@ segments, together with maximum measured key lengths, to retry the sort budget.
 The sort continues to use native TopDocs. Reduce the window or terms size when retained keys exceed their budget;
 independent top-k requests do not produce a globally equivalent answer.
 
-| Resource                          | Bound                                                         | Enforcement                                                                                                                                                                                                                                                                                                                              |
-| --------------------------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Named flat aggregations           | 8; each name 1–128 UTF-8 bytes, unique                        | Facade and native validation before collection.                                                                                                                                                                                                                                                                                          |
-| Terms size / explicit range count | 1–100 each                                                    | String terms or numeric ranges only. Native terms `segment_size` is ten times requested `size`; counts/top-category membership can be approximate across segments.                                                                                                                                                                       |
-| Returned aggregation buckets      | 1,024 across all aggregations                                 | Native limit; overflow rejects with `E_RESOURCE_LIMIT`. No partial histogram/range response.                                                                                                                                                                                                                                             |
-| Native aggregation structures     | 16 MiB estimated, shared across segment collectors            | Tantivy guard; this is not total process memory and does not account for every decoded key.                                                                                                                                                                                                                                              |
-| Decoded term keys                 | 16 MiB conservative preflight                                 | Sum `min(10 × size, dictionary terms) × (maximum key bytes + 128)` per segment and terms request. Uses 65,530 bytes initially, measured maxima on deadline-bound fallback; checked before collector construction.                                                                                                                        |
-| Retained metadata sort keys       | 64 MiB conservative preflight                                 | Native fixed top-k buffers bounded by actual executor concurrency, plus sum `min(offset + limit, live segment documents) × (ID bound + 128 + value bound)`. Initially uses 4,096-byte IDs and 65,530-byte strings or eight-byte numbers; deadline-bound fallback measures string maxima. Existing 10,000-window and prefix limits apply. |
-| Serialized search response        | Existing 8 MiB, including aggregates                          | Reject with `E_RESULT_TOO_LARGE`; reduce returned hit page or terms size.                                                                                                                                                                                                                                                                |
-| Numeric arithmetic                | Finite input/output; representable histogram bucket positions | Invalid intervals/ranges reject with `E_INVALID_ARGUMENT`; arithmetic/capacity overflow rejects with `E_RESOURCE_LIMIT`.                                                                                                                                                                                                                 |
+| Resource                           | Bound                                                   | Enforcement                                                                                                                                                                                                                                                     |
+| ---------------------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sort fields / aggregation siblings | Encoded request budget; no small fixed count cap        | Sort keys must be distinct. Aggregation names are 1–128 UTF-8 bytes and unique among siblings.                                                                                                                                                                  |
+| Aggregation depth                  | 32 levels                                               | Independent facade, wire, validation, collector and result walkers reject deeper trees.                                                                                                                                                                         |
+| Terms size / explicit range count  | Positive u32 size; nonempty ranges within request bytes | Checked tenfold native candidate oversampling; terms remain approximate across segments. Large requested sizes can succeed on low-cardinality fields.                                                                                                           |
+| Returned aggregation buckets       | 1,024 across the entire tree                            | Native global bucket guard; overflow rejects with `E_RESOURCE_LIMIT`. No partial histogram/range response.                                                                                                                                                      |
+| Collector construction             | 16 MiB conservative admission estimate                  | Charges request nodes, range setup and segment count before constructing collectors. Stats nodes are charged even though they return no buckets.                                                                                                                |
+| Native aggregation structures      | 16 MiB estimated, shared across segment collectors      | Tantivy guard; not total process memory and not every decoded key.                                                                                                                                                                                              |
+| Decoded term keys                  | 16 MiB conservative preflight                           | Per-segment candidates are bounded by oversampling, dictionary size and observed values. Descendants multiply by possible parent instances; each candidate charges maximum key bytes plus overhead. Dictionary scans refine maximum lengths under the deadline. |
+| Retained metadata sort keys        | 64 MiB conservative preflight                           | Charges every requested key, vector storage, native top-k buffers, IDs and global decoded keys across segments. Existing 10,000-window and prefix limits apply.                                                                                                 |
+| Request / response                 | Existing 8 MiB each                                     | Input normalization charges bytes incrementally; result encoding charges all descendants. Minimum output and construction cost are checked before collection. Oversized output rejects with `E_RESULT_TOO_LARGE`.                                               |
+| Numeric arithmetic                 | Finite input/output; representable histogram positions  | Invalid intervals/ranges reject with `E_INVALID_ARGUMENT`; arithmetic/capacity overflow rejects with `E_RESOURCE_LIMIT`.                                                                                                                                        |
 
 The metadata collector checks the original request deadline before setup, at segment boundaries,
 every 1,024 visited matches, and around final merge. Native scorer setup, individual dictionary

@@ -694,7 +694,7 @@ impl Engine {
 		});
 		let catalog = catalog_fields
 			.as_deref()
-			.map(|fields| catalog::validate_requests(request.sort.as_ref(), &request.aggregations, fields))
+			.map(|fields| catalog::validate_requests(request.sort.as_deref(), &request.aggregations, fields))
 			.transpose()?;
 		check_deadline(deadline)?;
 		let snapshot = if request.traversal {
@@ -735,7 +735,7 @@ impl Engine {
 			let more = scored_docs.len() > request.limit;
 			scored_docs.truncate(request.limit);
 			let hits = search_hits(searcher, scored_docs)?;
-			let bytes = search_response_bytes(&hits, 14 + 4 + snapshot.len() + 1)?;
+			let bytes = search_response_bytes(&hits, 17 + 4 + snapshot.len() + 1)?;
 			if bytes > MAX_SEARCH_RESPONSE_BYTES {
 				return Err(FulltextError::new(
 					"E_RESULT_TOO_LARGE",
@@ -774,7 +774,7 @@ impl Engine {
 			} else {
 				Some(catalog::encode_results(&aggregations)?)
 			};
-			let aggregate_bytes = encoded_aggregations.as_ref().map_or(1, Vec::len);
+			let aggregate_bytes = encoded_aggregations.as_ref().map_or(4, Vec::len);
 			if search_response_bytes(&hits, 13)?.saturating_add(aggregate_bytes) > MAX_SEARCH_RESPONSE_BYTES {
 				return Err(FulltextError::new(
 					"E_RESULT_TOO_LARGE",
@@ -909,7 +909,7 @@ impl Engine {
 			Some(catalog::encode_results(&aggregations)?)
 		};
 		let response_bytes =
-			search_response_bytes(&hits, 13)?.saturating_add(encoded_aggregations.as_ref().map_or(1, Vec::len));
+			search_response_bytes(&hits, 13)?.saturating_add(encoded_aggregations.as_ref().map_or(4, Vec::len));
 		check_deadline(deadline)?;
 		if response_bytes > MAX_SEARCH_RESPONSE_BYTES {
 			return Err(FulltextError::new(
@@ -5496,6 +5496,7 @@ mod tests {
 		let request = SearchRequest {
 			sort: None,
 			aggregations: vec![catalog::AggregationRequest {
+				aggregations: Vec::new(),
 				name: "prices".into(),
 				field: "price".into(),
 				kind: catalog::AggregationKind::Stats,

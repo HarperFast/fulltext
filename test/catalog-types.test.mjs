@@ -21,6 +21,9 @@ const search = {
 	],
 	filter: { operator: 'not', clause: { field: 'brand', comparator: 'missing' } },
 } satisfies SearchRequest;
+const multiple = { sort: [search.sort, { field: 'brand', direction: 'desc', missing: 'first' }], aggregations: [{name:'brands',field:'brand',type:'terms',size:200,aggregations:[{name:'price',field:'price',type:'stats'}]}] } satisfies SearchRequest;
+// @ts-expect-error Metrics cannot own child aggregations.
+const metricChildren = { aggregations: [{name:'price',field:'price',type:'stats',aggregations:[]}] } satisfies SearchRequest;
 const page = { text: 'trail shoes', continuation: 'token', filter: { field: 'brand', comparator: 'exists' } } satisfies SearchPageRequest;
 const filter = { operator: 'not', clause: { operator: 'and', clauses: [
 	{ field: 'brand', comparator: 'exists' },

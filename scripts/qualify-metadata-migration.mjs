@@ -250,8 +250,8 @@ if (values.action) {
 		const oldRuntime = execute(values['old-module'], 'runtime');
 		const runtime = execute(values.module, 'runtime');
 		assert(
-			oldRuntime.queryApiVersion < runtime.queryApiVersion,
-			'The old facade/addon must precede the metadata query API',
+			oldRuntime.queryApiVersion < 5 && runtime.queryApiVersion >= 6,
+			'Use a released pre-metadata facade/addon and the expanded metadata build (query API 6+)',
 		);
 		const numeric = configuration('numeric-boolean', false);
 		execute(values['old-module'], 'write', numeric);

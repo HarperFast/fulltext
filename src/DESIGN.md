@@ -102,7 +102,7 @@ Observed: Rust and public Node tests pass locally on macOS arm64, 2026-10-28.
 
 `Engine::search_inner` validates catalog requests once before building the query on the supplied
 reader snapshot. Only `validate_requests` constructs `ValidatedCatalog`; its private fields and
-collection methods preserve that validation boundary. Sorting and flat aggregation reuse the query;
+collection methods preserve that validation boundary. Sorting and recursive aggregation reuse the query;
 aggregation never runs over the returned hit page. Numeric and string sorts share `collect_sorted`,
 which composes native collectors rather than sorting wrapper-owned results.
 `native-metadata.test.mjs` pins filtered/candidate counts, retained-reader behavior, and every string
@@ -167,3 +167,11 @@ Tantivy operations and query construction remain uninterruptible.
 - [Facade and token identity](../ts/native.ts)
 - [Public API tests](../test/native-traversal.test.mjs)
 - [Pinned Tantivy version](../Cargo.toml)
+
+Multi-field sorting composes native per-field sort-key computers into a runtime list as the head
+of Tantivy's native ID/score tuple. Lazy threshold comparison avoids allocating rejected keys;
+TopDocs still owns collection and merging. One-field requests retain the typed path. Bucket
+aggregation children map directly to native `sub_aggregation` trees. Resource admission accounts
+for collector construction and possible parent instances before collection; independent depth
+checks protect each recursive wire/API walker. Packed protocol 7, ABI 11 and query API 6 change
+in lockstep; this expansion does not change persisted identity v8.

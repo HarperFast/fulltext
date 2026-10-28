@@ -134,11 +134,13 @@ fn metadata_collector_qualification() {
 			"terms_stats",
 			vec![
 				AggregationRequest {
+					aggregations: Vec::new(),
 					name: "brands".into(),
 					field: "brand".into(),
 					kind: AggregationKind::Terms { size: 32 },
 				},
 				AggregationRequest {
+					aggregations: Vec::new(),
 					name: "prices".into(),
 					field: "price".into(),
 					kind: AggregationKind::Stats,
@@ -148,6 +150,7 @@ fn metadata_collector_qualification() {
 		(
 			"safe_histogram",
 			vec![AggregationRequest {
+				aggregations: Vec::new(),
 				name: "prices".into(),
 				field: "price".into(),
 				kind: AggregationKind::Histogram { interval: 10.0 },
@@ -156,6 +159,7 @@ fn metadata_collector_qualification() {
 		(
 			"unsafe_histogram_unmatched_outlier",
 			vec![AggregationRequest {
+				aggregations: Vec::new(),
 				name: "prices".into(),
 				field: "unsafePrice".into(),
 				kind: AggregationKind::Histogram { interval: 10.0 },
@@ -305,16 +309,19 @@ fn metadata_collector_qualification() {
 	});
 	let requests = vec![
 		AggregationRequest {
+			aggregations: Vec::new(),
 			name: "stats".into(),
 			field: "multivalue".into(),
 			kind: AggregationKind::Stats,
 		},
 		AggregationRequest {
+			aggregations: Vec::new(),
 			name: "histogram".into(),
 			field: "multivalue".into(),
 			kind: AggregationKind::Histogram { interval: 10.0 },
 		},
 		AggregationRequest {
+			aggregations: Vec::new(),
 			name: "brands".into(),
 			field: "brand".into(),
 			kind: AggregationKind::Terms { size: 32 },
@@ -400,6 +407,7 @@ fn dictionary_cache_concurrency_qualification() {
 		field_type: FilterFieldType::String,
 	}];
 	let requests = vec![AggregationRequest {
+		aggregations: Vec::new(),
 		name: "brands".into(),
 		field: "brand".into(),
 		kind: AggregationKind::Terms { size: 10 },

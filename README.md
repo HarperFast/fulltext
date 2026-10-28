@@ -372,13 +372,20 @@ const result = await index.search({
 console.log(result.hits, result.aggregations);
 ```
 
-Sorting selects the globally correct window before pagination. It accepts one numeric or string
-metadata field, explicit `asc`/`desc` direction, and explicit `first`/`last` missing placement.
-For arrays it selects the caller's first value, rather than a minimum or maximum. Ties use raw
-UTF-8 ID ascending, independently of score; returned scores keep their original relevance value.
-Sorted searches return exact totals, even without `exactTotal: true`. Omitting `sort` preserves the
-existing relevance order and total-relation behavior. Boolean sorting and metadata-derived score
-adjustments are not supported in this increment.
+Sorting selects the globally correct window before pagination. Pass one sort object or an ordered,
+nonempty array of numeric/string sort objects. Each field has its own `asc`/`desc` direction and
+`first`/`last` missing placement; duplicate fields reject. For arrays it selects the caller's first
+value, rather than a minimum or maximum. Keys compare in request order, then raw UTF-8 ID ascending;
+returned scores keep their original relevance value. Sorted searches return exact totals, even
+without `exactTotal: true`. Omitting `sort` preserves relevance ordering. Boolean sorting and
+metadata-derived score adjustments are not supported.
+
+```js
+sort: [
+	{ field: 'brand', direction: 'asc', missing: 'last' },
+	{ field: 'price', direction: 'desc', missing: 'first' },
+];
+```
 
 Hits and all aggregations use the same query, candidate IDs, filters, and reader snapshot.
 Aggregations cover the full matching set, independently of `offset` and `limit`. Results are a
@@ -392,13 +399,32 @@ named array in request order. Missing metadata contributes no value. Each bucket
 | `histogram` | Number   | Populated interval buckets, numeric key ascending; ranges are `[key, key + interval)`. A document counts once per bucket, and can appear in multiple buckets.                                                                                                                                                                                                                           |
 | `range`     | Number   | Ascending contiguous, non-overlapping `[from, to)` ranges. Only first/last may omit their outside endpoint. Tantivy adds uncovered outer buckets; missing values remain excluded. A document counts once per bucket.                                                                                                                                                                    |
 
-There are at most eight flat aggregations, 100 requested terms or ranges per aggregation, and
-1,024 returned buckets. Native aggregation structures have a 16 MiB guard. Additional conservative
-key budgets account for decoded string keys across segments: large sort windows or many term
-candidates can fail with `E_RESOURCE_LIMIT` before collection. See [metadata resource
-policy](docs/limits.md#metadata-collectors) for formulas. Non-finite aggregate results reject;
-search never returns silently truncated histograms or ranges. Terms expose their explicitly
-approximate candidate-selection policy.
+Bucket requests (`terms`, `histogram`, `range`) accept child `aggregations`. Tantivy collects children
+within each parent bucket; the corresponding result bucket includes its named `aggregations` array.
+Stats are leaves. Names must be unique among siblings; separate branches may reuse names.
+
+```js
+aggregations: [
+	{
+		name: 'brands',
+		type: 'terms',
+		field: 'brand',
+		size: 150,
+		aggregations: [{ name: 'prices', type: 'stats', field: 'price' }],
+	},
+];
+```
+
+There is no fixed limit of eight aggregations or 100 terms/ranges. Requests remain bounded by
+8 MiB of encoded input and 32 aggregation levels. Terms size is a positive u32; native candidate
+oversampling uses checked arithmetic. There are at most 1,024 returned buckets across the entire
+tree, a 16 MiB native aggregation guard, a separate 16 MiB decoded-term-key budget, a 64 MiB
+sort-key budget, and an 8 MiB response budget. Construction costs are checked before opening
+collectors. Nested parent buckets multiply intermediate costs, so a small final result can still
+exceed a budget. Reduce the request shape or terms size after `E_RESOURCE_LIMIT`; splitting global
+top-k requests is not equivalent. See [metadata resource policy](docs/limits.md#metadata-collectors).
+Non-finite aggregate results reject. Search never silently truncates histograms or ranges; terms
+retain Tantivy's explicitly approximate candidate-selection policy.
 
 `sort` and `aggregations` are supported by `search()`, including dedicated readers. `searchPage()`
 rejects both: its score/ID continuation cannot represent a metadata boundary. Use ordinary bounded
@@ -445,7 +471,7 @@ indexes fail closed and rebuild instead of silently changing recall.
 
 ## Upgrading from 0.7.x
 
-The unreleased metadata APIs use query API version 5 and native ABI version 10. Deploy the
+The unreleased metadata APIs use query API version 6 and native ABI version 11. Deploy the
 JavaScript facade and native addon built from the same revision; the published 0.7.0 addon cannot
 serve these requests. Indexes with a string `filterFields` entry need rebuilding because string
 metadata now also uses raw fast fields. Open and inspection report `E_IDENTITY_MISMATCH` for the
@@ -707,7 +733,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 10, query API 5, and packed protocol 6. The loader rejects older addon
+This API uses native ABI 11, query API 6, and packed protocol 7. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
 columns. Previously released string-metadata indexes must

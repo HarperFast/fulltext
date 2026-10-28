@@ -95,13 +95,26 @@ try {
 	);
 	const byBrand = await index.search({
 		text: 'trail',
-		sort: { field: 'brand', direction: 'asc', missing: 'last' },
+		sort: [
+			{ field: 'brand', direction: 'asc', missing: 'last' },
+			{ field: 'price', direction: 'desc', missing: 'last' },
+		],
+		aggregations: [
+			{
+				name: 'brands',
+				field: 'brand',
+				type: 'terms',
+				size: 150,
+				aggregations: [{ name: 'prices', field: 'price', type: 'stats' }],
+			},
+		],
 		limit: 10,
 	});
 	assert.deepStrictEqual(
 		byBrand.hits.map(({ id }) => id),
-		['a', 'c', 'b', 'e', 'd'],
+		['c', 'a', 'b', 'e', 'd'],
 	);
+	assert.strictEqual(byBrand.aggregations[0].buckets.find(({ key }) => key === 'cedar').aggregations[0].sum, 50);
 	console.log(
 		JSON.stringify(
 			{ result, missingBrandIds: missing.hits.map(({ id }) => id), sortedBrandIds: byBrand.hits.map(({ id }) => id) },
