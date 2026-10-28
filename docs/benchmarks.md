@@ -169,6 +169,9 @@ Three alternating optimized macOS arm64 pairs compared the preserved mutex basel
 against a candidate changing only the cache lock to `RwLock`. Eight-caller preflight median p50 was
 **0.172958 ms** for both. Full aggregation changed from **0.739375 ms** to **0.710292 ms** (**−3.93%**).
 One-caller preflight changed from **0.046375 ms** to **0.046959 ms** (**+1.26%**).
+The retained mutex baseline rises **3.73×** from one to eight callers. The comparison does not
+attribute that increase to lock waits, fast-field work, memory contention or scheduling; it rules
+out the proposed lock substitution as a demonstrated fix for this workload.
 
 Retain the mutex: the candidate missed the declared threshold of at least **10%** improvement in
 eight-caller preflight and **2%** in full aggregation. This fixture qualifies warm concurrent access;

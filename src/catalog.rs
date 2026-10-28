@@ -14,7 +14,9 @@ use tantivy::aggregation::{
 	metric::StatsAggregation,
 	AggContextParams, AggregationCollector, AggregationError, AggregationLimitsGuard, Key,
 };
-use tantivy::collector::sort_key::{ComparatorEnum, SortBySimilarityScore, SortByStaticFastValue, SortByString};
+use tantivy::collector::sort_key::{
+	ComparatorEnum, SortBySimilarityScore, SortByStaticFastValue, SortByString, SortKeyComputer,
+};
 use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs};
 use tantivy::{
 	query::{Query, Weight},
@@ -632,16 +634,13 @@ impl ValidatedCatalog<'_> {
 			(SortDirection::Desc, MissingOrder::Last) => ComparatorEnum::Natural,
 		};
 		let name = format!("__fulltext_filter_{index}");
-		let id = || (SortByString::for_field("__fulltext_id"), tantivy::Order::Asc);
 		let histograms = histogram_checks(requests, fields)?;
 		let collected = if config.field_type == FilterFieldType::String {
 			collect_sorted(
 				searcher,
 				query,
-				TopDocs::for_doc_range(0..end).order_by((
-					(SortByString::for_field(name), comparator),
-					(id(), SortBySimilarityScore),
-				)),
+				(SortByString::for_field(name), comparator),
+				end,
 				aggregation_collector,
 				histograms,
 				deadline,
@@ -650,10 +649,8 @@ impl ValidatedCatalog<'_> {
 			collect_sorted(
 				searcher,
 				query,
-				TopDocs::for_doc_range(0..end).order_by((
-					(SortByStaticFastValue::<f64>::for_field(name), comparator),
-					(id(), SortBySimilarityScore),
-				)),
+				(SortByStaticFastValue::<f64>::for_field(name), comparator),
+				end,
 				aggregation_collector,
 				histograms,
 				deadline,
@@ -776,17 +773,22 @@ struct CollectedSortedCatalog {
 	total: usize,
 	aggregations: Option<tantivy::aggregation::agg_result::AggregationResults>,
 }
-fn collect_sorted<K, C>(
+fn collect_sorted<S: SortKeyComputer + Send + 'static>(
 	searcher: &Searcher,
 	query: &dyn Query,
-	collector: C,
+	primary: S,
+	end: usize,
 	aggregations: Option<AggregationCollector>,
 	histograms: Vec<(String, f64)>,
 	deadline: Option<Instant>,
-) -> Result<CollectedSortedCatalog>
-where
-	C: Collector<Fruit = Vec<((K, (Option<String>, Score)), DocAddress)>>,
-{
+) -> Result<CollectedSortedCatalog> {
+	let collector = TopDocs::for_doc_range(0..end).order_by((
+		primary,
+		(
+			(SortByString::for_field("__fulltext_id"), tantivy::Order::Asc),
+			SortBySimilarityScore,
+		),
+	));
 	let (hits, total, aggregations) = searcher
 		.search(
 			query,
