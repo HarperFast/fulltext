@@ -48,7 +48,7 @@ revision is the persisted analysis contract; never rewrite the sidecar to reuse 
 
 ## Writer close ownership
 
-Close must retain the original writer until its indexing and merge threads have joined. In pinned
+Native handle close must retain the original writer until its indexing and merge threads have joined. In pinned
 Tantivy 0.27, `IndexWriter::rollback` replaces the writer; dropping the old writer joins indexing
 workers but does not join its old merges. Waiting on the replacement cannot establish quiescence
 for the original generation. Close therefore consumes the original writer through
@@ -57,6 +57,12 @@ explicit discard authorization for dirty handles. Reopen tests preserve committe
 payloads while discarding pending upserts and deletes; the gated merge regression holds close
 until the original merge can finish. Do not substitute delayed filesystem cleanup for this ownership
 invariant: reset and retirement depend on completed native I/O.
+
+The public Rust `Writer::rollback` remains a direct, reusable-writer Tantivy operation, not a
+quiescence barrier. A Rust caller that explicitly rolls back has already replaced the writer;
+a subsequent close cannot join the earlier merges. Terminal Rust shutdown should consume `close`
+directly. Native handles no longer call that rollback primitive. Tracking a broader Rust rollback
+ownership contract remains separate from this native-handle fix.
 
 ## Request preparation
 

@@ -235,16 +235,49 @@ try {
 	}
 	for (const scenario of cases)
 		for (const parallel of concurrency) {
-			const tail = measurements
-				.filter((entry) => entry.name === scenario.name && entry.concurrency === parallel)
-				.slice(-5)
-				.map((entry) => entry.rssEndBytes);
-			if (tail.length === 5)
-				assert(
-					Math.max(...tail) - Math.min(...tail) <= gates.maxTailRoundRssRangeBytes,
-					`${scenario.name}: last-five-round RSS range gate exceeded`,
-				);
+			const cell = measurements.filter((entry) => entry.name === scenario.name && entry.concurrency === parallel);
+			const tail = cell.slice(-5).map((entry) => entry.rssEndBytes);
+			if (tail.length === 5) {
+				const minimum = Math.min(...tail);
+				const maximum = Math.max(...tail);
+				const range = maximum - minimum;
+				if (range > gates.maxTailRoundRssRangeBytes) {
+					const status = index.status();
+					console.error(
+						JSON.stringify({
+							benchmark: 'metadata-workload',
+							phase: 'tail-rss-gate-failure',
+							name: scenario.name,
+							concurrency: parallel,
+							lastFiveRssEndBytes: tail,
+							latestMinusFirstBytes: tail.at(-1) - tail[0],
+							minimumBytes: minimum,
+							maximumBytes: maximum,
+							rangeBytes: range,
+							thresholdBytes: gates.maxTailRoundRssRangeBytes,
+							postIndexBaseline,
+							lastTenRounds: cell
+								.slice(-10)
+								.map(({ round, rssBeforeBytes, rssEndBytes, sampledPeakRssBytes, heapEndBytes }) => ({
+									round,
+									rssBeforeBytes,
+									rssEndBytes,
+									sampledPeakRssBytes,
+									heapEndBytes,
+								})),
+							status: {
+								state: status.state,
+								searchQueuedCommands: String(status.searchQueuedCommands),
+								searchQueuedBytes: String(status.searchQueuedBytes),
+								commitOpstamp: String(status.commitOpstamp),
+							},
+						}),
+					);
+				}
+				assert(range <= gates.maxTailRoundRssRangeBytes, `${scenario.name}: last-five-round RSS range gate exceeded`);
+			}
 		}
+
 	if (documents > 1024)
 		await expectPressure(
 			'high-cardinality-histogram',

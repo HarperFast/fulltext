@@ -2343,6 +2343,9 @@ impl Writer {
 		Ok(opstamp)
 	}
 
+	/// Discard pending mutations while keeping this writer usable. Tantivy replaces the writer
+	/// without joining prior merges. For terminal shutdown, call `close` directly instead;
+	/// closing a replacement cannot join the earlier writer's merges.
 	pub fn rollback(&mut self) -> Result<u64> {
 		self.inner.rollback().map_err(index_error)
 	}

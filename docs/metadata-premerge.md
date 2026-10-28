@@ -1,6 +1,6 @@
 # Metadata premerge acceptance
 
-Status: draft — acceptance targets planned; no results claimed. Owner: Harper Engineering · Last reviewed: 2026-10-28.
+Status: draft — consumer, lifecycle and Harper Table checks verified locally; workload acceptance pending. Owner: Harper Engineering · Last reviewed: 2026-10-28.
 
 Merge qualification covers the public metadata contract, a representative local synthetic workload,
 and a local Harper Table source-journal reconstruction exercise. It does not qualify a production
@@ -8,15 +8,16 @@ service, deployed fulltext adapter, distributed replication, or a production lat
 
 ## Acceptance matrix
 
-| Area                 | Required behavior                                                                                                                                              | Evidence / status                                    |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| Consumer sorting     | Use the first supplied array value; honor per-field missing placement and ordered keys; resolve equal keys by raw UTF-8 ID.                                    | Untested in this acceptance run.                     |
-| Nested results       | Collect children within the matching parent bucket; preserve named request order; omit empty child arrays.                                                     | Untested in this acceptance run.                     |
-| Resource rejection   | Return a stable resource error, return no partial results, and allow a valid request afterward.                                                                | Untested in this acceptance run.                     |
-| Pagination           | Reject metadata sort/aggregation requests through `searchPage`; use bounded offset pagination.                                                                 | Untested in this acceptance run.                     |
-| Terms accuracy       | Expose approximate candidate-selection diagnostics; exact document totals do not make top terms an exact census.                                               | Contract acceptance; not a billing/census guarantee. |
-| Workload correctness | Compare metadata results with fixture-derived expected values at every tested caller width; normal requests have zero errors; timed failures recover.          | Untested; targets below.                             |
-| Local source handoff | Rebuild from actual Harper Table records, catch up the source journal, verify checkpoint-aligned cutover, and reconstruct rollback from retained source state. | Untested; local harness under construction.          |
+| Area                 | Required behavior                                                                                                                                              | Evidence / status                                                                              |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Consumer sorting     | Use the first supplied array value; honor per-field missing placement and ordered keys; resolve equal keys by raw UTF-8 ID.                                    | Verified locally: public/native regressions and Harper consumer harness.                       |
+| Nested results       | Collect children within the matching parent bucket; preserve named request order; omit the `aggregations` property when no children were requested.            | Verified locally: public/native regressions and Harper consumer harness.                       |
+| Resource rejection   | Return a stable resource error, return no partial results, and allow a valid request afterward.                                                                | Verified locally: public/native regressions and Harper consumer harness.                       |
+| Pagination           | Reject metadata sort/aggregation requests through `searchPage`; use bounded offset pagination.                                                                 | Verified locally: public/native regressions and Harper consumer harness.                       |
+| Terms accuracy       | Expose approximate candidate-selection diagnostics; exact document totals do not make top terms an exact census.                                               | Contract acceptance; not a billing/census guarantee.                                           |
+| Timeout recovery     | Real 1 ms budgets may expire cooperatively; full-budget requests afterward return exact totals and drain queues.                                               | Verified: final count-load run; details below.                                                 |
+| Workload correctness | Compare metadata results with fixture-derived expected values at every tested caller width; normal requests have zero errors; timed failures recover.          | Untested; targets below.                                                                       |
+| Local source handoff | Rebuild from actual Harper Table records, catch up the source journal, verify checkpoint-aligned cutover, and reconstruct rollback from retained source state. | Verified locally: checkpoints 7, 10 and 11, child-process reopen and old-build reconstruction. |
 
 ## Planned workload gates
 
@@ -40,6 +41,64 @@ These gates trigger investigation of this fixture. They are not product performa
 Record workload sizes, caller widths, timings, sampling method, and deviations alongside results;
 do not label a failed gate as passed because another workload was faster.
 
+## Reproduce from source checkouts
+
+These drivers are source-checkout tools, not installed-package files. Build the new fulltext
+checkout with `npm run build`; build the previous fulltext and Harper checkouts separately.
+Each module path must select its matching facade and addon. Use an existing isolated scratch parent.
+
+```sh
+FULLTEXT_PREFER_LOCAL_BUILD=1 node scripts/qualify-harper-metadata.mjs --harper-root /built/harper --module /new/dist/native.js --old-module /old/dist/native.js --scratch-dir /existing/scratch
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/metadata-workload.mjs --module /new/dist/native.js --scratch /existing/scratch --documents 50000 --queries 60 --rounds 10 --concurrency 1,4,8 --features flat
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/metadata-workload.mjs --module /new/dist/native.js --scratch /existing/scratch --documents 50000 --queries 60 --concurrency 1,4,8 --features expanded --duration 30
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/metadata-count-load.mjs --module /new/dist/native.js --scratch /existing/scratch --documents 100000 --queries 60 --concurrency 1,4,8 --budget-ms 1
+```
+
+Run flat mode three times per revision in alternating process order, using the same driver with
+[the pre-expansion baseline](https://github.com/HarperFast/fulltext/commit/f808c58) and current
+module paths. Compare the same case/caller-width cells. Expanded mode runs 12 cells for at least
+30 seconds each, approximately six minutes plus setup and pressure checks.
+
+## Workload acceptance still pending
+
+One current-build flat run failed the unchanged 32 MiB last-five-round RSS-span gate. The failure
+must remain part of acceptance evidence. A diagnostic rerun passed with the same gates; that
+rerun does not explain or erase the failure. Historical samples sufficient to determine whether
+the original span came from growth or a decrease were not retained. The expanded six-minute run
+and investigation of this flag remain pending. No memory acceptance is claimed yet.
+
+## Verified consumer and lifecycle evidence
+
+Observed on 2026-10-28: the final full gate passed 124 Rust tests (five ignored), 416 Node tests
+across four groups, and nine optimized expensive-lane tests. These runs cover first-value sorting,
+missing placement, UTF-8 ties, nested aggregation scope, omitted child properties, resource rejection
+and recovery. This is local macOS arm64 evidence, not platform-wide qualification.
+
+The exercise exposed a close-quiescence defect: rollback replaced the original native writer
+before its merge work was joined. The [close fix](https://github.com/HarperFast/fulltext/commit/33399a6)
+joins the original writer, discards unpublished changes and preserves the published checkpoint.
+A deterministic blocked-merge regression failed before the fix and passed afterward; it also passes
+in the full gate. This verifies the close invariant rather than relying on cleanup retries.
+
+The installed previous 0.7.0 facade/addon migration check passed: numeric/Boolean reuse and reverse
+writes, unchanged-file rejection for incompatible strings, new-generation rebuild, and old-build
+rollback reconstruction. See the [migration contract](metadata-migration.md) for the rebuild boundary.
+
+## Verified timeout recovery
+
+Observed final-addon count-load run: 100,000 documents, 60 requests per case/caller-width cell,
+and 1/4/8 callers. All 360 normal requests returned exact results. With a 1 ms budget, 180 AND
+requests succeeded and 180 filtered dense-OR requests returned `E_TIMEOUT`. All 12 measured cells
+then passed full-budget recovery with exact totals and zero queued commands/bytes. The largest
+reported timeout p99 was approximately 2.088 ms: the budget is cooperative, not a hard wall-clock
+limit. This public run does not identify whether expiry occurred in queueing, hits or Count;
+the deterministic native interruption regression covers active collection.
+
+The native handle-close regression verifies quiescence on that lifecycle path. Direct Rust
+`Writer::rollback` remains a pre-existing native primitive without that quiescence contract;
+direct Rust callers should close the original writer when they require safe resource shutdown.
+This distinction is not an outstanding JavaScript handle-close failure.
+
 ## Local source-journal procedure
 
 1. Write the authoritative fixture through actual built Harper Table CRUD and record its source
@@ -50,16 +109,29 @@ do not label a failed gate as passed because another workload was faster.
 5. Reconstruct the rollback generation from retained authoritative records/journal and verify it before
    switching back. Preserve enough source history to make this reconstruction possible.
 
-The local harness uses child-process reopen, journal catch-up, cutover, and rollback. It does not
-exercise HTTP, distributed replication, or a production fulltext adapter. It must disclose whether
-mutations overlap reconstruction and exactly which checkpoint
-boundary it verifies. Stop qualification if a source change is missing, a checkpoint advances before
-its mutations are indexed, or a reopened generation disagrees with source records.
+Observed local harness result: actual built Harper 5.2.5 at
+[the recorded source revision](https://github.com/HarperFast/harper/commit/9f469c079a0624a27ff66165078b98e9a4e1ec35)
+seeded seven records at checkpoint 7. Three source mutations were interleaved sequentially between
+snapshot indexing chunks; replay reached the quiesced source checkpoint 10 before publication and
+cutover. A separate child reopened source and derived reader and verified checkpoint and results.
+Resumed ingestion advanced to checkpoint 11 and passed another reopen. Reset with the new build
+followed by old-build reconstruction reopened all seven latest records at checkpoint 11. The
+retired old artifact remained present through successful new publication.
+
+The harness verifies source-tenant candidate restriction before aggregate collection, ordered
+first-value/missing/UTF-8 sorting, parent-scoped numeric children, resource errors and same-handle
+recovery. Its Table, Resource and database entry files have recorded combined SHA-256 digest
+`5276a08ec97347b40d8a895e6f9d170050edac2d5bf516e8144e9ac6acd95b50`.
+This fingerprints those loaded entry files, not the entire Harper build.
+
+These are sequential local journal interleavings, not a concurrent external writer, HTTP workload,
+distributed replication, or production fulltext adapter. Stop qualification if a source change is
+missing, a checkpoint advances before its mutations are indexed, or a reopened generation disagrees
+with source records.
 
 ## Open items
 
-- Run and review the consumer, workload, and Harper Table harnesses; replace planned rows only with
-  verified outcomes and their artifacts.
+- Complete the quiet paired workload rerun and expanded six-minute observation. Earlier timings overlapping compilation are excluded from acceptance.
 - Qualify a consuming application's adapter, retention policy, downtime tolerance, distributed
   catch-up, and production cutover/rollback separately. No existing main/core/pro fulltext adapter
   is assumed by this local exercise.
@@ -69,6 +141,10 @@ its mutations are indexed, or a reopened generation disagrees with source record
 
 ## Sources
 
+- [Executable Harper Table qualification](../scripts/qualify-harper-metadata.mjs).
+- [Public count-load timeout driver](../benchmarks/metadata-count-load.mjs).
+- [Synthetic workload driver](../benchmarks/metadata-workload.mjs).
+- [Native close lifecycle and regression](../src/engine.rs).
 - [Public metadata contract](../README.md#native-metadata-sorting-and-aggregations).
 - [Resource policy](limits.md#metadata-collectors).
 - [Index migration procedure and prior local qualification](metadata-migration.md).
