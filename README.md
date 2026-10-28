@@ -461,7 +461,7 @@ existing identity when the rest of the configuration is unchanged.
    needed. See the [reset/rebuild example](examples/reset-rebuild.mjs) and [lifecycle details](#lifecycle-and-recovery).
 
 Before downgrading, retire a rebuilt string-metadata index with the new build's reset API, then
-rebuild with the older package. Do not force compatibility by changing identity files.
+rebuild with the older package. Do not force compatibility by changing identity files. See the [tested metadata rebuild procedure](docs/metadata-migration.md) for the full sequence and a real previous-version qualification.
 
 ## Upgrading from 0.6.x
 

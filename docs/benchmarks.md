@@ -236,3 +236,87 @@ For a controlled same-query comparison of ordinary and traversal first-page over
 `npm run build && node scripts/run-local.mjs benchmarks/traversal-driver.mjs`. It alternates
 60 calls per method after warmup on one retained snapshot, with identical exact totals and
 page size. This manual benchmark has no timing assertion or CI performance threshold.
+
+## Concurrent exact-count and cold-start qualification
+
+Build optimized artifacts first. Run both revisions through the same count driver in alternating
+process order; `--module` must select each revision's matching facade and addon:
+
+```sh
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/metadata-count-load.mjs --module /path/to/checkout/dist/native.js --scratch /path/to/scratch --documents 100000 --queries 120 --concurrency 1,4,8 --revision candidate
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/metadata-cold-start.mjs --scratch /path/to/scratch --documents 65536 --rounds 3 --concurrency 1,4,8
+```
+
+The count driver asserts exact totals and distinct scores at the ranked page boundary. Its filtered
+dense OR bypasses the stable-score-tie shortcut. It measures normal requests and 1 ms budgets,
+then requires full-budget recovery and zero retained queue commands/bytes. Timeouts can occur in
+queueing or hit collection before Count; this public experiment does not isolate Count cancellation.
+The direct native cancellation regression remains the proof for interruption inside Count.
+
+The cold-start driver writes eight indexes with 65,536 unique strings each. Every measured cohort
+runs in a fresh child process, with either one shared index or independent indexes. Sixteen
+candidate IDs keep matching work small; requesting 100 terms forces the dictionary-key admission
+scan despite the selective query. Each cohort runs a first wave, a recovery wave, then 20 warm waves.
+A separate fresh process exercises a 1 ms first-wave budget and subsequent recovery. CPU covers
+Node and native threads; sampled RSS includes the reader/process baseline and is not an allocation
+or leak measurement. The dictionary maximum cache is cold; filesystem caches are uncontrolled and
+likely warm. This does not measure disk-cold startup.
+
+### Observed exact-count load results
+
+Three alternating optimized macOS arm64 process pairs compared the
+[previous implementation](https://github.com/HarperFast/fulltext/commit/0b5608778b2d80ed2a8dfbea79565d509837e7ff)
+with the [qualified runtime](https://github.com/HarperFast/fulltext/commit/a471b58c90b2daf5247745449dc975f155694b21)
+on 2026-10-28: 100,000 documents, two native search threads and 120 requests per cell.
+The table shows medians of three per-run statistics; p99 has few tail observations.
+This compares the whole branch, not the Count stage in isolation.
+
+| Workload / callers    | p50 base → current ms | p95 base → current ms | p99 base → current ms | Success/s base → current |
+| --------------------- | --------------------- | --------------------- | --------------------- | ------------------------ |
+| AND / 1               | 0.070 → 0.072         | 0.112 → 0.107         | 0.262 → 0.122         | 12,058 → 12,792          |
+| AND / 4               | 0.187 → 0.203         | 0.214 → 0.213         | 0.308 → 0.221         | 20,319 → 19,514          |
+| AND / 8               | 0.365 → 0.395         | 0.404 → 0.422         | 0.420 → 0.451         | 21,331 → 19,575          |
+| Filtered dense OR / 1 | 2.110 → 2.080         | 2.274 → 2.137         | 2.454 → 2.422         | 470 → 477                |
+| Filtered dense OR / 4 | 8.282 → 8.263         | 8.460 → 8.535         | 8.528 → 8.594         | 482 → 482                |
+| Filtered dense OR / 8 | 16.560 → 16.813       | 16.681 → 17.311       | 16.720 → 17.460       | 483 → 474                |
+
+Per version, all 2,160 normal requests and 1,080 budgeted AND requests returned exact results;
+1,080 budgeted OR requests returned `E_TIMEOUT`. Each cell then recovered at full caller width
+with exact totals and zero queued commands/bytes. At eight callers, CPU per normal 120-request cell
+changed from 9.5 to 9.4 ms for AND, and 253.8 to 260.2 ms for OR. Median peak RSS across runs was
+about 2 MiB higher on the branch; current peaks ranged from 274.4 to 275.6 MiB across normal cells.
+Sampled RSS and short runs cannot establish long-term memory stability.
+
+Decision: retain cooperative Count. At eight callers the AND throughput fell 8.2% and p99 rose
+7.3%; OR throughput fell 1.7% and p99 rose 4.4%. These local differences do not justify changing
+cancellation or adding a new collector mechanism. A consuming application with a tighter CPU or
+latency budget must rerun its own workload before adopting. Production concurrency, sustained
+runs, and other platforms remain open qualification work, not guarantees from this experiment.
+
+### Observed cold-start results
+
+Three optimized macOS arm64 rounds on 2026-10-28 used the
+[qualified runtime](https://github.com/HarperFast/fulltext/commit/a471b58c90b2daf5247745449dc975f155694b21).
+Cold percentiles pool only three waves (3–24 observations per row); warm rows pool 60 waves.
+They are local observations, not production latency guarantees.
+
+| Callers | Indexes     | Cold p50 / p95 ms | Warm p50 / p95 ms | Cold median CPU ms per wave | Highest cold RSS MiB |
+| ------- | ----------- | ----------------- | ----------------- | --------------------------- | -------------------- |
+| 1       | Shared      | 1.649 / 3.714     | 0.413 / 0.485     | 1.889                       | 58.6                 |
+| 1       | Independent | 1.549 / 1.643     | 0.414 / 0.493     | 1.798                       | 58.5                 |
+| 4       | Shared      | 1.542 / 1.873     | 0.939 / 1.354     | 3.734                       | 58.7                 |
+| 4       | Independent | 1.512 / 2.116     | 0.509 / 0.648     | 6.402                       | 67.0                 |
+| 8       | Shared      | 2.059 / 3.114     | 1.501 / 2.547     | 6.101                       | 59.3                 |
+| 8       | Independent | 1.481 / 1.996     | 0.531 / 0.624     | 11.739                      | 74.1                 |
+
+Every full-budget cold/recovery/warm request returned the expected exact total of 16 and 16 one-document
+buckets. Of 78 requests with 1 ms budgets, 62 timed out; successful requests had exact results.
+The largest timeout response was 1.692 ms; the largest subsequent recovery latency was 2.710 ms.
+All cohorts ended with zero queued commands/bytes. These observations do not identify duplicate
+scans or attribute CPU scaling to the mutex; native admission also limits shared-index concurrency.
+
+Decision: retain the existing cache and admission behavior. The measured cold cost is visible but
+provides no evidence that scan coordination would improve the release materially. Revisit with a
+reproducing workload if first-search latency, CPU, or recovery violates a consuming application's
+budget. Linux/Windows, larger dictionaries/segment counts, disk-cold startup and sustained memory
+behavior remain unqualified; see [Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
