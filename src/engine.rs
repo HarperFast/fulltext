@@ -692,9 +692,10 @@ impl Engine {
 				})
 				.collect::<Vec<_>>()
 		});
-		if let Some(fields) = &catalog_fields {
-			catalog::validate_requests(request.sort.as_ref(), &request.aggregations, fields)?;
-		}
+		let catalog = catalog_fields
+			.as_deref()
+			.map(|fields| catalog::validate_requests(request.sort.as_ref(), &request.aggregations, fields))
+			.transpose()?;
 		check_deadline(deadline)?;
 		let snapshot = if request.traversal {
 			let snapshot = search_snapshot(searcher.generation().segments());
@@ -710,14 +711,14 @@ impl Engine {
 		};
 		let query = self.query(searcher, request)?;
 		check_deadline(deadline)?;
-		self.collect_search(searcher, request, deadline, catalog_fields, snapshot, query)
+		self.collect_search(searcher, request, deadline, catalog, snapshot, query)
 	}
 	fn collect_search(
 		&self,
 		searcher: &Searcher,
 		request: &SearchRequest,
 		deadline: Option<Instant>,
-		catalog_fields: Option<Vec<crate::protocol::FilterFieldConfig>>,
+		catalog: Option<catalog::ValidatedCatalog<'_>>,
 		snapshot: Option<String>,
 		query: BuiltQuery,
 	) -> Result<SearchResult> {
@@ -752,22 +753,18 @@ impl Engine {
 			});
 		}
 
-		if let Some(sort) = &request.sort {
-			let fields = catalog_fields.as_ref().unwrap();
+		if request.sort.is_some() {
+			let catalog =
+				catalog.ok_or_else(|| FulltextError::native("Validated catalog missing for sorted search"))?;
 			let catalog::SortedCatalogResult {
 				hits: scored_docs,
 				total,
 				aggregations,
-			} = catalog::sorted_catalog(
+			} = catalog.sorted_catalog(
 				searcher,
 				query.query.as_ref(),
-				catalog::SortedCatalogRequest {
-					sort,
-					aggregations: &request.aggregations,
-					offset: request.offset,
-					limit: request.limit,
-				},
-				fields,
+				request.offset,
+				request.limit,
 				self.index.tokenizers().clone(),
 				deadline,
 			)?;
@@ -862,13 +859,11 @@ impl Engine {
 			};
 			(hits, total, relation, collected_total)
 		};
-		let (aggregation_total, aggregations) = if let Some(fields) = &catalog_fields {
+		let (aggregation_total, aggregations) = if let Some(catalog) = catalog {
 			if request.exact_total && collected_total.is_none() && bounded_total_relation != TotalRelation::Exact {
-				let (total, results) = catalog::aggregate_count(
+				let (total, results) = catalog.aggregate_count(
 					searcher,
 					query.query.as_ref(),
-					&request.aggregations,
-					fields,
 					self.index.tokenizers().clone(),
 					deadline,
 				)?;
@@ -876,11 +871,9 @@ impl Engine {
 			} else {
 				(
 					None,
-					catalog::aggregate(
+					catalog.aggregate(
 						searcher,
 						query.query.as_ref(),
-						&request.aggregations,
-						fields,
 						self.index.tokenizers().clone(),
 						deadline,
 					)?,
@@ -5446,7 +5439,7 @@ mod tests {
 				&searcher,
 				&request,
 				None,
-				Some(config.identity.filter_fields.clone()),
+				Some(catalog::validate_requests(None, &request.aggregations, &config.identity.filter_fields).unwrap()),
 				None,
 				query,
 			)

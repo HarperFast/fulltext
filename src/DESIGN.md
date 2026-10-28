@@ -1,7 +1,7 @@
 # Native search collection
 
 Status: verified against Tantivy 0.27.0 source and local macOS arm64 tests · Owner: Harper
-Engineering · Last verified: 2026-10-27
+Engineering · Last verified: 2026-10-28
 
 `TraversalScoreTieCollector` owns its scorer loop so it can return `E_TIMEOUT` between document
 batches. Keep the ordinary `StableScoreTieCollector` independent: traversal-only boundary and
@@ -98,11 +98,17 @@ encoding; Rust does not need to normalize candidates again.
 
 ## Metadata collectors
 
-Observed: Rust and public Node tests pass locally on macOS arm64, 2026-10-27.
+Observed: Rust and public Node tests pass locally on macOS arm64, 2026-10-28.
 
-`Engine::search_inner` builds the query on the supplied reader snapshot. Sorting and flat
-aggregation reuse that query; aggregation never runs over the returned hit page.
-`native-metadata.test.mjs` pins filtered/candidate counts and retained-reader behavior.
+`Engine::search_inner` validates catalog requests once before building the query on the supplied
+reader snapshot. Only `validate_requests` constructs `ValidatedCatalog`; its private fields and
+collection methods preserve that validation boundary. Sorting and flat aggregation reuse the query;
+aggregation never runs over the returned hit page. Numeric and string sorts share `collect_sorted`,
+which composes native collectors rather than sorting wrapper-owned results.
+`native-metadata.test.mjs` pins filtered/candidate counts, retained-reader behavior, and every string
+sort direction/missing-order combination. Its sort-key memory regression checks native
+`E_RESOURCE_LIMIT` rejection with 1,199 short values and one 60 KB value, then verifies smaller
+sorted windows and ordinary searches still succeed.
 
 Only string metadata gains a fast column. The writer removes repeated strings per document
 as a storage optimization, preserving first occurrence. Native terms aggregation independently
@@ -120,7 +126,10 @@ or dictionary cardinality; a deadline-bound streaming scan can qualify actual ma
 the supported-length estimate fails. Completed maxima use a 1,024-entry FIFO cache keyed by
 immutable segment ID and field. Merges create new segment IDs; deletes leave a conservative
 dictionary maximum, so neither invalidates a cached bound. A completed scan is cached before
-the final timeout check; interrupted scans never populate the cache. Sorting retains the ID contract first,
+the final timeout check; interrupted scans never populate the cache. Scans run outside the cache
+mutex. A warm-cache qualification compares the mutex with an experimental reader/writer lock across
+eight indexes and up to eight callers; the measured gain missed the declared replacement threshold,
+so the mutex remains. Concurrent cold-miss amplification remains unqualified. Sorting retains the ID contract first,
 measuring IDs only when necessary. If that segment-wide estimate still fails, a deadline-aware
 native Count pass supplies a global matching count that bounds total retained hits across
 segments; the fallback combines it with maximum measured key lengths for the sort budget. Native Searcher and

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 import {
+	FulltextError,
 	openNativeFullTextIndex,
 	openNativeFullTextReader,
 	inspectNativeFullTextIndex,
@@ -87,6 +88,8 @@ test('metadata sorting is global, deterministic, preserves scores, and selects f
 		[sort('price', 'desc', 'first'), ['e', 'f', 'c', 'b', 'a', 'd']],
 		[sort('brand'), ['d', 'b', 'a', 'c', 'e', 'f']],
 		[sort('brand', 'desc'), ['c', 'a', 'b', 'd', 'e', 'f']],
+		[sort('brand', 'asc', 'first'), ['e', 'f', 'd', 'b', 'a', 'c']],
+		[sort('brand', 'desc', 'first'), ['e', 'f', 'c', 'a', 'b', 'd']],
 	]) {
 		const result = await index.search({ text: 'shoe', sort: key, limit: 10 });
 		assert.deepStrictEqual(ids(result), expected);
@@ -309,6 +312,42 @@ test('catalog errors are explicit and leave the handle usable', async (context) 
 		{ code: 'E_RESOURCE_LIMIT' },
 	);
 	assert.strictEqual((await index.search({ text: 'shoe', exactTotal: true })).total, 6);
+});
+
+test('sort key memory rejection preserves smaller sorted windows and ordinary searches', async (context) => {
+	const options = config(context, [{ name: 'brand', type: 'string' }]);
+	const index = await openNativeFullTextIndex(options);
+	context.after(() => index.close({ mode: 'rollback' }));
+	const count = 1200;
+	const padding = 'x'.repeat(60_000);
+	for (let offset = 0; offset < count; offset += 100) {
+		await index.applyMutationBatch({
+			upserts: Array.from({ length: 100 }, (_, position) => {
+				const id = String(offset + position).padStart(4, '0');
+				return {
+					id,
+					fields: { title: 'shoe' },
+					filters: { brand: offset + position === count - 1 ? `${id}${padding}` : id },
+				};
+			}),
+		});
+	}
+	await index.commit();
+	await index.reload();
+	await assert.rejects(index.search({ text: 'shoe', sort: sort('brand'), limit: count }), (error) => {
+		assert(error instanceof FulltextError);
+		assert.strictEqual(error.code, 'E_RESOURCE_LIMIT');
+		assert.strictEqual(error.message, 'Retained keys exceed materialization memory budget');
+		return true;
+	});
+	const smaller = await index.search({ text: 'shoe', sort: sort('brand'), limit: 3 });
+	assert.deepStrictEqual(ids(smaller), ['0000', '0001', '0002']);
+	assert.strictEqual(smaller.total, count);
+	assert.strictEqual(smaller.totalRelation, 'exact');
+	const ordinary = await index.search({ text: 'shoe', limit: 3, exactTotal: true });
+	assert.strictEqual(ordinary.hits.length, 3);
+	assert.strictEqual(ordinary.total, count);
+	assert.strictEqual(ordinary.totalRelation, 'exact');
 });
 
 test('raw packed catalog requests use the same native contract', async (context) => {

@@ -152,10 +152,34 @@ baselines; only metadata cases require API 5. Three alternating pairs observed m
 of **+6.3%** for ordinary exact totals and
 **+1.1%** with the Boolean filter. These small local samples provide no production latency bound.
 
+### Concurrent dictionary-cache qualification
+
+```bash
+cargo test --release --all-features dictionary_cache_concurrency_qualification -- --ignored --nocapture
+```
+
+The fixture creates eight real in-memory indexes with 40 segments of 128 documents each and one
+string field. It asserts that all 320 dictionary maxima are cached before measurement. At one,
+four and eight concurrent callers, five samples per process report per-request p50/p95 and median
+wall time for warm dictionary preflight and full `aggregate_count` requests. Full requests assert
+native counts and terms results.
+
+Three alternating optimized macOS arm64 pairs compared the preserved mutex baseline
+[03df642](https://github.com/HarperFast/fulltext/commit/03df642d0d05fe71c2dbc5715ada8d40e14ada40), with this qualification added,
+against a candidate changing only the cache lock to `RwLock`. Eight-caller preflight median p50 was
+**0.172958 ms** for both. Full aggregation changed from **0.739375 ms** to **0.710292 ms** (**−3.93%**).
+One-caller preflight changed from **0.046375 ms** to **0.046959 ms** (**+1.26%**).
+
+Retain the mutex: the candidate missed the declared threshold of at least **10%** improvement in
+eight-caller preflight and **2%** in full aggregation. This fixture qualifies warm concurrent access;
+it neither establishes absence of contention nor predicts production or cross-platform performance.
+
 Dictionary results are cached only after a complete scan. Concurrent cold misses may duplicate
 that bounded-memory scan: avoiding an in-flight lock keeps one request's deadline from blocking
-another. These measurements cover collector CPU work and result comparison, not peak RSS,
-production storage, concurrent cold-miss amplification or end-to-end application latency.
+another. The cache retains at most 1,024 entries in FIFO order, publishes only complete scans, and performs
+scanning outside its guard. The qualifications cover collector CPU work, result comparison and
+warm concurrent cache access, not peak RSS, production storage, concurrent cold-miss amplification
+or end-to-end application latency.
 
 ## Traversal
 

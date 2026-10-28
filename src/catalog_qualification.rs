@@ -233,7 +233,6 @@ fn metadata_collector_qualification() {
 			count.to_string()
 		});
 	}
-	// Keep scalar measurements above separate from the deletion/multivalue cases below.
 	let mut writer = index
 		.writer_with_num_threads::<tantivy::schema::TantivyDocument>(1, 50_000_000)
 		.unwrap();
@@ -386,5 +385,117 @@ fn metadata_collector_qualification() {
 			}
 			format!("{results:?}")
 		});
+	}
+}
+
+#[test]
+#[ignore = "concurrent multi-index metadata cache qualification"]
+fn dictionary_cache_concurrency_qualification() {
+	use std::sync::Barrier;
+	const INDEXES: usize = 8;
+	const SEGMENTS_PER_INDEX: usize = 40;
+	const ROWS_PER_SEGMENT: usize = 128;
+	let fields = vec![FilterFieldConfig {
+		name: "brand".into(),
+		field_type: FilterFieldType::String,
+	}];
+	let requests = vec![AggregationRequest {
+		name: "brands".into(),
+		field: "brand".into(),
+		kind: AggregationKind::Terms { size: 10 },
+	}];
+	let searchers = (0..INDEXES)
+		.map(|_| {
+			let mut schema = Schema::builder();
+			let brand = schema.add_text_field("__fulltext_filter_0", STRING | FAST);
+			let index = Index::create_in_ram(schema.build());
+			let mut writer = index.writer_with_num_threads(1, 20_000_000).unwrap();
+			writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+			for _ in 0..SEGMENTS_PER_INDEX {
+				for row in 0..ROWS_PER_SEGMENT {
+					writer.add_document(doc!(brand => format!("brand-{row:04}"))).unwrap();
+				}
+				writer.commit().unwrap();
+			}
+			writer.wait_merging_threads().unwrap();
+			let searcher = index.reader().unwrap().searcher();
+			assert_eq!(searcher.segment_readers().len(), SEGMENTS_PER_INDEX);
+			check_terms_budget(&searcher, &requests, &fields, None).unwrap();
+			searcher
+		})
+		.collect::<Vec<_>>();
+	{
+		let cache = dictionary_cache().lock().unwrap();
+		for searcher in &searchers {
+			for segment in searcher.segment_readers() {
+				let field = segment.schema().get_field("__fulltext_filter_0").unwrap();
+				assert_eq!(cache.maxima.get(&(segment.segment_id(), field)), Some(&10));
+			}
+		}
+		println!(
+			"{{\"qualification\":\"dictionary_cache_warmup\",\"entries\":{},\"expectedEntries\":{}}}",
+			cache.maxima.len(),
+			INDEXES * SEGMENTS_PER_INDEX
+		);
+	}
+	for workers in [1, 4, 8] {
+		for preflight_only in [true, false] {
+			let iterations = if preflight_only { 2000 } else { 100 };
+			let mut latencies = Vec::new();
+			let mut walls = Vec::new();
+			for _ in 0..5 {
+				let barrier = Barrier::new(workers);
+				let start = Instant::now();
+				let samples = std::thread::scope(|scope| {
+					let handles = searchers
+						.iter()
+						.take(workers)
+						.map(|searcher| {
+							let barrier = &barrier;
+							let requests = &requests;
+							let fields = &fields;
+							scope.spawn(move || {
+								let mut samples = Vec::with_capacity(iterations);
+								barrier.wait();
+								for _ in 0..iterations {
+									let start = Instant::now();
+									let deadline = Some(start + Duration::from_secs(30));
+									if preflight_only {
+										check_terms_budget(searcher, requests, fields, deadline).unwrap();
+									} else {
+										let (count, results) = aggregate_count(
+											searcher,
+											&tantivy::query::AllQuery,
+											requests,
+											fields,
+											TokenizerManager::default(),
+											deadline,
+										)
+										.unwrap();
+										assert_eq!(count, (SEGMENTS_PER_INDEX * ROWS_PER_SEGMENT) as u64);
+										let AggregationValue::Terms { buckets, .. } = &results[0].value else {
+											panic!("expected terms")
+										};
+										assert_eq!(buckets.len(), 10);
+										assert!(buckets.iter().all(|bucket| bucket.count == SEGMENTS_PER_INDEX as u64));
+									}
+									samples.push(start.elapsed().as_secs_f64() * 1000.0);
+								}
+								samples
+							})
+						})
+						.collect::<Vec<_>>();
+					handles
+						.into_iter()
+						.flat_map(|handle| handle.join().unwrap())
+						.collect::<Vec<_>>()
+				});
+				walls.push(start.elapsed().as_secs_f64() * 1000.0);
+				latencies.extend(samples);
+			}
+			latencies.sort_by(f64::total_cmp);
+			walls.sort_by(f64::total_cmp);
+			println!("{{\"qualification\":\"dictionary_cache_concurrency\",\"preflightOnly\":{preflight_only},\"indexes\":{workers},\"segmentsPerIndex\":{SEGMENTS_PER_INDEX},\"iterationsPerWorker\":{iterations},\"samples\":{},\"p50Ms\":{:.6},\"p95Ms\":{:.6},\"medianWallMs\":{:.3}}}", latencies.len(), latencies[latencies.len()/2], latencies[latencies.len()*95/100], walls[2]);
+		}
 	}
 }

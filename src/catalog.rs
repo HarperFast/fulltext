@@ -110,11 +110,17 @@ fn field<'a>(name: &str, fields: &'a [FilterFieldConfig]) -> Result<(usize, &'a 
 		.find(|(_, f)| f.name == name)
 		.ok_or_else(|| FulltextError::invalid(format!("Unknown filter field: {name}")))
 }
-pub(crate) fn validate_requests(
-	sort: Option<&SortRequest>,
-	aggs: &[AggregationRequest],
-	fields: &[FilterFieldConfig],
-) -> Result<()> {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ValidatedCatalog<'a> {
+	sort: Option<&'a SortRequest>,
+	requests: &'a [AggregationRequest],
+	fields: &'a [FilterFieldConfig],
+}
+pub(crate) fn validate_requests<'a>(
+	sort: Option<&'a SortRequest>,
+	aggs: &'a [AggregationRequest],
+	fields: &'a [FilterFieldConfig],
+) -> Result<ValidatedCatalog<'a>> {
 	if let Some(sort) = sort {
 		if field(&sort.field, fields)?.1.field_type == FilterFieldType::Boolean {
 			return Err(FulltextError::invalid("Sorting requires a string or number field"));
@@ -171,7 +177,11 @@ pub(crate) fn validate_requests(
 			}
 		}
 	}
-	Ok(())
+	Ok(ValidatedCatalog {
+		sort,
+		requests: aggs,
+		fields,
+	})
 }
 fn native_error(error: TantivyError) -> FulltextError {
 	match &error {
@@ -548,6 +558,7 @@ fn check_terms_budget(
 	}
 	Ok(())
 }
+#[cfg(test)]
 pub(crate) struct SortedCatalogRequest<'a> {
 	pub sort: &'a SortRequest,
 	pub aggregations: &'a [AggregationRequest],
@@ -584,6 +595,143 @@ pub(crate) fn sorted_hits(
 	)?
 	.hits)
 }
+impl ValidatedCatalog<'_> {
+	pub(crate) fn sorted_catalog(
+		&self,
+		searcher: &Searcher,
+		query: &dyn Query,
+		offset: usize,
+		limit: usize,
+		tokenizers: TokenizerManager,
+		deadline: Option<Instant>,
+	) -> Result<SortedCatalogResult> {
+		let sort = self
+			.sort
+			.ok_or_else(|| FulltextError::invalid("Sorted collection requires a sort request"))?;
+		let requests = self.requests;
+		let fields = self.fields;
+		check_deadline(deadline).map_err(native_error)?;
+		let (index, config) = field(&sort.field, fields)?;
+		let end = offset
+			.checked_add(limit)
+			.ok_or_else(|| resource("Sort window overflow"))?
+			.min(searcher.num_docs().max(1) as usize);
+		check_sort_budget(
+			searcher,
+			query,
+			end,
+			index,
+			config.field_type == FilterFieldType::String,
+			deadline,
+		)?;
+		let aggregation_collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
+		let comparator = match (&sort.direction, &sort.missing) {
+			(SortDirection::Asc, MissingOrder::First) => ComparatorEnum::Reverse,
+			(SortDirection::Asc, MissingOrder::Last) => ComparatorEnum::ReverseNoneLower,
+			(SortDirection::Desc, MissingOrder::First) => ComparatorEnum::NaturalNoneHigher,
+			(SortDirection::Desc, MissingOrder::Last) => ComparatorEnum::Natural,
+		};
+		let name = format!("__fulltext_filter_{index}");
+		let id = || (SortByString::for_field("__fulltext_id"), tantivy::Order::Asc);
+		let histograms = histogram_checks(requests, fields)?;
+		let collected = if config.field_type == FilterFieldType::String {
+			collect_sorted(
+				searcher,
+				query,
+				TopDocs::for_doc_range(0..end).order_by((
+					(SortByString::for_field(name), comparator),
+					(id(), SortBySimilarityScore),
+				)),
+				aggregation_collector,
+				histograms,
+				deadline,
+			)?
+		} else {
+			collect_sorted(
+				searcher,
+				query,
+				TopDocs::for_doc_range(0..end).order_by((
+					(SortByStaticFastValue::<f64>::for_field(name), comparator),
+					(id(), SortBySimilarityScore),
+				)),
+				aggregation_collector,
+				histograms,
+				deadline,
+			)?
+		};
+		let CollectedSortedCatalog {
+			hits,
+			total: count,
+			aggregations,
+		} = collected;
+
+		let hits = hits
+			.into_iter()
+			.map(|(id, score, doc)| {
+				let id = id
+					.filter(|id| !id.is_empty() && id.len() <= crate::protocol::MAX_RECORD_ID_BYTES)
+					.ok_or_else(|| FulltextError::new("E_INDEX_CORRUPT", "Sort hit has missing or invalid ID"))?;
+				Ok(((score, id), doc))
+			})
+			.collect::<Result<Vec<_>>>()?;
+		Ok(SortedCatalogResult {
+			hits: hits.into_iter().skip(offset).collect(),
+			total: count as u64,
+			aggregations: finish_aggregations(aggregations, requests, deadline)?,
+		})
+	}
+	pub(crate) fn aggregate_count(
+		&self,
+		searcher: &Searcher,
+		query: &dyn Query,
+		tokenizers: TokenizerManager,
+		deadline: Option<Instant>,
+	) -> Result<(u64, Vec<AggregationResult>)> {
+		let requests = self.requests;
+		let fields = self.fields;
+		check_deadline(deadline).map_err(native_error)?;
+		let collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
+		let (count, aggregations) = searcher
+			.search(
+				query,
+				&DeadlineCollector {
+					inner: (Count, collector),
+					deadline,
+					histograms: histogram_checks(requests, fields)?,
+				},
+			)
+			.map_err(native_error)?;
+		Ok((count as u64, finish_aggregations(aggregations, requests, deadline)?))
+	}
+	pub(crate) fn aggregate(
+		&self,
+		searcher: &Searcher,
+		query: &dyn Query,
+		tokenizers: TokenizerManager,
+		deadline: Option<Instant>,
+	) -> Result<Vec<AggregationResult>> {
+		let requests = self.requests;
+		let fields = self.fields;
+		check_deadline(deadline).map_err(native_error)?;
+		if requests.is_empty() {
+			return Ok(Vec::new());
+		}
+		let collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
+		let results = searcher
+			.search(
+				query,
+				&DeadlineCollector {
+					inner: collector,
+					histograms: histogram_checks(requests, fields)?,
+					deadline,
+				},
+			)
+			.map_err(native_error)?;
+		finish_aggregations(results, requests, deadline)
+	}
+}
+
+#[cfg(test)]
 pub(crate) fn sorted_catalog(
 	searcher: &Searcher,
 	query: &dyn Query,
@@ -592,94 +740,16 @@ pub(crate) fn sorted_catalog(
 	tokenizers: TokenizerManager,
 	deadline: Option<Instant>,
 ) -> Result<SortedCatalogResult> {
-	let SortedCatalogRequest {
-		sort,
-		aggregations: requests,
-		offset,
-		limit,
-	} = request;
-	validate_requests(Some(sort), requests, fields)?;
-	check_deadline(deadline).map_err(native_error)?;
-
-	let (index, config) = field(&sort.field, fields)?;
-	let end = offset
-		.checked_add(limit)
-		.ok_or_else(|| resource("Sort window overflow"))?
-		.min(searcher.num_docs().max(1) as usize);
-	check_sort_budget(
+	validate_requests(Some(request.sort), request.aggregations, fields)?.sorted_catalog(
 		searcher,
 		query,
-		end,
-		index,
-		config.field_type == FilterFieldType::String,
+		request.offset,
+		request.limit,
+		tokenizers,
 		deadline,
-	)?;
-	let aggregation_collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
-	let comparator = match (&sort.direction, &sort.missing) {
-		(SortDirection::Asc, MissingOrder::First) => ComparatorEnum::Reverse,
-		(SortDirection::Asc, MissingOrder::Last) => ComparatorEnum::ReverseNoneLower,
-		(SortDirection::Desc, MissingOrder::First) => ComparatorEnum::NaturalNoneHigher,
-		(SortDirection::Desc, MissingOrder::Last) => ComparatorEnum::Natural,
-	};
-	let name = format!("__fulltext_filter_{index}");
-	let id = || (SortByString::for_field("__fulltext_id"), tantivy::Order::Asc);
-	let (hits, count, aggregations) = if config.field_type == FilterFieldType::String {
-		let collector = TopDocs::for_doc_range(0..end).order_by((
-			(SortByString::for_field(name), comparator),
-			(id(), SortBySimilarityScore),
-		));
-		let (hits, count, aggregations) = searcher
-			.search(
-				query,
-				&DeadlineCollector {
-					inner: (collector, Count, aggregation_collector),
-					histograms: histogram_checks(requests, fields)?,
-					deadline,
-				},
-			)
-			.map_err(native_error)?;
-		let hits = hits
-			.into_iter()
-			.map(|((_, (id, score)), doc)| (id, score, doc))
-			.collect::<Vec<_>>();
-		(hits, count, aggregations)
-	} else {
-		let collector = TopDocs::for_doc_range(0..end).order_by((
-			(SortByStaticFastValue::<f64>::for_field(name), comparator),
-			(id(), SortBySimilarityScore),
-		));
-		let (hits, count, aggregations) = searcher
-			.search(
-				query,
-				&DeadlineCollector {
-					inner: (collector, Count, aggregation_collector),
-					histograms: histogram_checks(requests, fields)?,
-					deadline,
-				},
-			)
-			.map_err(native_error)?;
-		let hits = hits
-			.into_iter()
-			.map(|((_, (id, score)), doc)| (id, score, doc))
-			.collect::<Vec<_>>();
-		(hits, count, aggregations)
-	};
-
-	let hits = hits
-		.into_iter()
-		.map(|(id, score, doc)| {
-			let id = id
-				.filter(|id| !id.is_empty() && id.len() <= crate::protocol::MAX_RECORD_ID_BYTES)
-				.ok_or_else(|| FulltextError::new("E_INDEX_CORRUPT", "Sort hit has missing or invalid ID"))?;
-			Ok(((score, id), doc))
-		})
-		.collect::<Result<Vec<_>>>()?;
-	Ok(SortedCatalogResult {
-		hits: hits.into_iter().skip(offset).collect(),
-		total: count as u64,
-		aggregations: finish_aggregations(aggregations, requests, deadline)?,
-	})
+	)
 }
+#[cfg(test)]
 pub(crate) fn aggregate_count(
 	searcher: &Searcher,
 	query: &dyn Query,
@@ -688,21 +758,9 @@ pub(crate) fn aggregate_count(
 	tokenizers: TokenizerManager,
 	deadline: Option<Instant>,
 ) -> Result<(u64, Vec<AggregationResult>)> {
-	validate_requests(None, requests, fields)?;
-	check_deadline(deadline).map_err(native_error)?;
-	let collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
-	let (count, aggregations) = searcher
-		.search(
-			query,
-			&DeadlineCollector {
-				inner: (Count, collector),
-				deadline,
-				histograms: histogram_checks(requests, fields)?,
-			},
-		)
-		.map_err(native_error)?;
-	Ok((count as u64, finish_aggregations(aggregations, requests, deadline)?))
+	validate_requests(None, requests, fields)?.aggregate_count(searcher, query, tokenizers, deadline)
 }
+#[cfg(test)]
 pub(crate) fn aggregate(
 	searcher: &Searcher,
 	query: &dyn Query,
@@ -711,24 +769,44 @@ pub(crate) fn aggregate(
 	tokenizers: TokenizerManager,
 	deadline: Option<Instant>,
 ) -> Result<Vec<AggregationResult>> {
-	validate_requests(None, requests, fields)?;
-	check_deadline(deadline).map_err(native_error)?;
-	if requests.is_empty() {
-		return Ok(Vec::new());
-	}
-	let collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
-	let results = searcher
+	validate_requests(None, requests, fields)?.aggregate(searcher, query, tokenizers, deadline)
+}
+struct CollectedSortedCatalog {
+	hits: Vec<(Option<String>, Score, DocAddress)>,
+	total: usize,
+	aggregations: Option<tantivy::aggregation::agg_result::AggregationResults>,
+}
+fn collect_sorted<K, C>(
+	searcher: &Searcher,
+	query: &dyn Query,
+	collector: C,
+	aggregations: Option<AggregationCollector>,
+	histograms: Vec<(String, f64)>,
+	deadline: Option<Instant>,
+) -> Result<CollectedSortedCatalog>
+where
+	C: Collector<Fruit = Vec<((K, (Option<String>, Score)), DocAddress)>>,
+{
+	let (hits, total, aggregations) = searcher
 		.search(
 			query,
 			&DeadlineCollector {
-				inner: collector,
-				histograms: histogram_checks(requests, fields)?,
+				inner: (collector, Count, aggregations),
+				histograms,
 				deadline,
 			},
 		)
 		.map_err(native_error)?;
-	finish_aggregations(results, requests, deadline)
+	Ok(CollectedSortedCatalog {
+		hits: hits
+			.into_iter()
+			.map(|((_, (id, score)), doc)| (id, score, doc))
+			.collect(),
+		total,
+		aggregations,
+	})
 }
+
 fn histogram_checks(requests: &[AggregationRequest], fields: &[FilterFieldConfig]) -> Result<Vec<(String, f64)>> {
 	let mut seen = HashSet::new();
 	let mut checks = Vec::new();
@@ -1112,6 +1190,18 @@ mod tests {
 		assert_eq!(
 			ids(&index, "category", SortDirection::Asc, MissingOrder::Last, 0, 10),
 			["a", "c", "d", "b", "missing"]
+		);
+		assert_eq!(
+			ids(&index, "category", SortDirection::Asc, MissingOrder::First, 0, 10),
+			["missing", "a", "c", "d", "b"]
+		);
+		assert_eq!(
+			ids(&index, "category", SortDirection::Desc, MissingOrder::First, 0, 10),
+			["missing", "b", "d", "a", "c"]
+		);
+		assert_eq!(
+			ids(&index, "category", SortDirection::Desc, MissingOrder::Last, 0, 10),
+			["b", "d", "a", "c", "missing"]
 		);
 	}
 	#[test]
