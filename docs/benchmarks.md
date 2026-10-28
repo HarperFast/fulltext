@@ -361,3 +361,11 @@ These timings include collector construction, scoring, Count, deadline checks an
 exclude index creation, admission and the JavaScript/native boundary. They are collector-path
 samples, not public API latency, a production service guarantee or cross-platform qualification.
 Larger key lists and sustained concurrent loads remain unqualified.
+
+## Public synthetic catalog acceptance
+
+See the [premerge qualification](metadata-premerge.md) for the public-addon workload driver,
+predeclared latency/throughput/RSS gates, three alternating baseline/current pairs and a
+six-minute expanded workload observation. The guide retains an unexplained earlier RSS-span
+flag alongside all subsequent passing diagnostic and acceptance runs. These are local synthetic
+observations, not production performance objectives.

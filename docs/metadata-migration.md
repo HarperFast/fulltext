@@ -1,7 +1,7 @@
 # Metadata index migration
 
 Status: draft release; Kyle approved the API/migration direction on 2026-10-28. Local procedure
-qualification passed; application-specific cutover remains untested.
+qualification passed, including a controlled local Harper Table catch-up/cutover rehearsal. Production cutover remains untested.
 
 The branch is unreleased. Its manifests still use the previous package version. Before publishing,
 release preparation must choose a new version and align the root package, Cargo package and exact
@@ -108,12 +108,22 @@ reverse numeric writes, nonmutating string rejection, rebuild/publication/reopen
 reconstruction all passed again. Multi-field sorting and nested aggregations add no stored-schema
 change beyond the string fast-column migration described here.
 
+## Additional premerge qualification
+
+The installed published 0.7.0 facade and optional macOS arm64 native package also passed
+numeric compatibility, reverse writes, nonmutating string rejection, rebuild/publication/reopen
+and downgrade reconstruction on 2026-10-28. The consumer lockfile recorded registry tarball
+integrities; this does not qualify every platform package.
+
+The [premerge qualification](metadata-premerge.md) additionally exercised actual built Harper
+Table/Resource writes, a durable harness-owned source journal, controlled interleaving during
+snapshot rebuild, checkpoint catch-up, publication/reopen and old-build rollback. This local
+rehearsal does not establish distributed replication or production adapter behavior.
+
 ## Open items
 
-- Application-specific cutover, checkpoint catch-up, and rollback qualification.
-- The installed optional-platform-package loading route is supported by the script but was not run;
-  the recorded executions used the compiled previous-base wrapper/addon pair, not an installed
-  published 0.7.0 package. Published-version error-code differences remain unqualified.
+- Production-specific concurrent cutover, checkpoint catch-up and rollback qualification.
+- Cross-platform installed package qualification and release version alignment.
 
 ## Sources
 

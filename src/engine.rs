@@ -5634,6 +5634,8 @@ mod tests {
 		struct MergeGateDirectory {
 			inner: RamDirectory,
 			gate: Arc<MergeGate>,
+			index_gate: Option<Arc<MergeGate>>,
+			fail_index_write: Arc<AtomicBool>,
 		}
 		impl Directory for MergeGateDirectory {
 			fn get_file_handle(&self, path: &Path) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
@@ -5646,11 +5648,21 @@ mod tests {
 				self.inner.exists(path)
 			}
 			fn open_write(&self, path: &Path) -> std::result::Result<WritePtr, OpenWriteError> {
-				if std::thread::current()
-					.name()
-					.is_some_and(|name| name.starts_with("merge_thread"))
-				{
+				let current = std::thread::current();
+				let name = current.name().unwrap_or("");
+				if name.starts_with("merge_thread") {
 					self.gate.block();
+				}
+				if name.starts_with("thrd-tantivy-index") {
+					if let Some(gate) = &self.index_gate {
+						gate.block();
+					}
+					if self.fail_index_write.swap(false, Ordering::AcqRel) {
+						return Err(OpenWriteError::wrap_io_error(
+							io::Error::other("injected indexing write failure during close"),
+							path.to_path_buf(),
+						));
+					}
 				}
 				self.inner.open_write(path)
 			}
@@ -5677,6 +5689,8 @@ mod tests {
 			let directory = MergeGateDirectory {
 				inner: RamDirectory::create(),
 				gate: gate.clone(),
+				index_gate: None,
+				fail_index_write: Arc::new(AtomicBool::new(false)),
 			};
 			let config = config();
 			let engine = Engine::open(directory.clone(), &config).unwrap();
@@ -5712,11 +5726,15 @@ mod tests {
 				.unwrap();
 			let (finished, completion) = mpsc::channel();
 			let (started, start) = mpsc::channel();
+			let close_gate = gate.clone();
 			let closer = std::thread::spawn(move || {
 				let mut writer = Some(writer);
 				started.send(()).unwrap();
 				let result = crate::native::finish_writer_close(&mut writer, false);
-				finished.send((result.quiesced, result.error)).unwrap();
+				let released_at_return = close_gate.state.lock().unwrap().released;
+				finished
+					.send((result.quiesced, result.error, released_at_return))
+					.unwrap();
 			});
 			start.recv_timeout(Duration::from_secs(5)).unwrap();
 			let premature = completion.recv_timeout(Duration::from_millis(250)).ok();
@@ -5728,7 +5746,11 @@ mod tests {
 				"discard close completed while its original native merge was blocked"
 			);
 			assert!(merged.is_ok());
-			let (quiesced, error) = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+			let (quiesced, error, released_at_return) = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+			assert!(
+				released_at_return,
+				"close returned before the native merge gate was released"
+			);
 			assert!(quiesced);
 			assert!(error.is_none());
 			let reopened = Engine::open(directory, &config).unwrap();
@@ -5751,6 +5773,77 @@ mod tests {
 			let mut writer = reopened.writer(&config).unwrap();
 			assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
 			writer.close().unwrap();
+		}
+		#[test]
+		fn discard_close_reports_unproven_quiescence_on_native_pending_write_failure() {
+			let index_gate = Arc::new(MergeGate::default());
+			let _release = ReleaseGate(index_gate.clone());
+			let failure = Arc::new(AtomicBool::new(false));
+			let directory = MergeGateDirectory {
+				inner: RamDirectory::create(),
+				gate: Arc::new(MergeGate::default()),
+				index_gate: Some(index_gate.clone()),
+				fail_index_write: failure.clone(),
+			};
+			let config = config();
+			let engine = Engine::open(directory.clone(), &config).unwrap();
+			let mut writer = engine.writer(&config).unwrap();
+			writer
+				.inner
+				.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+			writer.apply(batch()).unwrap();
+			writer.commit_with_payload(Some("published")).unwrap();
+			index_gate.arm();
+			writer
+				.apply(MutationBatch {
+					upserts: vec![crate::protocol::Upsert {
+						id: "pending".to_owned(),
+						version: None,
+						fields: vec![("title".to_owned(), vec!["shoe".to_owned()])],
+						filters: Vec::new(),
+					}],
+					deletes: vec!["one".to_owned()],
+				})
+				.unwrap();
+			index_gate.wait_entered();
+			assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("published"));
+			let (started, start) = mpsc::channel();
+			let (finished, completion) = mpsc::channel();
+			let closer = std::thread::spawn(move || {
+				let mut writer = Some(writer);
+				failure.store(true, Ordering::Release);
+				started.send(()).unwrap();
+				let result = crate::native::finish_writer_close(&mut writer, false);
+				finished.send((result.quiesced, result.error)).unwrap();
+			});
+			start.recv_timeout(Duration::from_secs(5)).unwrap();
+			index_gate.release();
+			let (quiesced, error) = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+			closer.join().unwrap();
+			assert!(!quiesced);
+			assert_eq!(error.unwrap().code, "E_NATIVE_FAILURE");
+			assert!(
+				!directory.fail_index_write.load(Ordering::Acquire),
+				"native indexing open_write failure was not exercised"
+			);
+			drop(engine);
+			let reopened = Engine::open(directory, &config).unwrap();
+			let searcher = reopened.reader().unwrap().searcher();
+			assert_eq!(searcher.num_docs(), 2);
+			let count = |id| {
+				searcher
+					.search(
+						&tantivy::query::TermQuery::new(
+							Term::from_field_text(reopened.id_field, id),
+							IndexRecordOption::Basic,
+						),
+						&tantivy::collector::Count,
+					)
+					.unwrap()
+			};
+			assert_eq!(count("one"), 1);
+			assert_eq!(count("pending"), 0);
+			assert_eq!(reopened.committed_payload().unwrap().as_deref(), Some("published"));
 		}
 	}
 }

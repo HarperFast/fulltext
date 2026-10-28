@@ -58,6 +58,14 @@ payloads while discarding pending upserts and deletes; the gated merge regressio
 until the original merge can finish. Do not substitute delayed filesystem cleanup for this ownership
 invariant: reset and retirement depend on completed native I/O.
 
+Joining also drains indexing workers and finalizes pending segments. Discard close therefore pays
+I/O proportional to outstanding work and can leave unpublished files for native garbage collection.
+It needs storage headroom. If finalization fails, Tantivy may return before joining all workers or
+merges; the native outcome must remain unquiesced, producing `E_QUIESCENCE_FAILED` and retaining the
+path reservation until process restart. The indexing-write failure regression pins that conservative
+classification. Avoiding this discard I/O while preserving the original merge join would require
+an upstream native lifecycle hook.
+
 The public Rust `Writer::rollback` remains a direct, reusable-writer Tantivy operation, not a
 quiescence barrier. A Rust caller that explicitly rolls back has already replaced the writer;
 a subsequent close cannot join the earlier merges. Terminal Rust shutdown should consume `close`

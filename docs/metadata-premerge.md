@@ -1,6 +1,6 @@
 # Metadata premerge acceptance
 
-Status: draft — consumer, lifecycle and Harper Table checks verified locally; workload acceptance pending. Owner: Harper Engineering · Last reviewed: 2026-10-28.
+Status: local acceptance runs passed; historical RSS observation remains unexplained and requires review before merge. Owner: Harper Engineering · Last reviewed: 2026-10-28.
 
 Merge qualification covers the public metadata contract, a representative local synthetic workload,
 and a local Harper Table source-journal reconstruction exercise. It does not qualify a production
@@ -16,13 +16,13 @@ service, deployed fulltext adapter, distributed replication, or a production lat
 | Pagination           | Reject metadata sort/aggregation requests through `searchPage`; use bounded offset pagination.                                                                 | Verified locally: public/native regressions and Harper consumer harness.                       |
 | Terms accuracy       | Expose approximate candidate-selection diagnostics; exact document totals do not make top terms an exact census.                                               | Contract acceptance; not a billing/census guarantee.                                           |
 | Timeout recovery     | Real 1 ms budgets may expire cooperatively; full-budget requests afterward return exact totals and drain queues.                                               | Verified: final count-load run; details below.                                                 |
-| Workload correctness | Compare metadata results with fixture-derived expected values at every tested caller width; normal requests have zero errors; timed failures recover.          | Untested; targets below.                                                                       |
+| Workload correctness | Compare metadata results with fixture-derived expected values at every tested caller width; normal requests have zero errors; timed failures recover.          | Verified: final quiet flat pairs and expanded observation passed the declared gates.           |
 | Local source handoff | Rebuild from actual Harper Table records, catch up the source journal, verify checkpoint-aligned cutover, and reconstruct rollback from retained source state. | Verified locally: checkpoints 7, 10 and 11, child-process reopen and old-build reconstruction. |
 
-## Planned workload gates
+## Declared workload gates
 
 Use a synthetic product catalog. Fix the workload and gates before recording results. At every
-case/caller-width cell, the planned local acceptance thresholds are:
+case/caller-width cell, the premeasurement local acceptance thresholds were:
 
 - Zero normal-request errors, exact fixture-derived results, and drained queues.
 - Normal-request p95 at most 250 ms, p99 at most 5,000 ms, and successful throughput at least
@@ -59,17 +59,58 @@ Run flat mode three times per revision in alternating process order, using the s
 module paths. Compare the same case/caller-width cells. Expanded mode runs 12 cells for at least
 30 seconds each, approximately six minutes plus setup and pressure checks.
 
-## Workload acceptance still pending
+## Flat workload acceptance and retained RSS observation
 
-One current-build flat run failed the unchanged 32 MiB last-five-round RSS-span gate. The failure
-must remain part of acceptance evidence. A diagnostic rerun passed with the same gates; that
-rerun does not explain or erase the failure. Historical samples sufficient to determine whether
-the original span came from growth or a decrease were not retained. The expanded six-minute run
-and investigation of this flag remain pending. No memory acceptance is claimed yet.
+Three final quiet alternating pairs compared the same three flat cases at 1/4/8 callers, using
+50,000 records and ten rounds of 60 requests per cell. All nine cells passed the unchanged paired
+thresholds. The table reports medians of three per-process pooled p95s and throughputs as current /
+baseline ratios; absolute gates also passed in these final acceptance runs.
+
+| Case                   | Callers | p95 ratio | Throughput ratio |
+| ---------------------- | ------- | --------- | ---------------- |
+| ordinary-exact         | 1       | 0.983     | 1.009            |
+| ordinary-exact         | 4       | 0.984     | 1.012            |
+| ordinary-exact         | 8       | 0.998     | 1.000            |
+| flat-price-sort        | 1       | 0.950     | 1.053            |
+| flat-price-sort        | 4       | 0.925     | 1.061            |
+| flat-price-sort        | 8       | 0.938     | 1.052            |
+| flat-filter-candidates | 1       | 1.002     | 0.998            |
+| flat-filter-candidates | 4       | 0.999     | 0.997            |
+| flat-filter-candidates | 8       | 1.003     | 0.995            |
+
+An earlier current-build flat run failed the unchanged 32 MiB last-five-round RSS-span gate.
+That observation remains part of acceptance evidence; its growth/decrease direction and cause
+are unknown because sufficient historical samples were not retained. An exact diagnostic rerun,
+ten fresh GC-traced processes and ten fresh untraced processes subsequently passed unchanged
+gates. Across the latter 20 processes, maximum tail span was 0.969 MiB and maximum sampled peak
+RSS growth was 10.984 MiB. This bounded investigation is complete without reproducing or explaining
+the original failure. Passing final runs do not erase it or establish leak absence; review the
+residual observation before merge and retain it in
+[Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
+
+## Verified expanded workload observation
+
+Observed final-addon run: 50,000 synthetic product records, four cases at 1/4/8 callers, each cell
+running at least 30 seconds. All 895,680 normal requests passed the source oracle and absolute
+local gates across 12 cells. The worst pooled p95 was 10.143 ms; maximum sampled RSS growth was
+45.125 MiB above the post-index baseline. The largest last-five-round RSS span was 2.969 MiB,
+below the 32 MiB gate. These sampled short-run results do not establish leak freedom.
+
+| Nested multi-sort case callers | Completed requests | p95 ms | Successes/second |
+| ------------------------------ | ------------------ | ------ | ---------------- |
+| 1                              | 23,520             | 1.304  | 783.4            |
+| 4                              | 23,400             | 5.742  | 779.4            |
+| 8                              | 24,600             | 10.143 | 820.0            |
+
+High-cardinality histogram and long-term-key pressure both returned `E_RESOURCE_LIMIT`. Subsequent
+full-budget requests on the same handles recovered exact totals of 50,000 and 300 respectively,
+with the expected first IDs and drained queues. There is no old-API equivalent for the nested case;
+these observations make no previous-version speedup claim. The unexplained earlier flat RSS
+observation remains recorded above despite passing final acceptance runs.
 
 ## Verified consumer and lifecycle evidence
 
-Observed on 2026-10-28: the final full gate passed 124 Rust tests (five ignored), 416 Node tests
+Observed on 2026-10-28: the final full gate passed 125 Rust tests (five ignored), 416 Node tests
 across four groups, and nine optimized expensive-lane tests. These runs cover first-value sorting,
 missing placement, UTF-8 ties, nested aggregation scope, omitted child properties, resource rejection
 and recovery. This is local macOS arm64 evidence, not platform-wide qualification.
@@ -77,6 +118,9 @@ and recovery. This is local macOS arm64 evidence, not platform-wide qualificatio
 The exercise exposed a close-quiescence defect: rollback replaced the original native writer
 before its merge work was joined. The [close fix](https://github.com/HarperFast/fulltext/commit/33399a6)
 joins the original writer, discards unpublished changes and preserves the published checkpoint.
+Discard may flush unpublished segments while joining, so it requires I/O headroom. A natural
+storage-error regression verifies that an unsuccessful shutdown is not marked quiesced: native
+handle close reports `E_QUIESCENCE_FAILED`, requiring process restart before reset.
 A deterministic blocked-merge regression failed before the fix and passed afterward; it also passes
 in the full gate. This verifies the close invariant rather than relying on cleanup retries.
 
@@ -131,7 +175,8 @@ with source records.
 
 ## Open items
 
-- Complete the quiet paired workload rerun and expanded six-minute observation. Earlier timings overlapping compilation are excluded from acceptance.
+- Review the retained unexplained RSS observation before merge; final acceptance runs passed.
+  Earlier timings overlapping compilation are excluded from acceptance.
 - Qualify a consuming application's adapter, retention policy, downtime tolerance, distributed
   catch-up, and production cutover/rollback separately. No existing main/core/pro fulltext adapter
   is assumed by this local exercise.

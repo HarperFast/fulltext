@@ -630,7 +630,12 @@ publisher between frames. Searches may still run concurrently with either writer
 ## Lifecycle and recovery
 
 `close()` rejects uncommitted data by default. Use `close({ mode: 'rollback' })` to discard it
-explicitly. `commit()` publishes mutations, and `reload()` makes the latest commit visible to this
+explicitly. Discard close joins the original Tantivy writer. It can finish indexing queued mutations
+and write unpublished segment files before discarding them; it does not advance the committed
+checkpoint. Reserve storage headroom and allow shutdown time for that work. A storage failure during
+this flush can prevent a proven join and reject with `E_QUIESCENCE_FAILED`; restart the process before
+resetting or reopening that path. Unpublished files are eligible for later native garbage collection.
+`commit()` publishes mutations, and `reload()` makes the latest commit visible to this
 handle's searches. A reload that cannot align Tantivy's snapshot with its checkpoint after three
 bounded attempts returns `E_RELOAD_FAILED`; callers can retry because the reader remains open.
 The failed attempt leaves the reader on its previous aligned snapshot and checkpoint.
