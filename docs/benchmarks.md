@@ -146,7 +146,10 @@ shortcuts.
 For the public exact-total route, run the paired metadata commands with
 `--distinct-scores --ordinary-only --documents 100000 --queries 300`. The fixture verifies that
 ranked hits do not tie at the filtered window boundary, ensuring the final Count path is used.
-Three alternating pairs observed median p50 changes of **+6.3%** for ordinary exact totals and
+Use the reviewed pre-Count-fix baseline [e7f5a07](https://github.com/HarperFast/fulltext/commit/e7f5a07307cef11c7730213d5c88cde550cbc42d)
+with its matching addon for this comparison. Ordinary filtered queries also run against query API 4
+baselines; only metadata cases require API 5. Three alternating pairs observed median p50 changes
+of **+6.3%** for ordinary exact totals and
 **+1.1%** with the Boolean filter. These small local samples provide no production latency bound.
 
 Dictionary results are cached only after a complete scan. Concurrent cold misses may duplicate
