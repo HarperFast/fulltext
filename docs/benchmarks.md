@@ -135,6 +135,20 @@ numeric fields. Independent assertions check live counts, value-based statistics
 bucket deduplication. Five alternating pairs observed deadline/native ratios of **0.94–0.99×**
 for these additional cases; small apparent improvements are local timing noise, not a speedup claim.
 
+The qualification also compares bare native `Count` with the cooperative count used by ordinary
+exact-total searches. In a one-million-document fixture, dense AND counting added approximately
+**11%** and dense OR **37%**. A single-term native count uses a constant-time shortcut; the
+cooperative version enumerates blocks (about **0.13 ms** in this run). These count-only costs are
+not represented by the aggregation tuple comparisons above. Native count remains in use when no
+deadline is supplied; with a deadline, bounded interruption is chosen over uninterruptible count
+shortcuts.
+
+For the public exact-total route, run the paired metadata commands with
+`--distinct-scores --ordinary-only --documents 100000 --queries 300`. The fixture verifies that
+ranked hits do not tie at the filtered window boundary, ensuring the final Count path is used.
+Three alternating pairs observed median p50 changes of **+6.3%** for ordinary exact totals and
+**+1.1%** with the Boolean filter. These small local samples provide no production latency bound.
+
 Dictionary results are cached only after a complete scan. Concurrent cold misses may duplicate
 that bounded-memory scan: avoiding an in-flight lock keeps one request's deadline from blocking
 another. These measurements cover collector CPU work and result comparison, not peak RSS,

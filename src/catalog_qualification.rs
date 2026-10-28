@@ -204,6 +204,35 @@ fn metadata_collector_qualification() {
 			format!("{results:?}")
 		});
 	}
+	let term = |field, value| {
+		Box::new(TermQuery::new(
+			Term::from_field_text(field, value),
+			IndexRecordOption::WithFreqs,
+		)) as Box<dyn Query>
+	};
+	let dense_and = BooleanQuery::new(vec![
+		(Occur::Must, term(text, "shoe")),
+		(Occur::Must, term(flags, "red")),
+	]);
+	let dense_or = BooleanQuery::new(vec![
+		(Occur::Should, term(flags, "red")),
+		(Occur::Should, term(flags, "blue")),
+	]);
+	for (name, query, expected_count) in [
+		("bare_count_term", &query as &dyn Query, MATCHES),
+		("bare_count_dense_and", &dense_and as &dyn Query, MATCHES / 2),
+		("bare_count_dense_or", &dense_or as &dyn Query, MATCHES),
+	] {
+		paired_case(name, expected_count, |wrapped| {
+			let count = if wrapped {
+				count_matches(&searcher, query, Some(Instant::now() + Duration::from_secs(30))).unwrap() as usize
+			} else {
+				searcher.search(query, &Count).unwrap()
+			};
+			assert_eq!(count, expected_count);
+			count.to_string()
+		});
+	}
 	// Keep scalar measurements above separate from the deletion/multivalue cases below.
 	let mut writer = index
 		.writer_with_num_threads::<tantivy::schema::TantivyDocument>(1, 50_000_000)

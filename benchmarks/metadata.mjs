@@ -6,6 +6,8 @@ import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 
 const smoke = process.argv.includes('--smoke');
+const distinctScores = process.argv.includes('--distinct-scores');
+const ordinaryOnly = process.argv.includes('--ordinary-only');
 const documentCount = integerArgument('--documents', smoke ? 300 : 10_000);
 const queryCount = integerArgument('--queries', smoke ? 10 : 100);
 const modulePath = stringArgument('--module');
@@ -61,6 +63,14 @@ try {
 	];
 	const cases = [
 		{ name: 'ordinary', request: {} },
+		...(distinctScores
+			? [
+					{
+						name: 'ordinary-filtered-count',
+						request: { filter: { field: 'active', comparator: 'equals', value: true } },
+					},
+				]
+			: []),
 		{ name: 'numeric-sort', request: { sort: priceSort } },
 		{ name: 'string-sort', request: { sort: { field: 'brand', direction: 'asc', missing: 'last' } } },
 		...aggregations.map((aggregation) => ({ name: aggregation.type, request: { aggregations: [aggregation] } })),
@@ -69,8 +79,19 @@ try {
 			request: { sort: priceSort, aggregations, filter: { field: 'active', comparator: 'equals', value: true } },
 		},
 	];
+	if (distinctScores) {
+		const boundary = await index.search({
+			text: 'trail shoe',
+			mode: 'all',
+			limit: 11,
+			filter: { field: 'active', comparator: 'equals', value: true },
+		});
+		assert.strictEqual(boundary.hits.length, 11);
+		assert.notStrictEqual(boundary.hits[9].score, boundary.hits[10].score);
+	}
 	const measurements = {};
 	for (const { name, request } of cases) {
+		if (ordinaryOnly && !name.startsWith('ordinary')) continue;
 		if (native.queryApiVersion < 5 && name !== 'ordinary') {
 			measurements[name] = { skipped: `query API ${native.queryApiVersion} does not support metadata collectors` };
 			continue;
@@ -93,6 +114,8 @@ try {
 					documents: documentCount,
 					queriesPerCase: queryCount,
 					stringValues,
+					distinctScores,
+					ordinaryOnly,
 					batchSize: 300,
 					concurrency: 1,
 				},
@@ -121,7 +144,12 @@ try {
 function record(index) {
 	return {
 		id: `product-${String(index).padStart(9, '0')}`,
-		fields: { title: `Trail shoe model ${index % 100}`, description: `Outdoor running equipment ${index % 7}` },
+		fields: {
+			title: distinctScores
+				? `Trail shoe ${'detail '.repeat(index < 32 ? index : 100)}`
+				: `Trail shoe model ${index % 100}`,
+			description: `Outdoor running equipment ${index % 7}`,
+		},
 		filters: {
 			...(index % 17 ? { brand: brandValues(index) } : {}),
 			...(index % 19 ? { price: index % 1000 } : {}),
@@ -146,7 +174,9 @@ async function measure(index, name, request) {
 			const result = await index.search({ text: 'trail shoe', mode: 'all', exactTotal: true, limit: 10, ...request });
 			assert.strictEqual(
 				result.total,
-				name === 'combined' ? documentCount - Math.ceil(documentCount / 3) : documentCount,
+				name === 'combined' || name === 'ordinary-filtered-count'
+					? documentCount - Math.ceil(documentCount / 3)
+					: documentCount,
 			);
 			matched = result.total;
 			if (iteration >= 0) latencies.push(performance.now() - started);

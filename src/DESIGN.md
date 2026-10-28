@@ -126,7 +126,9 @@ native Count pass supplies a global matching count that bounds total retained hi
 segments; the fallback combines it with maximum measured key lengths for the sort budget. Native Searcher and
 TopDocs still own collection. Terms retain native tenfold candidate oversampling.
 Sorted hits, count and aggregates share a native tuple collector; unsorted aggregates preserve
-the ordinary ranked-hits path; their exact totals share that aggregation pass. Segment buffer
+the ordinary ranked-hits path; their exact totals share that aggregation pass.
+`exact_total_with_aggregations_uses_two_native_query_passes` guards this with real native query
+weights, contrasting two production passes with a separate three-pass control. Segment buffer
 accounting follows the actual executor concurrency while decoded fruits remain budgeted across
 all segments. Engine encodes bounded aggregates once, and native wire encoding
 including its success envelope finishes inside the request permit/deadline;

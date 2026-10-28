@@ -710,6 +710,17 @@ impl Engine {
 		};
 		let query = self.query(searcher, request)?;
 		check_deadline(deadline)?;
+		self.collect_search(searcher, request, deadline, catalog_fields, snapshot, query)
+	}
+	fn collect_search(
+		&self,
+		searcher: &Searcher,
+		request: &SearchRequest,
+		deadline: Option<Instant>,
+		catalog_fields: Option<Vec<crate::protocol::FilterFieldConfig>>,
+		snapshot: Option<String>,
+		query: BuiltQuery,
+	) -> Result<SearchResult> {
 		if let Some(snapshot) = snapshot {
 			let collector = TraversalScoreTieCollector {
 				inner: StableScoreTieCollector::new(0..request.limit.saturating_add(1)),
@@ -5340,5 +5351,144 @@ mod tests {
 			Err(error) => error,
 		};
 		assert_eq!(error.code, "E_INCOMPLETE_CREATE");
+	}
+	#[test]
+	fn exact_total_with_aggregations_uses_two_native_query_passes() {
+		use std::sync::{
+			atomic::{AtomicUsize, Ordering},
+			Arc,
+		};
+		use tantivy::query::{EnableScoring, Weight};
+		#[derive(Debug)]
+		struct CountingQuery {
+			inner: Box<dyn Query>,
+			weights: Arc<AtomicUsize>,
+		}
+		impl Clone for CountingQuery {
+			fn clone(&self) -> Self {
+				Self {
+					inner: self.inner.box_clone(),
+					weights: self.weights.clone(),
+				}
+			}
+		}
+
+		impl Query for CountingQuery {
+			fn weight(&self, scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+				self.weights.fetch_add(1, Ordering::Relaxed);
+				self.inner.weight(scoring)
+			}
+		}
+		let mut config = config();
+		config.identity.filter_fields.push(FilterFieldConfig {
+			name: "price".into(),
+			field_type: FilterFieldType::Number,
+		});
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		let texts = [
+			"shoe shoe shoe shoe",
+			"shoe shoe",
+			"shoe",
+			"shoe padding padding padding padding padding",
+		];
+		writer
+			.apply(MutationBatch {
+				upserts: texts
+					.into_iter()
+					.enumerate()
+					.map(|(index, text)| crate::protocol::Upsert {
+						id: format!("record-{index}"),
+						version: None,
+						fields: vec![("title".into(), vec![text.into()])],
+						filters: vec![("price".into(), vec![FilterValue::Number((index + 1) as f64)])],
+					})
+					.collect(),
+				deletes: vec![],
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let reader = engine.reader().unwrap();
+		reader.reload().unwrap();
+		let searcher = reader.searcher();
+		let request = SearchRequest {
+			sort: None,
+			aggregations: vec![catalog::AggregationRequest {
+				name: "prices".into(),
+				field: "price".into(),
+				kind: catalog::AggregationKind::Stats,
+			}],
+			expression: expression("shoe", SearchMode::Any, vec!["title".into()]),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 1,
+			exact_total: true,
+			budget_milliseconds: 30000,
+			traversal: false,
+			after: None,
+		};
+		let query = engine.query(&searcher, &request).unwrap();
+		let scores = searcher
+			.search(query.query.as_ref(), &TopDocs::with_limit(2).order_by_score())
+			.unwrap();
+		assert_ne!(scores[0].0, scores[1].0);
+		let weights = Arc::new(AtomicUsize::new(0));
+		let query = BuiltQuery {
+			query: Box::new(CountingQuery {
+				inner: query.query,
+				weights: weights.clone(),
+			}),
+			clauses: query.clauses,
+		};
+		let result = engine
+			.collect_search(
+				&searcher,
+				&request,
+				None,
+				Some(config.identity.filter_fields.clone()),
+				None,
+				query,
+			)
+			.unwrap();
+		assert_eq!(
+			weights.load(Ordering::Relaxed),
+			2,
+			"expected hits and combined count/aggregation query passes"
+		);
+		assert_eq!(result.total, 4);
+		assert_eq!(result.total_relation, TotalRelation::Exact);
+		assert_eq!(result.hits.len(), 1);
+		assert_eq!(
+			result.aggregations[0].value,
+			catalog::AggregationValue::Stats {
+				count: 4,
+				sum: 10.0,
+				min: Some(1.0),
+				max: Some(4.0),
+				avg: Some(2.5)
+			}
+		);
+		let control_weights = Arc::new(AtomicUsize::new(0));
+		let control = CountingQuery {
+			inner: engine.query(&searcher, &request).unwrap().query,
+			weights: control_weights.clone(),
+		};
+		searcher
+			.search(&control, &TopDocs::with_limit(2).order_by_score())
+			.unwrap();
+		let control_aggregations = catalog::aggregate(
+			&searcher,
+			&control,
+			&request.aggregations,
+			&config.identity.filter_fields,
+			engine.index.tokenizers().clone(),
+			None,
+		)
+		.unwrap();
+		let control_total = catalog::count_matches(&searcher, &control, None).unwrap();
+		assert_eq!(control_weights.load(Ordering::Relaxed), 3);
+		assert_eq!(control_total, result.total);
+		assert_eq!(control_aggregations, result.aggregations);
 	}
 }

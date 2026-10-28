@@ -171,10 +171,10 @@ export function encodeCatalog(
 	}
 }
 
-export function decodeAggregations(cursor: CatalogCursor): AggregationResult[] {
+export function decodeAggregations(cursor: CatalogCursor): AggregationResult[] | undefined {
 	const count = cursor.u8();
 	if (count > maxAggregations) nativeFailure('Native aggregation count exceeds its limit');
-	if (count === 0) return [];
+	if (count === 0) return;
 	const results: AggregationResult[] = [];
 	const names = new Set<string>();
 	let totalBuckets = 0;

@@ -806,7 +806,7 @@ export class NativeFullTextIndex {
 			total,
 			totalRelation: relation === 0 ? 'exact' : 'lower-bound',
 			hits,
-			...(aggregations.length === 0 ? {} : { aggregations }),
+			...(aggregations === undefined ? {} : { aggregations }),
 			...(continuation === undefined ? {} : { continuation }),
 		};
 	}

@@ -5,6 +5,10 @@ import { decodeAggregations, encodeCatalog, normalizeCatalog } from '../dist/cat
 const invalid = (error) => error.code === 'E_INVALID_ARGUMENT';
 const nativeFailure = (error) => error.code === 'E_NATIVE_FAILURE';
 
+test('an absent aggregation payload needs only its count byte', () => {
+	assert.strictEqual(decodeAggregations({ u8: () => 0 }), undefined);
+});
+
 test('catalog normalization snapshots all mutable request containers', () => {
 	const sort = { field: 'price', direction: 'asc', missing: 'last' };
 	const requests = [
