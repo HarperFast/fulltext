@@ -243,6 +243,7 @@ test('numeric bucket counts deduplicate documents while stats retain every array
 			[10, 10],
 			[1, 1],
 			[10, 11],
+			[1, 11, 2, 1],
 		].map((price, position) => ({
 			id: String(position),
 			fields: { title: 'shoe' },
@@ -265,7 +266,7 @@ test('numeric bucket counts deduplicate documents while stats retain every array
 		},
 	];
 	let baseline;
-	for (const order of [undefined, sort('price')]) {
+	for (const order of [undefined, sort('price', 'desc')]) {
 		const result = await index.search({
 			text: 'shoe',
 			sort: order,
@@ -273,20 +274,20 @@ test('numeric bucket counts deduplicate documents while stats retain every array
 			exactTotal: true,
 			aggregations: requests,
 		});
-		assert.strictEqual(result.total, 4);
+		assert.strictEqual(result.total, 5);
 		assert.strictEqual(result.totalRelation, 'exact');
-		assert.strictEqual(result.hits.length, 1);
+		assert.deepStrictEqual(ids(result), [order ? '1' : '0']);
 		const [stats, histogram, ranges] = result.aggregations;
-		assert.deepStrictEqual(stats, { name: 'prices', type: 'stats', count: 8, sum: 46, min: 1, max: 11, avg: 5.75 });
+		assert.deepStrictEqual(stats, { name: 'prices', type: 'stats', count: 12, sum: 61, min: 1, max: 11, avg: 61 / 12 });
 		assert.deepStrictEqual(histogram.buckets, [
-			{ key: 0, count: 2 },
-			{ key: 10, count: 2 },
+			{ key: 0, count: 3 },
+			{ key: 10, count: 3 },
 		]);
 		assert.deepStrictEqual(
 			ranges.buckets.filter(({ count }) => count > 0).map(({ from, to, count }) => ({ from, to, count })),
 			[
-				{ from: 0, to: 10, count: 2 },
-				{ from: 10, to: 20, count: 2 },
+				{ from: 0, to: 10, count: 3 },
+				{ from: 10, to: 20, count: 3 },
 			],
 		);
 		if (baseline) assert.deepStrictEqual(result.aggregations, baseline);
