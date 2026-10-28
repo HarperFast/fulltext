@@ -106,6 +106,10 @@ test('aggregations cover the full matching snapshot and deduplicate string value
 	const result = await index.search({ text: 'shoe', limit: 1, aggregations, exactTotal: true });
 	assert.strictEqual(result.hits.length, 1);
 	assert.strictEqual(result.total, 6);
+	assert.strictEqual(result.totalRelation, 'exact');
+	const approximate = await index.search({ text: 'shoe', limit: 1, aggregations });
+	assert.strictEqual(approximate.totalRelation, 'lower-bound');
+	assert.deepStrictEqual(approximate.aggregations, result.aggregations);
 	const [terms, stats, histogram, ranges] = result.aggregations;
 	assert.strictEqual(terms.type, 'terms');
 	assert.deepStrictEqual(

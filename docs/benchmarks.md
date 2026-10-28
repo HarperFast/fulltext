@@ -67,6 +67,22 @@ ingestion, footprint and ordinary search across revisions; compare new collector
 ordinary search within the current revision. These synthetic observations are not production
 latency guarantees.
 
+### Observed string-metadata cost
+
+Three alternating optimized arm64 pairs compared [the baseline](https://github.com/HarperFast/fulltext/commit/0b5608778b2d80ed2a8dfbea79565d509837e7ff)
+with [the metadata writer](https://github.com/HarperFast/fulltext/commit/1adb7511a587521bf581f65b01de35f03aba89b3), using 10,000 documents,
+32 brands and 1,000 queries per case on the same host. Later collector fixes leave this writer and
+schema unchanged. Median persisted bytes increased **7.0%**; median durable ingestion throughput
+was flat at the reported precision. Ordinary exact-total p50 increased **0.6%** and p99 **1.5%**.
+These small local samples varied and do not establish a production latency or throughput bound.
+They measure the complete branch, not the fast column in isolation; raw host-specific reports
+remain local.
+
+Every configured string filter gains the fast column so the same metadata supports presence,
+sorting and facets without another capability flag. This deliberately makes equality-only string
+indexes pay the rebuild and storage cost too. Numeric/Boolean-only indexes retain their existing
+schema and identity.
+
 ## Native search and ingestion
 
 The native benchmark generates a deterministic, high-cardinality product catalog and emits one versioned
@@ -82,6 +98,26 @@ the logical API performs both inside one call. `--commit-every` sets the target 
 between durability points; it materially affects throughput and peak memory because
 replacement-safe upserts include delete terms. CI runs only the correctness smoke profile; timing
 comparisons require controlled hardware.
+
+### Paired native collector qualification
+
+Run `cargo test --release --all-features metadata_collector_qualification -- --ignored --nocapture`
+for a same-process comparison against Tantivy's native collectors. The in-memory fixture contains
+one million matching documents across ten segments and one unmatched extreme numeric outlier.
+After warmup, five alternating pairs compare identical hit ordering, exact counts and aggregate
+values. It also compares cold and cached dictionary qualification across one million ID keys.
+
+In this synthetic fixture, the deadline-aware path added approximately **18%** for numeric sorting,
+**1%** for terms/statistics, **2%** for a safe histogram, and **14%** for the histogram fallback that
+checks matching values when segment extrema are unsafe. Completed dictionary qualification was reused on the warm lookup; cold scans and cache hits
+are reported separately rather than treated as a production latency target. Unscored collection uses native block reads; deadline checkpoints occur
+at most 1,024 documents apart. The extreme-value fallback deliberately pays for validating live
+matches so unrelated or deleted extremes do not reject an otherwise valid request.
+
+Dictionary results are cached only after a complete scan. Concurrent cold misses may duplicate
+that bounded-memory scan: avoiding an in-flight lock keeps one request's deadline from blocking
+another. These measurements cover collector CPU work and result comparison, not peak RSS,
+production storage, concurrent cold-miss amplification or end-to-end application latency.
 
 ## Traversal
 

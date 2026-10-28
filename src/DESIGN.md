@@ -120,7 +120,9 @@ immutable segment ID and field. Merges create new segment IDs; deletes leave a c
 dictionary maximum, so neither invalidates a cached bound. Sorting retains the ID contract first,
 measuring IDs only when necessary. Terms retain native tenfold candidate oversampling.
 Sorted hits, count and aggregates share a native tuple collector; unsorted aggregates preserve
-the ordinary ranked-hits path. Engine encodes bounded aggregates once, and native wire encoding
+the ordinary ranked-hits path; their exact totals share that aggregation pass. Segment buffer
+accounting follows the actual executor concurrency while decoded fruits remain budgeted across
+all segments. Engine encodes bounded aggregates once, and native wire encoding
 including its success envelope finishes inside the request permit/deadline;
 `encode_results` bounds the response. Catalog resource tests pin rejection rather than
 partial output. See [metadata resource policy](../docs/limits.md#metadata-collectors).

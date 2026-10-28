@@ -851,6 +851,34 @@ impl Engine {
 			};
 			(hits, total, relation, collected_total)
 		};
+		let (aggregation_total, aggregations) = if let Some(fields) = &catalog_fields {
+			if request.exact_total && collected_total.is_none() && bounded_total_relation != TotalRelation::Exact {
+				let (total, results) = catalog::aggregate_count(
+					searcher,
+					query.query.as_ref(),
+					&request.aggregations,
+					fields,
+					self.index.tokenizers().clone(),
+					deadline,
+				)?;
+				(Some(total), results)
+			} else {
+				(
+					None,
+					catalog::aggregate(
+						searcher,
+						query.query.as_ref(),
+						&request.aggregations,
+						fields,
+						self.index.tokenizers().clone(),
+						deadline,
+					)?,
+				)
+			}
+		} else {
+			(None, Vec::new())
+		};
+		let collected_total = collected_total.or(aggregation_total);
 		let (total, total_relation) = if request.exact_total {
 			match collected_total {
 				Some(total) => {
@@ -871,18 +899,6 @@ impl Engine {
 		};
 		check_deadline(deadline)?;
 
-		let aggregations = if let Some(fields) = &catalog_fields {
-			catalog::aggregate(
-				searcher,
-				query.query.as_ref(),
-				&request.aggregations,
-				fields,
-				self.index.tokenizers().clone(),
-				deadline,
-			)?
-		} else {
-			Vec::new()
-		};
 		let encoded_aggregations = if aggregations.is_empty() {
 			None
 		} else {

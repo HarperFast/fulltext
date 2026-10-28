@@ -110,7 +110,7 @@ fn field<'a>(name: &str, fields: &'a [FilterFieldConfig]) -> Result<(usize, &'a 
 		.find(|(_, f)| f.name == name)
 		.ok_or_else(|| FulltextError::invalid(format!("Unknown filter field: {name}")))
 }
-pub fn validate_requests(
+pub(crate) fn validate_requests(
 	sort: Option<&SortRequest>,
 	aggs: &[AggregationRequest],
 	fields: &[FilterFieldConfig],
@@ -204,6 +204,18 @@ fn histogram_position_safe(value: f64, interval: f64) -> bool {
 	let position = (value / interval).floor();
 	position.is_finite() && position >= i64::MIN as f64 && position < i64::MAX as f64
 }
+fn validate_histogram_doc(histograms: &[(tantivy::fastfield::Column<f64>, f64)], doc: u32) -> tantivy::Result<()> {
+	for (column, interval) in histograms {
+		for value in column.values_for_doc(doc) {
+			if !histogram_position_safe(value, *interval) {
+				return Err(TantivyError::InvalidArgument(
+					"Histogram values exceed representable bucket positions".into(),
+				));
+			}
+		}
+	}
+	Ok(())
+}
 struct DeadlineCollector<C> {
 	histograms: Vec<(String, f64)>,
 	inner: C,
@@ -255,45 +267,60 @@ impl<C: Collector> Collector for DeadlineCollector<C> {
 		let mut scorer = weight.scorer(reader, 1.0)?;
 		let alive = reader.alive_bitset();
 		let scoring = self.requires_scoring();
-		let mut block = Vec::with_capacity(64);
 		let mut visited = 0usize;
-		let mut doc = scorer.doc();
-		while doc != tantivy::TERMINATED {
-			if visited.is_multiple_of(1024) {
-				check_deadline(self.deadline)?;
+		if scoring {
+			let mut doc = scorer.doc();
+			while doc != tantivy::TERMINATED {
+				if visited.is_multiple_of(1024) {
+					check_deadline(self.deadline)?;
+				}
+				if alive.is_none_or(|alive| alive.is_alive(doc)) {
+					validate_histogram_doc(&histograms, doc)?;
+					collector.collect(doc, scorer.score());
+				}
+				visited += 1;
+				doc = scorer.advance();
 			}
-			if alive.is_none_or(|a| a.is_alive(doc)) {
-				for (column, interval) in &histograms {
-					for value in column.values_for_doc(doc) {
-						if !histogram_position_safe(value, *interval) {
-							return Err(TantivyError::InvalidArgument(
-								"Histogram values exceed representable bucket positions".into(),
-							));
+		} else {
+			let mut buffer = [0u32; tantivy::COLLECT_BLOCK_BUFFER_LEN];
+			loop {
+				if visited.is_multiple_of(1024 / tantivy::COLLECT_BLOCK_BUFFER_LEN) {
+					check_deadline(self.deadline)?;
+				}
+				let count = scorer.fill_buffer(&mut buffer);
+				if count == 0 {
+					break;
+				}
+				visited += 1;
+				let count = if let Some(alive) = alive {
+					let mut retained = 0;
+					for index in 0..count {
+						let doc = buffer[index];
+						if alive.is_alive(doc) {
+							buffer[retained] = doc;
+							retained += 1;
 						}
 					}
-				}
-				if scoring {
-					collector.collect(doc, scorer.score());
+					retained
 				} else {
-					block.push(doc);
-					if block.len() == 64 {
-						collector.collect_block(&block);
-						block.clear();
+					count
+				};
+				if !histograms.is_empty() {
+					for &doc in &buffer[..count] {
+						validate_histogram_doc(&histograms, doc)?;
 					}
 				}
+				if count > 0 {
+					collector.collect_block(&buffer[..count]);
+				}
 			}
-			visited += 1;
-			doc = scorer.advance();
 		}
 		check_deadline(self.deadline)?;
-		if !block.is_empty() {
-			collector.collect_block(&block);
-		}
 		Ok(collector.harvest())
 	}
 }
 #[cfg(test)]
-pub fn count_matches(searcher: &Searcher, query: &dyn Query, deadline: Option<Instant>) -> Result<u64> {
+pub(crate) fn count_matches(searcher: &Searcher, query: &dyn Query, deadline: Option<Instant>) -> Result<u64> {
 	check_deadline(deadline).map_err(native_error)?;
 	searcher
 		.search(
@@ -333,6 +360,25 @@ fn dictionary_cache() -> &'static Mutex<DictionaryCache> {
 	static CACHE: OnceLock<Mutex<DictionaryCache>> = OnceLock::new();
 	CACHE.get_or_init(|| Mutex::new(DictionaryCache::default()))
 }
+fn scan_dictionary_max(
+	mut next_key_length: impl FnMut() -> Option<usize>,
+	mut check: impl FnMut() -> Result<()>,
+) -> Result<usize> {
+	let mut maximum = 0;
+	let mut visited = 0usize;
+	loop {
+		if visited.is_multiple_of(1024) {
+			check()?;
+		}
+		let Some(length) = next_key_length() else {
+			break;
+		};
+		maximum = maximum.max(length);
+		visited += 1;
+	}
+	check()?;
+	Ok(maximum)
+}
 fn max_dictionary_key(segment: &SegmentReader, name: &str, deadline: Option<Instant>) -> Result<usize> {
 	check_deadline(deadline).map_err(native_error)?;
 	let key = (
@@ -346,12 +392,10 @@ fn max_dictionary_key(segment: &SegmentReader, name: &str, deadline: Option<Inst
 	}
 	let maximum = if let Some(column) = segment.fast_fields().str(name).map_err(native_error)? {
 		let mut stream = column.dictionary().stream().map_err(FulltextError::native)?;
-		let mut maximum = 0;
-		while stream.advance() {
-			check_deadline(deadline).map_err(native_error)?;
-			maximum = maximum.max(stream.key().len());
-		}
-		maximum
+		scan_dictionary_max(
+			|| stream.advance().then(|| stream.key().len()),
+			|| check_deadline(deadline).map_err(native_error),
+		)?
 	} else {
 		0
 	};
@@ -374,6 +418,15 @@ fn add_key_budget(total: &mut usize, count: usize, bytes: usize, limit: usize) -
 	}
 	Ok(())
 }
+fn sort_buffer_bytes(end: usize, segments: usize, parallelism: usize) -> Result<usize> {
+	let segment_key_bytes = std::mem::size_of::<((Option<u64>, (Option<u64>, Score)), u32)>();
+	let global_key_bytes = std::mem::size_of::<((Option<String>, (Option<String>, Score)), DocAddress)>();
+	end.checked_mul(2)
+		.and_then(|n| n.checked_mul(segment_key_bytes))
+		.and_then(|n| n.checked_mul(segments.min(parallelism)))
+		.and_then(|n| n.checked_add(end.checked_mul(2)?.checked_mul(global_key_bytes)?))
+		.ok_or_else(|| resource("Sort buffer memory overflow"))
+}
 fn check_sort_budget(
 	searcher: &Searcher,
 	end: usize,
@@ -381,14 +434,12 @@ fn check_sort_budget(
 	is_string: bool,
 	deadline: Option<Instant>,
 ) -> Result<()> {
-	let segment_key_bytes = std::mem::size_of::<((Option<u64>, (Option<u64>, Score)), u32)>();
-	let global_key_bytes = std::mem::size_of::<((Option<String>, (Option<String>, Score)), DocAddress)>();
-	let fixed = end
-		.checked_mul(2)
-		.and_then(|n| n.checked_mul(segment_key_bytes))
-		.and_then(|n| n.checked_mul(searcher.segment_readers().len()))
-		.and_then(|n| n.checked_add(end.checked_mul(2)?.checked_mul(global_key_bytes)?))
-		.ok_or_else(|| resource("Sort buffer memory overflow"))?;
+	let segments = searcher.segment_readers().len();
+	let parallelism = match searcher.index().search_executor() {
+		tantivy::Executor::SingleThread => 1,
+		tantivy::Executor::ThreadPool(pool) => pool.current_num_threads(),
+	};
+	let fixed = sort_buffer_bytes(end, segments, parallelism)?;
 	if fixed > MAX_SORT_MEMORY_BYTES {
 		return Err(resource("Sort buffers exceed memory budget"));
 	}
@@ -482,19 +533,19 @@ fn check_terms_budget(
 	}
 	Ok(())
 }
-pub struct SortedCatalogRequest<'a> {
+pub(crate) struct SortedCatalogRequest<'a> {
 	pub sort: &'a SortRequest,
 	pub aggregations: &'a [AggregationRequest],
 	pub offset: usize,
 	pub limit: usize,
 }
-pub struct SortedCatalogResult {
+pub(crate) struct SortedCatalogResult {
 	pub hits: Vec<((Score, String), DocAddress)>,
 	pub total: u64,
 	pub aggregations: Vec<AggregationResult>,
 }
 #[cfg(test)]
-pub fn sorted_hits(
+pub(crate) fn sorted_hits(
 	searcher: &Searcher,
 	query: &dyn Query,
 	sort: &SortRequest,
@@ -518,7 +569,7 @@ pub fn sorted_hits(
 	)?
 	.hits)
 }
-pub fn sorted_catalog(
+pub(crate) fn sorted_catalog(
 	searcher: &Searcher,
 	query: &dyn Query,
 	request: SortedCatalogRequest<'_>,
@@ -534,24 +585,7 @@ pub fn sorted_catalog(
 	} = request;
 	validate_requests(Some(sort), requests, fields)?;
 	check_deadline(deadline).map_err(native_error)?;
-	if limit == 0 {
-		let collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
-		let (count, aggregations) = searcher
-			.search(
-				query,
-				&DeadlineCollector {
-					inner: (Count, collector),
-					deadline,
-					histograms: histogram_checks(requests, fields)?,
-				},
-			)
-			.map_err(native_error)?;
-		return Ok(SortedCatalogResult {
-			hits: Vec::new(),
-			total: count as u64,
-			aggregations: finish_aggregations(aggregations, requests, deadline)?,
-		});
-	}
+
 	let (index, config) = field(&sort.field, fields)?;
 	let end = offset
 		.checked_add(limit)
@@ -630,7 +664,30 @@ pub fn sorted_catalog(
 		aggregations: finish_aggregations(aggregations, requests, deadline)?,
 	})
 }
-pub fn aggregate(
+pub(crate) fn aggregate_count(
+	searcher: &Searcher,
+	query: &dyn Query,
+	requests: &[AggregationRequest],
+	fields: &[FilterFieldConfig],
+	tokenizers: TokenizerManager,
+	deadline: Option<Instant>,
+) -> Result<(u64, Vec<AggregationResult>)> {
+	validate_requests(None, requests, fields)?;
+	check_deadline(deadline).map_err(native_error)?;
+	let collector = prepare_aggregations(searcher, requests, fields, tokenizers, deadline)?;
+	let (count, aggregations) = searcher
+		.search(
+			query,
+			&DeadlineCollector {
+				inner: (Count, collector),
+				deadline,
+				histograms: histogram_checks(requests, fields)?,
+			},
+		)
+		.map_err(native_error)?;
+	Ok((count as u64, finish_aggregations(aggregations, requests, deadline)?))
+}
+pub(crate) fn aggregate(
 	searcher: &Searcher,
 	query: &dyn Query,
 	requests: &[AggregationRequest],
@@ -868,7 +925,7 @@ impl Encoder {
 		Ok(())
 	}
 }
-pub fn encode_results(results: &[AggregationResult]) -> Result<Vec<u8>> {
+pub(crate) fn encode_results(results: &[AggregationResult]) -> Result<Vec<u8>> {
 	if results.len() > MAX_AGGREGATIONS {
 		return Err(resource("Too many aggregation results"));
 	}
@@ -1732,4 +1789,125 @@ mod tests {
 		assert_eq!(cache.maxima[&newest], 11);
 		assert_eq!(cache.insertion_order.len(), MAX_DICTIONARY_CACHE_ENTRIES);
 	}
+	#[test]
+	fn sort_buffer_budget_counts_active_executor_threads() {
+		let mut single = sort_buffer_bytes(10000, 40, 1).unwrap();
+		add_key_budget(&mut single, 400000, 128 + 20 + 8, MAX_SORT_MEMORY_BYTES).unwrap();
+		let mut concurrent = sort_buffer_bytes(10000, 40, 40).unwrap();
+		assert_eq!(
+			add_key_budget(&mut concurrent, 400000, 128 + 20 + 8, MAX_SORT_MEMORY_BYTES)
+				.unwrap_err()
+				.code,
+			"E_RESOURCE_LIMIT"
+		);
+		assert_eq!(
+			sort_buffer_bytes(10000, 40, 2).unwrap(),
+			sort_buffer_bytes(10000, 2, 40).unwrap()
+		);
+	}
+	#[test]
+	fn dictionary_scan_checks_deadline_midstream_at_bounded_intervals() {
+		use std::cell::Cell;
+		let visited = Cell::new(0usize);
+		let checks = Cell::new(0usize);
+		let error = scan_dictionary_max(
+			|| {
+				visited.set(visited.get() + 1);
+				Some(7)
+			},
+			|| {
+				checks.set(checks.get() + 1);
+				if checks.get() == 2 {
+					Err(FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE))
+				} else {
+					Ok(())
+				}
+			},
+		)
+		.unwrap_err();
+		assert_eq!(error.code, "E_TIMEOUT");
+		assert_eq!(visited.get(), 1024);
+		assert_eq!(checks.get(), 2);
+	}
+	#[test]
+	fn deep_string_sort_qualifies_id_fallback_and_rejects_large_ids() {
+		for id_bytes in [20, crate::protocol::MAX_RECORD_ID_BYTES] {
+			let mut schema = Schema::builder();
+			let id = schema.add_text_field("__fulltext_id", STRING | FAST);
+			let category = schema.add_text_field("__fulltext_filter_0", STRING | FAST);
+			schema.add_f64_field("__fulltext_filter_1", INDEXED | FAST);
+			let index = Index::create_in_ram(schema.build());
+			let mut writer = index
+				.writer_with_num_threads::<TantivyDocument>(1, 100_000_000)
+				.unwrap();
+			writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+			let value = "v".repeat(30000);
+			for segment in 0..2 {
+				for record in 0..1000 {
+					let prefix = format!("{segment:01}-{record:04}");
+					let key = format!("{prefix}{}", "x".repeat(id_bytes - prefix.len()));
+					writer.add_document(doc!(id=>key,category=>value.as_str())).unwrap();
+				}
+				writer.commit().unwrap();
+			}
+			drop(writer);
+			let searcher = index.reader().unwrap().searcher();
+			assert_eq!(searcher.segment_readers().len(), 2);
+			let sort = SortRequest {
+				field: "category".into(),
+				direction: SortDirection::Asc,
+				missing: MissingOrder::Last,
+			};
+			let result = sorted_hits(&searcher, &AllQuery, &sort, &fields(), 0, 1000, None);
+			if id_bytes == 20 {
+				assert_eq!(result.unwrap().len(), 1000);
+				for segment in searcher.segment_readers() {
+					assert_eq!(max_dictionary_key(segment, "__fulltext_id", None).unwrap(), 20);
+					assert!(dictionary_cache()
+						.lock()
+						.unwrap()
+						.maxima
+						.contains_key(&(segment.segment_id(), id)));
+				}
+			} else {
+				assert_eq!(result.unwrap_err().code, "E_RESOURCE_LIMIT");
+			}
+		}
+	}
+	#[test]
+	fn combined_aggregation_count_matches_independent_results() {
+		let index = fixture();
+		let searcher = index.reader().unwrap().searcher();
+		let requests = vec![AggregationRequest {
+			name: "stats".into(),
+			field: "price".into(),
+			kind: AggregationKind::Stats,
+		}];
+		let (count, aggregations) = aggregate_count(
+			&searcher,
+			&AllQuery,
+			&requests,
+			&fields(),
+			index.tokenizers().clone(),
+			None,
+		)
+		.unwrap();
+		assert_eq!(count, 5);
+		assert_eq!(
+			aggregations,
+			aggregate(
+				&searcher,
+				&AllQuery,
+				&requests,
+				&fields(),
+				index.tokenizers().clone(),
+				None
+			)
+			.unwrap()
+		);
+	}
 }
+
+#[cfg(test)]
+#[path = "catalog_qualification.rs"]
+mod qualification;

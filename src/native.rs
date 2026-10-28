@@ -2186,7 +2186,7 @@ fn execute_search_command(
 			let result = decode_search(&bytes).and_then(|request| {
 				engine
 					.search_with_deadline(&reader.searcher(), &request, deadline)
-					.and_then(search_body)
+					.map(search_body)
 					.and_then(|body| {
 						let response = success_envelope(body);
 						if Instant::now() >= deadline {
@@ -3106,7 +3106,7 @@ fn u64_body(value: u64) -> Vec<u8> {
 	value.to_le_bytes().to_vec()
 }
 
-fn search_body(result: SearchResult) -> Result<Vec<u8>> {
+fn search_body(result: SearchResult) -> Vec<u8> {
 	let mut bytes = Vec::new();
 	push_u64(&mut bytes, result.total);
 	bytes.push(match result.total_relation {
@@ -3131,7 +3131,7 @@ fn search_body(result: SearchResult) -> Result<Vec<u8>> {
 		push_string(&mut bytes, &snapshot);
 		bytes.push(more as u8);
 	}
-	Ok(bytes)
+	bytes
 }
 
 fn trace_body(result: TraceResult) -> Vec<u8> {
