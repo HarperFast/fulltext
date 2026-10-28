@@ -348,6 +348,7 @@ pub enum TotalRelation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchResult {
 	pub aggregations: Vec<AggregationResult>,
+	pub(crate) encoded_aggregations: Option<Vec<u8>>,
 	pub total: u64,
 	pub total_relation: TotalRelation,
 	pub hits: Vec<SearchHit>,
@@ -727,6 +728,7 @@ impl Engine {
 			check_deadline(deadline)?;
 			return Ok(SearchResult {
 				aggregations: Vec::new(),
+				encoded_aggregations: None,
 				total,
 				total_relation: TotalRelation::Exact,
 				hits,
@@ -736,26 +738,30 @@ impl Engine {
 
 		if let Some(sort) = &request.sort {
 			let fields = catalog_fields.as_ref().unwrap();
-			let scored_docs = catalog::sorted_hits(
+			let catalog::SortedCatalogResult {
+				hits: scored_docs,
+				total,
+				aggregations,
+			} = catalog::sorted_catalog(
 				searcher,
 				query.query.as_ref(),
-				sort,
-				fields,
-				request.offset,
-				request.limit,
-				deadline,
-			)?;
-			let hits = search_hits(searcher, scored_docs)?;
-			let total = catalog::count_matches(searcher, query.query.as_ref(), deadline)?;
-			let aggregations = catalog::aggregate(
-				searcher,
-				query.query.as_ref(),
-				&request.aggregations,
+				catalog::SortedCatalogRequest {
+					sort,
+					aggregations: &request.aggregations,
+					offset: request.offset,
+					limit: request.limit,
+				},
 				fields,
 				self.index.tokenizers().clone(),
 				deadline,
 			)?;
-			let aggregate_bytes = catalog::encode_results(&aggregations)?.len();
+			let hits = search_hits(searcher, scored_docs)?;
+			let encoded_aggregations = if aggregations.is_empty() {
+				None
+			} else {
+				Some(catalog::encode_results(&aggregations)?)
+			};
+			let aggregate_bytes = encoded_aggregations.as_ref().map_or(1, Vec::len);
 			if search_response_bytes(&hits, 13)?.saturating_add(aggregate_bytes) > MAX_SEARCH_RESPONSE_BYTES {
 				return Err(FulltextError::new(
 					"E_RESULT_TOO_LARGE",
@@ -769,6 +775,7 @@ impl Engine {
 				hits,
 				traversal: None,
 				aggregations,
+				encoded_aggregations,
 			});
 		}
 		let window_end = request.offset + request.limit;
@@ -871,11 +878,14 @@ impl Engine {
 		} else {
 			Vec::new()
 		};
-		let response_bytes = search_response_bytes(&hits, 13)?.saturating_add(if aggregations.is_empty() {
-			1
+		let encoded_aggregations = if aggregations.is_empty() {
+			None
 		} else {
-			catalog::encode_results(&aggregations)?.len()
-		});
+			Some(catalog::encode_results(&aggregations)?)
+		};
+		let response_bytes =
+			search_response_bytes(&hits, 13)?.saturating_add(encoded_aggregations.as_ref().map_or(1, Vec::len));
+		check_deadline(deadline)?;
 		if response_bytes > MAX_SEARCH_RESPONSE_BYTES {
 			return Err(FulltextError::new(
 				"E_RESULT_TOO_LARGE",
@@ -884,6 +894,7 @@ impl Engine {
 		}
 		Ok(SearchResult {
 			aggregations,
+			encoded_aggregations,
 			total,
 			total_relation,
 			hits,
@@ -1910,10 +1921,7 @@ fn filter_term(field: &EngineFilterField, value: &FilterValue) -> Result<Term> {
 
 fn check_deadline(deadline: Option<Instant>) -> Result<()> {
 	if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-		Err(FulltextError::new(
-			"E_TIMEOUT",
-			"full-text search exceeded its execution budget",
-		))
+		Err(FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE))
 	} else {
 		Ok(())
 	}
@@ -2241,19 +2249,23 @@ impl Writer {
 					FulltextError::new("E_SCHEMA_MISMATCH", format!("unknown mutation filter {name}"))
 				})?;
 				let filter = &self.filter_fields[*index];
+				let deduplicate = values.len() > 1;
 				let mut seen_values = HashSet::new();
 				for value in values {
 					match (filter.field_type, value) {
 						(FilterFieldType::String, FilterValue::String(value)) => {
-							if !seen_values.insert(value.clone()) {
-								continue;
-							}
 							if value.len() > MAX_TOKEN_LEN {
 								return Err(FulltextError::invalid(format!(
 									"mutation filter {name} exceeds {MAX_TOKEN_LEN} UTF-8 bytes"
 								)));
 							}
+							if deduplicate && seen_values.contains(value.as_str()) {
+								continue;
+							}
 							document.add_text(filter.field, &value);
+							if deduplicate {
+								seen_values.insert(value);
+							}
 						}
 						(FilterFieldType::Number, FilterValue::Number(value)) => {
 							document.add_f64(filter.field, canonical_number(value));
@@ -3255,6 +3267,53 @@ mod tests {
 			],
 			deletes: Vec::new(),
 		}
+	}
+
+	#[test]
+	fn prepared_string_filters_preserve_first_value_order_and_reject_oversized_values() {
+		use tantivy::schema::Value;
+		let mut config = config();
+		config.identity.filter_fields.push(FilterFieldConfig {
+			name: "category".to_owned(),
+			field_type: FilterFieldType::String,
+		});
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let writer = engine.writer(&config).unwrap();
+		let prepare = |values: Vec<String>| {
+			let mut mutation = batch();
+			mutation.upserts.truncate(1);
+			mutation.upserts[0].filters = vec![(
+				"category".to_owned(),
+				values.into_iter().map(FilterValue::String).collect(),
+			)];
+			writer.prepare(mutation)
+		};
+		for (values, expected) in [
+			(vec!["solo"], vec!["solo"]),
+			(
+				vec!["zeta", "alpha", "zeta", "", "alpha", ""],
+				vec!["zeta", "alpha", ""],
+			),
+		] {
+			let prepared = prepare(values.into_iter().map(str::to_owned).collect()).unwrap();
+			let actual = prepared.documents[0]
+				.1
+				.get_all(engine.filter_fields[0].field)
+				.map(|value| value.as_str().unwrap())
+				.collect::<Vec<_>>();
+			assert_eq!(actual, expected);
+		}
+		for values in [
+			vec!["x".repeat(MAX_TOKEN_LEN + 1)],
+			vec!["valid".to_owned(), "x".repeat(MAX_TOKEN_LEN + 1)],
+		] {
+			let error = match prepare(values) {
+				Ok(_) => panic!("oversized string filter accepted"),
+				Err(error) => error,
+			};
+			assert_eq!(error.code, "E_INVALID_ARGUMENT");
+		}
+		writer.close().unwrap();
 	}
 
 	#[test]

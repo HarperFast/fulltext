@@ -2,9 +2,12 @@
 
 Native Tantivy full-text indexing for Node.js.
 
-**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.7.0.** The engine is compiled into
-the native addon; no separate Tantivy installation is required. Upgrading from fulltext 0.6.x
-requires an index rebuild; see [Upgrading from 0.6.x](#upgrading-from-06x) before deploying.
+**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.7.0.** The engine is compiled
+into the native addon; no separate Tantivy installation is required. This source tree still has
+version 0.7.0 in its package manifests, but the metadata sorting, aggregation and new filter APIs
+documented here are unreleased and absent from the published 0.7.0 artifacts. See
+[Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
+before deploying a build from this tree.
 
 This repository is under active development. The native entry point provides a standalone Tantivy
 index backed by `MmapDirectory`. Applications own their source records and may reuse compatible
@@ -16,7 +19,7 @@ local index files or rebuild them from that authoritative data.
 - [Install](#installation) and [create your first index](#quick-start).
 - [Choose an API](#choose-an-api) and [understand search results](#reading-search-results).
 - [Configure analysis](#analyzer-and-field-configuration), [filters](#structured-filters), and [highlighting](#highlighting-and-snippets).
-- [Manage writes](#mutations-and-backpressure), [recover an index](#lifecycle-and-recovery), or [upgrade from 0.6.x](#upgrading-from-06x).
+- [Manage writes](#mutations-and-backpressure), [recover an index](#lifecycle-and-recovery), or [upgrade from 0.7.x](#upgrading-from-07x) / [0.6.x](#upgrading-from-06x).
 - Reference: [limits and recovery](docs/limits.md), [benchmarks](docs/benchmarks.md), and [backend internals](docs/native-backend-implementation.md).
 
 ## Capabilities
@@ -328,7 +331,8 @@ const result = await index.search({
 });
 ```
 
-Supported comparators are `equals`, `in`, `lt`, `le`, `gt`, `ge`, and inclusive `between`.
+Supported comparators are `equals`, `in`, `lt`, `le`, `gt`, `ge`, inclusive `between`,
+and value-free `exists`/`missing`. Combine clauses with `and`, `or`, or unary `not`.
 Range comparators require a number field. Candidate IDs and structured filters may be combined;
 both must match. Filter definitions are part of the persisted index identity, so changing them
 requires a new generation or a rebuild from the authoritative source. Filter terms are present in
@@ -434,12 +438,32 @@ The public analyzer name and identity-sidecar version jointly identify persisted
 Any future filter or ordering change must use a new analyzer name or sidecar version so existing
 indexes fail closed and rebuild instead of silently changing recall.
 
+## Upgrading from 0.7.x
+
+The unreleased metadata APIs use query API version 5 and native ABI version 10. Deploy the
+JavaScript facade and native addon built from the same revision; the published 0.7.0 addon cannot
+serve these requests. Indexes with a string `filterFields` entry need rebuilding because string
+metadata now also uses raw fast fields. Open and inspection report `E_IDENTITY_MISMATCH` for the
+old schema. Indexes with only numeric/boolean filter fields, or no filter fields, retain their
+existing identity when the rest of the configuration is unchanged.
+
+1. Drain requests and close every reader and writer using the index path.
+2. With the new build, call `resetNativeFullTextIndex({ path, indexId })` using the existing logical
+   index ID. Reset retires the incompatible directory without editing its sidecar.
+3. Open a new generation and rebuild from authoritative source records. Publish its checkpoint
+   only after indexing covers that checkpoint; switch application reads after publication.
+4. Reclaim retired files through `reclaimRetiredNativeFullTextIndexes()` when they are no longer
+   needed. See the [reset/rebuild example](examples/reset-rebuild.mjs) and [lifecycle details](#lifecycle-and-recovery).
+
+Before downgrading, retire a rebuilt string-metadata index with the new build's reset API, then
+rebuild with the older package. Do not force compatibility by changing identity files.
+
 ## Upgrading from 0.6.x
 
 Version 0.7.0 embeds Tantivy 0.27.0 and requires rebuilding existing indexes. The new English
 stemmer changes some terms (`added`: `ad` → `add`), so opening an old index with the same
 `english@2` configuration returns `E_IDENTITY_MISMATCH`. Inspection reports that incompatibility
-before search or mutation. The public analyzer name and query API are unchanged.
+before search or mutation. That release kept the public analyzer name and query API unchanged.
 
 Drain and close readers/writers, call `resetNativeFullTextIndex()` with the existing logical index ID,
 and rebuild from authoritative source records. Use the checkpoint-publication lifecycle to publish

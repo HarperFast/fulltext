@@ -90,7 +90,7 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 			max_terms_size: crate::catalog::MAX_TERMS_SIZE,
 			max_aggregation_memory_bytes: crate::catalog::MAX_AGGREGATION_MEMORY_BYTES as u32,
 			max_sort_key_bytes: crate::catalog::MAX_SORT_MEMORY_BYTES as u32,
-			max_term_key_bytes: 16 * 1024 * 1024,
+			max_term_key_bytes: crate::catalog::MAX_TERM_KEY_BYTES as u32,
 
 			max_commit_payload_bytes: engine::MAX_COMMIT_PAYLOAD_BYTES as u32,
 			max_query_text_bytes: protocol::MAX_QUERY_TEXT_BYTES as u32,

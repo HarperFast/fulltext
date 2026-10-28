@@ -2,7 +2,8 @@ import { FulltextError } from './errors.js';
 
 export const maxAggregations = 8;
 export const maxAggregationNameBytes = 128;
-export const maxAggregationBuckets = 100;
+export const maxTermsSize = 100;
+export const maxAggregationRanges = 100;
 export const maxAggregationResponseBuckets = 1_024;
 const maxCatalogFieldBytes = 1 << 20;
 const invalidSurrogate = /[\uD800-\uDFFF]/u;
@@ -91,8 +92,8 @@ export function normalizeCatalog(
 		switch (value.type) {
 			case 'terms': {
 				const size = value.size;
-				if (typeof size !== 'number' || !Number.isInteger(size) || size < 1 || size > maxAggregationBuckets) {
-					invalid(`terms size must be an integer from 1 to ${maxAggregationBuckets}`);
+				if (typeof size !== 'number' || !Number.isInteger(size) || size < 1 || size > maxTermsSize) {
+					invalid(`terms size must be an integer from 1 to ${maxTermsSize}`);
 				}
 				return { name, field, type: 'terms', size };
 			}
@@ -105,8 +106,8 @@ export function normalizeCatalog(
 			}
 			case 'range': {
 				const input = value.ranges;
-				if (!Array.isArray(input) || input.length < 1 || input.length > maxAggregationBuckets) {
-					invalid(`ranges must contain between 1 and ${maxAggregationBuckets} entries`);
+				if (!Array.isArray(input) || input.length < 1 || input.length > maxAggregationRanges) {
+					invalid(`ranges must contain between 1 and ${maxAggregationRanges} entries`);
 				}
 				const ranges = Array.from(input, (entry, index): AggregationRange => {
 					const range = object(entry, 'range');

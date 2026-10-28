@@ -5,7 +5,7 @@ import {
 	type AggregationRequest,
 	type AggregationResult,
 } from './catalog.js';
-export type { SortRequest, AggregationRequest, AggregationResult } from './catalog.js';
+export type { SortRequest, AggregationRequest, AggregationResult, AggregationRange } from './catalog.js';
 import { createHash, createHmac, randomBytes, timingSafeEqual, webcrypto } from 'node:crypto';
 import { lstat, readdir, realpath, rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';

@@ -112,8 +112,13 @@ compatible. The public identity-migration regression checks open, inspection, an
 native top-k/aggregation ownership and checks the shared deadline every 1,024 visited matches.
 `deadline_interrupts_an_active_collection` verifies expiry after collection starts.
 
-Native aggregation structure accounting excludes some decoded keys. `sorted_hits` and
-`aggregate` perform separate worst-case key preflights before creating collectors;
+Native aggregation structure accounting excludes some decoded keys. `sorted_catalog` and
+`aggregate` bound retained keys before creating collectors. Counts use segment live documents
+or dictionary cardinality; a capped dictionary scan can qualify actual maximum key lengths when
+the supported-length estimate fails. Terms retain native tenfold candidate oversampling.
+Sorted hits, count and aggregates share a native tuple collector; unsorted aggregates preserve
+the ordinary ranked-hits path. Engine encodes bounded aggregates once, and native wire encoding
+finishes inside the request permit/deadline;
 `encode_results` bounds the response. Catalog resource tests pin rejection rather than
 partial output. See [metadata resource policy](../docs/limits.md#metadata-collectors).
 

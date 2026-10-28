@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub const SEARCH_TIMEOUT_MESSAGE: &str = "full-text search exceeded its execution budget";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FulltextError {
 	pub code: &'static str,

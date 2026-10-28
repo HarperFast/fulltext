@@ -32,6 +32,41 @@ for final-page version decoding, lazy native fuzzy-prefix matching, the retained
 and the benchmark methodology. These implementation changes preserve the public matching and
 pagination contracts; synthetic timings do not establish a general production speedup.
 
+## Metadata sorting and aggregation
+
+`npm run benchmark:metadata` builds optimized artifacts, then runs the deterministic metadata
+driver with 10,000 documents and 100 measured requests per case. For a correctness smoke run,
+build first with `npm run build`, then run `npm run benchmark:metadata:smoke` (300 documents,
+10 requests per case). The driver itself never builds. Override workload sizes with
+`--documents` and `--queries`:
+
+```bash
+npm run benchmark:metadata -- --documents 10000 --queries 100
+```
+
+The JSON report includes Node, platform, architecture and native versions, the complete index
+configuration, durable write throughput, total filesystem bytes after close, and query
+p50/p95/p99. Query cases cover ordinary search, numeric/string sorting, terms, statistics,
+histograms, and a combined filtered query. Each case warms three requests before measurement;
+all requests run sequentially with exact totals and ten-hit windows. The footprint includes
+metadata and segment files; it does not isolate the cost of string fast fields. Resource-limit,
+response-size and timeout rejections appear in the JSON and on stderr.
+
+Compare baseline and current using this **same driver** and identical optimized builds. Build
+both worktrees first, then run from the current worktree:
+
+```bash
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/metadata.mjs --module /absolute/baseline/dist/native.js --documents 10000 --queries 100 --revision baseline > metadata-baseline.json
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/metadata.mjs --documents 10000 --queries 100 --revision current > metadata-current.json
+```
+
+The `--module` argument loads the selected worktree's JavaScript facade and matching native
+addon. A query API older than version 5 measures writes, footprint and ordinary search, and marks
+metadata cases skipped. Alternate process order over repeated pairs on idle hardware. Compare
+ingestion, footprint and ordinary search across revisions; compare new collector costs against
+ordinary search within the current revision. These synthetic observations are not production
+latency guarantees.
+
 ## Native search and ingestion
 
 The native benchmark generates a deterministic, high-cardinality product catalog and emits one versioned

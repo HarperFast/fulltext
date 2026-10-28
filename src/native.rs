@@ -2183,7 +2183,13 @@ fn execute_search_command(
 			let result = decode_search(&bytes).and_then(|request| {
 				engine
 					.search_with_deadline(&reader.searcher(), &request, deadline)
-					.map(SearchOutcome::Search)
+					.and_then(search_body)
+					.and_then(|body| {
+						if Instant::now() >= deadline {
+							return Err(search_timeout());
+						}
+						Ok(SearchOutcome::Search(body))
+					})
 			});
 			runtime
 				.search_execution_nanoseconds
@@ -2221,10 +2227,7 @@ fn execute_search_command(
 		}
 	}));
 	match result {
-		Ok(Ok(SearchOutcome::Search(result))) => match search_body(result) {
-			Ok(bytes) => completion.success(bytes),
-			Err(error) => completion.failure(error),
-		},
+		Ok(Ok(SearchOutcome::Search(body))) => completion.success(body),
 		Ok(Ok(SearchOutcome::Trace(result))) => completion.success(trace_body(result)),
 		Ok(Err(error)) => completion.failure(error),
 		Err(_) => {
@@ -2237,7 +2240,7 @@ fn execute_search_command(
 }
 
 enum SearchOutcome {
-	Search(SearchResult),
+	Search(Vec<u8>),
 	Trace(TraceResult),
 }
 
@@ -2248,7 +2251,7 @@ fn operation_deadline(budget_milliseconds: u32, queued_for: Duration) -> Result<
 }
 
 fn search_timeout() -> FulltextError {
-	FulltextError::new("E_TIMEOUT", "full-text search exceeded its execution budget")
+	FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE)
 }
 
 fn open_on_thread(
@@ -3117,10 +3120,10 @@ fn search_body(result: SearchResult) -> Result<Vec<u8>> {
 			push_string(&mut bytes, &version);
 		}
 	}
-	if result.aggregations.is_empty() {
-		bytes.push(0);
+	if let Some(aggregations) = result.encoded_aggregations {
+		bytes.extend_from_slice(&aggregations);
 	} else {
-		bytes.extend_from_slice(&crate::catalog::encode_results(&result.aggregations)?);
+		bytes.push(0);
 	}
 	if let Some((snapshot, more)) = result.traversal {
 		push_string(&mut bytes, &snapshot);

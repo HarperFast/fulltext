@@ -187,7 +187,7 @@ test('retained readers keep sort and aggregates on one snapshot across deletes a
 	assert(!after.aggregations[0].buckets.some((bucket) => bucket.key === 'alpha' && bucket.count === 2));
 });
 
-test('sort ties use UTF-8 IDs across commits, reload and merges', async (context) => {
+test('sort ties use UTF-8 IDs across commits and reload', async (context) => {
 	const options = config(context);
 	const index = await openNativeFullTextIndex(options);
 	context.after(() => index.close({ mode: 'rollback' }));
@@ -229,9 +229,7 @@ test('catalog errors are explicit and leave the handle usable', async (context) 
 		await assert.rejects(index.search({ text: 'shoe', ...request }), { code: 'E_INVALID_ARGUMENT' });
 	await assert.rejects(index.searchPage({ text: 'shoe', sort: sort('price') }), { code: 'E_INVALID_ARGUMENT' });
 	await assert.rejects(index.searchPage({ text: 'shoe', aggregations }), { code: 'E_INVALID_ARGUMENT' });
-	await assert.rejects(index.search({ text: 'shoe', sort: sort('brand'), limit: 10_000 }), {
-		code: 'E_RESOURCE_LIMIT',
-	});
+	assert.strictEqual((await index.search({ text: 'shoe', sort: sort('brand'), limit: 10_000 })).hits.length, 6);
 	await assert.rejects(
 		index.search({
 			text: 'shoe',
