@@ -234,6 +234,66 @@ test('aggregations cover the full matching snapshot and deduplicate string value
 	});
 });
 
+test('numeric bucket counts deduplicate documents while stats retain every array value', async (context) => {
+	const index = await openNativeFullTextIndex(config(context));
+	context.after(() => index.close({ mode: 'rollback' }));
+	await index.applyMutationBatch({
+		upserts: [
+			[1, 2],
+			[10, 10],
+			[1, 1],
+			[10, 11],
+		].map((price, position) => ({
+			id: String(position),
+			fields: { title: 'shoe' },
+			filters: { price },
+		})),
+	});
+	await index.commit();
+	await index.reload();
+	const requests = [
+		{ name: 'prices', type: 'stats', field: 'price' },
+		{ name: 'histogram', type: 'histogram', field: 'price', interval: 10 },
+		{
+			name: 'ranges',
+			type: 'range',
+			field: 'price',
+			ranges: [
+				{ from: 0, to: 10 },
+				{ from: 10, to: 20 },
+			],
+		},
+	];
+	let baseline;
+	for (const order of [undefined, sort('price')]) {
+		const result = await index.search({
+			text: 'shoe',
+			sort: order,
+			limit: 1,
+			exactTotal: true,
+			aggregations: requests,
+		});
+		assert.strictEqual(result.total, 4);
+		assert.strictEqual(result.totalRelation, 'exact');
+		assert.strictEqual(result.hits.length, 1);
+		const [stats, histogram, ranges] = result.aggregations;
+		assert.deepStrictEqual(stats, { name: 'prices', type: 'stats', count: 8, sum: 46, min: 1, max: 11, avg: 5.75 });
+		assert.deepStrictEqual(histogram.buckets, [
+			{ key: 0, count: 2 },
+			{ key: 10, count: 2 },
+		]);
+		assert.deepStrictEqual(
+			ranges.buckets.filter(({ count }) => count > 0).map(({ from, to, count }) => ({ from, to, count })),
+			[
+				{ from: 0, to: 10, count: 2 },
+				{ from: 10, to: 20, count: 2 },
+			],
+		);
+		if (baseline) assert.deepStrictEqual(result.aggregations, baseline);
+		baseline = result.aggregations;
+	}
+});
+
 test('retained readers keep sort and aggregates on one snapshot across deletes and commits', async (context) => {
 	const { index, options } = await fixture(context);
 	const reader = await openNativeFullTextReader(options);
