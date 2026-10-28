@@ -383,8 +383,9 @@ document containing its source. Match tracing uses the same document-side expans
 replacement to the source token span. Crossing its 262,144-token-per-value ceiling marks the trace
 incomplete instead of failing the request. Versions 1–5 remain parseable for safe reset
 but mismatch current open/inspection so the application can retire and rebuild them. Filter-free
-indexes use sidecar v6; indexes with structured filter fields use v7 so their field names and types
-participate in compatibility checks alongside the current stemmer revision.
+indexes use sidecar v6; numeric/Boolean-only metadata retains v7. Configurations with string metadata
+use v8 for raw fast columns and per-document string deduplication, requiring a rebuild of older
+string-metadata indexes. Names and types remain fingerprinted alongside the current stemmer revision.
 
 Search builds a typed Boolean query rather than exposing Tantivy's query-string syntax. Each
 analyzed term is searched across the selected fields, applying configured field boosts. `any`

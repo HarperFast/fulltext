@@ -1,7 +1,7 @@
 # Native search collection
 
 Status: verified against Tantivy 0.27.0 source and local macOS arm64 tests · Owner: Harper
-Engineering · Last verified: 2026-10-26
+Engineering · Last verified: 2026-10-27
 
 `TraversalScoreTieCollector` owns its scorer loop so it can return `E_TIMEOUT` between document
 batches. Keep the ordinary `StableScoreTieCollector` independent: traversal-only boundary and
@@ -96,12 +96,39 @@ JavaScript’s UTF-16 sort establishes request identity. Native hit ordering use
 field and query-clause order because it can affect scores. Ordinary search keeps its existing
 encoding; Rust does not need to normalize candidates again.
 
+## Metadata collectors
+
+Observed: Rust and public Node tests pass locally on macOS arm64, 2026-10-27.
+
+`Engine::search_inner` builds the query on the supplied reader snapshot. Sorting and flat
+aggregation reuse that query; aggregation never runs over the returned hit page.
+`native-metadata.test.mjs` pins filtered/candidate counts and retained-reader behavior.
+
+Only string metadata gains a fast column and per-document deduplication. `identity_bytes`
+emits v8 only for string configurations; numeric/Boolean-only v7 and text-only v6 remain
+compatible. The public identity-migration regression checks open, inspection, and reset.
+
+`catalog::DeadlineCollector` wraps only metadata collectors. Its deletion-aware loop keeps
+native top-k/aggregation ownership and checks the shared deadline every 1,024 visited matches.
+`deadline_interrupts_an_active_collection` verifies expiry after collection starts.
+
+Native aggregation structure accounting excludes some decoded keys. `sorted_hits` and
+`aggregate` perform separate worst-case key preflights before creating collectors;
+`encode_results` bounds the response. Catalog resource tests pin rejection rather than
+partial output. See [metadata resource policy](../docs/limits.md#metadata-collectors).
+
+Sorted snapshot continuation and metadata-derived score adjustment remain outside this
+increment. Production latency, process-memory residency, and Harper integration are untested.
+
 ## Remaining limits
 
 Local verification covers macOS arm64; use the platform CI results for Linux and Windows. Individual
 Tantivy operations and query construction remain uninterruptible.
 
 ## Sources
+
+- [Metadata collectors and native tests](catalog.rs)
+- [Public metadata regressions](../test/native-metadata.test.mjs)
 
 - [Collector and native tests](engine.rs)
 - [Facade and token identity](../ts/native.ts)

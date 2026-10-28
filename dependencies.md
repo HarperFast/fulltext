@@ -44,7 +44,7 @@ bare dependency-name ignore rule.
 Tantivy 0.27 replaces the English stemmer with `frostem`. Persisted identities 6 (text only)
 and 7 (typed filters) distinguish that output from identities 4/5; the public `english@2`
 configuration remains unchanged. Older indexes must be retired and rebuilt from authoritative
-records. Reset still recognizes identities 1–7. Retire a new index with the 0.7 reset API before
+records. Reset still recognizes identities 1–8. Retire a new index with the 0.7 reset API before
 downgrading and rebuilding with 0.6; its reset parser cannot recognize identities 6/7. Never copy
 an old sidecar over a new index to bypass inspection.
 
@@ -103,3 +103,11 @@ preserves installation without lifecycle scripts or a Rust toolchain.
 | `@harperfast/fulltext-linux-arm64-gnu` | optional runtime | Linux arm64 glibc addon for this version.      |
 | `@harperfast/fulltext-linux-x64-gnu`   | optional runtime | Linux x64 glibc native addon for this version. |
 | `@harperfast/fulltext-win32-x64-msvc`  | optional runtime | Windows x64 native addon for this version.     |
+
+### Metadata collectors
+
+Sorting reuses Tantivy's composable `TopDocs` sort keys. Flat aggregations use its typed
+`AggregationCollector` API without another dependency or public upstream request types.
+String-metadata configurations use identity8 for raw fast columns and per-document string
+value deduplication; numeric/Boolean-only configurations retain identity7. The library guards
+decoded sort/term keys separately from Tantivy's estimated aggregation structure memory.

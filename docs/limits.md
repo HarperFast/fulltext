@@ -295,3 +295,32 @@ accompany the pre-1.0 package change from 0.5 to 0.6; they do not introduce a `s
 - [Advertised runtime limits](../src/lib.rs)
 - [Analyzer, query, and collector behavior](../src/engine.rs)
 - [JavaScript preparation and mutation framing](../ts/native.ts)
+
+## Metadata collectors
+
+`runtimeInfo().limits` exposes aggregation counts, bucket count, terms size, native aggregation
+memory, sort-key bytes, and term-key bytes. All are fixed library safety limits. The preflights
+use worst-case supported key lengths, so a request can be rejected even when its actual values
+would be shorter. Reduce the window or terms size, or compact segments; do not split independent
+top-k requests and claim a globally equivalent answer.
+
+| Resource                          | Bound                                                         | Enforcement                                                                                                                                                                                                                   |
+| --------------------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Named flat aggregations           | 8; each name 1–128 UTF-8 bytes, unique                        | Facade and native validation before collection.                                                                                                                                                                               |
+| Terms size / explicit range count | 1–100 each                                                    | String terms or numeric ranges only. Native terms `segment_size` equals requested `size`; counts/top-category membership can be approximate across segments.                                                                  |
+| Returned aggregation buckets      | 1,024 across all aggregations                                 | Native limit; overflow rejects with `E_RESOURCE_LIMIT`. No partial histogram/range response.                                                                                                                                  |
+| Native aggregation structures     | 16 MiB estimated, shared across segment collectors            | Tantivy guard; this is not total process memory and does not account for every decoded key.                                                                                                                                   |
+| Decoded term keys                 | 16 MiB conservative preflight                                 | Sum `size × segment count × (65,530 + 128)` over terms requests, before collector construction; checked integer arithmetic. Covers per-segment candidate key materialization separately from native structure accounting.     |
+| Retained metadata sort keys       | 64 MiB conservative preflight                                 | `(offset + limit) × segment count × (4,096 + 128 + value bound)`; value bound is 65,530 for strings or eight for numbers. Rejects before native top-k allocation. Ordinary 10,000-window and prefix restrictions still apply. |
+| Serialized search response        | Existing 8 MiB, including aggregates                          | Reject with `E_RESULT_TOO_LARGE`; reduce returned hit page or terms size.                                                                                                                                                     |
+| Numeric arithmetic                | Finite input/output; representable histogram bucket positions | Invalid intervals/ranges reject with `E_INVALID_ARGUMENT`; arithmetic/capacity overflow rejects with `E_RESOURCE_LIMIT`.                                                                                                      |
+
+The metadata collector checks the original request deadline before setup, at segment boundaries,
+every 1,024 visited matches, and around final merge. Native scorer setup, individual dictionary
+conversion, and native aggregation merge remain synchronous within those checkpoints. This is a
+cooperative deadline, not a hard wall-clock or memory-residency guarantee. Deleted documents are
+excluded using the snapshot's deletion mask. Existing ordinary requests do not use this wrapper.
+
+String metadata adds a raw fast column and deduplicates repeated strings within a document,
+preserving first occurrence. Upgrading a released index containing string metadata requires a
+rebuild to sidecar v8. Numeric/Boolean-only metadata keeps sidecar v7; text-only keeps v6.

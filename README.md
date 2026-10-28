@@ -300,7 +300,7 @@ Source projection, current-record validation, and Harper REST integration remain
 Filter fields are typed metadata stored in the Tantivy index alongside the analyzed text. They let
 Tantivy discard non-matching documents before returning ranked IDs, reducing source-record reads
 without changing BM25 scores. The caller's records remain authoritative; filter metadata is a
-derived copy used only to narrow search results.
+derived copy used to filter, sort, and aggregate search results.
 
 The library does not infer this metadata. Declare each field in `filterFields` when opening the
 index and supply its value in each upsert's `filters` object. A field omitted from `filterFields`
@@ -311,9 +311,9 @@ Declare only fields commonly combined with text search. Filter metadata increase
 mutation work, and changing its definition requires a new generation or rebuild. Filter fields are
 separate from analyzed text fields and may reuse the same logical name. String filters are exact
 and case-sensitive; number filters support exact and range comparisons; Boolean filters support
-exact comparison. Arrays add one value per element. Missing fields add no value. String values are
-limited to 65,530 UTF-8 bytes. Number fields are also stored as Tantivy fast fields to keep broad
-range filters from materializing term bitsets; this further increases index size.
+exact comparison. Arrays add one value per element; duplicate string values are indexed once, preserving first occurrence. Missing fields and empty arrays add no value. String values are
+limited to 65,530 UTF-8 bytes. Number fields are stored as Tantivy fast fields to keep broad
+range filters from materializing term bitsets. String fields have raw fast columns for sorting and facets; these columns increase indexing work and disk usage.
 
 ```js
 const result = await index.search({
@@ -333,6 +333,73 @@ Range comparators require a number field. Candidate IDs and structured filters m
 both must match. Filter definitions are part of the persisted index identity, so changing them
 requires a new generation or a rebuild from the authoritative source. Filter terms are present in
 the local Tantivy term dictionary and should be protected like the indexed text itself.
+
+### Negation and field presence
+
+Use `{ operator: 'not', clause: filter }` to exclude a filter match, and
+`{ field: 'brand', comparator: 'exists' }` or `comparator: 'missing'` without a `value`.
+Omitted fields and empty arrays are missing; `false`, zero, and the empty string are present.
+A comparison matches when any array element matches. Negating it means no element matches,
+including records where the field is missing. Filters remain score-neutral and share the existing
+nesting and clause limits.
+
+### Native metadata sorting and aggregations
+
+Declare metadata in `filterFields` and supply it through upsert `filters`, then request:
+
+```js
+const result = await index.search({
+	text: 'running shoes',
+	filter: { field: 'active', comparator: 'equals', value: true },
+	sort: { field: 'price', direction: 'asc', missing: 'last' },
+	limit: 10,
+	aggregations: [
+		{ name: 'brands', type: 'terms', field: 'brand', size: 10 },
+		{ name: 'prices', type: 'stats', field: 'price' },
+		{ name: 'priceBands', type: 'histogram', field: 'price', interval: 25 },
+		{ name: 'ranges', type: 'range', field: 'price', ranges: [{ to: 50 }, { from: 50, to: 100 }, { from: 100 }] },
+	],
+});
+console.log(result.hits, result.aggregations);
+```
+
+Sorting selects the globally correct window before pagination. It accepts one numeric or string
+metadata field, explicit `asc`/`desc` direction, and explicit `first`/`last` missing placement.
+For arrays it selects the caller's first value, rather than a minimum or maximum. Ties use raw
+UTF-8 ID ascending, independently of score; returned scores keep their original relevance value.
+Sorted searches return exact totals, even without `exactTotal: true`. Omitting `sort` preserves the
+existing relevance order and total-relation behavior. Boolean sorting and metadata-derived score
+adjustments are not supported in this increment.
+
+Hits and all aggregations use the same query, candidate IDs, filters, and reader snapshot.
+Aggregations cover the full matching set, independently of `offset` and `limit`. Results are a
+named array in request order. Missing metadata contributes no value. Each bucket has `key` and
+`count`; range buckets also expose optional `from` and `to`.
+
+| Type        | Metadata | Result semantics                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `terms`     | String   | Up to `size` top categories, count descending with key ties. Each distinct value counts once per document. Native per-segment candidate selection is approximate: inspect `docCountErrorUpperBound` and `sumOtherDocCount`; a positive error bound can also mean globally important categories were omitted. These are bucket contributions, not a count of distinct omitted documents. |
+| `stats`     | Number   | `count`, `sum`, `min`, `max`, `avg` over all array values, including repeated values. Empty results have count/sum zero and min/max/avg null.                                                                                                                                                                                                                                           |
+| `histogram` | Number   | Populated interval buckets, numeric key ascending; ranges are `[key, key + interval)`. A document counts once per bucket, and can appear in multiple buckets.                                                                                                                                                                                                                           |
+| `range`     | Number   | Ascending contiguous, non-overlapping `[from, to)` ranges. Only first/last may omit their outside endpoint. Tantivy adds uncovered outer buckets; missing values remain excluded. A document counts once per bucket.                                                                                                                                                                    |
+
+There are at most eight flat aggregations, 100 requested terms or ranges per aggregation, and
+1,024 returned buckets. Native aggregation structures have a 16 MiB guard. Additional conservative
+key budgets account for decoded string keys across segments: large sort windows or many term
+candidates can fail with `E_RESOURCE_LIMIT` before collection. See [metadata resource
+policy](docs/limits.md#metadata-collectors) for formulas. Non-finite aggregate results reject;
+search never returns silently truncated histograms or ranges. Terms expose their explicitly
+approximate candidate-selection policy.
+
+`sort` and `aggregations` are supported by `search()`, including dedicated readers. `searchPage()`
+rejects both: its score/ID continuation cannot represent a metadata boundary. Use ordinary bounded
+offset pagination for sorted results. Aggregation-only requests preserve the normal hits path;
+aggregation collection is a separate bounded pass over the same snapshot. New catalog requests
+use the expensive-search lane and the original shared deadline.
+
+Permissions for aggregate contributions must be expressed in `filter` or `candidateIds` before
+collection. Removing unauthorized hits afterward cannot remove their bucket or numeric contribution.
+See the executable [metadata example](examples/metadata-search.mjs).
 
 ## Analyzer and field configuration
 
@@ -611,10 +678,13 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 9 and packed protocol 5. The loader rejects older addon binaries. Native
-identity sidecar v6 identifies indexes without structured filter fields. Configuring filter fields
-uses sidecar v7, which also fingerprints their names and types. Older v1–v5 indexes remain
-identifiable for safe reset but cannot be reopened; rebuild them from the authoritative source.
+This API uses native ABI 10, query API 5, and packed protocol 6. The loader rejects older addon
+binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
+for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
+columns and per-document string deduplication. Previously released string-metadata indexes must
+be retired and rebuilt from authoritative records; open and inspection reject their old identity.
+Reset recognizes v1–v8. Retire a v8 index with this version before downgrading: the 0.7.0 reset
+parser cannot recognize v8. Never rewrite a sidecar to bypass the rebuild boundary.
 
 ## Diagnostics and errors
 

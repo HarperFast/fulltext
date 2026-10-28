@@ -1,3 +1,11 @@
+import {
+	normalizeCatalog,
+	decodeAggregations,
+	type SortRequest,
+	type AggregationRequest,
+	type AggregationResult,
+} from './catalog.js';
+export type { SortRequest, AggregationRequest, AggregationResult } from './catalog.js';
 import { createHash, createHmac, randomBytes, timingSafeEqual, webcrypto } from 'node:crypto';
 import { lstat, readdir, realpath, rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -39,7 +47,7 @@ const maxContinuationBytes = continuationOffsets.id + maxRecordIdBytes;
 const maxContinuationCharacters = Math.ceil((maxContinuationBytes * 4) / 3);
 const maxSynchronousIdentityBytes = 64 * 1024;
 const maxPreparationCommands = Math.floor(maxSearchRequestBytes / maxSynchronousIdentityBytes);
-const filterComparators = new Set(['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between']);
+const filterComparators = new Set(['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between', 'exists', 'missing']);
 
 export { FulltextError } from './errors.js';
 export type { FulltextErrorCode } from './errors.js';
@@ -48,12 +56,19 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	queryApiVersion: 4;
+	queryApiVersion: 5;
 	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
 	mutationBatchApiVersion: 5;
 	storageBackends: ReadonlyArray<'native'>;
 	limits: {
+		maxAggregations: number;
+		maxAggregationBuckets: number;
+		maxTermsSize: number;
+		maxAggregationMemoryBytes: number;
+		maxSortKeyBytes: number;
+		maxTermKeyBytes: number;
+
 		maxCommitPayloadBytes: number;
 		maxQueryTextBytes: number;
 		maxQueryTerms: number;
@@ -223,9 +238,13 @@ export type FilterExpression =
 			comparator: 'equals' | 'in' | 'lt' | 'le' | 'gt' | 'ge' | 'between';
 			value: FilterValue | FilterValue[];
 	  }
+	| { field: string; comparator: 'exists' | 'missing' }
+	| { operator: 'not'; clause: FilterExpression }
 	| { operator: 'and' | 'or'; clauses: FilterExpression[] };
 
 export interface SearchRequest {
+	sort?: SortRequest;
+	aggregations?: AggregationRequest[];
 	text?: string;
 	query?: SearchExpression;
 	mode?: SearchMode;
@@ -238,7 +257,7 @@ export interface SearchRequest {
 	exactTotal?: boolean;
 }
 
-export interface SearchPageRequest extends Omit<SearchRequest, 'offset' | 'exactTotal'> {
+export interface SearchPageRequest extends Omit<SearchRequest, 'offset' | 'exactTotal' | 'sort' | 'aggregations'> {
 	offset?: number | null;
 	exactTotal?: boolean | null;
 	continuation?: string;
@@ -257,6 +276,7 @@ export interface TraceSearchRequest {
 }
 
 export interface SearchResult {
+	aggregations?: AggregationResult[];
 	total: number;
 	totalRelation: 'exact' | 'lower-bound';
 	hits: Array<{ id: string; score: number; version?: string }>;
@@ -655,7 +675,12 @@ export class NativeFullTextIndex {
 		if (traversal && request.offset != null && request.offset !== 0) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'searchPage requires offset zero');
 		}
+
+		const catalog = normalizeCatalog((request as SearchRequest).sort, (request as SearchRequest).aggregations);
+		if (traversal && (catalog.sort !== undefined || catalog.aggregations.length > 0))
+			throw new FulltextError('E_INVALID_ARGUMENT', 'sort and aggregations are not supported by searchPage');
 		const packed = {
+			...catalog,
 			expression,
 			candidateIds: request.candidateIds,
 			filter: request.filter === undefined ? undefined : normalizeFilterExpression(request.filter, 0, { leaves: 0 }),
@@ -739,6 +764,7 @@ export class NativeFullTextIndex {
 			const version = cursor.u8() === 1 ? cursor.string() : undefined;
 			return { score, id, ...(version === undefined ? {} : { version }) };
 		});
+		const aggregations = decodeAggregations(cursor);
 		let continuation: string | undefined;
 		if (traversal) {
 			const snapshot = cursor.string();
@@ -776,6 +802,7 @@ export class NativeFullTextIndex {
 			total,
 			totalRelation: relation === 0 ? 'exact' : 'lower-bound',
 			hits,
+			...(aggregations.length === 0 ? {} : { aggregations }),
 			...(continuation === undefined ? {} : { continuation }),
 		};
 	}
@@ -1276,7 +1303,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			queryApiVersion: info.queryApiVersion as 4,
+			queryApiVersion: info.queryApiVersion as 5,
 			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
 			mutationBatchApiVersion: 5,
@@ -1367,6 +1394,12 @@ function normalizeFilterExpression(
 		if (!filterComparators.has(expression.comparator)) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'unknown filter comparator');
 		}
+		if (expression.comparator === 'exists' || expression.comparator === 'missing') {
+			if ('value' in expression)
+				throw new FulltextError('E_INVALID_ARGUMENT', 'presence filters do not accept a value');
+			return { field: expression.field, comparator: expression.comparator, values: [] };
+		}
+		if (!('value' in expression)) throw new FulltextError('E_INVALID_ARGUMENT', 'filter clause requires a value');
 		const values = Array.isArray(expression.value) ? expression.value.slice() : [expression.value];
 		const expected = expression.comparator === 'in' ? undefined : expression.comparator === 'between' ? 2 : 1;
 		if (
@@ -1386,6 +1419,9 @@ function normalizeFilterExpression(
 			);
 		}
 		return { field: expression.field, comparator: expression.comparator, values };
+	}
+	if (expression.operator === 'not') {
+		return { operator: 'not', clause: normalizeFilterExpression(expression.clause, depth + 1, state) };
 	}
 	if (
 		(expression.operator !== 'and' && expression.operator !== 'or') ||

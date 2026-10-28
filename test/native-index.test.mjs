@@ -986,7 +986,7 @@ test('rejects previous stemmer identities before open and retires them for rebui
 		}
 		const identityPath = path.join(indexPath, '.harper-fulltext-identity');
 		const identity = readFileSync(identityPath);
-		assert.strictEqual(identity[4], filtered ? 7 : 6);
+		assert.strictEqual(identity[4], filtered ? 8 : 6);
 		identity[4] = filtered ? 5 : 4;
 		writeFileSync(identityPath, identity);
 		assert.deepStrictEqual(inspectNativeFullTextIndex(config), {

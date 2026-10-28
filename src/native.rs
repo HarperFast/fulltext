@@ -2221,7 +2221,10 @@ fn execute_search_command(
 		}
 	}));
 	match result {
-		Ok(Ok(SearchOutcome::Search(result))) => completion.success(search_body(result)),
+		Ok(Ok(SearchOutcome::Search(result))) => match search_body(result) {
+			Ok(bytes) => completion.success(bytes),
+			Err(error) => completion.failure(error),
+		},
 		Ok(Ok(SearchOutcome::Trace(result))) => completion.success(trace_body(result)),
 		Ok(Err(error)) => completion.failure(error),
 		Err(_) => {
@@ -3098,7 +3101,7 @@ fn u64_body(value: u64) -> Vec<u8> {
 	value.to_le_bytes().to_vec()
 }
 
-fn search_body(result: SearchResult) -> Vec<u8> {
+fn search_body(result: SearchResult) -> Result<Vec<u8>> {
 	let mut bytes = Vec::new();
 	push_u64(&mut bytes, result.total);
 	bytes.push(match result.total_relation {
@@ -3114,11 +3117,16 @@ fn search_body(result: SearchResult) -> Vec<u8> {
 			push_string(&mut bytes, &version);
 		}
 	}
+	if result.aggregations.is_empty() {
+		bytes.push(0);
+	} else {
+		bytes.extend_from_slice(&crate::catalog::encode_results(&result.aggregations)?);
+	}
 	if let Some((snapshot, more)) = result.traversal {
 		push_string(&mut bytes, &snapshot);
 		bytes.push(more as u8);
 	}
-	bytes
+	Ok(bytes)
 }
 
 fn trace_body(result: TraceResult) -> Vec<u8> {

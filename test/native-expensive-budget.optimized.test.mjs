@@ -9,7 +9,7 @@ import { encodeOpen } from '../dist/codec.js';
 import { invoke } from '../dist/invoke.js';
 import { loadAddon } from '../dist/load-addon.js';
 
-for (const scenario of ['phrase', 'traversal']) {
+for (const scenario of ['phrase', 'traversal', 'exists', 'missing', 'not', 'sort', 'stats', 'terms', 'histogram']) {
 	test(`optimized ${scenario} searches preserve ordinary capacity and close queued expensive work`, async (context) => {
 		const indexPath = mkdtempSync(path.join(tmpdir(), 'fulltext-optimized-permit-'));
 		context.after(() => rmSync(indexPath, { recursive: true, force: true }));
@@ -26,6 +26,10 @@ for (const scenario of ['phrase', 'traversal']) {
 			indexId: 'products',
 			generation: 'v1',
 			fields: [{ name: 'title', weight: 1 }],
+			filterFields: [
+				{ name: 'price', type: 'number' },
+				{ name: 'brand', type: 'string' },
+			],
 			analyzer: 'english@2',
 			stopWords: true,
 			positions: true,
@@ -53,14 +57,30 @@ for (const scenario of ['phrase', 'traversal']) {
 			maxBatchBytes: options.limits.maxBatchBytes,
 			searchLimits: { ...options.limits, maxQueuedCommands: 1 },
 			fieldNames: options.fields.map((field) => field.name),
+			filterFields: options.filterFields,
 		});
-		const searchExpensive = (executionOptions = {}) =>
-			scenario === 'phrase'
-				? index.search({ text: 'trail running', mode: 'phrase' }, executionOptions)
-				: index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' }, executionOptions);
+		const searchExpensive = (executionOptions = {}) => {
+			if (scenario === 'traversal') return index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' }, executionOptions);
+			const request = { text: 'trail running' };
+			if (scenario === 'phrase') request.mode = 'phrase';
+			if (scenario === 'exists') request.filter = { field: 'price', comparator: 'exists' };
+			if (scenario === 'missing') request.filter = { field: 'brand', comparator: 'missing' };
+			if (scenario === 'not')
+				request.filter = { operator: 'not', clause: { field: 'brand', comparator: 'equals', value: 'excluded' } };
+			if (scenario === 'sort') request.sort = { field: 'price', direction: 'asc', missing: 'last' };
+			if (scenario === 'stats') request.aggregations = [{ name: 'prices', field: 'price', type: 'stats' }];
+			if (scenario === 'terms') request.aggregations = [{ name: 'brands', field: 'brand', type: 'terms', size: 5 }];
+			if (scenario === 'histogram')
+				request.aggregations = [{ name: 'prices', field: 'price', type: 'histogram', interval: 10 }];
+			return index.search(request, executionOptions);
+		};
 		context.after(() => index.close({ mode: 'rollback' }).catch(() => undefined));
 		await index.applyMutationBatch({
-			upserts: ['one', 'two'].map((id) => ({ id, fields: { title: 'waterproof trail running shoe' } })),
+			upserts: ['one', 'two'].map((id) => ({
+				id,
+				fields: { title: 'waterproof trail running shoe' },
+				filters: { price: id === 'one' ? 10 : 20 },
+			})),
 		});
 		await index.commit();
 		await index.reload();
@@ -74,7 +94,7 @@ for (const scenario of ['phrase', 'traversal']) {
 		const long = searchExpensive({ remainingBudgetMilliseconds: 1_000 });
 		await waitFor(() => index.status().searchQueuedCommands > 0n);
 		const short =
-			scenario === 'phrase'
+			scenario !== 'traversal'
 				? searchExpensive({ remainingBudgetMilliseconds: 10 })
 				: index.searchPage(
 						{ text: 'trai', mode: 'fuzzy-prefix', limit: 1, continuation: firstPage.continuation },
@@ -182,6 +202,7 @@ for (const scenario of ['phrase', 'traversal']) {
 			maxBatchBytes: options.limits.maxBatchBytes,
 			searchLimits: { ...options.limits, maxQueuedCommands: 1 },
 			fieldNames: ['title'],
+			filterFields: options.filterFields,
 		});
 		try {
 			assert.strictEqual((await recovered.searchPage({ text: 'trai', mode: 'fuzzy-prefix' })).total, 2);

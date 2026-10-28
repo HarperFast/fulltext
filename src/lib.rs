@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod catalog;
 #[cfg(test)]
 mod directory_harness;
 pub mod engine;
@@ -23,12 +24,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "test-panic")]
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const NATIVE_ABI_VERSION: u32 = 9;
+pub const NATIVE_ABI_VERSION: u32 = 10;
 pub const TANTIVY_VERSION: &str = "0.27.0";
 
 #[cfg(feature = "node-api")]
 #[napi(object)]
 pub struct RuntimeLimits {
+	pub max_aggregations: u32,
+	pub max_aggregation_buckets: u32,
+	pub max_terms_size: u32,
+	pub max_aggregation_memory_bytes: u32,
+	pub max_sort_key_bytes: u32,
+	pub max_term_key_bytes: u32,
+
 	pub max_commit_payload_bytes: u32,
 	pub max_query_text_bytes: u32,
 	pub max_query_terms: u32,
@@ -73,10 +81,17 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 		package_version: env!("CARGO_PKG_VERSION").to_owned(),
 		tantivy_version: TANTIVY_VERSION.to_owned(),
 		native_abi_version: NATIVE_ABI_VERSION,
-		query_api_version: 4,
+		query_api_version: 5,
 		query_class_isolation_minimum_search_threads: 2,
 		storage_backends: vec!["native".to_owned()],
 		limits: RuntimeLimits {
+			max_aggregations: crate::catalog::MAX_AGGREGATIONS as u32,
+			max_aggregation_buckets: crate::catalog::MAX_AGGREGATION_BUCKETS as u32,
+			max_terms_size: crate::catalog::MAX_TERMS_SIZE,
+			max_aggregation_memory_bytes: crate::catalog::MAX_AGGREGATION_MEMORY_BYTES as u32,
+			max_sort_key_bytes: crate::catalog::MAX_SORT_MEMORY_BYTES as u32,
+			max_term_key_bytes: 16 * 1024 * 1024,
+
 			max_commit_payload_bytes: engine::MAX_COMMIT_PAYLOAD_BYTES as u32,
 			max_query_text_bytes: protocol::MAX_QUERY_TEXT_BYTES as u32,
 			max_query_terms: protocol::MAX_QUERY_TERMS as u32,

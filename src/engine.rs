@@ -15,8 +15,8 @@ use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
 use tantivy::index::SegmentId;
 use tantivy::query::{
-	BooleanQuery, BoostQuery, ConstScoreQuery, DfaWrapper, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur,
-	PhraseQuery, Query, RangeQuery, TermQuery, TermSetQuery,
+	BooleanQuery, BoostQuery, ConstScoreQuery, DfaWrapper, DisjunctionMaxQuery, EmptyQuery, ExistsQuery,
+	FuzzyTermQuery, Occur, PhraseQuery, Query, RangeQuery, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{
 	Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, FAST, INDEXED,
@@ -32,6 +32,7 @@ use tantivy::{
 use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
 use unicode_normalization::is_nfkc;
 
+use crate::catalog::{self, AggregationResult};
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
 	validate_record_id, validate_search_window, EngineConfig, EngineIdentityConfig, FilterComparator, FilterExpression,
@@ -346,6 +347,7 @@ pub enum TotalRelation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchResult {
+	pub aggregations: Vec<AggregationResult>,
 	pub total: u64,
 	pub total_relation: TotalRelation,
 	pub hits: Vec<SearchHit>,
@@ -668,6 +670,25 @@ impl Engine {
 				validate_record_id(id)?;
 			}
 		}
+
+		let has_catalog = request.sort.is_some() || !request.aggregations.is_empty();
+		if request.traversal && has_catalog {
+			return Err(FulltextError::invalid(
+				"sort and aggregations are not supported by searchPage",
+			));
+		}
+		let catalog_fields = has_catalog.then(|| {
+			self.filter_fields
+				.iter()
+				.map(|field| crate::protocol::FilterFieldConfig {
+					name: field.name.clone(),
+					field_type: field.field_type,
+				})
+				.collect::<Vec<_>>()
+		});
+		if let Some(fields) = &catalog_fields {
+			catalog::validate_requests(request.sort.as_ref(), &request.aggregations, fields)?;
+		}
 		check_deadline(deadline)?;
 		let snapshot = if request.traversal {
 			let snapshot = search_snapshot(searcher.generation().segments());
@@ -696,7 +717,7 @@ impl Engine {
 			let more = scored_docs.len() > request.limit;
 			scored_docs.truncate(request.limit);
 			let hits = search_hits(searcher, scored_docs)?;
-			let bytes = search_response_bytes(&hits, 13 + 4 + snapshot.len() + 1)?;
+			let bytes = search_response_bytes(&hits, 14 + 4 + snapshot.len() + 1)?;
 			if bytes > MAX_SEARCH_RESPONSE_BYTES {
 				return Err(FulltextError::new(
 					"E_RESULT_TOO_LARGE",
@@ -705,10 +726,49 @@ impl Engine {
 			}
 			check_deadline(deadline)?;
 			return Ok(SearchResult {
+				aggregations: Vec::new(),
 				total,
 				total_relation: TotalRelation::Exact,
 				hits,
 				traversal: Some((snapshot, more)),
+			});
+		}
+
+		if let Some(sort) = &request.sort {
+			let fields = catalog_fields.as_ref().unwrap();
+			let scored_docs = catalog::sorted_hits(
+				searcher,
+				query.query.as_ref(),
+				sort,
+				fields,
+				request.offset,
+				request.limit,
+				deadline,
+			)?;
+			let hits = search_hits(searcher, scored_docs)?;
+			let total = catalog::count_matches(searcher, query.query.as_ref(), deadline)?;
+			let aggregations = catalog::aggregate(
+				searcher,
+				query.query.as_ref(),
+				&request.aggregations,
+				fields,
+				self.index.tokenizers().clone(),
+				deadline,
+			)?;
+			let aggregate_bytes = catalog::encode_results(&aggregations)?.len();
+			if search_response_bytes(&hits, 13)?.saturating_add(aggregate_bytes) > MAX_SEARCH_RESPONSE_BYTES {
+				return Err(FulltextError::new(
+					"E_RESULT_TOO_LARGE",
+					"search response exceeds its byte limit",
+				));
+			}
+			check_deadline(deadline)?;
+			return Ok(SearchResult {
+				total,
+				total_relation: TotalRelation::Exact,
+				hits,
+				traversal: None,
+				aggregations,
 			});
 		}
 		let window_end = request.offset + request.limit;
@@ -798,7 +858,24 @@ impl Engine {
 			(bounded_total, bounded_total_relation)
 		};
 		check_deadline(deadline)?;
-		let response_bytes = search_response_bytes(&hits, 13)?;
+
+		let aggregations = if let Some(fields) = &catalog_fields {
+			catalog::aggregate(
+				searcher,
+				query.query.as_ref(),
+				&request.aggregations,
+				fields,
+				self.index.tokenizers().clone(),
+				deadline,
+			)?
+		} else {
+			Vec::new()
+		};
+		let response_bytes = search_response_bytes(&hits, 13)?.saturating_add(if aggregations.is_empty() {
+			1
+		} else {
+			catalog::encode_results(&aggregations)?.len()
+		});
 		if response_bytes > MAX_SEARCH_RESPONSE_BYTES {
 			return Err(FulltextError::new(
 				"E_RESULT_TOO_LARGE",
@@ -806,6 +883,7 @@ impl Engine {
 			));
 		}
 		Ok(SearchResult {
+			aggregations,
 			total,
 			total_relation,
 			hits,
@@ -1624,6 +1702,7 @@ impl Engine {
 		let Some(filter) = filter else {
 			return Ok(query);
 		};
+		validate_filter_shape(filter)?;
 		let filter = Box::new(ConstScoreQuery::new(self.filter_query(filter)?, 0.0));
 		Ok(Box::new(BooleanQuery::new(vec![
 			(Occur::Must, query),
@@ -1638,6 +1717,7 @@ impl Engine {
 				comparator,
 				values,
 			} => self.filter_clause(field, *comparator, values),
+			FilterExpression::Not(child) => Ok(complement_query(self.filter_query(child)?)),
 			FilterExpression::And(children) | FilterExpression::Or(children) => {
 				if children.is_empty() || children.len() > MAX_QUERY_CLAUSES {
 					return Err(FulltextError::invalid(format!(
@@ -1667,9 +1747,10 @@ impl Engine {
 		let expected_values = match comparator {
 			FilterComparator::In => None,
 			FilterComparator::Between => Some(2),
+			FilterComparator::Exists | FilterComparator::Missing => Some(0),
 			_ => Some(1),
 		};
-		if values.is_empty()
+		if (values.is_empty() && expected_values != Some(0))
 			|| values.len() > MAX_QUERY_CLAUSES
 			|| expected_values.is_some_and(|count| count != values.len())
 		{
@@ -1680,11 +1761,42 @@ impl Engine {
 			.get(name)
 			.ok_or_else(|| FulltextError::invalid(format!("unknown filter field {name}")))?;
 		let field = &self.filter_fields[*index];
+		if matches!(comparator, FilterComparator::Exists | FilterComparator::Missing) {
+			let exists: Box<dyn Query> = if field.field_type == FilterFieldType::Boolean {
+				Box::new(BooleanQuery::new(vec![
+					(
+						Occur::Should,
+						Box::new(TermQuery::new(
+							Term::from_field_bool(field.field, true),
+							IndexRecordOption::Basic,
+						)),
+					),
+					(
+						Occur::Should,
+						Box::new(TermQuery::new(
+							Term::from_field_bool(field.field, false),
+							IndexRecordOption::Basic,
+						)),
+					),
+				]))
+			} else {
+				Box::new(ExistsQuery::new(
+					self.index.schema().get_field_name(field.field).to_owned(),
+					false,
+				))
+			};
+			return Ok(if comparator == FilterComparator::Missing {
+				complement_query(exists)
+			} else {
+				exists
+			});
+		}
 		let terms = values
 			.iter()
 			.map(|value| filter_term(field, value))
 			.collect::<Result<Vec<_>>>()?;
 		match comparator {
+			FilterComparator::Exists | FilterComparator::Missing => unreachable!(),
 			FilterComparator::Equals => Ok(Box::new(TermQuery::new(terms[0].clone(), IndexRecordOption::Basic))),
 			FilterComparator::In if terms.len() == 1 => {
 				Ok(Box::new(TermQuery::new(terms[0].clone(), IndexRecordOption::Basic)))
@@ -1737,6 +1849,41 @@ impl Engine {
 		}
 		Ok(())
 	}
+}
+
+fn complement_query(query: Box<dyn Query>) -> Box<dyn Query> {
+	Box::new(BooleanQuery::new(vec![
+		(Occur::Must, Box::new(tantivy::query::AllQuery)),
+		(Occur::MustNot, query),
+	]))
+}
+
+fn validate_filter_shape(expression: &FilterExpression) -> Result<()> {
+	let mut pending = vec![(expression, 0)];
+	let mut leaves = 0;
+	while let Some((expression, depth)) = pending.pop() {
+		if depth > crate::protocol::MAX_EXPRESSION_DEPTH {
+			return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
+		}
+		match expression {
+			FilterExpression::Clause { .. } => {
+				leaves += 1;
+				if leaves > MAX_QUERY_CLAUSES {
+					return Err(FulltextError::invalid("filter expression exceeds 256 clauses"));
+				}
+			}
+			FilterExpression::Not(child) => pending.push((child, depth + 1)),
+			FilterExpression::And(children) | FilterExpression::Or(children) => {
+				if children.is_empty() || children.len() > MAX_QUERY_CLAUSES {
+					return Err(FulltextError::invalid(
+						"filter boolean expression requires 1 to 256 children",
+					));
+				}
+				pending.extend(children.iter().map(|child| (child, depth + 1)));
+			}
+		}
+	}
+	Ok(())
 }
 
 fn filter_term(field: &EngineFilterField, value: &FilterValue) -> Result<Term> {
@@ -2094,9 +2241,13 @@ impl Writer {
 					FulltextError::new("E_SCHEMA_MISMATCH", format!("unknown mutation filter {name}"))
 				})?;
 				let filter = &self.filter_fields[*index];
+				let mut seen_values = HashSet::new();
 				for value in values {
 					match (filter.field_type, value) {
 						(FilterFieldType::String, FilterValue::String(value)) => {
+							if !seen_values.insert(value.clone()) {
+								continue;
+							}
 							if value.len() > MAX_TOKEN_LEN {
 								return Err(FulltextError::invalid(format!(
 									"mutation filter {name} exceeds {MAX_TOKEN_LEN} UTF-8 bytes"
@@ -2233,7 +2384,10 @@ fn build_schema_with_surface_record(
 					.set_tokenizer("raw")
 					.set_index_option(IndexRecordOption::Basic)
 					.set_fieldnorms(false);
-				builder.add_text_field(&schema_name, TextOptions::default().set_indexing_options(indexing))
+				builder.add_text_field(
+					&schema_name,
+					TextOptions::default().set_indexing_options(indexing).set_fast("raw"),
+				)
 			}
 			FilterFieldType::Number => builder.add_f64_field(&schema_name, INDEXED | FAST),
 			FilterFieldType::Boolean => builder.add_bool_field(&schema_name, INDEXED),
@@ -2784,6 +2938,12 @@ fn canonical_synonym_term(analyzer: &mut TextAnalyzer, text: &str, label: &str) 
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 	let mut bytes = if config.filter_fields.is_empty() {
 		b"HTFI\x06\x00".to_vec()
+	} else if config
+		.filter_fields
+		.iter()
+		.any(|field| field.field_type == FilterFieldType::String)
+	{
+		b"HTFI\x08\x00".to_vec()
 	} else {
 		b"HTFI\x07\x00".to_vec()
 	};
@@ -2826,7 +2986,14 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	if bytes.get(..4)? != b"HTFI"
 		|| !matches!(
 			version,
-			b"\x01\x00" | b"\x02\x00" | b"\x03\x00" | b"\x04\x00" | b"\x05\x00" | b"\x06\x00" | b"\x07\x00"
+			b"\x01\x00"
+				| b"\x02\x00"
+				| b"\x03\x00"
+				| b"\x04\x00"
+				| b"\x05\x00"
+				| b"\x06\x00"
+				| b"\x07\x00"
+				| b"\x08\x00"
 		) {
 		return None;
 	}
@@ -2844,7 +3011,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	offset += 3;
 	if matches!(
 		version,
-		b"\x03\x00" | b"\x04\x00" | b"\x05\x00" | b"\x06\x00" | b"\x07\x00"
+		b"\x03\x00" | b"\x04\x00" | b"\x05\x00" | b"\x06\x00" | b"\x07\x00" | b"\x08\x00"
 	) {
 		let synonym_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
@@ -2863,7 +3030,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	for _ in 0..field_count {
 		take_string(bytes, &mut offset)?;
 	}
-	if matches!(version, b"\x05\x00" | b"\x07\x00") {
+	if matches!(version, b"\x05\x00" | b"\x07\x00" | b"\x08\x00") {
 		let filter_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
 		for _ in 0..filter_count {
@@ -3091,6 +3258,26 @@ mod tests {
 	}
 
 	#[test]
+	fn direct_filter_validation_bounds_depth_and_total_leaves() {
+		let leaf = FilterExpression::Clause {
+			field: "category".to_owned(),
+			comparator: FilterComparator::Exists,
+			values: vec![],
+		};
+		assert!(validate_filter_shape(&leaf).is_ok());
+		let mut nested = leaf.clone();
+		for _ in 0..9 {
+			nested = FilterExpression::Not(Box::new(nested));
+		}
+		assert!(validate_filter_shape(&nested).is_err());
+		let oversized = FilterExpression::And(vec![
+			FilterExpression::Or(vec![leaf.clone(); 129]),
+			FilterExpression::Or(vec![leaf; 129]),
+		]);
+		assert!(validate_filter_shape(&oversized).is_err());
+	}
+
+	#[test]
 	#[ignore]
 	fn traversal_many_segment_qualification() {
 		for segment_count in [1, 256] {
@@ -3121,6 +3308,8 @@ mod tests {
 			let searcher = reader.searcher();
 			assert_eq!(searcher.segment_readers().len(), segment_count);
 			let mut request = SearchRequest {
+				sort: None,
+				aggregations: Vec::new(),
 				expression: expression("widget catalog", SearchMode::Any, vec!["title".to_owned()]),
 				candidate_ids: None,
 				filter: None,
@@ -3218,6 +3407,8 @@ mod tests {
 		let pinned = reader.searcher();
 		assert_eq!(pinned.segment_readers().len(), 2);
 		let mut request = SearchRequest {
+			sort: None,
+			aggregations: Vec::new(),
 			expression: expression("shoes", SearchMode::Any, Vec::new()),
 			candidate_ids: None,
 			filter: None,
@@ -3315,6 +3506,8 @@ mod tests {
 		let snapshot = reader.searcher();
 		for mode in [SearchMode::Prefix, SearchMode::FuzzyPrefix] {
 			let mut request = SearchRequest {
+				sort: None,
+				aggregations: Vec::new(),
 				expression: expression("widg", mode, Vec::new()),
 				candidate_ids: None,
 				filter: None,
@@ -3454,6 +3647,8 @@ mod tests {
 			.search(
 				&searcher,
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("waterproof trail", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -3494,6 +3689,8 @@ mod tests {
 			.search(
 				&searcher,
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("waterproof trail", SearchMode::All, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -3514,6 +3711,8 @@ mod tests {
 			.search(
 				&searcher,
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("waterproof trail ", SearchMode::Prefix, Vec::new()),
 					candidate_ids: Some(vec!["both".to_owned()]),
 					filter: None,
@@ -3795,6 +3994,8 @@ mod tests {
 		let trace = engine
 			.trace_matches(
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("needle", SearchMode::Any, vec!["description".to_owned()]),
 					candidate_ids: None,
 					filter: None,
@@ -3853,6 +4054,8 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
+						sort: None,
+						aggregations: Vec::new(),
 						expression: expression(text, SearchMode::Any, Vec::new()),
 						candidate_ids: None,
 						filter: None,
@@ -3870,6 +4073,8 @@ mod tests {
 		let trace = engine
 			.trace_matches(
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("television", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -3892,6 +4097,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("stand", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -3939,6 +4146,8 @@ mod tests {
 			.search(
 				&baseline_reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("stand", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4060,6 +4269,8 @@ mod tests {
 		let reader = engine.reader().unwrap();
 		reader.reload().unwrap();
 		let mut request = SearchRequest {
+			sort: None,
+			aggregations: Vec::new(),
 			expression: expression("shoes", SearchMode::Any, Vec::new()),
 			candidate_ids: None,
 			filter: None,
@@ -4132,6 +4343,8 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
+						sort: None,
+						aggregations: Vec::new(),
 						expression: expression(text, mode, Vec::new()),
 						candidate_ids: candidates.map(|ids| ids.into_iter().map(str::to_owned).collect()),
 						filter: None,
@@ -4162,6 +4375,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: SearchExpression::And(vec![
 						expression("waterproof", SearchMode::Any, Vec::new()),
 						SearchExpression::Not(Box::new(expression("wireless", SearchMode::Any, Vec::new()))),
@@ -4185,6 +4400,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: SearchExpression::Not(Box::new(expression("wireless", SearchMode::Any, Vec::new()))),
 					candidate_ids: None,
 					filter: None,
@@ -4224,6 +4441,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression,
 					candidate_ids: None,
 					filter: None,
@@ -4441,6 +4660,8 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
+						sort: None,
+						aggregations: Vec::new(),
 						expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 						candidate_ids: None,
 						filter: None,
@@ -4464,6 +4685,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4482,6 +4705,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4500,6 +4725,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("identical", SearchMode::Any, vec!["title".to_owned()]),
 					candidate_ids: None,
 					filter: None,
@@ -4551,6 +4778,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4572,6 +4801,8 @@ mod tests {
 			.search(
 				&reopened.reader().unwrap().searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("identical catalog", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4661,6 +4892,8 @@ mod tests {
 		}
 		let searcher = engine.reader().unwrap().searcher();
 		let mut request = SearchRequest {
+			sort: None,
+			aggregations: Vec::new(),
 			expression: expression("catalog", SearchMode::All, vec!["title".to_owned()]),
 			candidate_ids: None,
 			filter: None,
@@ -4735,6 +4968,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("cat", SearchMode::Prefix, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4786,7 +5021,7 @@ mod tests {
 			field_type: FilterFieldType::String,
 		});
 		let identity = identity_bytes(&filtered);
-		assert_eq!(&identity[4..6], b"\x07\x00");
+		assert_eq!(&identity[4..6], b"\x08\x00");
 		assert_eq!(persisted_index_id(&identity), Some("products"));
 	}
 
