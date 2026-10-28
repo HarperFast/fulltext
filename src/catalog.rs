@@ -201,7 +201,7 @@ fn native_error(error: TantivyError) -> FulltextError {
 		TantivyError::AggregationError(AggregationError::InvalidRequest(_)) | TantivyError::InvalidArgument(_) => {
 			FulltextError::invalid(error.to_string())
 		}
-		_ => FulltextError::native(error),
+		_ => crate::error::index_error(error),
 	}
 }
 fn check_deadline(deadline: Option<Instant>) -> tantivy::Result<()> {
@@ -1164,6 +1164,65 @@ mod tests {
 		.into_iter()
 		.map(|((_, id), _)| id)
 		.collect()
+	}
+	#[test]
+	fn metadata_collection_preserves_storage_error_classification() {
+		#[derive(Clone, Debug)]
+		struct ReadFailure;
+		impl Query for ReadFailure {
+			fn weight(&self, _: tantivy::query::EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+				Err(TantivyError::IoError(std::sync::Arc::new(std::io::Error::other(
+					"metadata read failed",
+				))))
+			}
+		}
+		let index = fixture();
+		let searcher = index.reader().unwrap().searcher();
+		let fields = fields();
+		for name in ["category", "price"] {
+			let sort = SortRequest {
+				field: name.into(),
+				direction: SortDirection::Asc,
+				missing: MissingOrder::Last,
+			};
+			assert_eq!(
+				sorted_hits(&searcher, &ReadFailure, &sort, &fields, 0, 1, None)
+					.unwrap_err()
+					.code,
+				"E_STORAGE"
+			);
+		}
+		let requests = vec![AggregationRequest {
+			name: "prices".into(),
+			field: "price".into(),
+			kind: AggregationKind::Stats,
+		}];
+		assert_eq!(
+			aggregate(
+				&searcher,
+				&ReadFailure,
+				&requests,
+				&fields,
+				index.tokenizers().clone(),
+				None
+			)
+			.unwrap_err()
+			.code,
+			"E_STORAGE"
+		);
+		assert_eq!(
+			aggregate_count(
+				&searcher,
+				&ReadFailure,
+				&requests,
+				&fields,
+				index.tokenizers().clone(),
+				None
+			)
+			.unwrap_err()
+			.code,
+			"E_STORAGE"
+		);
 	}
 	#[test]
 	fn native_sort_keeps_global_id_ties_missing_policy_and_first_value() {

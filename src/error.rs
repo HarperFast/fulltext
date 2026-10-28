@@ -25,6 +25,19 @@ impl FulltextError {
 	}
 }
 
+pub(crate) fn index_error(error: tantivy::TantivyError) -> FulltextError {
+	match error {
+		tantivy::TantivyError::LockFailure(tantivy::directory::error::LockError::LockBusy, _) => {
+			FulltextError::new("E_LOCK_BUSY", "another writer owns the Tantivy index lock")
+		}
+		tantivy::TantivyError::OpenDirectoryError(_)
+		| tantivy::TantivyError::OpenReadError(_)
+		| tantivy::TantivyError::OpenWriteError(_)
+		| tantivy::TantivyError::IoError(_) => FulltextError::new("E_STORAGE", error.to_string()),
+		other => FulltextError::native(other),
+	}
+}
+
 impl fmt::Display for FulltextError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{}: {}", self.code, self.message)

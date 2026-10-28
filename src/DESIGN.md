@@ -122,6 +122,9 @@ native top-k/aggregation ownership and checks the shared deadline every 1,024 vi
 `count_matches` returns native errors so each caller retains its error policy;
 `ordinary_exact_count_preserves_native_error_classification` pins ordinary storage, internal-query
 and timeout codes through the production count branch.
+The shared `error::index_error` maps storage failures consistently for ordinary and metadata
+searches; `metadata_collection_preserves_storage_error_classification` exercises native sorts,
+aggregation and combined count collection.
 
 Native aggregation structure accounting excludes some decoded keys. `sorted_catalog` and
 `aggregate` bound retained keys before creating collectors. Counts use segment live documents

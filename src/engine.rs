@@ -33,7 +33,7 @@ use unicode_normalization::char::{canonical_combining_class, compose, decompose_
 use unicode_normalization::is_nfkc;
 
 use crate::catalog::{self, AggregationResult};
-use crate::error::{FulltextError, Result};
+use crate::error::{index_error, FulltextError, Result};
 use crate::protocol::{
 	validate_record_id, validate_search_window, EngineConfig, EngineIdentityConfig, FilterComparator, FilterExpression,
 	FilterFieldType, FilterValue, MutationBatch, SearchClause, SearchExpression, SearchMode, SearchRequest,
@@ -3094,19 +3094,6 @@ fn count_error(error: tantivy::TantivyError) -> FulltextError {
 			FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE)
 		}
 		_ => index_error(error),
-	}
-}
-
-fn index_error(error: tantivy::TantivyError) -> FulltextError {
-	match error {
-		tantivy::TantivyError::LockFailure(tantivy::directory::error::LockError::LockBusy, _) => {
-			FulltextError::new("E_LOCK_BUSY", "another writer owns the Tantivy index lock")
-		}
-		tantivy::TantivyError::OpenDirectoryError(_)
-		| tantivy::TantivyError::OpenReadError(_)
-		| tantivy::TantivyError::OpenWriteError(_)
-		| tantivy::TantivyError::IoError(_) => storage_error(error),
-		other => FulltextError::native(other),
 	}
 }
 
