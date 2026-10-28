@@ -2,7 +2,7 @@ import assert from 'node:assert';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const option = (name, fallback) => {
 	const position = process.argv.indexOf(name);
@@ -18,13 +18,13 @@ const queries = positive('--queries', 120);
 const budget = positive('--budget-ms', 1);
 const concurrency = String(option('--concurrency', '1,4,8')).split(',').map(Number);
 assert(concurrency.every((value) => Number.isSafeInteger(value) && value > 0));
-const modulePath = option('--module', path.resolve('dist/native.js'));
+const modulePath = option('--module', fileURLToPath(new URL('../dist/native.js', import.meta.url)));
 const { openNativeFullTextIndex, runtimeInfo } = await import(pathToFileURL(path.resolve(modulePath)).href);
 const scratch = option('--scratch');
 assert(scratch, '--scratch requires an existing directory for temporary index files');
 const directory = await mkdtemp(path.join(scratch, 'fulltext-count-load-'));
 const config = {
-	path: directory,
+	path: path.join(directory, 'index'),
 	indexId: 'count-load',
 	generation: 'one',
 	analyzer: 'english@2',

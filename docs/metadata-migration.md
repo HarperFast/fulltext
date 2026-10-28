@@ -2,6 +2,11 @@
 
 Status: draft; procedure awaiting human API/migration review.
 
+The branch is unreleased. Its manifests still use the previous package version. Before publishing,
+release preparation must choose a new version and align the root package, Cargo package and exact
+platform dependencies. Do not install the published 0.7.0 package expecting this metadata API.
+Version alignment is tracked in [Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
+
 ## Decide whether to rebuild
 
 The metadata implementation adds raw fast fields to string `filterFields`. Existing string-metadata
@@ -41,6 +46,8 @@ Application availability, source checkpoint retention, and cutover belong to the
 
 Build two separate checkouts: the previous implementation and this metadata implementation. Use each
 checkout's own `dist/native.js` and native addon. Do not copy a new addon over the old wrapper.
+For an installed package, pass its `dist/native.js`; when no local `fulltext.*.node` exists beside
+the package manifest, the script lets the facade load its matching optional platform package.
 
 ```sh
 FULLTEXT_PREFER_LOCAL_BUILD=1 node scripts/qualify-metadata-migration.mjs \
@@ -53,14 +60,17 @@ The normal command creates and removes only its generated `fulltext-migration-*`
 no existing index path. Each phase runs in a separate process to load the requested facade/addon pair.
 Assertions check the following:
 
-| Case                                             | Required result                                                                                                                                |
-| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Genuine previous build, string metadata          | New inspection, reader open, and writer open reject `E_IDENTITY_MISMATCH`; every old index file name and byte remains unchanged.               |
-| Reset and authoritative rebuild, new generation  | Reopened checkpoint matches publication; text/filter queries, numeric and string sorts, string terms and numeric statistics match the records. |
-| Genuine previous build, numeric/boolean metadata | New reader opens the original generation; checkpoint, filter, numeric sorting and statistics work without rebuilding.                          |
+| Case                                                        | Required result                                                                                                                                |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Genuine previous build, string metadata                     | New inspection, reader open, and writer open reject `E_IDENTITY_MISMATCH`; every old index file name and byte remains unchanged.               |
+| Reset and authoritative rebuild, new generation             | Reopened checkpoint matches publication; text/filter queries, numeric and string sorts, string terms and numeric statistics match the records. |
+| Genuine previous build, numeric/boolean metadata            | New reader opens the original generation; checkpoint, filter, numeric sorting and statistics work without rebuilding.                          |
+| Old reader after new writes to numeric/boolean index        | New writer republishes the original generation; old reader reopens its checkpoint and verifies text and boolean filter results.                |
+| Old build against rebuilt string index                      | Inspection and both opens reject a compatibility/corrupt-format code; every rebuilt index file name and byte remains unchanged.                |
+| Downgrade using the new reset and old authoritative rebuild | Old reader reopens generation `v3`; checkpoint, text results, boolean filter and string equality filter match the records.                     |
 
-The local fixture contains three authoritative records. It qualifies the migration boundary and rebuild
-sequence, not application cutover under concurrent replication or large-scale rebuild performance. The script checks the previous query API is older; callers must supply the actual
+The local fixture contains three authoritative records. It qualifies upgrade rejection and rebuilding in both upgrade and downgrade directions. Application cutover under concurrent replication
+and large-scale rebuild performance require separate qualification. The script checks the previous query API is older; callers must supply the actual
 previous build and record its source revision separately.
 
 ## Executed result
@@ -71,15 +81,31 @@ On 2026-10-28, the previous
 [metadata implementation](https://github.com/HarperFast/fulltext/commit/a471b58c90b2daf5247745449dc975f155694b21)
 (query API 5, native ABI 10) passed every assertion above. Both builds embed Tantivy 0.27.0.
 
-The numeric/boolean control reopened without rebuilding. The string index was rejected without
+The numeric/boolean control reopened without rebuilding. The new writer then upserted the same
+authoritative records and published into that original generation; the old reader reopened its
+new `source-checkpoint-4`, recovered all three text hits, and matched active records `a`, `b`. The string index was rejected without
 changing its contents, then reset and rebuilt as generation `v2`. Reopening recovered
 `source-checkpoint-3`; active records sorted by ascending price were `b`, `a`, with a numeric sum of 30.
 Filtering `brand = cedar` returned `a`, `c`, and the string terms bucket counted two documents.
+
+The compiled previous build rejected inspection, writer open, and reader open of the rebuilt string
+index with `E_IDENTITY_MISMATCH`; all its index file names and contents remained unchanged. The
+script records the observed old-build code and accepts `E_IDENTITY_MISMATCH` or `E_INDEX_CORRUPT`,
+since earlier sidecar parsers can classify an unknown format as corrupt.
+
+A follow-up execution used the new build to reset that rebuilt string index, then the previous build
+to reconstruct generation `v3` from the same authoritative records. After closing and reopening with
+the previous build, checkpoint `source-checkpoint-3`, all three text hits, active records `a`, `b`,
+and `brand = cedar` records `a`, `c` passed. This exercises downgrade reconstruction; it does not
+qualify live application rollback or checkpoint catch-up.
 
 ## Open items
 
 - Human approval of API semantics and the application rebuild requirement.
 - Application-specific cutover, checkpoint catch-up, and rollback qualification.
+- The installed optional-platform-package loading route is supported by the script but was not run;
+  the recorded executions used the compiled previous-base wrapper/addon pair, not an installed
+  published 0.7.0 package. Published-version error-code differences remain unqualified.
 
 ## Sources
 
