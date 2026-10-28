@@ -48,9 +48,9 @@ try {
 			reader.searchPage(query),
 			(error) => error.code === 'E_QUEUE_FULL' && /preparation/.test(error.message),
 		);
+		const completed = await pending;
 		assert.equal((await reader.searchPage({ text: 'widget' })).total, 3);
 		assert.equal((await reader.search({ text: 'widget' })).total, 3);
-		const completed = await pending;
 		if (completed.error) {
 			assert.equal(completed.error.code, 'E_QUEUE_FULL');
 			assert(!/preparation/.test(completed.error.message));
