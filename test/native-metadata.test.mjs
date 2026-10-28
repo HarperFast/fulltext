@@ -227,6 +227,14 @@ test('catalog errors are explicit and leave the handle usable', async (context) 
 		{ aggregations: [{ name: 'bad', type: 'range', field: 'price', ranges: [{ from: 2, to: 1 }] }] },
 	])
 		await assert.rejects(index.search({ text: 'shoe', ...request }), { code: 'E_INVALID_ARGUMENT' });
+	await assert.rejects(index.search({ text: 'sh', mode: 'prefix', sort: sort('price'), offset: 100, limit: 100 }), {
+		code: 'E_INVALID_ARGUMENT',
+		message: /metadata continuation is not supported/,
+	});
+	await assert.rejects(index.search({ text: 'shoe', sort: sort('price'), offset: 10_000, limit: 1 }), {
+		code: 'E_INVALID_ARGUMENT',
+		message: /metadata continuation is not supported/,
+	});
 	await assert.rejects(index.searchPage({ text: 'shoe', sort: sort('price') }), { code: 'E_INVALID_ARGUMENT' });
 	await assert.rejects(index.searchPage({ text: 'shoe', aggregations }), { code: 'E_INVALID_ARGUMENT' });
 	assert.strictEqual((await index.search({ text: 'shoe', sort: sort('brand'), limit: 10_000 })).hits.length, 6);

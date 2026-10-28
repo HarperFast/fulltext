@@ -155,7 +155,7 @@ pub const MAX_SEARCH_REQUEST_BYTES: usize = 8 << 20;
 pub const MAX_SEARCH_RESPONSE_BYTES: usize = 8 << 20;
 pub const MAX_SEARCH_BUDGET_MILLISECONDS: u32 = 30_000;
 
-pub(crate) fn validate_search_window(offset: usize, limit: usize, traversal: bool) -> Result<()> {
+pub(crate) fn validate_search_window(offset: usize, limit: usize, traversal: bool, has_catalog: bool) -> Result<()> {
 	if limit == 0 {
 		return Err(FulltextError::invalid("search limit must be greater than zero"));
 	}
@@ -167,7 +167,12 @@ pub(crate) fn validate_search_window(offset: usize, limit: usize, traversal: boo
 		}
 	} else if offset.checked_add(limit).is_none_or(|end| end > MAX_SEARCH_WINDOW) {
 		return Err(FulltextError::invalid(format!(
-			"offset + limit must not exceed {MAX_SEARCH_WINDOW}; use searchPage for deeper results"
+			"offset + limit must not exceed {MAX_SEARCH_WINDOW}; {}",
+			if has_catalog {
+				"metadata continuation is not supported"
+			} else {
+				"use searchPage for deeper results"
+			}
 		)));
 	}
 	Ok(())
@@ -751,11 +756,13 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 			"search budget must be between 1 and {MAX_SEARCH_BUDGET_MILLISECONDS} milliseconds"
 		)));
 	}
-	validate_search_window(offset, limit, traversal)?;
+	validate_search_window(offset, limit, traversal, sort.is_some() || !aggregations.is_empty())?;
 	if contains_prefix(&expression) && !traversal && (offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS) {
-		return Err(FulltextError::invalid(
-			"prefix search requires offset zero and a limit no greater than 100; use searchPage for subsequent matches",
-		));
+		return Err(FulltextError::invalid(if sort.is_some() || !aggregations.is_empty() {
+			"prefix search with sort or aggregations requires offset zero and a limit no greater than 100; metadata continuation is not supported"
+		} else {
+			"prefix search requires offset zero and a limit no greater than 100; use searchPage for subsequent matches"
+		}));
 	}
 	Ok(SearchRequest {
 		sort,

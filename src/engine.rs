@@ -665,7 +665,12 @@ impl Engine {
 		request: &SearchRequest,
 		deadline: Option<Instant>,
 	) -> Result<SearchResult> {
-		validate_search_window(request.offset, request.limit, request.traversal)?;
+		validate_search_window(
+			request.offset,
+			request.limit,
+			request.traversal,
+			request.sort.is_some() || !request.aggregations.is_empty(),
+		)?;
 		if let Some(candidate_ids) = &request.candidate_ids {
 			for id in candidate_ids {
 				validate_record_id(id)?;
@@ -1713,7 +1718,6 @@ impl Engine {
 		let Some(filter) = filter else {
 			return Ok(query);
 		};
-		validate_filter_shape(filter)?;
 		let filter = Box::new(ConstScoreQuery::new(self.filter_query(filter)?, 0.0));
 		Ok(Box::new(BooleanQuery::new(vec![
 			(Occur::Must, query),
@@ -1722,13 +1726,31 @@ impl Engine {
 	}
 
 	fn filter_query(&self, expression: &FilterExpression) -> Result<Box<dyn Query>> {
+		self.filter_query_inner(expression, 0, &mut 0)
+	}
+
+	fn filter_query_inner(
+		&self,
+		expression: &FilterExpression,
+		depth: usize,
+		leaves: &mut usize,
+	) -> Result<Box<dyn Query>> {
+		if depth > crate::protocol::MAX_EXPRESSION_DEPTH {
+			return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
+		}
 		match expression {
 			FilterExpression::Clause {
 				field,
 				comparator,
 				values,
-			} => self.filter_clause(field, *comparator, values),
-			FilterExpression::Not(child) => Ok(complement_query(self.filter_query(child)?)),
+			} => {
+				*leaves += 1;
+				if *leaves > MAX_QUERY_CLAUSES {
+					return Err(FulltextError::invalid("filter expression exceeds 256 clauses"));
+				}
+				self.filter_clause(field, *comparator, values)
+			}
+			FilterExpression::Not(child) => Ok(complement_query(self.filter_query_inner(child, depth + 1, leaves)?)),
 			FilterExpression::And(children) | FilterExpression::Or(children) => {
 				if children.is_empty() || children.len() > MAX_QUERY_CLAUSES {
 					return Err(FulltextError::invalid(format!(
@@ -1742,7 +1764,7 @@ impl Engine {
 				};
 				let mut queries = Vec::with_capacity(children.len());
 				for child in children {
-					queries.push((occur, self.filter_query(child)?));
+					queries.push((occur, self.filter_query_inner(child, depth + 1, leaves)?));
 				}
 				Ok(Box::new(BooleanQuery::new(queries)))
 			}
@@ -1867,34 +1889,6 @@ fn complement_query(query: Box<dyn Query>) -> Box<dyn Query> {
 		(Occur::Must, Box::new(tantivy::query::AllQuery)),
 		(Occur::MustNot, query),
 	]))
-}
-
-fn validate_filter_shape(expression: &FilterExpression) -> Result<()> {
-	let mut pending = vec![(expression, 0)];
-	let mut leaves = 0;
-	while let Some((expression, depth)) = pending.pop() {
-		if depth > crate::protocol::MAX_EXPRESSION_DEPTH {
-			return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
-		}
-		match expression {
-			FilterExpression::Clause { .. } => {
-				leaves += 1;
-				if leaves > MAX_QUERY_CLAUSES {
-					return Err(FulltextError::invalid("filter expression exceeds 256 clauses"));
-				}
-			}
-			FilterExpression::Not(child) => pending.push((child, depth + 1)),
-			FilterExpression::And(children) | FilterExpression::Or(children) => {
-				if children.is_empty() || children.len() > MAX_QUERY_CLAUSES {
-					return Err(FulltextError::invalid(
-						"filter boolean expression requires 1 to 256 children",
-					));
-				}
-				pending.extend(children.iter().map(|child| (child, depth + 1)));
-			}
-		}
-	}
-	Ok(())
 }
 
 fn filter_term(field: &EngineFilterField, value: &FilterValue) -> Result<Term> {
@@ -3318,22 +3312,32 @@ mod tests {
 
 	#[test]
 	fn direct_filter_validation_bounds_depth_and_total_leaves() {
+		let mut config = config();
+		config.identity.filter_fields.push(FilterFieldConfig {
+			name: "category".to_owned(),
+			field_type: FilterFieldType::String,
+		});
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
 		let leaf = FilterExpression::Clause {
 			field: "category".to_owned(),
 			comparator: FilterComparator::Exists,
 			values: vec![],
 		};
-		assert!(validate_filter_shape(&leaf).is_ok());
+		assert!(engine.filter_query(&leaf).is_ok());
 		let mut nested = leaf.clone();
 		for _ in 0..9 {
 			nested = FilterExpression::Not(Box::new(nested));
 		}
-		assert!(validate_filter_shape(&nested).is_err());
+		assert!(engine.filter_query(&nested).is_err());
 		let oversized = FilterExpression::And(vec![
 			FilterExpression::Or(vec![leaf.clone(); 129]),
-			FilterExpression::Or(vec![leaf; 129]),
+			FilterExpression::Or(vec![leaf.clone(); 129]),
 		]);
-		assert!(validate_filter_shape(&oversized).is_err());
+		assert!(engine.filter_query(&oversized).is_err());
+		assert!(engine.filter_query(&FilterExpression::And(vec![])).is_err());
+		assert!(engine
+			.filter_query(&FilterExpression::Or(vec![leaf; MAX_QUERY_CLAUSES + 1]))
+			.is_err());
 	}
 
 	#[test]
