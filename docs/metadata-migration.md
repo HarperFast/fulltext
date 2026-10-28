@@ -48,9 +48,10 @@ Build two separate checkouts: the previous implementation and this metadata impl
 checkout's own `dist/native.js` and native addon. Do not copy a new addon over the old wrapper.
 For an installed package, pass its `dist/native.js`; when no local `fulltext.*.node` exists beside
 the package manifest, the script lets the facade load its matching optional platform package.
+The script selects this per module, independently of the caller's `FULLTEXT_PREFER_LOCAL_BUILD` setting.
 
 ```sh
-FULLTEXT_PREFER_LOCAL_BUILD=1 node scripts/qualify-metadata-migration.mjs \
+node scripts/qualify-metadata-migration.mjs \
   --old-module /path/to/old-checkout/dist/native.js \
   --module /path/to/new-checkout/dist/native.js \
   --scratch-dir /path/to/existing/scratch-directory
