@@ -407,7 +407,10 @@ fn max_dictionary_key_with_check(
 		}
 	}
 	let maximum = if let Some(column) = segment.fast_fields().str(name).map_err(native_error)? {
-		let mut stream = column.dictionary().stream().map_err(FulltextError::native)?;
+		let mut stream = column
+			.dictionary()
+			.stream()
+			.map_err(|error| crate::error::index_error(error.into()))?;
 		scan_dictionary_max(|| stream.advance().then(|| stream.key().len()), &mut check)?
 	} else {
 		0
