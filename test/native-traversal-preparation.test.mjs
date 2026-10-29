@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-for (const scenario of ['commands', 'bytes', 'reentrant', 'concurrent', 'timeout', 'close']) {
+for (const scenario of ['commands', 'bytes', 'reentrant', 'concurrent', 'timeout', 'close', 'ordinary-isolation']) {
 	test(`traversal preparation handles ${scenario} and releases capacity`, () => {
 		const output = execFileSync(
 			process.execPath,

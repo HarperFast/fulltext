@@ -318,6 +318,7 @@ impl Collector for TraversalScoreTieCollector {
 pub struct Writer {
 	inner: IndexWriter,
 	checkpoint_required: bool,
+	worker_ownership_unproven: bool,
 	id_field: Field,
 	version_field: Field,
 	fields: Vec<EngineField>,
@@ -599,6 +600,7 @@ impl Engine {
 			Writer {
 				inner,
 				checkpoint_required: payload.is_some(),
+				worker_ownership_unproven: false,
 				id_field: self.id_field,
 				version_field: self.version_field,
 				fields: self.fields.clone(),
@@ -2334,7 +2336,11 @@ impl Writer {
 				"commit payload exceeds {MAX_COMMIT_PAYLOAD_BYTES} UTF-8 bytes"
 			)));
 		}
+		// Tantivy can detach unjoined workers when prepare_commit fails.
+		let previously_unproven = self.worker_ownership_unproven;
+		self.worker_ownership_unproven = true;
 		let mut commit = self.inner.prepare_commit().map_err(index_error)?;
+		self.worker_ownership_unproven = previously_unproven;
 		if let Some(payload) = payload {
 			commit.set_payload(payload);
 		}
@@ -2351,7 +2357,11 @@ impl Writer {
 	}
 
 	pub fn close(self) -> Result<()> {
-		self.inner.wait_merging_threads().map_err(index_error)
+		let result = self.inner.wait_merging_threads().map_err(index_error);
+		if self.worker_ownership_unproven {
+			return Err(FulltextError::new("E_QUIESCENCE_FAILED", "a failed Tantivy commit preparation may have detached indexing workers; restart before reusing this generation"));
+		}
+		result
 	}
 }
 
@@ -5636,6 +5646,7 @@ mod tests {
 			gate: Arc<MergeGate>,
 			index_gate: Option<Arc<MergeGate>>,
 			fail_index_write: Arc<AtomicBool>,
+			worker_gates: HashMap<String, Arc<MergeGate>>,
 		}
 		impl Directory for MergeGateDirectory {
 			fn get_file_handle(&self, path: &Path) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
@@ -5654,6 +5665,9 @@ mod tests {
 					self.gate.block();
 				}
 				if name.starts_with("thrd-tantivy-index") {
+					if let Some(gate) = self.worker_gates.get(name) {
+						gate.block();
+					}
 					if let Some(gate) = &self.index_gate {
 						gate.block();
 					}
@@ -5691,6 +5705,7 @@ mod tests {
 				gate: gate.clone(),
 				index_gate: None,
 				fail_index_write: Arc::new(AtomicBool::new(false)),
+				worker_gates: HashMap::new(),
 			};
 			let config = config();
 			let engine = Engine::open(directory.clone(), &config).unwrap();
@@ -5738,15 +5753,19 @@ mod tests {
 			});
 			start.recv_timeout(Duration::from_secs(5)).unwrap();
 			let premature = completion.recv_timeout(Duration::from_millis(250)).ok();
+			let returned_before_release = premature.is_some();
 			gate.release();
+			let completed = premature
+				.or_else(|| completion.recv_timeout(Duration::from_secs(5)).ok())
+				.expect("close did not complete after releasing its native merge");
 			closer.join().unwrap();
 			let merged = merging.wait();
 			assert!(
-				premature.is_none(),
+				!returned_before_release,
 				"discard close completed while its original native merge was blocked"
 			);
 			assert!(merged.is_ok());
-			let (quiesced, error, released_at_return) = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+			let (quiesced, error, released_at_return) = completed;
 			assert!(
 				released_at_return,
 				"close returned before the native merge gate was released"
@@ -5784,6 +5803,7 @@ mod tests {
 				gate: Arc::new(MergeGate::default()),
 				index_gate: Some(index_gate.clone()),
 				fail_index_write: failure.clone(),
+				worker_gates: HashMap::new(),
 			};
 			let config = config();
 			let engine = Engine::open(directory.clone(), &config).unwrap();
@@ -5844,6 +5864,95 @@ mod tests {
 			assert_eq!(count("one"), 1);
 			assert_eq!(count("pending"), 0);
 			assert_eq!(reopened.committed_payload().unwrap().as_deref(), Some("published"));
+		}
+		#[test]
+		fn failed_prepare_commit_cannot_prove_close_while_another_native_worker_is_blocked() {
+			let failing = Arc::new(MergeGate::default());
+			let blocked = Arc::new(MergeGate::default());
+			let _release_failing = ReleaseGate(failing.clone());
+			let _release_blocked = ReleaseGate(blocked.clone());
+			let failure = Arc::new(AtomicBool::new(false));
+			let directory = MergeGateDirectory {
+				inner: RamDirectory::create(),
+				gate: Arc::new(MergeGate::default()),
+				index_gate: None,
+				fail_index_write: failure.clone(),
+				worker_gates: HashMap::from([
+					("thrd-tantivy-index0".to_owned(), failing.clone()),
+					("thrd-tantivy-index1".to_owned(), blocked.clone()),
+				]),
+			};
+			let mut config = config();
+			config.limits.indexing_threads = 2;
+			config.limits.writer_memory_bytes = 30_000_000;
+			let engine = Engine::open(directory, &config).unwrap();
+			let mut seed = engine.writer(&config).unwrap();
+			seed.apply(batch()).unwrap();
+			seed.commit_with_payload(Some("published")).unwrap();
+			seed.close().unwrap();
+			let writer = engine.writer(&config).unwrap();
+			writer
+				.inner
+				.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+			failing.arm();
+			blocked.arm();
+			let upsert = |id: &str| crate::protocol::Upsert {
+				id: id.to_owned(),
+				version: None,
+				fields: vec![("title".to_owned(), vec!["shoe".to_owned()])],
+				filters: Vec::new(),
+			};
+			writer
+				.apply(MutationBatch {
+					upserts: vec![upsert("pending-a"), upsert("pending-b")],
+					deletes: vec!["one".to_owned()],
+				})
+				.unwrap();
+			failing.wait_entered();
+			blocked.wait_entered();
+			failure.store(true, Ordering::Release);
+			failing.release();
+			let (finished, completion) = mpsc::channel();
+			let closer = std::thread::spawn(move || {
+				let mut writer = writer;
+				let preparation_error = writer.commit_with_payload(Some("not-published")).unwrap_err();
+				let mut writer = Some(writer);
+				let result = crate::native::finish_writer_close(&mut writer, false);
+				finished
+					.send((preparation_error, result.quiesced, result.error))
+					.unwrap();
+			});
+			let (preparation_error, quiesced, error) = completion
+				.recv_timeout(Duration::from_secs(5))
+				.expect("failed prepare/close did not return while the detached worker was gated");
+			let blocked_at_close_return = !blocked.state.lock().unwrap().released;
+			failure.store(true, Ordering::Release);
+			blocked.release();
+			closer.join().unwrap();
+			assert_eq!(preparation_error.code, "E_STORAGE");
+			assert!(blocked_at_close_return);
+			assert!(
+				!quiesced,
+				"close claimed quiescence after failed prepare discarded a still-blocked worker handle"
+			);
+			assert_eq!(error.unwrap().code, "E_QUIESCENCE_FAILED");
+			let searcher = engine.reader().unwrap().searcher();
+			assert_eq!(searcher.num_docs(), 2);
+			let count = |id| {
+				searcher
+					.search(
+						&tantivy::query::TermQuery::new(
+							Term::from_field_text(engine.id_field, id),
+							IndexRecordOption::Basic,
+						),
+						&tantivy::collector::Count,
+					)
+					.unwrap()
+			};
+			assert_eq!(count("one"), 1);
+			assert_eq!(count("pending-a"), 0);
+			assert_eq!(count("pending-b"), 0);
+			assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("published"));
 		}
 	}
 }

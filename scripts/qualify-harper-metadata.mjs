@@ -231,18 +231,19 @@ async function child() {
 			assert.strictEqual(await source.sequence(), 0);
 			for (const record of initial) await source.mutate('upsert', record);
 			index = await api.openNativeFullTextIndex(config(root, 'old'));
+			const checkpoint = await source.sequence();
 			const records = await source.rows(source.Source);
 			assert.deepStrictEqual((await index.applyMutationBatch({ upserts: records.map(upsert) })).rejected, []);
-			await index.publish(checkpointPayload(await source.sequence()));
+			await index.publish(checkpointPayload(checkpoint));
 			assert.deepStrictEqual(
 				(await index.search({ text: 'trail', exactTotal: true, limit: 100 })).hits.map(({ id }) => id).sort(utf8),
 				records.map(({ id }) => id).sort(utf8),
 			);
-			await source.Checkpoint.put('active', { sequence: await source.sequence(), generation: 'old' });
+			await source.Checkpoint.put('active', { sequence: checkpoint, generation: 'old' });
 			result = {
 				phase: values.phase,
 				records: records.length,
-				checkpoint: await source.sequence(),
+				checkpoint,
 				runtime: runtimeSummary,
 			};
 		} else if (values.phase === 'rebuild-new') {
@@ -264,10 +265,7 @@ async function child() {
 			});
 			assert.strictEqual(retired.state, 'reset');
 			await writeFile(path.join(root, 'retired-old.json'), JSON.stringify(retired));
-			const snapshot = await source.rows(source.Source),
-				barrier = await source.sequence();
-			index = await api.openNativeFullTextIndex(config(root, 'new'));
-			await apply({ upserts: snapshot.slice(0, 1).map(upsert) });
+			const barrier = await source.sequence();
 			await source.mutate('upsert', {
 				id: 'a',
 				tenant: 'catalog',
@@ -275,6 +273,10 @@ async function child() {
 				brand: ['beta', 'alpha'],
 				price: [15, 2],
 			});
+			const snapshot = await source.rows(source.Source);
+			assert.deepStrictEqual(snapshot.find(({ id }) => id === 'a').price, [15, 2]);
+			index = await api.openNativeFullTextIndex(config(root, 'new'));
+			await apply({ upserts: snapshot.slice(0, 1).map(upsert) });
 			await source.mutate('delete', { id: 'c' });
 			await source.mutate('upsert', {
 				id: 'f',
@@ -291,6 +293,10 @@ async function child() {
 				tail.map(({ operation }) => operation),
 				['upsert', 'delete', 'upsert'],
 			);
+			assert.deepStrictEqual(
+				tail.map(({ sequence }) => sequence),
+				[barrier + 1, barrier + 2, barrier + 3],
+			);
 			for (const event of tail)
 				await apply(
 					event.operation === 'delete' ? { deletes: [event.record.id] } : { upserts: [upsert(event.record)] },
@@ -304,6 +310,7 @@ async function child() {
 			result = {
 				phase: values.phase,
 				snapshotCheckpoint: barrier,
+				snapshotIncludesReplayedUpdate: true,
 				replayed: tail.length,
 				checkpoint,
 				retiredOldPreservedUntilPublish: true,
@@ -348,8 +355,8 @@ async function child() {
 			result = { phase: values.phase, reset: true };
 		} else if (values.phase === 'rollback-old') {
 			index = await api.openNativeFullTextIndex(config(root, 'rollback'));
-			const records = await source.rows(source.Source),
-				checkpoint = await source.sequence();
+			const checkpoint = await source.sequence();
+			const records = await source.rows(source.Source);
 			assert.deepStrictEqual((await index.applyMutationBatch({ upserts: records.map(upsert) })).rejected, []);
 			await index.publish(checkpointPayload(checkpoint));
 			assert.deepStrictEqual(await index.close(), {});

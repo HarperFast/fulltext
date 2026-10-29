@@ -78,9 +78,9 @@ previous build and record its source revision separately.
 ## Executed result
 
 On 2026-10-28, the previous
-[base implementation](https://github.com/HarperFast/fulltext/commit/0b5608778b2d80ed2a8dfbea79565d509837e7ff)
+[base implementation (0b56087)](https://github.com/HarperFast/fulltext/pull/75/commits)
 (query API 4, native ABI 9) created both indexes. The
-[metadata implementation](https://github.com/HarperFast/fulltext/commit/a471b58c90b2daf5247745449dc975f155694b21)
+[metadata implementation (a471b58)](https://github.com/HarperFast/fulltext/pull/75/commits)
 (query API 5, native ABI 10) passed every assertion above. Both builds embed Tantivy 0.27.0.
 
 The numeric/boolean control reopened without rebuilding. The new writer then upserted the same
@@ -102,7 +102,7 @@ and `brand = cedar` records `a`, `c` passed. This exercises downgrade reconstruc
 qualify live application rollback or checkpoint catch-up.
 
 The qualification was repeated on 2026-10-28 against the
-[expanded metadata implementation](https://github.com/HarperFast/fulltext/commit/5c502fb1318e92d97d0c9347d2d5e092655fce90)
+[expanded metadata implementation (5c502fb)](https://github.com/HarperFast/fulltext/pull/75/commits)
 (query API 6, native ABI 11), using the same genuine previous base build. Numeric compatibility,
 reverse numeric writes, nonmutating string rejection, rebuild/publication/reopen, and downgrade
 reconstruction all passed again. Multi-field sorting and nested aggregations add no stored-schema

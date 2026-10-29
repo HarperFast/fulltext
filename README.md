@@ -634,7 +634,8 @@ explicitly. Discard close joins the original Tantivy writer. It can finish index
 and write unpublished segment files before discarding them; it does not advance the committed
 checkpoint. Reserve storage headroom and allow shutdown time for that work. A storage failure during
 this flush can prevent a proven join and reject with `E_QUIESCENCE_FAILED`; restart the process before
-resetting or reopening that path. Unpublished files are eligible for later native garbage collection.
+resetting or reopening that path. A failed commit preparation can likewise leave worker ownership
+unproven, so a later close must not clear that restart requirement. Unpublished files are eligible for later native garbage collection.
 `commit()` publishes mutations, and `reload()` makes the latest commit visible to this
 handle's searches. A reload that cannot align Tantivy's snapshot with its checkpoint after three
 bounded attempts returns `E_RELOAD_FAILED`; callers can retry because the reader remains open.

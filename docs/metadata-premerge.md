@@ -55,7 +55,7 @@ FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/metadata-count-load.mjs --module /
 ```
 
 Run flat mode three times per revision in alternating process order, using the same driver with
-[the pre-expansion baseline](https://github.com/HarperFast/fulltext/commit/f808c58) and current
+[the pre-expansion baseline (f808c58)](https://github.com/HarperFast/fulltext/pull/75/commits) and current
 module paths. Compare the same case/caller-width cells. Expanded mode runs 12 cells for at least
 30 seconds each, approximately six minutes plus setup and pressure checks.
 
@@ -116,7 +116,7 @@ missing placement, UTF-8 ties, nested aggregation scope, omitted child propertie
 and recovery. This is local macOS arm64 evidence, not platform-wide qualification.
 
 The exercise exposed a close-quiescence defect: rollback replaced the original native writer
-before its merge work was joined. The [close fix](https://github.com/HarperFast/fulltext/commit/33399a6)
+before its merge work was joined. The [close fix (33399a6)](https://github.com/HarperFast/fulltext/pull/75/commits)
 joins the original writer, discards unpublished changes and preserves the published checkpoint.
 Discard may flush unpublished segments while joining, so it requires I/O headroom. A natural
 storage-error regression verifies that an unsuccessful shutdown is not marked quiesced: native
@@ -155,8 +155,8 @@ This distinction is not an outstanding JavaScript handle-close failure.
 
 Observed local harness result: actual built Harper 5.2.5 at
 [the recorded source revision](https://github.com/HarperFast/harper/commit/9f469c079a0624a27ff66165078b98e9a4e1ec35)
-seeded seven records at checkpoint 7. Three source mutations were interleaved sequentially between
-snapshot indexing chunks; replay reached the quiesced source checkpoint 10 before publication and
+seeded seven records at checkpoint 7. Three source mutations were interleaved sequentially before and during
+snapshot indexing; replay reached the quiesced source checkpoint 10 before publication and
 cutover. A separate child reopened source and derived reader and verified checkpoint and results.
 Resumed ingestion advanced to checkpoint 11 and passed another reopen. Reset with the new build
 followed by old-build reconstruction reopened all seven latest records at checkpoint 11. The

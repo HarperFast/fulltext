@@ -104,3 +104,58 @@ test('metadata workload requires an explicit scratch directory', async () => {
 		return true;
 	});
 });
+
+test(
+	'metadata workload retains the failed round and cleans up before reporting failure',
+	{ timeout: 35_000 },
+	async (context) => {
+		const scratch = await mkdtemp(path.join(tmpdir(), 'fulltext-workload-gate-test-'));
+		context.after(() => rm(scratch, { recursive: true, force: true }));
+		await assert.rejects(
+			execute(
+				process.execPath,
+				[
+					driver,
+					'--scratch',
+					scratch,
+					'--documents',
+					'20',
+					'--rounds',
+					'1',
+					'--queries',
+					'1',
+					'--concurrency',
+					'1',
+					'--features',
+					'flat',
+					'--min-throughput',
+					'1000000000000',
+					'--max-p95-ms',
+					'30000',
+					'--max-p99-ms',
+					'30000',
+				],
+				{ timeout: 30_000, env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1' } },
+			),
+			(error) => {
+				assert.strictEqual(error.stdout, '', 'a failed gate must not emit a qualification pass');
+				const diagnostics = error.stderr
+					.split('\n')
+					.filter((line) => line.startsWith('{'))
+					.map((line) => JSON.parse(line));
+				const failure = diagnostics.find(({ phase }) => phase === 'round-gate-failure');
+				assert(failure, 'structured failed-round evidence must be retained');
+				assert.strictEqual(failure.gate, 'throughput');
+				assert.strictEqual(failure.name, 'ordinary-exact');
+				assert.strictEqual(failure.concurrency, 1);
+				assert.strictEqual(failure.lastTenRounds.length, 1);
+				assert.strictEqual(failure.lastTenRounds[0].round, 1);
+				assert.strictEqual(failure.lastTenRounds[0].completed, 1);
+				assert.strictEqual(failure.lastTenRounds[0].latencyMilliseconds.length, 1);
+				assert(failure.postIndexBaseline.rss > 0);
+				return true;
+			},
+		);
+		assert.deepStrictEqual(await readdir(scratch), [], 'failure must still close and remove generated indexes');
+	},
+);

@@ -200,18 +200,8 @@ try {
 				const used = process.cpuUsage(cpu);
 				const after = process.memoryUsage();
 				const status = index.status();
-				assert.strictEqual(status.searchQueuedCommands, 0n);
-				assert.strictEqual(status.searchQueuedBytes, 0n);
-				assert.strictEqual(status.state, 'open');
 				const timing = percentiles(latencies);
 				const throughput = (latencies.length * 1000) / elapsed;
-				assert(timing.p95Milliseconds <= gates.maxP95Milliseconds, `${scenario.name}: p95 gate exceeded`);
-				assert(timing.p99Milliseconds <= gates.maxP99Milliseconds, `${scenario.name}: p99 gate exceeded`);
-				assert(throughput >= gates.minSuccessesPerSecond, `${scenario.name}: throughput gate failed`);
-				assert(
-					peakRss - postIndexBaseline.rss <= gates.maxPeakRssGrowthBytes,
-					`${scenario.name}: RSS observation gate exceeded`,
-				);
 				measurements.push({
 					name: scenario.name,
 					concurrency: parallel,
@@ -230,6 +220,17 @@ try {
 					observedMaxQueuedCommands: String(maxQueueCommands),
 					observedMaxQueuedBytes: String(maxQueueBytes),
 				});
+				for (const [passed, gate] of [
+					[
+						status.searchQueuedCommands === 0n && status.searchQueuedBytes === 0n && status.state === 'open',
+						'queues-drained',
+					],
+					[timing.p95Milliseconds <= gates.maxP95Milliseconds, 'p95'],
+					[timing.p99Milliseconds <= gates.maxP99Milliseconds, 'p99'],
+					[throughput >= gates.minSuccessesPerSecond, 'throughput'],
+					[peakRss - postIndexBaseline.rss <= gates.maxPeakRssGrowthBytes, 'rss-growth'],
+				])
+					assertQualificationGate(passed, 'round-gate-failure', gate, scenario.name, parallel, postIndexBaseline);
 			} while (durationMode ? performance.now() < until : round < rounds);
 		}
 	}
@@ -241,40 +242,22 @@ try {
 				const minimum = Math.min(...tail);
 				const maximum = Math.max(...tail);
 				const range = maximum - minimum;
-				if (range > gates.maxTailRoundRssRangeBytes) {
-					const status = index.status();
-					console.error(
-						JSON.stringify({
-							benchmark: 'metadata-workload',
-							phase: 'tail-rss-gate-failure',
-							name: scenario.name,
-							concurrency: parallel,
-							lastFiveRssEndBytes: tail,
-							latestMinusFirstBytes: tail.at(-1) - tail[0],
-							minimumBytes: minimum,
-							maximumBytes: maximum,
-							rangeBytes: range,
-							thresholdBytes: gates.maxTailRoundRssRangeBytes,
-							postIndexBaseline,
-							lastTenRounds: cell
-								.slice(-10)
-								.map(({ round, rssBeforeBytes, rssEndBytes, sampledPeakRssBytes, heapEndBytes }) => ({
-									round,
-									rssBeforeBytes,
-									rssEndBytes,
-									sampledPeakRssBytes,
-									heapEndBytes,
-								})),
-							status: {
-								state: status.state,
-								searchQueuedCommands: String(status.searchQueuedCommands),
-								searchQueuedBytes: String(status.searchQueuedBytes),
-								commitOpstamp: String(status.commitOpstamp),
-							},
-						}),
-					);
-				}
-				assert(range <= gates.maxTailRoundRssRangeBytes, `${scenario.name}: last-five-round RSS range gate exceeded`);
+				assertQualificationGate(
+					range <= gates.maxTailRoundRssRangeBytes,
+					'tail-rss-gate-failure',
+					'tail-rss-range',
+					scenario.name,
+					parallel,
+					postIndexBaseline,
+					{
+						lastFiveRssEndBytes: tail,
+						latestMinusFirstBytes: tail.at(-1) - tail[0],
+						minimumBytes: minimum,
+						maximumBytes: maximum,
+						rangeBytes: range,
+						thresholdBytes: gates.maxTailRoundRssRangeBytes,
+					},
+				);
 			}
 		}
 
@@ -365,6 +348,31 @@ try {
 	}
 }
 console.log(JSON.stringify(completedReport, null, 2));
+
+function assertQualificationGate(passed, phase, gate, name, parallel, postIndexBaseline, details = {}) {
+	if (passed) return;
+	const status = index.status();
+	console.error(
+		JSON.stringify({
+			benchmark: 'metadata-workload',
+			phase,
+			gate,
+			name,
+			concurrency: parallel,
+			gates,
+			postIndexBaseline,
+			lastTenRounds: measurements.filter((entry) => entry.name === name && entry.concurrency === parallel).slice(-10),
+			status: {
+				state: status.state,
+				searchQueuedCommands: String(status.searchQueuedCommands),
+				searchQueuedBytes: String(status.searchQueuedBytes),
+				commitOpstamp: String(status.commitOpstamp),
+			},
+			...details,
+		}),
+	);
+	assert.fail(`${name}: ${gate} qualification gate exceeded`);
+}
 
 function percentiles(values) {
 	const sorted = [...values].sort((a, b) => a - b);

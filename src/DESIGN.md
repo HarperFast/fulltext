@@ -63,7 +63,9 @@ I/O proportional to outstanding work and can leave unpublished files for native 
 It needs storage headroom. If finalization fails, Tantivy may return before joining all workers or
 merges; the native outcome must remain unquiesced, producing `E_QUIESCENCE_FAILED` and retaining the
 path reservation until process restart. The indexing-write failure regression pins that conservative
-classification. Avoiding this discard I/O while preserving the original merge join would require
+classification. A failed `prepare_commit` can also detach indexing workers before close begins;
+writer ownership uncertainty must remain sticky through later close attempts, even when joining
+the remaining native handles succeeds. Avoiding this discard I/O while preserving the original merge join would require
 an upstream native lifecycle hook.
 
 The public Rust `Writer::rollback` remains a direct, reusable-writer Tantivy operation, not a

@@ -48,13 +48,13 @@ pub(super) fn collect_native(
 		.ok_or_else(|| FulltextError::invalid("Sorted collection requires a sort request"))?;
 	let fields = catalog.fields;
 	macro_rules! collect {
-  (@primary $primary:expr) => {
-   collect_sorted(searcher, query, $primary, end, aggregations, histograms, deadline)
-  };
-  ($first:expr, $second:expr) => {
-   collect!(@primary (($first, comparator(&sorts[0])), ($second, comparator(&sorts[1]))))
-  };
- }
+		(@primary $primary:expr) => {
+			collect_sorted(searcher, query, $primary, end, aggregations, histograms, deadline)
+		};
+		($first:expr, $second:expr) => {
+			collect!(@primary (($first, comparator(&sorts[0])), ($second, comparator(&sorts[1]))))
+		};
+	}
 	let erased = |position: usize| -> Result<_> {
 		let index = field(&sorts[position].field, fields)?.0;
 		Ok((
