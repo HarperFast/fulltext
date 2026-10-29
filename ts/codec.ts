@@ -477,6 +477,22 @@ export function encodeRuntimeBudget(limits: PackedRuntimeBudgetLimits): Buffer {
 	return writer.finish();
 }
 
+export function resolveQueryLimits(limits?: { maxQueryTerms?: number; maxQueryClauses?: number }): {
+	maxQueryTerms: number;
+	maxQueryClauses: number;
+} {
+	const terms = limits?.maxQueryTerms ?? maxQueryTerms;
+	const clauses = limits?.maxQueryClauses ?? maxQueryClauses;
+	for (const [name, value, ceiling] of [
+		['maxQueryTerms', terms, maxConfiguredQueryTerms],
+		['maxQueryClauses', clauses, maxConfiguredQueryClauses],
+	] as const) {
+		if (!Number.isInteger(value) || value < 1 || value > ceiling)
+			throw new FulltextError('E_INVALID_ARGUMENT', `${name} must be between 1 and ${ceiling}`);
+	}
+	return { maxQueryTerms: terms, maxQueryClauses: clauses };
+}
+
 function encodeEngine(writer: ByteWriter, config: PackedEngineConfig): void {
 	encodeIndexIdentity(writer, config);
 	writer.u16(config.limits.indexingThreads, 'limits.indexingThreads');
@@ -485,15 +501,7 @@ function encodeEngine(writer: ByteWriter, config: PackedEngineConfig): void {
 	writer.u32(config.limits.maxQueuedCommands, 'limits.maxQueuedCommands');
 	writer.u64(config.limits.maxQueuedBytes, 'limits.maxQueuedBytes');
 	writer.u64(config.limits.maxBatchBytes, 'limits.maxBatchBytes');
-	const terms = config.limits.maxQueryTerms ?? maxQueryTerms;
-	const clauses = config.limits.maxQueryClauses ?? maxQueryClauses;
-	for (const [name, value, ceiling] of [
-		['maxQueryTerms', terms, maxConfiguredQueryTerms],
-		['maxQueryClauses', clauses, maxConfiguredQueryClauses],
-	] as const) {
-		if (!Number.isInteger(value) || value < 1 || value > ceiling)
-			throw new FulltextError('E_INVALID_ARGUMENT', `${name} must be between 1 and ${ceiling}`);
-	}
+	const { maxQueryTerms: terms, maxQueryClauses: clauses } = resolveQueryLimits(config.limits);
 	writer.u32(terms, 'limits.maxQueryTerms');
 	writer.u32(clauses, 'limits.maxQueryClauses');
 }

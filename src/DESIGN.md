@@ -218,8 +218,9 @@ remains authoritative for raw frames and direct Rust opens.
 
 Phrase construction charges positions × fields across the request; fuzzy construction charges
 term-field automata across the tree. Their fixed bounds retain the default policy's implied upper
-bounds even when configured term/clause limits rise. Hash-set trace plans avoid repeated linear
-membership scans. Boundary and construction regressions live in `query-capacity.test.mjs` and the
+bounds even when configured term/clause limits rise. Trace membership uses short vector comparisons
+for up to eight terms and hash lookup above that; branch-local found cardinality makes completion
+checks constant-time. Boundary and construction regressions live in `query-capacity.test.mjs` and the
 engine tests.
 
 Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;

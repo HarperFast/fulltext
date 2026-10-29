@@ -449,7 +449,9 @@ are advertised separately as `runtimeInfo().limits.maxConfiguredQueryTerms` and
 `maxConfiguredQueryClauses`; they are safety ceilings, not a guarantee that every query below them
 will succeed. For example, use `limits: { ...existingLimits, maxQueryTerms: 128, maxQueryClauses: 512 }`.
 
-The synchronous, frozen `index.queryLimits` / `reader.queryLimits` getter reports effective settings.
+The synchronous, frozen `index.queryLimits` / `reader.queryLimits` getter reports settings supplied at open.
+When constructing `NativeFullTextIndex` directly around a native handle, supply the same query policy
+in `searchLimits`; the constructor validates it but cannot inspect the native handle’s policy.
 Search requests cannot raise them. Apply the same policy to every worker serving a logical index;
 changing it requires reopening handles but no index rebuild. The facade and native addon must match
 ABI 12. Query API 6 and packed mutation/search version 7 remain unchanged; the open frame has an

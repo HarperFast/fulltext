@@ -3,7 +3,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { openNativeFullTextIndex, openNativeFullTextReader, runtimeInfo } from '@harperfast/fulltext/native';
+import {
+	NativeFullTextIndex,
+	openNativeFullTextIndex,
+	openNativeFullTextReader,
+	runtimeInfo,
+} from '@harperfast/fulltext/native';
 import { decodeResponse, encodeOpen } from '../dist/codec.js';
 import { loadAddon } from '../dist/load-addon.js';
 
@@ -161,6 +166,19 @@ test('query construction has fixed whole-tree phrase and fuzzy safeguards', asyn
 		}),
 		(error) => invalid(error) && /fuzzy construction/.test(error.message),
 	);
+	await assert.rejects(
+		index.search({
+			query: {
+				operator: 'or',
+				clauses: Array.from({ length: 129 }, () => ({
+					text: 'alpha',
+					mode: 'fuzzy-prefix',
+					fields: ['field0', 'field1'],
+				})),
+			},
+		}),
+		(error) => invalid(error) && /fuzzy construction/.test(error.message),
+	);
 	await index.search({ text: 'alpha', fields: ['field0'] });
 });
 
@@ -168,6 +186,11 @@ test('open rejects invalid policies in the facade and native decoder; capability
 	const info = await runtimeInfo();
 	assert.strictEqual(info.limits.maxQueryTerms, 64);
 	assert.strictEqual(info.limits.maxQueryClauses, 256);
+	assert.throws(
+		() =>
+			new NativeFullTextIndex({ handle: 0, fieldNames: [], maxBatchBytes: 1024, searchLimits: { maxQueryTerms: -1 } }),
+		invalid,
+	);
 	for (const [name, ceiling] of [
 		['maxQueryTerms', info.limits.maxConfiguredQueryTerms],
 		['maxQueryClauses', info.limits.maxConfiguredQueryClauses],

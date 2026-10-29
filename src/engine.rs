@@ -422,12 +422,44 @@ struct SourceToken {
 	position: usize,
 }
 
+enum TraceTerms {
+	Small(Vec<String>),
+	Large(HashSet<String>),
+}
+
+impl FromIterator<String> for TraceTerms {
+	fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+		let terms: Vec<_> = iter.into_iter().collect();
+		if terms.len() <= 8 {
+			Self::Small(terms)
+		} else {
+			Self::Large(terms.into_iter().collect())
+		}
+	}
+}
+
+impl TraceTerms {
+	fn len(&self) -> usize {
+		match self {
+			Self::Small(terms) => terms.len(),
+			Self::Large(terms) => terms.len(),
+		}
+	}
+
+	fn contains(&self, term: &str) -> bool {
+		match self {
+			Self::Small(terms) => terms.iter().any(|candidate| candidate == term),
+			Self::Large(terms) => terms.contains(term),
+		}
+	}
+}
+
 enum TracePlan {
-	Any(HashSet<String>),
-	All(HashSet<String>),
+	Any(TraceTerms),
+	All(TraceTerms),
 	Phrase(Vec<(usize, String)>),
 	Prefix {
-		completed: HashSet<String>,
+		completed: TraceTerms,
 		prefix: String,
 		matcher: Option<FuzzyPrefixMatcher>,
 	},
@@ -479,15 +511,14 @@ impl FuzzyPrefixMatcher {
 
 impl TracePlan {
 	fn record_matches(&self, found: &HashSet<String>) -> bool {
+		// Each trace branch inserts only its own distinct terms or its private match marker.
 		match self {
-			Self::Any(terms) if terms.is_empty() => false,
-			Self::Any(terms) => terms.iter().any(|term| found.contains(term)),
-			Self::All(terms) => !terms.is_empty() && terms.iter().all(|term| found.contains(term)),
+			Self::Any(_) | Self::Fuzzy { .. } => !found.is_empty(),
+			Self::All(terms) => terms.len() != 0 && found.len() == terms.len(),
 			Self::Phrase(terms) => !terms.is_empty() && found.contains("__phrase"),
 			Self::Prefix { completed, prefix, .. } => {
-				!prefix.is_empty() && found.contains("__prefix") && completed.iter().all(|term| found.contains(term))
+				!prefix.is_empty() && found.contains("__prefix") && found.len() == completed.len() + 1
 			}
-			Self::Fuzzy { exact, .. } => !exact.is_empty() && exact.iter().any(|term| found.contains(term)),
 		}
 	}
 }

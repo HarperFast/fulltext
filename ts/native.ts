@@ -28,7 +28,7 @@ import {
 	maxTraceRecords,
 	maxExpressionDepth,
 	maxQueryClauses,
-	maxQueryTerms,
+	resolveQueryLimits,
 	encodeTrace,
 	MutationBatchFrameCursor,
 } from './codec.js';
@@ -382,10 +382,7 @@ export class NativeFullTextIndex {
 			'maxQueuedCommands' | 'maxQueuedBytes' | 'maxQueryTerms' | 'maxQueryClauses'
 		>;
 	}) {
-		this.#queryLimits = Object.freeze({
-			maxQueryTerms: options.searchLimits?.maxQueryTerms ?? maxQueryTerms,
-			maxQueryClauses: options.searchLimits?.maxQueryClauses ?? maxQueryClauses,
-		});
+		this.#queryLimits = Object.freeze(resolveQueryLimits(options.searchLimits));
 		const preparationCommands = options.searchLimits?.maxQueuedCommands ?? maxPreparationCommands;
 		const preparationBytes = options.searchLimits?.maxQueuedBytes ?? maxSearchRequestBytes;
 		for (const value of [preparationCommands, preparationBytes]) {
