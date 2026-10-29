@@ -28,6 +28,7 @@ import {
 	maxTraceRecords,
 	maxExpressionDepth,
 	maxQueryClauses,
+	maxQueryTerms,
 	encodeTrace,
 	MutationBatchFrameCursor,
 } from './codec.js';
@@ -70,6 +71,8 @@ export interface RuntimeInfo {
 
 		maxCommitPayloadBytes: number;
 		maxQueryTextBytes: number;
+		maxConfiguredQueryTerms: number;
+		maxConfiguredQueryClauses: number;
 		maxQueryTerms: number;
 		maxQueryClauses: number;
 		maxCandidateIds: number;
@@ -113,7 +116,14 @@ export interface NativeFullTextIndexOptions {
 	limits: NativeFullTextIndexLimits;
 }
 
+export interface QueryLimits {
+	readonly maxQueryTerms: number;
+	readonly maxQueryClauses: number;
+}
+
 export interface NativeFullTextIndexLimits {
+	maxQueryTerms?: number;
+	maxQueryClauses?: number;
 	indexingThreads: number;
 	searchThreads: number;
 	writerMemoryBytes: number;
@@ -355,6 +365,7 @@ export class NativeFullTextIndex {
 	#logicalMutationState: 'idle' | 'active' | 'incomplete' = 'idle';
 	#continuationKey?: Buffer;
 	#candidateLimits?: Pick<RuntimeInfo['limits'], 'maxCandidateIds' | 'maxCandidateBytes'>;
+	readonly #queryLimits: Readonly<QueryLimits>;
 	readonly #maxPreparationCommands: number;
 	readonly #maxPreparationBytes: number;
 	#preparationCommands = 0;
@@ -366,8 +377,15 @@ export class NativeFullTextIndex {
 		maxBatchBytes: number;
 		fieldNames: Iterable<string>;
 		filterFields?: Iterable<{ name: string; type: 'string' | 'number' | 'boolean' }>;
-		searchLimits?: Pick<NativeFullTextIndexLimits, 'maxQueuedCommands' | 'maxQueuedBytes'>;
+		searchLimits?: Pick<
+			NativeFullTextIndexLimits,
+			'maxQueuedCommands' | 'maxQueuedBytes' | 'maxQueryTerms' | 'maxQueryClauses'
+		>;
 	}) {
+		this.#queryLimits = Object.freeze({
+			maxQueryTerms: options.searchLimits?.maxQueryTerms ?? maxQueryTerms,
+			maxQueryClauses: options.searchLimits?.maxQueryClauses ?? maxQueryClauses,
+		});
 		const preparationCommands = options.searchLimits?.maxQueuedCommands ?? maxPreparationCommands;
 		const preparationBytes = options.searchLimits?.maxQueuedBytes ?? maxSearchRequestBytes;
 		for (const value of [preparationCommands, preparationBytes]) {
@@ -382,6 +400,10 @@ export class NativeFullTextIndex {
 		this.#maxBatchBytes = options.maxBatchBytes;
 		this.#fieldNames = new Set(options.fieldNames);
 		this.#filterFieldTypes = new Map(Array.from(options.filterFields ?? [], (field) => [field.name, field.type]));
+	}
+
+	get queryLimits(): Readonly<QueryLimits> {
+		return this.#queryLimits;
 	}
 
 	get committedPayload(): string | undefined {
@@ -1007,6 +1029,10 @@ export class NativeFullTextReader {
 
 	constructor(inner: NativeFullTextIndex) {
 		this.#inner = inner;
+	}
+
+	get queryLimits(): Readonly<QueryLimits> {
+		return this.#inner.queryLimits;
 	}
 
 	get committedPayload(): string | undefined {

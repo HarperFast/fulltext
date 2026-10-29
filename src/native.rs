@@ -22,7 +22,7 @@ use crate::engine::{
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
 	decode_batch, decode_inspect, decode_open, decode_reset, decode_runtime_budget, decode_search, decode_trace,
-	search_budget, search_is_expensive, trace_budget, validate_batch_header, validate_search_header,
+	search_budget, search_is_expensive_for_fields, trace_budget, validate_batch_header, validate_search_header,
 	validate_trace_header, EngineConfig, RuntimeBudgetLimits, PROTOCOL_VERSION,
 };
 
@@ -474,7 +474,11 @@ pub fn native_search(
 		let runtime = runtime(&env, handle)?;
 		runtime.require_open().map_err(fulltext_napi_error)?;
 		validate_search_header(&packed_request).map_err(fulltext_napi_error)?;
-		let expensive = search_is_expensive(&packed_request).map_err(fulltext_napi_error)?;
+		let raised = runtime.config.limits.max_query_terms > crate::protocol::MAX_QUERY_TERMS
+			|| runtime.config.limits.max_query_clauses > crate::protocol::MAX_QUERY_CLAUSES;
+		let expensive =
+			search_is_expensive_for_fields(&packed_request, raised.then_some(runtime.config.identity.fields.len()))
+				.map_err(fulltext_napi_error)?;
 		let queue = runtime.search_queue(expensive);
 		queue
 			.check_capacity(packed_request.len())
@@ -3229,6 +3233,8 @@ mod tests {
 			max_expensive_searches: 1,
 		}));
 		let limits = crate::protocol::Limits {
+			max_query_terms: crate::protocol::MAX_QUERY_TERMS,
+			max_query_clauses: crate::protocol::MAX_QUERY_CLAUSES,
 			indexing_threads: 1,
 			search_threads: 2,
 			writer_memory_bytes: 15_000_000,

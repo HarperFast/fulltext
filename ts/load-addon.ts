@@ -20,6 +20,8 @@ interface NativeRuntimeInfo {
 
 		maxCommitPayloadBytes: number;
 		maxQueryTextBytes: number;
+		maxConfiguredQueryTerms: number;
+		maxConfiguredQueryClauses: number;
 		maxQueryTerms: number;
 		maxQueryClauses: number;
 		maxCandidateIds: number;
@@ -76,7 +78,7 @@ interface NativeAddonApi {
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 11;
+const expectedNativeAbiVersion = 12;
 const packageManifest = require('../package.json') as { name: string; version: string };
 let loadedAddon: NativeAddonApi | undefined;
 let runtimeUsesGlibc: boolean | undefined;

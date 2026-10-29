@@ -24,12 +24,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "test-panic")]
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const NATIVE_ABI_VERSION: u32 = 11;
+pub const NATIVE_ABI_VERSION: u32 = 12;
 pub const TANTIVY_VERSION: &str = "0.27.0";
 
 #[cfg(feature = "node-api")]
 #[napi(object)]
 pub struct RuntimeLimits {
+	pub max_configured_query_terms: u32,
+	pub max_configured_query_clauses: u32,
 	pub max_aggregation_depth: u32,
 	pub max_aggregation_buckets: u32,
 	pub max_aggregation_memory_bytes: u32,
@@ -84,6 +86,8 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 		query_class_isolation_minimum_search_threads: 2,
 		storage_backends: vec!["native".to_owned()],
 		limits: RuntimeLimits {
+			max_configured_query_terms: protocol::MAX_CONFIGURED_QUERY_TERMS as u32,
+			max_configured_query_clauses: protocol::MAX_CONFIGURED_QUERY_CLAUSES as u32,
 			max_aggregation_depth: crate::catalog::MAX_AGGREGATION_DEPTH as u32,
 			max_aggregation_buckets: crate::catalog::MAX_AGGREGATION_BUCKETS as u32,
 			max_aggregation_memory_bytes: crate::catalog::MAX_AGGREGATION_MEMORY_BYTES as u32,

@@ -7,3 +7,5 @@
 - [Writer close ownership](src/DESIGN.md#writer-close-ownership) — join original native merges before releasing a generation or allowing reset.
 
 - [Qualification measurement](benchmarks/DESIGN.md) — fixed-generation reader leases and bounded-memory soak diagnostics.
+
+- [Query capacity policy](src/DESIGN.md#query-capacity-policy) — immutable operational limits, construction guards, and raised-profile admission.

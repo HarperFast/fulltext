@@ -10,6 +10,9 @@ export const maxSearchBudgetMilliseconds = 30_000;
 export const maxTraceRecords = 100;
 export const maxExpressionDepth = 8;
 export const maxQueryClauses = 256;
+export const maxQueryTerms = 64;
+export const maxConfiguredQueryTerms = 1_024;
+export const maxConfiguredQueryClauses = 4_096;
 const noFilterNames: string[] = [];
 export const maxSynonymRules = 1_024;
 export const maxSynonymReplacements = 16;
@@ -52,6 +55,8 @@ export interface PackedEngineConfig extends PackedIndexIdentityConfig {
 		maxQueuedCommands: number;
 		maxQueuedBytes: number;
 		maxBatchBytes: number;
+		maxQueryTerms?: number;
+		maxQueryClauses?: number;
 	};
 }
 
@@ -480,6 +485,17 @@ function encodeEngine(writer: ByteWriter, config: PackedEngineConfig): void {
 	writer.u32(config.limits.maxQueuedCommands, 'limits.maxQueuedCommands');
 	writer.u64(config.limits.maxQueuedBytes, 'limits.maxQueuedBytes');
 	writer.u64(config.limits.maxBatchBytes, 'limits.maxBatchBytes');
+	const terms = config.limits.maxQueryTerms ?? maxQueryTerms;
+	const clauses = config.limits.maxQueryClauses ?? maxQueryClauses;
+	for (const [name, value, ceiling] of [
+		['maxQueryTerms', terms, maxConfiguredQueryTerms],
+		['maxQueryClauses', clauses, maxConfiguredQueryClauses],
+	] as const) {
+		if (!Number.isInteger(value) || value < 1 || value > ceiling)
+			throw new FulltextError('E_INVALID_ARGUMENT', `${name} must be between 1 and ${ceiling}`);
+	}
+	writer.u32(terms, 'limits.maxQueryTerms');
+	writer.u32(clauses, 'limits.maxQueryClauses');
 }
 
 function encodeIndexIdentity(writer: ByteWriter, config: PackedIndexIdentityConfig): void {
