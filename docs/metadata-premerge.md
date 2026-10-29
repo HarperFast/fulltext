@@ -110,7 +110,7 @@ observation remains recorded above despite passing final acceptance runs.
 
 ## Verified consumer and lifecycle evidence
 
-Observed on 2026-10-28: the final full gate passed 125 Rust tests (five ignored), 416 Node tests
+Observed on 2026-10-28: the final full gate passed 126 Rust tests (five ignored), 418 Node tests
 across four groups, and nine optimized expensive-lane tests. These runs cover first-value sorting,
 missing placement, UTF-8 ties, nested aggregation scope, omitted child properties, resource rejection
 and recovery. This is local macOS arm64 evidence, not platform-wide qualification.
@@ -122,7 +122,11 @@ Discard may flush unpublished segments while joining, so it requires I/O headroo
 storage-error regression verifies that an unsuccessful shutdown is not marked quiesced: native
 handle close reports `E_QUIESCENCE_FAILED`, requiring process restart before reset.
 A deterministic blocked-merge regression failed before the fix and passed afterward; it also passes
-in the full gate. This verifies the close invariant rather than relying on cleanup retries.
+in the full gate. A separate two-worker regression proves a failed native commit preparation can
+detach another still-running worker. The wrapper now retains that ownership uncertainty through
+later close attempts; a successful join of remaining handles cannot clear the restart requirement.
+This regression also fails before and passes after the fix. These tests verify ownership rather
+than relying on cleanup retries.
 
 The installed previous 0.7.0 facade/addon migration check passed: numeric/Boolean reuse and reverse
 writes, unchanged-file rejection for incompatible strings, new-generation rebuild, and old-build
@@ -130,7 +134,7 @@ rollback reconstruction. See the [migration contract](metadata-migration.md) for
 
 ## Verified timeout recovery
 
-Observed final-addon count-load run: 100,000 documents, 60 requests per case/caller-width cell,
+Observed count-load run: 100,000 documents, 60 requests per case/caller-width cell,
 and 1/4/8 callers. All 360 normal requests returned exact results. With a 1 ms budget, 180 AND
 requests succeeded and 180 filtered dense-OR requests returned `E_TIMEOUT`. All 12 measured cells
 then passed full-budget recovery with exact totals and zero queued commands/bytes. The largest
