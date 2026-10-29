@@ -441,6 +441,34 @@ collection. Removing unauthorized hits afterward cannot remove their bucket or n
 See the executable [metadata example](examples/metadata-search.mjs), including typed resource-error
 recovery and rejected metadata continuation, and the [premerge qualification](docs/metadata-premerge.md).
 
+### Configurable query capacity
+
+Hosts can set `limits.maxQueryTerms` and `limits.maxQueryClauses` when opening a writer or reader.
+Defaults remain 64 analyzed terms per text leaf and 256 compiled text clauses. Supported ceilings
+are advertised separately as `runtimeInfo().limits.maxConfiguredQueryTerms` and
+`maxConfiguredQueryClauses`; they are safety ceilings, not a guarantee that every query below them
+will succeed. For example, use `limits: { ...existingLimits, maxQueryTerms: 128, maxQueryClauses: 512 }`.
+
+The synchronous, frozen `index.queryLimits` / `reader.queryLimits` getter reports effective settings.
+Search requests cannot raise them. Apply the same policy to every worker serving a logical index;
+changing it requires reopening handles but no index rebuild. The facade and native addon must match
+ABI 12. Query API 6 and packed mutation/search version 7 remain unchanged; the open frame has an
+optional policy extension, with defaults when absent.
+
+The clause setting covers compiled text queries, including field multiplication and expansion.
+It does not raise the independent 256 search/filter leaves, Boolean children or filter `in` values.
+A lower clause setting can reject NOT or multi-field queries even when a one-term query succeeds.
+Tracing uses the term setting for its supported simple text clauses; it does not compile indexed
+text queries or reproduce their clause expansion. Existing fuzzy, prefix, text-byte, depth, queue,
+response and deadline limits remain in force. Invalid settings/term or clause overflow reject with
+`E_INVALID_ARGUMENT`; prefix expansion/clause overflow retains `E_PREFIX_TOO_BROAD`.
+
+Higher-policy handles retain ordinary admission for conservatively small ASCII requests. Larger or
+non-ASCII requests use the expensive lane; this can change latency and admission even when the
+analyzed query is small. Fixed whole-request construction guards also bound phrase positions and
+fuzzy automata. See [query capacity safeguards](docs/limits.md#query-capacity-policy) and qualify the
+chosen policy on the consuming application's workload before rollout.
+
 ## Analyzer and field configuration
 
 Choose these settings when creating the index. Enable `surfaceTerms: true` if you need prefix
@@ -744,7 +772,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 11, query API 6, and packed protocol 7. The loader rejects older addon
+This API uses native ABI 12, query API 6, and packed protocol 7. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
 columns. Previously released string-metadata indexes must
@@ -835,31 +863,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
 ## License
 
 Apache-2.0
-
-### Configurable query capacity
-
-Hosts can set `limits.maxQueryTerms` and `limits.maxQueryClauses` when opening a writer or reader.
-Defaults remain 64 analyzed terms per text leaf and 256 compiled text clauses. Supported ceilings
-are advertised separately as `runtimeInfo().limits.maxConfiguredQueryTerms` and
-`maxConfiguredQueryClauses`; they are safety ceilings, not a guarantee that every query below them
-will succeed. For example, use `limits: { ...existingLimits, maxQueryTerms: 128, maxQueryClauses: 512 }`.
-
-The synchronous, frozen `index.queryLimits` / `reader.queryLimits` getter reports effective settings.
-Search requests cannot raise them. Apply the same policy to every worker serving a logical index;
-changing it requires reopening handles but no index rebuild. The facade and native addon must match
-ABI 12. Query API 6 and packed mutation/search version 7 remain unchanged; the open frame has an
-optional policy extension, with defaults when absent.
-
-The clause setting covers compiled text queries, including field multiplication and expansion.
-It does not raise the independent 256 search/filter leaves, Boolean children or filter `in` values.
-A lower clause setting can reject NOT or multi-field queries even when a one-term query succeeds.
-Tracing uses the term setting for its supported simple text clauses; it does not compile indexed
-text queries or reproduce their clause expansion. Existing fuzzy, prefix, text-byte, depth, queue,
-response and deadline limits remain in force. Invalid settings/term or clause overflow reject with
-`E_INVALID_ARGUMENT`; prefix expansion/clause overflow retains `E_PREFIX_TOO_BROAD`.
-
-Higher-policy handles retain ordinary admission for conservatively small ASCII requests. Larger or
-non-ASCII requests use the expensive lane; this can change latency and admission even when the
-analyzed query is small. Fixed whole-request construction guards also bound phrase positions and
-fuzzy automata. See [query capacity safeguards](docs/limits.md#query-capacity-policy) and qualify the
-chosen policy on the consuming application's workload before rollout.

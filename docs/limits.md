@@ -291,6 +291,10 @@ accompany the pre-1.0 package change from 0.5 to 0.6; they do not introduce a `s
 
 ## Direct Rust API compatibility for the unreleased metadata APIs
 
+Direct Rust `protocol::Limits` literals now also supply `max_query_terms: 64` and
+`max_query_clauses: 256` for default policy, or validated configured values. They are operational
+settings and do not alter persisted identity.
+
 When migrating from released 0.7.x, ordinary `protocol::SearchRequest` literals add `sort: None`
 and `aggregations: Vec::new()`. Catalog callers use `catalog::SortRequest` and
 `catalog::AggregationRequest` (with child `aggregations: Vec::new()` for leaves). Sorted requests
@@ -301,7 +305,7 @@ it: its cached wire representation is crate-private.
 Exhaustive matches must handle `FilterExpression::Not(Box<FilterExpression>)` and
 `FilterComparator::{Exists, Missing}`. Presence clauses carry `values: Vec::new()`.
 `SearchResult` and the filter enums are source changes to the pre-1.0 Rust API; the JavaScript
-facade uses packed protocol 7, native ABI 11, and query API 6 with its matching addon.
+facade uses packed protocol 7, native ABI 12, and query API 6 with its matching addon.
 
 ## Source reference
 

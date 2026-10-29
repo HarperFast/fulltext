@@ -371,3 +371,41 @@ predeclared latency/throughput/RSS gates, three alternating baseline/current pai
 six-minute expanded workload observation. The guide retains an unexplained earlier RSS-span
 flag alongside all subsequent passing diagnostic and acceptance runs. These are local synthetic
 observations, not production performance objectives.
+
+## Configurable query-capacity qualification
+
+Build optimized artifacts, then run:
+
+```sh
+npm run build
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/query-capacity.mjs > query-capacity.json
+```
+
+The driver creates an isolated synthetic 1,000-document index with 16 declared fields and text in
+one field. All cases request exact totals and therefore use expensive admission, including the small-query
+control. It checks 1,024 analyzed terms, 4,096 compiled clauses, 16,384 phrase
+term-field positions and 256 fuzzy term-field automata at 1/4/8 callers. Each cell has 12 rounds;
+all results must have exact source-derived totals, stable first IDs and finite scores. A default
+reader must match the raised-policy handle on a shared 64-term query. Twenty-four one-millisecond
+attempts may succeed correctly or time out; an eight-caller full-budget batch must recover and drain.
+
+Predeclared local gates: per-cell p99 at most 5,000 ms and sampled post-initialization RSS growth at
+most 256 MiB. Results are emitted only after successful native closes and directory cleanup;
+failures retain the generated index path. Process CPU and sampled RSS include JavaScript/oracle
+work, not only native allocation. Small-query checks occur between rounds and do not establish
+fairness; the separate optimized two-handle regression covers admission with one shared expensive
+permit. This finite fixture does not qualify production concurrency, large multi-segment
+working sets or sustained memory.
+
+Observed locally on macOS arm64, Node 24.16.0, 2026-10-29: all 780 timed requests across 15 cells
+passed. All 24 short-budget attempts returned `E_TIMEOUT`; full-budget recovery passed. Worst p99
+was 239.933 ms for phrase construction at eight callers. Sampled RSS growth was 169.375 MiB.
+These are one-run observations, not a previous-version speedup claim or universal latency bound.
+
+| Case at eight callers    |  p95 ms |  p99 ms |
+| ------------------------ | ------: | ------: |
+| Small exact-total        |   0.151 |   0.153 |
+| Maximum analyzed terms   |  13.187 |  13.681 |
+| Maximum compiled clauses |  57.479 |  60.022 |
+| Maximum phrase positions | 211.683 | 239.933 |
+| Maximum fuzzy automata   |  15.903 |  16.554 |

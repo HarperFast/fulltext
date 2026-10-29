@@ -188,8 +188,8 @@ aggregation children map directly to native `sub_aggregation` trees. Resource ad
 for collector construction and possible parent instances before collection. Histogram parents use
 position spans, with native query-scoped probes when conservative admission fails. Histogram safety
 checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
-checks protect each recursive wire/API walker. Packed protocol 7, ABI 11 and query API 6 change
-in lockstep; this expansion does not change persisted identity v8.
+checks protect each recursive wire/API walker. Packed protocol 7 and query API 6 describe the expanded query contract; current ABI 12 additionally
+requires query-capacity open support. Neither change alters persisted identity v8.
 
 Sorted snapshot continuation and metadata-derived score adjustment remain outside this
 increment. Production latency, process-memory residency, and Harper integration are untested.
@@ -227,3 +227,7 @@ non-ASCII input conservatively uses the expensive lane because normalization can
 Default-policy classification is unchanged. The optimized two-handle regression pins ordinary
 isolation and shared expensive permits. The optional open-frame extension preserves version-7
 mutation/search frames; ABI 12 requires a matching facade/addon.
+
+The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
+additional tail rejects. A future extension needs explicit framing/versioning rather than appending
+an ambiguous optional value.

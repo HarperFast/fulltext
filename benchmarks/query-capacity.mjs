@@ -1,4 +1,8 @@
 import assert from 'node:assert';
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -33,7 +37,7 @@ const config = {
 };
 const expected = ['id0000', 'id0001', 'id0002'];
 const cases = [
-	{ name: 'ordinary', request: { text: 'word0', fields: ['field0'] } },
+	{ name: 'small-exact-total', request: { text: 'word0', fields: ['field0'] } },
 	{ name: 'max-terms', request: { text, fields: ['field0'] } },
 	{ name: 'max-compiled-clauses', request: { text, fields: ['field0', 'field1', 'field2', 'field3'] } },
 	{ name: 'max-phrase-positions', request: { text, mode: 'phrase' } },
@@ -129,6 +133,12 @@ try {
 	assert(peakRss - rssBaseline <= gates.maxRssGrowthBytes);
 	report = {
 		schemaVersion: 1,
+		environment: {
+			platform: process.platform,
+			architecture: process.arch,
+			node: process.version,
+			observedAt: new Date().toISOString(),
+		},
 		runtime: await runtimeInfo(),
 		documents,
 		rounds,
@@ -139,7 +149,7 @@ try {
 		peakRss,
 		timeouts,
 		rows,
-		note: 'Local optimized synthetic qualification; sampled RSS is not native accounting or sustained-memory proof. CPU is process-wide. Ordinary control calls are between rounds, not a fairness measurement.',
+		note: 'Local optimized synthetic qualification; sampled RSS is not native accounting or sustained-memory proof. CPU is process-wide. All cases request exactTotal and use expensive admission. Small-query controls are between rounds, not a fairness measurement.',
 	};
 } catch (error) {
 	primaryError = error;
@@ -159,5 +169,16 @@ if (cleanupErrors.length || primaryError) {
 		{ cause: primaryError },
 	);
 }
+const addonPaths = Object.keys(createRequire(import.meta.url).cache).filter(
+	(file) => path.basename(file).startsWith('fulltext.') && file.endsWith('.node'),
+);
+assert.strictEqual(addonPaths.length, 1, 'qualification must identify one loaded native addon');
+report.fingerprints = await Promise.all(
+	[fileURLToPath(import.meta.url), ...addonPaths].map(async (file) => {
+		const hash = createHash('sha256');
+		for await (const chunk of createReadStream(file)) hash.update(chunk);
+		return { file: path.basename(file), sha256: hash.digest('hex') };
+	}),
+);
 await rm(root, { recursive: true });
 console.log(JSON.stringify(report, null, 2));

@@ -67,6 +67,16 @@ test('raised term and compiled-clause policies preserve results through readers 
 	assert.throws(() => {
 		index.queryLimits.maxQueryTerms = 64;
 	}, TypeError);
+	const defaultReader = await openNativeFullTextReader({
+		...config,
+		limits: { ...config.limits, maxQueryTerms: 64, maxQueryClauses: 256 },
+	});
+	try {
+		const request = { text: words(64), exactTotal: true };
+		assert.deepStrictEqual(await defaultReader.search(request), await index.search(request));
+	} finally {
+		assert(!(await defaultReader.close()).cleanupError);
+	}
 	const result = await index.search({ text: words(130), exactTotal: true });
 	assert.strictEqual(result.total, 2);
 	assert.deepStrictEqual(
@@ -108,11 +118,18 @@ test('raised term and compiled-clause policies preserve results through readers 
 });
 
 test('lowered policies apply to phrase, prefix, fuzzy and reader analysis without changing structural bounds', async (context) => {
-	const { index } = await fixture(context, { maxQueryTerms: 2, maxQueryClauses: 3 });
+	const { index, config } = await fixture(context, { maxQueryTerms: 2, maxQueryClauses: 3 });
 	for (const mode of ['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'])
 		await assert.rejects(index.search({ text: 'alpha bravo charlie', mode, fields: ['title'] }), invalid);
 	await assert.rejects(index.search({ text: 'alpha bravo' }), invalid);
 	await index.search({ text: 'alpha', fields: ['title'] });
+	await index.commit();
+	const reader = await openNativeFullTextReader(config);
+	try {
+		await assert.rejects(reader.search({ text: 'alpha bravo charlie', fields: ['title'] }), invalid);
+	} finally {
+		assert(!(await reader.close()).cleanupError);
+	}
 	const { index: raised } = await fixture(context, { maxQueryTerms: 1024, maxQueryClauses: 4096 });
 	await assert.rejects(
 		raised.search({ text: 'word0', filter: { field: 'category', comparator: 'in', value: Array(257).fill('sale') } }),
@@ -156,7 +173,10 @@ test('open rejects invalid policies in the facade and native decoder; capability
 		['maxQueryClauses', info.limits.maxConfiguredQueryClauses],
 	]) {
 		for (const value of [0, -1, 1.5, NaN, Infinity, -Infinity, '128', ceiling + 1, 2 ** 32])
-			await assert.rejects(openNativeFullTextIndex(options('unused', { [name]: value })), invalid);
+			await assert.rejects(
+				openNativeFullTextIndex(options('unused', { [name]: value })),
+				(error) => invalid(error) && error.message.includes(name),
+			);
 		for (const value of [0, ceiling + 1]) {
 			const bytes = encodeOpen(options('unused'));
 			bytes.writeUInt32LE(value, bytes.length - (name === 'maxQueryTerms' ? 8 : 4));
@@ -165,4 +185,35 @@ test('open rejects invalid policies in the facade and native decoder; capability
 	}
 	const legacy = encodeOpen(options('unused')).subarray(0, -8);
 	decodeResponse(loadAddon().__nativeValidateOpen(legacy)).finish();
+});
+
+test('prefix construction preserves empty expansions and remaining-clause errors', async (context) => {
+	const { index } = await fixture(context, { maxQueryClauses: 2 });
+	await index.applyMutationBatch({ upserts: [{ id: 'a', fields: { title: 'alpha beta gamma' } }] });
+	await index.commit();
+	await index.reload();
+	assert.strictEqual((await index.search({ text: 'alpha beta zzz', mode: 'prefix', fields: ['title'] })).total, 0);
+	await assert.rejects(
+		index.search({ text: 'alpha beta gam', mode: 'prefix', fields: ['title'] }),
+		(error) => error.code === 'E_PREFIX_TOO_BROAD' && /2 clauses/.test(error.message),
+	);
+	const { index: wide } = await fixture(
+		context,
+		{},
+		Array.from({ length: 257 }, (_, i) => ({ name: `field${i}` })),
+	);
+	assert.strictEqual((await wide.search({ text: 'nonexistent', mode: 'prefix' })).total, 0);
+});
+
+test('raised fuzzy tracing hashes exact-only terms and bounds fuzzy alternatives independently', async (context) => {
+	const { index } = await fixture(context, { maxQueryTerms: 1024, maxQueryClauses: 4096 });
+	const alphabetic =
+		'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa';
+	const query = { text: `${words(1008)} ${alphabetic}`, mode: 'fuzzy', fields: ['title'] };
+	const result = await index.traceMatches(query, [{ id: 'a', fields: { title: 'word1007 alphx wordx' } }]);
+	assert.strictEqual(result.complete, true);
+	assert.deepStrictEqual(result.records[0].values[0].spans, [
+		{ start: 0, end: 8 },
+		{ start: 9, end: 14 },
+	]);
 });

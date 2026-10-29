@@ -431,7 +431,10 @@ enum TracePlan {
 		prefix: String,
 		matcher: Option<FuzzyPrefixMatcher>,
 	},
-	Fuzzy(Vec<(String, String)>),
+	Fuzzy {
+		exact: HashSet<String>,
+		fuzzy: Vec<(String, String)>,
+	},
 }
 
 struct FuzzyPrefixMatcher {
@@ -484,7 +487,7 @@ impl TracePlan {
 			Self::Prefix { completed, prefix, .. } => {
 				!prefix.is_empty() && found.contains("__prefix") && completed.iter().all(|term| found.contains(term))
 			}
-			Self::Fuzzy(terms) => !terms.is_empty() && terms.iter().any(|(term, _)| found.contains(term)),
+			Self::Fuzzy { exact, .. } => !exact.is_empty() && exact.iter().any(|term| found.contains(term)),
 		}
 	}
 }
@@ -1155,7 +1158,13 @@ impl Engine {
 						"fuzzy search contains more than {MAX_FUZZY_TERMS} eligible terms"
 					)));
 				}
-				Ok(TracePlan::Fuzzy(terms))
+				Ok(TracePlan::Fuzzy {
+					exact: terms.iter().map(|(term, _)| term.clone()).collect(),
+					fuzzy: terms
+						.into_iter()
+						.filter(|(_, surface)| fuzzy_eligible(surface))
+						.collect(),
+				})
 			}
 		}
 	}
@@ -1287,7 +1296,7 @@ impl Engine {
 					}
 				}
 			}
-			TracePlan::Fuzzy(terms) => {
+			TracePlan::Fuzzy { exact, fuzzy } => {
 				let (surface, surface_truncated) = Self::source_tokens(surface_source_analyzer, value, deadline)?;
 				analysis_truncated |= surface_truncated;
 				let mut analyzed_by_position = HashMap::<usize, Vec<&str>>::new();
@@ -1301,25 +1310,29 @@ impl Engine {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
-					for (analyzed_term, surface_term) in terms {
-						let analyzed_matches = analyzed_by_position.get(&token.position).is_some_and(|tokens| {
-							tokens.iter().any(|token| {
-								*token == analyzed_term
-									|| (fuzzy_eligible(surface_term) && within_one_edit(analyzed_term, token))
+					let source_terms = analyzed_by_position.get(&token.position);
+					let exact_match =
+						source_terms.and_then(|tokens| tokens.iter().find(|term| exact.contains(**term)).copied());
+					let fuzzy_match = if exact_match.is_none() {
+						fuzzy
+							.iter()
+							.find(|(analyzed_term, surface_term)| {
+								source_terms.is_some_and(|tokens| {
+									tokens.iter().any(|term| within_one_edit(analyzed_term, term))
+								}) || within_one_edit(surface_term, &token.text)
 							})
-						});
-						if analyzed_matches
-							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
-						{
-							found.insert(analyzed_term.clone());
-							spans_truncated |= push_trace_span(
-								&mut spans,
-								&mut seen_spans,
-								source_span(&utf16_offsets, token.start, token.end),
-								max_spans,
-							);
-							break;
-						}
+							.map(|(term, _)| term.as_str())
+					} else {
+						None
+					};
+					if let Some(term) = exact_match.or(fuzzy_match) {
+						found.insert(term.to_owned());
+						spans_truncated |= push_trace_span(
+							&mut spans,
+							&mut seen_spans,
+							source_span(&utf16_offsets, token.start, token.end),
+							max_spans,
+						);
 					}
 					if spans_truncated && plan.record_matches(&found) {
 						break;
@@ -1633,7 +1646,9 @@ impl Engine {
 			)));
 		}
 		let completed_clause_count = completed.len().saturating_mul(fields.len());
-		if completed_clause_count > self.max_query_clauses {
+		let fuzzy_clause_count = usize::from(fuzzy && fuzzy_eligible(&surface_prefix)) * fields.len();
+		let known_clause_count = completed_clause_count.saturating_add(fuzzy_clause_count);
+		if known_clause_count > self.max_query_clauses {
 			return Err(FulltextError::new(
 				"E_PREFIX_TOO_BROAD",
 				format!("prefix query exceeds {} clauses", self.max_query_clauses),
@@ -1643,8 +1658,12 @@ impl Engine {
 		for term in completed {
 			clauses.push((Occur::Must, self.term_group(&term, fields)));
 		}
-		let (exact_prefix, prefix_clause_count) = self.expanded_prefix_group(searcher, &surface_prefix, fields)?;
-		let fuzzy_clause_count = usize::from(fuzzy && fuzzy_eligible(&surface_prefix)) * fields.len();
+		let (exact_prefix, prefix_clause_count) = self.expanded_prefix_group(
+			searcher,
+			&surface_prefix,
+			fields,
+			self.max_query_clauses - known_clause_count,
+		)?;
 		if completed_clause_count
 			.saturating_add(prefix_clause_count)
 			.saturating_add(fuzzy_clause_count)
@@ -1757,6 +1776,7 @@ impl Engine {
 		searcher: &Searcher,
 		prefix: &str,
 		fields: &[&EngineField],
+		remaining_clauses: usize,
 	) -> Result<(Box<dyn Query>, usize)> {
 		let mut alternatives = Vec::new();
 		for field in fields {
@@ -1781,6 +1801,12 @@ impl Engine {
 							format!("prefix expands to more than {MAX_PREFIX_EXPANSIONS} terms"),
 						));
 					}
+					if alternatives.len().saturating_add(terms.len()) > remaining_clauses {
+						return Err(FulltextError::new(
+							"E_PREFIX_TOO_BROAD",
+							format!("prefix query exceeds {} clauses", self.max_query_clauses),
+						));
+					}
 				}
 			}
 			for term in terms {
@@ -1789,12 +1815,6 @@ impl Engine {
 					IndexRecordOption::WithFreqs,
 				));
 				alternatives.push(boosted(query, field.weight));
-				if alternatives.len() > self.max_query_clauses {
-					return Err(FulltextError::new(
-						"E_PREFIX_TOO_BROAD",
-						format!("prefix query exceeds {} clauses", self.max_query_clauses),
-					));
-				}
 			}
 		}
 		let clause_count = alternatives.len();

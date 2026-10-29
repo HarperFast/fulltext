@@ -76,7 +76,7 @@ test(
 			} finally {
 				await small;
 			}
-			assert.strictEqual(addon.__testExpensiveSearchState(raised.handle)[0], 1500);
+			assert.strictEqual(addon.__testExpensiveSearchState(raised.handle)[0], 1);
 			const text = Array.from({ length: 65 }, (_, i) => `word${i}`).join(' ');
 			const large = raised.index.search({ text });
 			try {
