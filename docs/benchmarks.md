@@ -399,13 +399,14 @@ working sets or sustained memory.
 
 Observed locally on macOS arm64, Node 24.16.0, 2026-10-29: all 780 timed requests across 15 cells
 passed. All 24 short-budget attempts returned `E_TIMEOUT`; full-budget recovery passed. Worst p99
-was 239.933 ms for phrase construction at eight callers. Sampled RSS growth was 169.375 MiB.
+was 229.658 ms for phrase construction at eight callers. Sampled RSS growth was 187.531 MiB.
+The JSON report records environment metadata and SHA-256 fingerprints of the driver and loaded addon.
 These are one-run observations, not a previous-version speedup claim or universal latency bound.
 
 | Case at eight callers    |  p95 ms |  p99 ms |
 | ------------------------ | ------: | ------: |
-| Small exact-total        |   0.151 |   0.153 |
-| Maximum analyzed terms   |  13.187 |  13.681 |
-| Maximum compiled clauses |  57.479 |  60.022 |
-| Maximum phrase positions | 211.683 | 239.933 |
-| Maximum fuzzy automata   |  15.903 |  16.554 |
+| Small exact-total        |   0.160 |   0.166 |
+| Maximum analyzed terms   |  12.931 |  13.164 |
+| Maximum compiled clauses |  52.345 |  53.243 |
+| Maximum phrase positions | 207.036 | 229.658 |
+| Maximum fuzzy automata   |  15.623 |  16.475 |

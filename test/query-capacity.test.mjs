@@ -99,6 +99,17 @@ test('raised term and compiled-clause policies preserve results through readers 
 		const trace = await reader.traceMatches({ text: words(130) }, [{ id: 'a', fields: { title: words(130) } }]);
 		assert.strictEqual(trace.complete, true);
 		assert.strictEqual(trace.records[0].values[0].spans.length, 130);
+		const repeated = 'word0 '.repeat(1100);
+		const allTrace = await reader.traceMatches({ text: words(130), mode: 'all' }, [
+			{ id: 'complete', fields: { title: repeated + words(130) } },
+			{ id: 'missing-last', fields: { title: repeated + words(129) } },
+		]);
+		assert.strictEqual(allTrace.complete, false);
+		assert.deepStrictEqual(
+			allTrace.records.map((record) => record.id),
+			['complete'],
+		);
+		assert.strictEqual(allTrace.records[0].values[0].spans.length, 1024);
 	} finally {
 		assert(!(await reader.close()).cleanupError);
 	}
