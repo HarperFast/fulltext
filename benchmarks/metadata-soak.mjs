@@ -85,7 +85,7 @@ const manifest = {
 	},
 	gates,
 	measurement:
-		'Public addon, fixed-generation reader leases and source-derived oracles. Fixed latency histograms (0.1 ms bins), bounded recent samples, all samples streamed to disk. No forced GC. Segment observations read committed meta.json; disk samples every 10 seconds. Throughput includes validation and oracle preparation overhead.',
+		'Public addon, fixed-generation reader leases and source-derived oracles. Fixed latency histograms (0.1 ms bins), bounded recent samples, all samples streamed to disk. No forced GC. Segment observations read committed meta.json; disk samples every 10 seconds. Throughput includes validation and oracle preparation overhead. Mixed-phase query latency includes event-loop stalls from oracle preparation; measurements do not isolate native search latency.',
 };
 await writeFile(path.join(artifacts, 'manifest.json'), stringify(manifest) + '\n', { flag: 'wx' });
 log({ phase: 'premeasurement-gates', ...manifest });
@@ -132,6 +132,7 @@ const truth = new Map(
 );
 let writer,
 	writerClosed = false,
+	writerClosing = false,
 	current,
 	firstError,
 	stopping = false,
@@ -287,7 +288,7 @@ async function collectSample() {
 	const memory = process.memoryUsage();
 	sampledPeak = Math.max(sampledPeak, memory.rss);
 	const statuses = [...leases].filter((lease) => !lease.closing).map((lease) => lease.reader.status());
-	if (writer && !writerClosed) statuses.push(writer.status());
+	if (writer && !writerClosed && !writerClosing) statuses.push(writer.status());
 	const meta = JSON.parse(await readFile(path.join(indexPath, 'meta.json'), 'utf8'));
 	if (now - lastDiskAt >= 10_000) {
 		let bytes = 0,
@@ -379,7 +380,8 @@ async function readLoop(number) {
 		fail(error);
 	}
 }
-let finalReport;
+let finalReport,
+	telemetryClosed = false;
 try {
 	writer = await api.openNativeFullTextIndex(config);
 	const initial = [...truth.values()];
@@ -388,6 +390,7 @@ try {
 		assert.deepStrictEqual(result.rejected, []);
 		assert.strictEqual(result.processed, Math.min(200, initial.length - start));
 	}
+	initial.length = 0;
 	await writer.publish('soak:0');
 	await writer.reload();
 	await installReader();
@@ -426,6 +429,7 @@ try {
 		await delay(Math.max(0, nextWrite - performance.now()), undefined, { signal: controller.signal });
 	}
 	if (firstError) throw firstError;
+	writerClosing = true;
 	await bounded(writer.close(), 'writer drain');
 	writerClosed = true;
 	phase = 'drain';
@@ -482,8 +486,10 @@ try {
 	} finally {
 		await bounded(reopened.close(), 'reopened reader close');
 	}
+	await telemetry.close();
+	telemetryClosed = true;
 	await rm(indexPath, { recursive: true });
-	finalReport = {
+	const report = {
 		...manifest,
 		finishedAt: new Date().toISOString(),
 		accepted: true,
@@ -502,9 +508,11 @@ try {
 		indexCleanup: 'closed, reopened and verified, then removed',
 		telemetry: 'samples.ndjson',
 	};
-	await writeFile(path.join(artifacts, 'report.json'), stringify(finalReport) + '\n', { flag: 'wx' });
+	await writeFile(path.join(artifacts, 'report.json'), stringify(report) + '\n', { flag: 'wx' });
+	finalReport = report;
 	log({ phase: 'accepted', completed, publications, mutations, tails, peakGrowthBytes: finalReport.peakGrowthBytes });
 } catch (error) {
+	finalReport = undefined;
 	fail(error);
 	await Promise.allSettled(workers);
 	samplerStopping = true;
@@ -536,12 +544,15 @@ try {
 		recent,
 		queries: reportSummaries(),
 		closeErrors,
-		indexRetained: indexPath,
+		indexRetained: await stat(indexPath).then(
+			() => indexPath,
+			(error) => (error.code === 'ENOENT' ? null : 'unknown'),
+		),
 	};
 	await writeFile(path.join(artifacts, 'failure.json'), stringify(failure) + '\n', { flag: 'wx' });
 	log({ phase: 'failed', ...failure });
 	process.exitCode = 1;
 } finally {
-	await telemetry.close();
+	if (!telemetryClosed) await telemetry.close();
 }
 if (finalReport) console.log(stringify(finalReport));

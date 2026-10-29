@@ -1,10 +1,11 @@
 import assert from 'node:assert';
 import { execFile } from 'node:child_process';
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 
 const execute = promisify(execFile);
@@ -120,3 +121,36 @@ test(
 		await assert.rejects(access(path.join(artifacts, 'report.json')), { code: 'ENOENT' });
 	},
 );
+
+test('report artifact write failure cannot emit an accepted soak result', { timeout: 45_000 }, async (context) => {
+	const { artifacts, args } = await fixture(context);
+	const child = execute(process.execPath, args, {
+		timeout: 40_000,
+		maxBuffer: 4 << 20,
+		env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1' },
+	}).then(
+		(result) => ({ result }),
+		(error) => ({ error }),
+	);
+	const until = Date.now() + 5000;
+	while (true) {
+		try {
+			await access(path.join(artifacts, 'manifest.json'));
+			break;
+		} catch (error) {
+			if (error.code !== 'ENOENT' || Date.now() >= until) throw error;
+			await delay(5);
+		}
+	}
+	await mkdir(path.join(artifacts, 'report.json'));
+	const completed = await child;
+	assert(completed.error, 'report write failure must reject the child process');
+	assert.strictEqual(completed.error.stdout, '', 'artifact failure must not emit accepted output');
+	const failure = await readJson(path.join(artifacts, 'failure.json'));
+	assert.strictEqual(failure.accepted, false);
+	assert.strictEqual(failure.indexRetained, null, 'the successfully removed index must not be reported retained');
+	assert.deepStrictEqual(failure.closeErrors, []);
+	assert.match(failure.error.message, /EISDIR|EEXIST/);
+	await verifyRetainedSamples(artifacts);
+	await assert.rejects(access(path.join(artifacts, 'index')), { code: 'ENOENT' });
+});
