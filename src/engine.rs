@@ -9,14 +9,14 @@ use sha2::{Digest, Sha256};
 use tantivy_fst::Automaton;
 
 use tantivy::collector::sort_key::{NaturalComparator, ReverseComparator};
-use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs, TopNComputer};
+use tantivy::collector::{Collector, SegmentCollector, TopDocs, TopNComputer};
 use tantivy::columnar::StrColumn;
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::Directory;
 use tantivy::index::SegmentId;
 use tantivy::query::{
-	BooleanQuery, BoostQuery, ConstScoreQuery, DfaWrapper, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur,
-	PhraseQuery, Query, RangeQuery, TermQuery, TermSetQuery,
+	BooleanQuery, BoostQuery, ConstScoreQuery, DfaWrapper, DisjunctionMaxQuery, EmptyQuery, ExistsQuery,
+	FuzzyTermQuery, Occur, PhraseQuery, Query, RangeQuery, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{
 	Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, FAST, INDEXED,
@@ -32,7 +32,8 @@ use tantivy::{
 use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
 use unicode_normalization::is_nfkc;
 
-use crate::error::{FulltextError, Result};
+use crate::catalog::{self, AggregationResult};
+use crate::error::{index_error, FulltextError, Result};
 use crate::protocol::{
 	validate_record_id, validate_search_window, EngineConfig, EngineIdentityConfig, FilterComparator, FilterExpression,
 	FilterFieldType, FilterValue, MutationBatch, SearchClause, SearchExpression, SearchMode, SearchRequest,
@@ -317,6 +318,7 @@ impl Collector for TraversalScoreTieCollector {
 pub struct Writer {
 	inner: IndexWriter,
 	checkpoint_required: bool,
+	worker_ownership_unproven: bool,
 	id_field: Field,
 	version_field: Field,
 	fields: Vec<EngineField>,
@@ -346,6 +348,8 @@ pub enum TotalRelation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchResult {
+	pub aggregations: Vec<AggregationResult>,
+	pub(crate) encoded_aggregations: Option<Vec<u8>>,
 	pub total: u64,
 	pub total_relation: TotalRelation,
 	pub hits: Vec<SearchHit>,
@@ -596,6 +600,7 @@ impl Engine {
 			Writer {
 				inner,
 				checkpoint_required: payload.is_some(),
+				worker_ownership_unproven: false,
 				id_field: self.id_field,
 				version_field: self.version_field,
 				fields: self.fields.clone(),
@@ -662,11 +667,39 @@ impl Engine {
 		request: &SearchRequest,
 		deadline: Option<Instant>,
 	) -> Result<SearchResult> {
-		validate_search_window(request.offset, request.limit, request.traversal)?;
+		validate_search_window(
+			request.offset,
+			request.limit,
+			request.traversal,
+			request.sort.is_some() || !request.aggregations.is_empty(),
+		)?;
 		if let Some(candidate_ids) = &request.candidate_ids {
 			for id in candidate_ids {
 				validate_record_id(id)?;
 			}
+		}
+
+		let has_catalog = request.sort.is_some() || !request.aggregations.is_empty();
+		if request.traversal && has_catalog {
+			return Err(FulltextError::invalid(
+				"sort and aggregations are not supported by searchPage",
+			));
+		}
+		let catalog_fields = has_catalog.then(|| {
+			self.filter_fields
+				.iter()
+				.map(|field| crate::protocol::FilterFieldConfig {
+					name: field.name.clone(),
+					field_type: field.field_type,
+				})
+				.collect::<Vec<_>>()
+		});
+		let catalog = catalog_fields
+			.as_deref()
+			.map(|fields| catalog::validate_requests(request.sort.as_deref(), &request.aggregations, fields))
+			.transpose()?;
+		if catalog.is_some() {
+			catalog::check_aggregation_shape(&request.aggregations, searcher.segment_readers().len())?;
 		}
 		check_deadline(deadline)?;
 		let snapshot = if request.traversal {
@@ -683,6 +716,17 @@ impl Engine {
 		};
 		let query = self.query(searcher, request)?;
 		check_deadline(deadline)?;
+		self.collect_search(searcher, request, deadline, catalog, snapshot, query)
+	}
+	fn collect_search(
+		&self,
+		searcher: &Searcher,
+		request: &SearchRequest,
+		deadline: Option<Instant>,
+		catalog: Option<catalog::ValidatedCatalog<'_>>,
+		snapshot: Option<String>,
+		query: BuiltQuery,
+	) -> Result<SearchResult> {
 		if let Some(snapshot) = snapshot {
 			let collector = TraversalScoreTieCollector {
 				inner: StableScoreTieCollector::new(0..request.limit.saturating_add(1)),
@@ -696,7 +740,7 @@ impl Engine {
 			let more = scored_docs.len() > request.limit;
 			scored_docs.truncate(request.limit);
 			let hits = search_hits(searcher, scored_docs)?;
-			let bytes = search_response_bytes(&hits, 13 + 4 + snapshot.len() + 1)?;
+			let bytes = search_response_bytes(&hits, 17 + 4 + snapshot.len() + 1)?;
 			if bytes > MAX_SEARCH_RESPONSE_BYTES {
 				return Err(FulltextError::new(
 					"E_RESULT_TOO_LARGE",
@@ -705,10 +749,51 @@ impl Engine {
 			}
 			check_deadline(deadline)?;
 			return Ok(SearchResult {
+				aggregations: Vec::new(),
+				encoded_aggregations: None,
 				total,
 				total_relation: TotalRelation::Exact,
 				hits,
 				traversal: Some((snapshot, more)),
+			});
+		}
+
+		if request.sort.is_some() {
+			let catalog =
+				catalog.ok_or_else(|| FulltextError::native("Validated catalog missing for sorted search"))?;
+			let catalog::SortedCatalogResult {
+				hits: scored_docs,
+				total,
+				aggregations,
+			} = catalog.sorted_catalog(
+				searcher,
+				query.query.as_ref(),
+				request.offset,
+				request.limit,
+				self.index.tokenizers().clone(),
+				deadline,
+			)?;
+			let hits = search_hits(searcher, scored_docs)?;
+			let encoded_aggregations = if aggregations.is_empty() {
+				None
+			} else {
+				Some(catalog::encode_results(&aggregations)?)
+			};
+			let aggregate_bytes = encoded_aggregations.as_ref().map_or(4, Vec::len);
+			if search_response_bytes(&hits, 13)?.saturating_add(aggregate_bytes) > MAX_SEARCH_RESPONSE_BYTES {
+				return Err(FulltextError::new(
+					"E_RESULT_TOO_LARGE",
+					"search response exceeds its byte limit",
+				));
+			}
+			check_deadline(deadline)?;
+			return Ok(SearchResult {
+				total,
+				total_relation: TotalRelation::Exact,
+				hits,
+				traversal: None,
+				aggregations,
+				encoded_aggregations,
 			});
 		}
 		let window_end = request.offset + request.limit;
@@ -779,6 +864,30 @@ impl Engine {
 			};
 			(hits, total, relation, collected_total)
 		};
+		let (aggregation_total, aggregations) = if let Some(catalog) = catalog {
+			if request.exact_total && collected_total.is_none() && bounded_total_relation != TotalRelation::Exact {
+				let (total, results) = catalog.aggregate_count(
+					searcher,
+					query.query.as_ref(),
+					self.index.tokenizers().clone(),
+					deadline,
+				)?;
+				(Some(total), results)
+			} else {
+				(
+					None,
+					catalog.aggregate(
+						searcher,
+						query.query.as_ref(),
+						self.index.tokenizers().clone(),
+						deadline,
+					)?,
+				)
+			}
+		} else {
+			(None, Vec::new())
+		};
+		let collected_total = collected_total.or(aggregation_total);
 		let (total, total_relation) = if request.exact_total {
 			match collected_total {
 				Some(total) => {
@@ -789,7 +898,7 @@ impl Engine {
 				None => {
 					check_deadline(deadline)?;
 					(
-						searcher.search(query.query.as_ref(), &Count).map_err(index_error)? as u64,
+						catalog::count_matches(searcher, query.query.as_ref(), deadline).map_err(count_error)?,
 						TotalRelation::Exact,
 					)
 				}
@@ -798,7 +907,15 @@ impl Engine {
 			(bounded_total, bounded_total_relation)
 		};
 		check_deadline(deadline)?;
-		let response_bytes = search_response_bytes(&hits, 13)?;
+
+		let encoded_aggregations = if aggregations.is_empty() {
+			None
+		} else {
+			Some(catalog::encode_results(&aggregations)?)
+		};
+		let response_bytes =
+			search_response_bytes(&hits, 13)?.saturating_add(encoded_aggregations.as_ref().map_or(4, Vec::len));
+		check_deadline(deadline)?;
 		if response_bytes > MAX_SEARCH_RESPONSE_BYTES {
 			return Err(FulltextError::new(
 				"E_RESULT_TOO_LARGE",
@@ -806,6 +923,8 @@ impl Engine {
 			));
 		}
 		Ok(SearchResult {
+			aggregations,
+			encoded_aggregations,
 			total,
 			total_relation,
 			hits,
@@ -1632,12 +1751,31 @@ impl Engine {
 	}
 
 	fn filter_query(&self, expression: &FilterExpression) -> Result<Box<dyn Query>> {
+		self.filter_query_inner(expression, 0, &mut 0)
+	}
+
+	fn filter_query_inner(
+		&self,
+		expression: &FilterExpression,
+		depth: usize,
+		leaves: &mut usize,
+	) -> Result<Box<dyn Query>> {
+		if depth > crate::protocol::MAX_EXPRESSION_DEPTH {
+			return Err(FulltextError::invalid("filter expression nesting exceeds 8 levels"));
+		}
 		match expression {
 			FilterExpression::Clause {
 				field,
 				comparator,
 				values,
-			} => self.filter_clause(field, *comparator, values),
+			} => {
+				*leaves += 1;
+				if *leaves > MAX_QUERY_CLAUSES {
+					return Err(FulltextError::invalid("filter expression exceeds 256 clauses"));
+				}
+				self.filter_clause(field, *comparator, values)
+			}
+			FilterExpression::Not(child) => Ok(complement_query(self.filter_query_inner(child, depth + 1, leaves)?)),
 			FilterExpression::And(children) | FilterExpression::Or(children) => {
 				if children.is_empty() || children.len() > MAX_QUERY_CLAUSES {
 					return Err(FulltextError::invalid(format!(
@@ -1651,7 +1789,7 @@ impl Engine {
 				};
 				let mut queries = Vec::with_capacity(children.len());
 				for child in children {
-					queries.push((occur, self.filter_query(child)?));
+					queries.push((occur, self.filter_query_inner(child, depth + 1, leaves)?));
 				}
 				Ok(Box::new(BooleanQuery::new(queries)))
 			}
@@ -1667,9 +1805,10 @@ impl Engine {
 		let expected_values = match comparator {
 			FilterComparator::In => None,
 			FilterComparator::Between => Some(2),
+			FilterComparator::Exists | FilterComparator::Missing => Some(0),
 			_ => Some(1),
 		};
-		if values.is_empty()
+		if (values.is_empty() && expected_values != Some(0))
 			|| values.len() > MAX_QUERY_CLAUSES
 			|| expected_values.is_some_and(|count| count != values.len())
 		{
@@ -1680,11 +1819,42 @@ impl Engine {
 			.get(name)
 			.ok_or_else(|| FulltextError::invalid(format!("unknown filter field {name}")))?;
 		let field = &self.filter_fields[*index];
+		if matches!(comparator, FilterComparator::Exists | FilterComparator::Missing) {
+			let exists: Box<dyn Query> = if field.field_type == FilterFieldType::Boolean {
+				Box::new(BooleanQuery::new(vec![
+					(
+						Occur::Should,
+						Box::new(TermQuery::new(
+							Term::from_field_bool(field.field, true),
+							IndexRecordOption::Basic,
+						)),
+					),
+					(
+						Occur::Should,
+						Box::new(TermQuery::new(
+							Term::from_field_bool(field.field, false),
+							IndexRecordOption::Basic,
+						)),
+					),
+				]))
+			} else {
+				Box::new(ExistsQuery::new(
+					self.index.schema().get_field_name(field.field).to_owned(),
+					false,
+				))
+			};
+			return Ok(if comparator == FilterComparator::Missing {
+				complement_query(exists)
+			} else {
+				exists
+			});
+		}
 		let terms = values
 			.iter()
 			.map(|value| filter_term(field, value))
 			.collect::<Result<Vec<_>>>()?;
 		match comparator {
+			FilterComparator::Exists | FilterComparator::Missing => unreachable!(),
 			FilterComparator::Equals => Ok(Box::new(TermQuery::new(terms[0].clone(), IndexRecordOption::Basic))),
 			FilterComparator::In if terms.len() == 1 => {
 				Ok(Box::new(TermQuery::new(terms[0].clone(), IndexRecordOption::Basic)))
@@ -1739,6 +1909,13 @@ impl Engine {
 	}
 }
 
+fn complement_query(query: Box<dyn Query>) -> Box<dyn Query> {
+	Box::new(BooleanQuery::new(vec![
+		(Occur::Must, Box::new(tantivy::query::AllQuery)),
+		(Occur::MustNot, query),
+	]))
+}
+
 fn filter_term(field: &EngineFilterField, value: &FilterValue) -> Result<Term> {
 	match (field.field_type, value) {
 		(FilterFieldType::String, FilterValue::String(value)) => {
@@ -1763,10 +1940,7 @@ fn filter_term(field: &EngineFilterField, value: &FilterValue) -> Result<Term> {
 
 fn check_deadline(deadline: Option<Instant>) -> Result<()> {
 	if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-		Err(FulltextError::new(
-			"E_TIMEOUT",
-			"full-text search exceeded its execution budget",
-		))
+		Err(FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE))
 	} else {
 		Ok(())
 	}
@@ -2094,6 +2268,8 @@ impl Writer {
 					FulltextError::new("E_SCHEMA_MISMATCH", format!("unknown mutation filter {name}"))
 				})?;
 				let filter = &self.filter_fields[*index];
+				let deduplicate = values.len() > 1;
+				let mut seen_values = HashSet::new();
 				for value in values {
 					match (filter.field_type, value) {
 						(FilterFieldType::String, FilterValue::String(value)) => {
@@ -2102,7 +2278,13 @@ impl Writer {
 									"mutation filter {name} exceeds {MAX_TOKEN_LEN} UTF-8 bytes"
 								)));
 							}
+							if deduplicate && seen_values.contains(value.as_str()) {
+								continue;
+							}
 							document.add_text(filter.field, &value);
+							if deduplicate {
+								seen_values.insert(value);
+							}
 						}
 						(FilterFieldType::Number, FilterValue::Number(value)) => {
 							document.add_f64(filter.field, canonical_number(value));
@@ -2154,7 +2336,11 @@ impl Writer {
 				"commit payload exceeds {MAX_COMMIT_PAYLOAD_BYTES} UTF-8 bytes"
 			)));
 		}
+		// Tantivy can detach unjoined workers when prepare_commit fails.
+		let previously_unproven = self.worker_ownership_unproven;
+		self.worker_ownership_unproven = true;
 		let mut commit = self.inner.prepare_commit().map_err(index_error)?;
+		self.worker_ownership_unproven = previously_unproven;
 		if let Some(payload) = payload {
 			commit.set_payload(payload);
 		}
@@ -2163,12 +2349,25 @@ impl Writer {
 		Ok(opstamp)
 	}
 
+	/// Discard pending mutations while keeping this writer usable. Tantivy replaces the writer
+	/// without joining prior merges. For terminal shutdown, call `close` directly instead;
+	/// closing a replacement cannot join the earlier writer's merges.
 	pub fn rollback(&mut self) -> Result<u64> {
 		self.inner.rollback().map_err(index_error)
 	}
 
 	pub fn close(self) -> Result<()> {
-		self.inner.wait_merging_threads().map_err(index_error)
+		let result = self.inner.wait_merging_threads().map_err(index_error);
+		if self.worker_ownership_unproven {
+			let mut message =
+				"Tantivy commit preparation left worker ownership unproven; restart before reusing this generation"
+					.to_owned();
+			if let Err(error) = result {
+				message.push_str(&format!("; writer join also reported: {error}"));
+			}
+			return Err(FulltextError::new("E_QUIESCENCE_FAILED", message));
+		}
+		result
 	}
 }
 
@@ -2233,7 +2432,10 @@ fn build_schema_with_surface_record(
 					.set_tokenizer("raw")
 					.set_index_option(IndexRecordOption::Basic)
 					.set_fieldnorms(false);
-				builder.add_text_field(&schema_name, TextOptions::default().set_indexing_options(indexing))
+				builder.add_text_field(
+					&schema_name,
+					TextOptions::default().set_indexing_options(indexing).set_fast("raw"),
+				)
 			}
 			FilterFieldType::Number => builder.add_f64_field(&schema_name, INDEXED | FAST),
 			FilterFieldType::Boolean => builder.add_bool_field(&schema_name, INDEXED),
@@ -2784,6 +2986,12 @@ fn canonical_synonym_term(analyzer: &mut TextAnalyzer, text: &str, label: &str) 
 fn identity_bytes(config: &EngineIdentityConfig) -> Vec<u8> {
 	let mut bytes = if config.filter_fields.is_empty() {
 		b"HTFI\x06\x00".to_vec()
+	} else if config
+		.filter_fields
+		.iter()
+		.any(|field| field.field_type == FilterFieldType::String)
+	{
+		b"HTFI\x08\x00".to_vec()
 	} else {
 		b"HTFI\x07\x00".to_vec()
 	};
@@ -2826,7 +3034,14 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	if bytes.get(..4)? != b"HTFI"
 		|| !matches!(
 			version,
-			b"\x01\x00" | b"\x02\x00" | b"\x03\x00" | b"\x04\x00" | b"\x05\x00" | b"\x06\x00" | b"\x07\x00"
+			b"\x01\x00"
+				| b"\x02\x00"
+				| b"\x03\x00"
+				| b"\x04\x00"
+				| b"\x05\x00"
+				| b"\x06\x00"
+				| b"\x07\x00"
+				| b"\x08\x00"
 		) {
 		return None;
 	}
@@ -2844,7 +3059,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	offset += 3;
 	if matches!(
 		version,
-		b"\x03\x00" | b"\x04\x00" | b"\x05\x00" | b"\x06\x00" | b"\x07\x00"
+		b"\x03\x00" | b"\x04\x00" | b"\x05\x00" | b"\x06\x00" | b"\x07\x00" | b"\x08\x00"
 	) {
 		let synonym_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
@@ -2863,7 +3078,7 @@ pub(crate) fn persisted_index_id(bytes: &[u8]) -> Option<&str> {
 	for _ in 0..field_count {
 		take_string(bytes, &mut offset)?;
 	}
-	if matches!(version, b"\x05\x00" | b"\x07\x00") {
+	if matches!(version, b"\x05\x00" | b"\x07\x00" | b"\x08\x00") {
 		let filter_count = u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?) as usize;
 		offset += 2;
 		for _ in 0..filter_count {
@@ -2895,16 +3110,12 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 	FulltextError::new("E_STORAGE", error.to_string())
 }
 
-fn index_error(error: tantivy::TantivyError) -> FulltextError {
-	match error {
-		tantivy::TantivyError::LockFailure(tantivy::directory::error::LockError::LockBusy, _) => {
-			FulltextError::new("E_LOCK_BUSY", "another writer owns the Tantivy index lock")
+fn count_error(error: tantivy::TantivyError) -> FulltextError {
+	match &error {
+		tantivy::TantivyError::InvalidArgument(message) if message == crate::error::SEARCH_TIMEOUT_MESSAGE => {
+			FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE)
 		}
-		tantivy::TantivyError::OpenDirectoryError(_)
-		| tantivy::TantivyError::OpenReadError(_)
-		| tantivy::TantivyError::OpenWriteError(_)
-		| tantivy::TantivyError::IoError(_) => storage_error(error),
-		other => FulltextError::native(other),
+		_ => index_error(error),
 	}
 }
 
@@ -3091,6 +3302,83 @@ mod tests {
 	}
 
 	#[test]
+	fn prepared_string_filters_preserve_first_value_order_and_reject_oversized_values() {
+		use tantivy::schema::Value;
+		let mut config = config();
+		config.identity.filter_fields.push(FilterFieldConfig {
+			name: "category".to_owned(),
+			field_type: FilterFieldType::String,
+		});
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let writer = engine.writer(&config).unwrap();
+		let prepare = |values: Vec<String>| {
+			let mut mutation = batch();
+			mutation.upserts.truncate(1);
+			mutation.upserts[0].filters = vec![(
+				"category".to_owned(),
+				values.into_iter().map(FilterValue::String).collect(),
+			)];
+			writer.prepare(mutation)
+		};
+		for (values, expected) in [
+			(vec!["solo"], vec!["solo"]),
+			(
+				vec!["zeta", "alpha", "zeta", "", "alpha", ""],
+				vec!["zeta", "alpha", ""],
+			),
+		] {
+			let prepared = prepare(values.into_iter().map(str::to_owned).collect()).unwrap();
+			let actual = prepared.documents[0]
+				.1
+				.get_all(engine.filter_fields[0].field)
+				.map(|value| value.as_str().unwrap())
+				.collect::<Vec<_>>();
+			assert_eq!(actual, expected);
+		}
+		for values in [
+			vec!["x".repeat(MAX_TOKEN_LEN + 1)],
+			vec!["valid".to_owned(), "x".repeat(MAX_TOKEN_LEN + 1)],
+		] {
+			let error = match prepare(values) {
+				Ok(_) => panic!("oversized string filter accepted"),
+				Err(error) => error,
+			};
+			assert_eq!(error.code, "E_INVALID_ARGUMENT");
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn direct_filter_validation_bounds_depth_and_total_leaves() {
+		let mut config = config();
+		config.identity.filter_fields.push(FilterFieldConfig {
+			name: "category".to_owned(),
+			field_type: FilterFieldType::String,
+		});
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let leaf = FilterExpression::Clause {
+			field: "category".to_owned(),
+			comparator: FilterComparator::Exists,
+			values: vec![],
+		};
+		assert!(engine.filter_query(&leaf).is_ok());
+		let mut nested = leaf.clone();
+		for _ in 0..9 {
+			nested = FilterExpression::Not(Box::new(nested));
+		}
+		assert!(engine.filter_query(&nested).is_err());
+		let oversized = FilterExpression::And(vec![
+			FilterExpression::Or(vec![leaf.clone(); 129]),
+			FilterExpression::Or(vec![leaf.clone(); 129]),
+		]);
+		assert!(engine.filter_query(&oversized).is_err());
+		assert!(engine.filter_query(&FilterExpression::And(vec![])).is_err());
+		assert!(engine
+			.filter_query(&FilterExpression::Or(vec![leaf; MAX_QUERY_CLAUSES + 1]))
+			.is_err());
+	}
+
+	#[test]
 	#[ignore]
 	fn traversal_many_segment_qualification() {
 		for segment_count in [1, 256] {
@@ -3121,6 +3409,8 @@ mod tests {
 			let searcher = reader.searcher();
 			assert_eq!(searcher.segment_readers().len(), segment_count);
 			let mut request = SearchRequest {
+				sort: None,
+				aggregations: Vec::new(),
 				expression: expression("widget catalog", SearchMode::Any, vec!["title".to_owned()]),
 				candidate_ids: None,
 				filter: None,
@@ -3218,6 +3508,8 @@ mod tests {
 		let pinned = reader.searcher();
 		assert_eq!(pinned.segment_readers().len(), 2);
 		let mut request = SearchRequest {
+			sort: None,
+			aggregations: Vec::new(),
 			expression: expression("shoes", SearchMode::Any, Vec::new()),
 			candidate_ids: None,
 			filter: None,
@@ -3315,6 +3607,8 @@ mod tests {
 		let snapshot = reader.searcher();
 		for mode in [SearchMode::Prefix, SearchMode::FuzzyPrefix] {
 			let mut request = SearchRequest {
+				sort: None,
+				aggregations: Vec::new(),
 				expression: expression("widg", mode, Vec::new()),
 				candidate_ids: None,
 				filter: None,
@@ -3454,6 +3748,8 @@ mod tests {
 			.search(
 				&searcher,
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("waterproof trail", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -3494,6 +3790,8 @@ mod tests {
 			.search(
 				&searcher,
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("waterproof trail", SearchMode::All, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -3514,6 +3812,8 @@ mod tests {
 			.search(
 				&searcher,
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("waterproof trail ", SearchMode::Prefix, Vec::new()),
 					candidate_ids: Some(vec!["both".to_owned()]),
 					filter: None,
@@ -3795,6 +4095,8 @@ mod tests {
 		let trace = engine
 			.trace_matches(
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("needle", SearchMode::Any, vec!["description".to_owned()]),
 					candidate_ids: None,
 					filter: None,
@@ -3853,6 +4155,8 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
+						sort: None,
+						aggregations: Vec::new(),
 						expression: expression(text, SearchMode::Any, Vec::new()),
 						candidate_ids: None,
 						filter: None,
@@ -3870,6 +4174,8 @@ mod tests {
 		let trace = engine
 			.trace_matches(
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("television", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -3892,6 +4198,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("stand", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -3939,6 +4247,8 @@ mod tests {
 			.search(
 				&baseline_reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("stand", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4060,6 +4370,8 @@ mod tests {
 		let reader = engine.reader().unwrap();
 		reader.reload().unwrap();
 		let mut request = SearchRequest {
+			sort: None,
+			aggregations: Vec::new(),
 			expression: expression("shoes", SearchMode::Any, Vec::new()),
 			candidate_ids: None,
 			filter: None,
@@ -4132,6 +4444,8 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
+						sort: None,
+						aggregations: Vec::new(),
 						expression: expression(text, mode, Vec::new()),
 						candidate_ids: candidates.map(|ids| ids.into_iter().map(str::to_owned).collect()),
 						filter: None,
@@ -4162,6 +4476,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: SearchExpression::And(vec![
 						expression("waterproof", SearchMode::Any, Vec::new()),
 						SearchExpression::Not(Box::new(expression("wireless", SearchMode::Any, Vec::new()))),
@@ -4185,6 +4501,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: SearchExpression::Not(Box::new(expression("wireless", SearchMode::Any, Vec::new()))),
 					candidate_ids: None,
 					filter: None,
@@ -4224,6 +4542,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression,
 					candidate_ids: None,
 					filter: None,
@@ -4441,6 +4761,8 @@ mod tests {
 				.search(
 					&reader.searcher(),
 					&SearchRequest {
+						sort: None,
+						aggregations: Vec::new(),
 						expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 						candidate_ids: None,
 						filter: None,
@@ -4464,6 +4786,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4482,6 +4806,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4500,6 +4826,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("identical", SearchMode::Any, vec!["title".to_owned()]),
 					candidate_ids: None,
 					filter: None,
@@ -4551,6 +4879,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("identical catalog text", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4572,6 +4902,8 @@ mod tests {
 			.search(
 				&reopened.reader().unwrap().searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("identical catalog", SearchMode::Any, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4661,6 +4993,8 @@ mod tests {
 		}
 		let searcher = engine.reader().unwrap().searcher();
 		let mut request = SearchRequest {
+			sort: None,
+			aggregations: Vec::new(),
 			expression: expression("catalog", SearchMode::All, vec!["title".to_owned()]),
 			candidate_ids: None,
 			filter: None,
@@ -4735,6 +5069,8 @@ mod tests {
 			.search(
 				&reader.searcher(),
 				&SearchRequest {
+					sort: None,
+					aggregations: Vec::new(),
 					expression: expression("cat", SearchMode::Prefix, Vec::new()),
 					candidate_ids: None,
 					filter: None,
@@ -4786,7 +5122,7 @@ mod tests {
 			field_type: FilterFieldType::String,
 		});
 		let identity = identity_bytes(&filtered);
-		assert_eq!(&identity[4..6], b"\x07\x00");
+		assert_eq!(&identity[4..6], b"\x08\x00");
 		assert_eq!(persisted_index_id(&identity), Some("products"));
 	}
 
@@ -5026,5 +5362,603 @@ mod tests {
 			Err(error) => error,
 		};
 		assert_eq!(error.code, "E_INCOMPLETE_CREATE");
+	}
+	#[test]
+	fn ordinary_exact_count_preserves_native_error_classification() {
+		use tantivy::query::{EnableScoring, Weight};
+		#[derive(Clone, Copy, Debug)]
+		enum FailureKind {
+			Storage,
+			Query,
+			Timeout,
+		}
+		#[derive(Debug)]
+		struct CountFailure {
+			inner: Box<dyn Query>,
+			kind: FailureKind,
+		}
+		impl Clone for CountFailure {
+			fn clone(&self) -> Self {
+				Self {
+					inner: self.inner.box_clone(),
+					kind: self.kind,
+				}
+			}
+		}
+		impl Query for CountFailure {
+			fn weight(&self, scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+				if scoring.is_scoring_enabled() {
+					return self.inner.weight(scoring);
+				}
+				Err(match self.kind {
+					FailureKind::Storage => {
+						tantivy::TantivyError::IoError(std::sync::Arc::new(std::io::Error::other("count read failed")))
+					}
+					FailureKind::Query => tantivy::TantivyError::InvalidArgument("count query failed".into()),
+					FailureKind::Timeout => {
+						tantivy::TantivyError::InvalidArgument(crate::error::SEARCH_TIMEOUT_MESSAGE.into())
+					}
+				})
+			}
+		}
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		let mut mutation = batch();
+		mutation.upserts[0].fields = vec![("title".into(), vec!["shoe".into()])];
+		mutation.upserts[1].fields = vec![(
+			"title".into(),
+			vec!["shoe padding padding padding padding padding".into()],
+		)];
+		writer.apply(mutation).unwrap();
+		writer.commit().unwrap();
+		let reader = engine.reader().unwrap();
+		reader.reload().unwrap();
+		let searcher = reader.searcher();
+		let request = SearchRequest {
+			sort: None,
+			aggregations: vec![],
+			expression: expression("shoe", SearchMode::Any, vec!["title".into()]),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 1,
+			exact_total: true,
+			budget_milliseconds: 30000,
+			traversal: false,
+			after: None,
+		};
+		let real = engine.query(&searcher, &request).unwrap();
+		let scores = searcher
+			.search(real.query.as_ref(), &TopDocs::with_limit(2).order_by_score())
+			.unwrap();
+		assert_ne!(scores[0].0, scores[1].0);
+		for (kind, expected) in [
+			(FailureKind::Storage, "E_STORAGE"),
+			(FailureKind::Query, "E_NATIVE_FAILURE"),
+			(FailureKind::Timeout, "E_TIMEOUT"),
+		] {
+			let result = engine.collect_search(
+				&searcher,
+				&request,
+				None,
+				None,
+				None,
+				BuiltQuery {
+					query: Box::new(CountFailure {
+						inner: real.query.box_clone(),
+						kind,
+					}),
+					clauses: real.clauses,
+				},
+			);
+			assert_eq!(result.unwrap_err().code, expected);
+		}
+		assert_eq!(engine.search(&searcher, &request).unwrap().total, 2);
+	}
+	#[test]
+	fn exact_total_with_aggregations_uses_two_native_query_passes() {
+		use std::sync::{
+			atomic::{AtomicUsize, Ordering},
+			Arc,
+		};
+		use tantivy::query::{EnableScoring, Weight};
+		#[derive(Debug)]
+		struct CountingQuery {
+			inner: Box<dyn Query>,
+			weights: Arc<AtomicUsize>,
+		}
+		impl Clone for CountingQuery {
+			fn clone(&self) -> Self {
+				Self {
+					inner: self.inner.box_clone(),
+					weights: self.weights.clone(),
+				}
+			}
+		}
+
+		impl Query for CountingQuery {
+			fn weight(&self, scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+				self.weights.fetch_add(1, Ordering::Relaxed);
+				self.inner.weight(scoring)
+			}
+		}
+		let mut config = config();
+		config.identity.filter_fields.push(FilterFieldConfig {
+			name: "price".into(),
+			field_type: FilterFieldType::Number,
+		});
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		let texts = [
+			"shoe shoe shoe shoe",
+			"shoe shoe",
+			"shoe",
+			"shoe padding padding padding padding padding",
+		];
+		writer
+			.apply(MutationBatch {
+				upserts: texts
+					.into_iter()
+					.enumerate()
+					.map(|(index, text)| crate::protocol::Upsert {
+						id: format!("record-{index}"),
+						version: None,
+						fields: vec![("title".into(), vec![text.into()])],
+						filters: vec![("price".into(), vec![FilterValue::Number((index + 1) as f64)])],
+					})
+					.collect(),
+				deletes: vec![],
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let reader = engine.reader().unwrap();
+		reader.reload().unwrap();
+		let searcher = reader.searcher();
+		let request = SearchRequest {
+			sort: None,
+			aggregations: vec![catalog::AggregationRequest {
+				aggregations: Vec::new(),
+				name: "prices".into(),
+				field: "price".into(),
+				kind: catalog::AggregationKind::Stats,
+			}],
+			expression: expression("shoe", SearchMode::Any, vec!["title".into()]),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 1,
+			exact_total: true,
+			budget_milliseconds: 30000,
+			traversal: false,
+			after: None,
+		};
+		let query = engine.query(&searcher, &request).unwrap();
+		let scores = searcher
+			.search(query.query.as_ref(), &TopDocs::with_limit(2).order_by_score())
+			.unwrap();
+		assert_ne!(scores[0].0, scores[1].0);
+		let weights = Arc::new(AtomicUsize::new(0));
+		let query = BuiltQuery {
+			query: Box::new(CountingQuery {
+				inner: query.query,
+				weights: weights.clone(),
+			}),
+			clauses: query.clauses,
+		};
+		let result = engine
+			.collect_search(
+				&searcher,
+				&request,
+				None,
+				Some(catalog::validate_requests(None, &request.aggregations, &config.identity.filter_fields).unwrap()),
+				None,
+				query,
+			)
+			.unwrap();
+		assert_eq!(
+			weights.load(Ordering::Relaxed),
+			2,
+			"expected hits and combined count/aggregation query passes"
+		);
+		assert_eq!(result.total, 4);
+		assert_eq!(result.total_relation, TotalRelation::Exact);
+		assert_eq!(result.hits.len(), 1);
+		assert_eq!(
+			result.aggregations[0].value,
+			catalog::AggregationValue::Stats {
+				count: 4,
+				sum: 10.0,
+				min: Some(1.0),
+				max: Some(4.0),
+				avg: Some(2.5)
+			}
+		);
+		let control_weights = Arc::new(AtomicUsize::new(0));
+		let control = CountingQuery {
+			inner: engine.query(&searcher, &request).unwrap().query,
+			weights: control_weights.clone(),
+		};
+		searcher
+			.search(&control, &TopDocs::with_limit(2).order_by_score())
+			.unwrap();
+		let control_aggregations = catalog::aggregate(
+			&searcher,
+			&control,
+			&request.aggregations,
+			&config.identity.filter_fields,
+			engine.index.tokenizers().clone(),
+			None,
+		)
+		.unwrap();
+		let control_total = catalog::count_matches(&searcher, &control, None).unwrap();
+		assert_eq!(control_weights.load(Ordering::Relaxed), 3);
+		assert_eq!(control_total, result.total);
+		assert_eq!(control_aggregations, result.aggregations);
+	}
+	#[cfg(feature = "node-api")]
+	mod close_quiescence {
+		use super::*;
+		use std::sync::{mpsc, Condvar, Mutex};
+		use std::time::Duration;
+		#[derive(Debug, Default)]
+		struct GateState {
+			armed: bool,
+			entered: bool,
+			released: bool,
+		}
+		#[derive(Debug, Default)]
+		struct MergeGate {
+			state: Mutex<GateState>,
+			changed: Condvar,
+		}
+		impl MergeGate {
+			fn arm(&self) {
+				self.state.lock().unwrap().armed = true;
+			}
+			fn block(&self) {
+				let mut state = self.state.lock().unwrap();
+				if !state.armed {
+					return;
+				}
+				state.entered = true;
+				self.changed.notify_all();
+				while !state.released {
+					state = self.changed.wait(state).unwrap();
+				}
+			}
+			fn wait_entered(&self) {
+				let state = self.state.lock().unwrap();
+				let (state, _) = self
+					.changed
+					.wait_timeout_while(state, Duration::from_secs(5), |state| !state.entered)
+					.unwrap();
+				assert!(state.entered, "native merge did not reach the directory gate");
+			}
+			fn release(&self) {
+				self.state.lock().unwrap().released = true;
+				self.changed.notify_all();
+			}
+		}
+		struct ReleaseGate(Arc<MergeGate>);
+		impl Drop for ReleaseGate {
+			fn drop(&mut self) {
+				self.0.release();
+			}
+		}
+		#[derive(Clone, Debug)]
+		struct MergeGateDirectory {
+			inner: RamDirectory,
+			gate: Arc<MergeGate>,
+			index_gate: Option<Arc<MergeGate>>,
+			fail_index_write: Arc<AtomicBool>,
+			worker_gates: HashMap<String, Arc<MergeGate>>,
+		}
+		impl Directory for MergeGateDirectory {
+			fn get_file_handle(&self, path: &Path) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
+				self.inner.get_file_handle(path)
+			}
+			fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> {
+				self.inner.delete(path)
+			}
+			fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
+				self.inner.exists(path)
+			}
+			fn open_write(&self, path: &Path) -> std::result::Result<WritePtr, OpenWriteError> {
+				let current = std::thread::current();
+				let name = current.name().unwrap_or("");
+				if name.starts_with("merge_thread") {
+					self.gate.block();
+				}
+				if name.starts_with("thrd-tantivy-index") {
+					if let Some(gate) = self.worker_gates.get(name) {
+						gate.block();
+					}
+					if let Some(gate) = &self.index_gate {
+						gate.block();
+					}
+					if self.fail_index_write.swap(false, Ordering::AcqRel) {
+						return Err(OpenWriteError::wrap_io_error(
+							io::Error::other("injected indexing write failure during close"),
+							path.to_path_buf(),
+						));
+					}
+				}
+				self.inner.open_write(path)
+			}
+			fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
+				self.inner.atomic_read(path)
+			}
+			fn atomic_write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+				self.inner.atomic_write(path, bytes)
+			}
+			fn sync_directory(&self) -> io::Result<()> {
+				self.inner.sync_directory()
+			}
+			fn acquire_lock(&self, lock: &tantivy::directory::Lock) -> std::result::Result<DirectoryLock, LockError> {
+				self.inner.acquire_lock(lock)
+			}
+			fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+				self.inner.watch(callback)
+			}
+		}
+		#[test]
+		fn discard_close_waits_for_original_merge_and_preserves_checkpoint() {
+			let gate = Arc::new(MergeGate::default());
+			let _release = ReleaseGate(gate.clone());
+			let directory = MergeGateDirectory {
+				inner: RamDirectory::create(),
+				gate: gate.clone(),
+				index_gate: None,
+				fail_index_write: Arc::new(AtomicBool::new(false)),
+				worker_gates: HashMap::new(),
+			};
+			let config = config();
+			let engine = Engine::open(directory.clone(), &config).unwrap();
+			let mut writer = engine.writer(&config).unwrap();
+			writer
+				.inner
+				.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+			writer.apply(batch()).unwrap();
+			writer.commit_with_payload(Some("published")).unwrap();
+			let upsert = |id: &str| crate::protocol::Upsert {
+				id: id.to_owned(),
+				version: None,
+				fields: vec![("title".to_owned(), vec!["shoe".to_owned()])],
+				filters: Vec::new(),
+			};
+			writer
+				.apply(MutationBatch {
+					upserts: vec![upsert("three")],
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit_with_payload(Some("published")).unwrap();
+			let segments = engine.index.searchable_segment_ids().unwrap();
+			assert_eq!(segments.len(), 2);
+			gate.arm();
+			let merging = writer.inner.merge(&segments);
+			gate.wait_entered();
+			writer
+				.apply(MutationBatch {
+					upserts: vec![upsert("pending")],
+					deletes: vec!["one".to_owned()],
+				})
+				.unwrap();
+			let (finished, completion) = mpsc::channel();
+			let (started, start) = mpsc::channel();
+			let close_gate = gate.clone();
+			let closer = std::thread::spawn(move || {
+				let mut writer = Some(writer);
+				started.send(()).unwrap();
+				let result = crate::native::finish_writer_close(&mut writer, false);
+				let released_at_return = close_gate.state.lock().unwrap().released;
+				finished
+					.send((result.quiesced, result.error, released_at_return))
+					.unwrap();
+			});
+			start.recv_timeout(Duration::from_secs(5)).unwrap();
+			let premature = completion.recv_timeout(Duration::from_millis(250)).ok();
+			let returned_before_release = premature.is_some();
+			gate.release();
+			let completed = premature
+				.or_else(|| completion.recv_timeout(Duration::from_secs(5)).ok())
+				.expect("close did not complete after releasing its native merge");
+			closer.join().unwrap();
+			let merged = merging.wait();
+			assert!(
+				!returned_before_release,
+				"discard close completed while its original native merge was blocked"
+			);
+			assert!(merged.is_ok());
+			let (quiesced, error, released_at_return) = completed;
+			assert!(
+				released_at_return,
+				"close returned before the native merge gate was released"
+			);
+			assert!(quiesced);
+			assert!(error.is_none());
+			let reopened = Engine::open(directory, &config).unwrap();
+			let searcher = reopened.reader().unwrap().searcher();
+			assert_eq!(searcher.num_docs(), 3);
+			let count = |id| {
+				searcher
+					.search(
+						&tantivy::query::TermQuery::new(
+							Term::from_field_text(reopened.id_field, id),
+							IndexRecordOption::Basic,
+						),
+						&tantivy::collector::Count,
+					)
+					.unwrap()
+			};
+			assert_eq!(count("one"), 1);
+			assert_eq!(count("pending"), 0);
+			assert_eq!(reopened.committed_payload().unwrap().as_deref(), Some("published"));
+			let mut writer = reopened.writer(&config).unwrap();
+			assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
+			writer.close().unwrap();
+		}
+		#[test]
+		fn discard_close_reports_unproven_quiescence_on_native_pending_write_failure() {
+			let index_gate = Arc::new(MergeGate::default());
+			let _release = ReleaseGate(index_gate.clone());
+			let failure = Arc::new(AtomicBool::new(false));
+			let directory = MergeGateDirectory {
+				inner: RamDirectory::create(),
+				gate: Arc::new(MergeGate::default()),
+				index_gate: Some(index_gate.clone()),
+				fail_index_write: failure.clone(),
+				worker_gates: HashMap::new(),
+			};
+			let config = config();
+			let engine = Engine::open(directory.clone(), &config).unwrap();
+			let mut writer = engine.writer(&config).unwrap();
+			writer
+				.inner
+				.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+			writer.apply(batch()).unwrap();
+			writer.commit_with_payload(Some("published")).unwrap();
+			index_gate.arm();
+			writer
+				.apply(MutationBatch {
+					upserts: vec![crate::protocol::Upsert {
+						id: "pending".to_owned(),
+						version: None,
+						fields: vec![("title".to_owned(), vec!["shoe".to_owned()])],
+						filters: Vec::new(),
+					}],
+					deletes: vec!["one".to_owned()],
+				})
+				.unwrap();
+			index_gate.wait_entered();
+			assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("published"));
+			let (started, start) = mpsc::channel();
+			let (finished, completion) = mpsc::channel();
+			let closer = std::thread::spawn(move || {
+				let mut writer = Some(writer);
+				failure.store(true, Ordering::Release);
+				started.send(()).unwrap();
+				let result = crate::native::finish_writer_close(&mut writer, false);
+				finished.send((result.quiesced, result.error)).unwrap();
+			});
+			start.recv_timeout(Duration::from_secs(5)).unwrap();
+			index_gate.release();
+			let (quiesced, error) = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+			closer.join().unwrap();
+			assert!(!quiesced);
+			assert_eq!(error.unwrap().code, "E_NATIVE_FAILURE");
+			assert!(
+				!directory.fail_index_write.load(Ordering::Acquire),
+				"native indexing open_write failure was not exercised"
+			);
+			drop(engine);
+			let reopened = Engine::open(directory, &config).unwrap();
+			let searcher = reopened.reader().unwrap().searcher();
+			assert_eq!(searcher.num_docs(), 2);
+			let count = |id| {
+				searcher
+					.search(
+						&tantivy::query::TermQuery::new(
+							Term::from_field_text(reopened.id_field, id),
+							IndexRecordOption::Basic,
+						),
+						&tantivy::collector::Count,
+					)
+					.unwrap()
+			};
+			assert_eq!(count("one"), 1);
+			assert_eq!(count("pending"), 0);
+			assert_eq!(reopened.committed_payload().unwrap().as_deref(), Some("published"));
+		}
+		#[test]
+		fn failed_prepare_commit_cannot_prove_close_while_another_native_worker_is_blocked() {
+			let failing = Arc::new(MergeGate::default());
+			let blocked = Arc::new(MergeGate::default());
+			let _release_failing = ReleaseGate(failing.clone());
+			let _release_blocked = ReleaseGate(blocked.clone());
+			let failure = Arc::new(AtomicBool::new(false));
+			let directory = MergeGateDirectory {
+				inner: RamDirectory::create(),
+				gate: Arc::new(MergeGate::default()),
+				index_gate: None,
+				fail_index_write: failure.clone(),
+				worker_gates: HashMap::from([
+					("thrd-tantivy-index0".to_owned(), failing.clone()),
+					("thrd-tantivy-index1".to_owned(), blocked.clone()),
+				]),
+			};
+			let mut config = config();
+			config.limits.indexing_threads = 2;
+			config.limits.writer_memory_bytes = 30_000_000;
+			let engine = Engine::open(directory, &config).unwrap();
+			let mut seed = engine.writer(&config).unwrap();
+			seed.apply(batch()).unwrap();
+			seed.commit_with_payload(Some("published")).unwrap();
+			seed.close().unwrap();
+			let writer = engine.writer(&config).unwrap();
+			writer
+				.inner
+				.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+			failing.arm();
+			blocked.arm();
+			let upsert = |id: &str| crate::protocol::Upsert {
+				id: id.to_owned(),
+				version: None,
+				fields: vec![("title".to_owned(), vec!["shoe".to_owned()])],
+				filters: Vec::new(),
+			};
+			writer
+				.apply(MutationBatch {
+					upserts: vec![upsert("pending-a"), upsert("pending-b")],
+					deletes: vec!["one".to_owned()],
+				})
+				.unwrap();
+			failing.wait_entered();
+			blocked.wait_entered();
+			failure.store(true, Ordering::Release);
+			failing.release();
+			let (finished, completion) = mpsc::channel();
+			let closer = std::thread::spawn(move || {
+				let mut writer = writer;
+				let preparation_error = writer.commit_with_payload(Some("not-published")).unwrap_err();
+				let mut writer = Some(writer);
+				let result = crate::native::finish_writer_close(&mut writer, false);
+				finished
+					.send((preparation_error, result.quiesced, result.error))
+					.unwrap();
+			});
+			let (preparation_error, quiesced, error) = completion
+				.recv_timeout(Duration::from_secs(5))
+				.expect("failed prepare/close did not return while the detached worker was gated");
+			let blocked_at_close_return = !blocked.state.lock().unwrap().released;
+			failure.store(true, Ordering::Release);
+			blocked.release();
+			closer.join().unwrap();
+			assert_eq!(preparation_error.code, "E_STORAGE");
+			assert!(blocked_at_close_return);
+			assert!(
+				!quiesced,
+				"close claimed quiescence after failed prepare discarded a still-blocked worker handle"
+			);
+			assert_eq!(error.unwrap().code, "E_QUIESCENCE_FAILED");
+			let searcher = engine.reader().unwrap().searcher();
+			assert_eq!(searcher.num_docs(), 2);
+			let count = |id| {
+				searcher
+					.search(
+						&tantivy::query::TermQuery::new(
+							Term::from_field_text(engine.id_field, id),
+							IndexRecordOption::Basic,
+						),
+						&tantivy::collector::Count,
+					)
+					.unwrap()
+			};
+			assert_eq!(count("one"), 1);
+			assert_eq!(count("pending-a"), 0);
+			assert_eq!(count("pending-b"), 0);
+			assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("published"));
+		}
 	}
 }

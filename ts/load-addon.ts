@@ -12,6 +12,12 @@ interface NativeRuntimeInfo {
 	queryClassIsolationMinimumSearchThreads: number;
 	storageBackends: Array<string>;
 	limits: {
+		maxAggregationDepth: number;
+		maxAggregationBuckets: number;
+		maxAggregationMemoryBytes: number;
+		maxSortKeyBytes: number;
+		maxTermKeyBytes: number;
+
 		maxCommitPayloadBytes: number;
 		maxQueryTextBytes: number;
 		maxQueryTerms: number;
@@ -70,7 +76,7 @@ interface NativeAddonApi {
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 9;
+const expectedNativeAbiVersion = 11;
 const packageManifest = require('../package.json') as { name: string; version: string };
 let loadedAddon: NativeAddonApi | undefined;
 let runtimeUsesGlibc: boolean | undefined;
@@ -200,7 +206,7 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 			`Fulltext native ABI ${info.nativeAbiVersion} from ${artifactPath} does not match ${expectedNativeAbiVersion}`,
 		);
 	}
-	if (info.queryApiVersion !== 4) {
+	if (info.queryApiVersion !== 6) {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',
 			`Fulltext query API ${info.queryApiVersion} from ${artifactPath} is not supported`,

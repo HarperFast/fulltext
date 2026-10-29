@@ -1,6 +1,7 @@
+import { encodeCatalog, type SortRequest, type AggregationRequest } from './catalog.js';
 import { FulltextError, type FulltextErrorCode } from './errors.js';
 
-const protocolVersion = 5;
+const protocolVersion = 7;
 export const maxStringBytes = 1 << 20;
 export const maxFilterStringBytes = 65_530;
 export const maxCommitPayloadBytes = 64 * 1024;
@@ -407,12 +408,15 @@ export type PackedSearchExpression =
 export type PackedFilterExpression =
 	| {
 			field: string;
-			comparator: 'equals' | 'in' | 'lt' | 'le' | 'gt' | 'ge' | 'between';
+			comparator: 'equals' | 'in' | 'lt' | 'le' | 'gt' | 'ge' | 'between' | 'exists' | 'missing';
 			values: PackedFilterValue[];
 	  }
+	| { operator: 'not'; clause: PackedFilterExpression }
 	| { operator: 'and' | 'or'; clauses: PackedFilterExpression[] };
 
 export interface PackedSearchRequest {
+	sort?: SortRequest | SortRequest[];
+	aggregations?: AggregationRequest[];
 	expression: PackedSearchExpression;
 	candidateIds?: string[];
 	filter?: PackedFilterExpression;
@@ -753,6 +757,9 @@ export function encodeSearchFrame(
 	}
 	writer.boolean(request.filter !== undefined);
 	if (request.filter !== undefined) encodeFilterExpression(writer, request.filter, 0);
+	encodeCatalog(writer, request.sort, request.aggregations);
+	if (request.traversal && (request.sort !== undefined || (request.aggregations?.length ?? 0) > 0))
+		throw new FulltextError('E_INVALID_ARGUMENT', 'sort and aggregations are not supported by searchPage');
 	const identityLength = writer.length;
 	writer.u32(request.offset, 'offset');
 	writer.u32(request.limit, 'limit');
@@ -785,9 +792,17 @@ function encodeFilterExpression(writer: ByteWriter, expression: PackedFilterExpr
 	if ('field' in expression) {
 		writer.u8(0, 'filter expression type');
 		writer.string(expression.field);
-		writer.u8(['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between'].indexOf(expression.comparator), 'filter comparator');
+		writer.u8(
+			['equals', 'in', 'lt', 'le', 'gt', 'ge', 'between', 'exists', 'missing'].indexOf(expression.comparator),
+			'filter comparator',
+		);
 		writer.u16(expression.values.length, 'filter value count');
 		for (const value of expression.values) writer.filterValue(value);
+		return;
+	}
+	if (expression.operator === 'not') {
+		writer.u8(3, 'filter expression type');
+		encodeFilterExpression(writer, expression.clause, depth + 1);
 		return;
 	}
 	writer.u8(expression.operator === 'and' ? 1 : 2, 'filter expression type');
@@ -913,6 +928,12 @@ export class Cursor {
 		return value;
 	}
 
+	f64(): number {
+		const value = this.#buffer.readDoubleLE(this.#offset);
+		this.take(8);
+		return value;
+	}
+
 	f32(): number {
 		const value = this.#buffer.readFloatLE(this.#offset);
 		this.take(4);
@@ -925,6 +946,10 @@ export class Cursor {
 
 	text(length: number): string {
 		return this.take(length).toString('utf8');
+	}
+
+	remaining(): number {
+		return this.#buffer.length - this.#offset;
 	}
 
 	finish(): void {

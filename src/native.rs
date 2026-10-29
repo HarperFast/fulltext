@@ -257,9 +257,9 @@ enum WriterOutcome {
 	Poison(Result<Vec<u8>>, FulltextError),
 }
 
-struct WriterCloseOutcome {
-	quiesced: bool,
-	error: Option<FulltextError>,
+pub(crate) struct WriterCloseOutcome {
+	pub(crate) quiesced: bool,
+	pub(crate) error: Option<FulltextError>,
 }
 
 struct SearchCommand {
@@ -1801,8 +1801,7 @@ fn writer_loop_inner(
 						"index has uncommitted mutations; publish (or commit if uncheckpointed), or close with rollback",
 					)))
 				} else {
-					let rollback = rollback || dirty || runtime.state.load(Ordering::Acquire) == STATE_POISONED;
-					WriterOutcome::Stop(close_writer(&runtime, &mut writer, rollback))
+					WriterOutcome::Stop(close_writer(&runtime, &mut writer))
 				}
 			}
 		}));
@@ -1836,7 +1835,7 @@ fn writer_loop_inner(
 				runtime.poison(panic_error.clone());
 				let cleanup_runtime = runtime.clone();
 				match catch_unwind(AssertUnwindSafe(move || {
-					let close = close_writer(&cleanup_runtime, &mut writer, true);
+					let close = close_writer(&cleanup_runtime, &mut writer);
 					finish_runtime(&cleanup_runtime, engine, reader, close)
 				})) {
 					Ok(outcome) => {
@@ -1862,7 +1861,7 @@ fn writer_loop_inner(
 	}
 	let cleanup_runtime = runtime.clone();
 	if catch_unwind(AssertUnwindSafe(move || {
-		let outcome = close_writer(&cleanup_runtime, &mut writer, true);
+		let outcome = close_writer(&cleanup_runtime, &mut writer);
 		finish_runtime(&cleanup_runtime, engine, reader, outcome)
 	}))
 	.is_err()
@@ -1871,9 +1870,9 @@ fn writer_loop_inner(
 	}
 }
 
-fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool) -> WriterCloseOutcome {
-	let Some(mut writer) = writer.take() else {
-		if _runtime.read_only {
+pub(crate) fn finish_writer_close(writer: &mut Option<Writer>, read_only: bool) -> WriterCloseOutcome {
+	let Some(writer) = writer.take() else {
+		if read_only {
 			return WriterCloseOutcome {
 				quiesced: true,
 				error: None,
@@ -1884,17 +1883,20 @@ fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>, rollback: bool)
 			error: Some(FulltextError::new("E_POISONED", "writer is unavailable")),
 		};
 	};
-	let rollback_error = if rollback { writer.rollback().err() } else { None };
-	let outcome = match writer.close() {
+	match writer.close() {
 		Ok(()) => WriterCloseOutcome {
 			quiesced: true,
-			error: rollback_error,
+			error: None,
 		},
 		Err(error) => WriterCloseOutcome {
 			quiesced: false,
-			error: rollback_error.or(Some(error)),
+			error: Some(error),
 		},
-	};
+	}
+}
+
+fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>) -> WriterCloseOutcome {
+	let outcome = finish_writer_close(writer, _runtime.read_only);
 	#[cfg(feature = "test-panic")]
 	let outcome = {
 		let mut outcome = outcome;
@@ -1994,6 +1996,9 @@ fn close_result(outcome: WriterCloseOutcome) -> Result<Vec<u8>> {
 }
 
 fn quiescence_error(error: FulltextError) -> FulltextError {
+	if error.code == "E_QUIESCENCE_FAILED" {
+		return error;
+	}
 	FulltextError::new(
 		"E_QUIESCENCE_FAILED",
 		format!("native writer teardown did not prove quiescence: {error}"),
@@ -2156,7 +2161,10 @@ fn execute_search_command(
 	runtime
 		.search_queue_nanoseconds
 		.fetch_add(duration_ns(queued_for), Ordering::Relaxed);
-	let SearchCommand { operation, completion } = queued.value;
+	let SearchCommand {
+		operation,
+		mut completion,
+	} = queued.value;
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
 		SearchOperation::Search { bytes, expensive } => {
 			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
@@ -2183,7 +2191,14 @@ fn execute_search_command(
 			let result = decode_search(&bytes).and_then(|request| {
 				engine
 					.search_with_deadline(&reader.searcher(), &request, deadline)
-					.map(SearchOutcome::Search)
+					.map(search_body)
+					.and_then(|body| {
+						let response = success_envelope(body);
+						if Instant::now() >= deadline {
+							return Err(search_timeout());
+						}
+						Ok(response)
+					})
 			});
 			runtime
 				.search_execution_nanoseconds
@@ -2212,7 +2227,11 @@ fn execute_search_command(
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
 				}
-				Ok(SearchOutcome::Trace(result))
+				let response = success_envelope(trace_body(result));
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				Ok(response)
 			});
 			runtime
 				.search_execution_nanoseconds
@@ -2221,8 +2240,7 @@ fn execute_search_command(
 		}
 	}));
 	match result {
-		Ok(Ok(SearchOutcome::Search(result))) => completion.success(search_body(result)),
-		Ok(Ok(SearchOutcome::Trace(result))) => completion.success(trace_body(result)),
+		Ok(Ok(response)) => completion.send(response),
 		Ok(Err(error)) => completion.failure(error),
 		Err(_) => {
 			completion.failure(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
@@ -2233,11 +2251,6 @@ fn execute_search_command(
 	true
 }
 
-enum SearchOutcome {
-	Search(SearchResult),
-	Trace(TraceResult),
-}
-
 fn operation_deadline(budget_milliseconds: u32, queued_for: Duration) -> Result<Instant> {
 	let budget = Duration::from_millis(u64::from(budget_milliseconds));
 	let remaining = budget.checked_sub(queued_for).ok_or_else(search_timeout)?;
@@ -2245,7 +2258,7 @@ fn operation_deadline(budget_milliseconds: u32, queued_for: Duration) -> Result<
 }
 
 fn search_timeout() -> FulltextError {
-	FulltextError::new("E_TIMEOUT", "full-text search exceeded its execution budget")
+	FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE)
 }
 
 fn open_on_thread(
@@ -3114,6 +3127,11 @@ fn search_body(result: SearchResult) -> Vec<u8> {
 			push_string(&mut bytes, &version);
 		}
 	}
+	if let Some(aggregations) = result.encoded_aggregations {
+		bytes.extend_from_slice(&aggregations);
+	} else {
+		bytes.extend_from_slice(&0u32.to_le_bytes());
+	}
 	if let Some((snapshot, more)) = result.traversal {
 		push_string(&mut bytes, &snapshot);
 		bytes.push(more as u8);
@@ -3173,6 +3191,16 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn quiescence_errors_preserve_classification_without_duplicate_prefix() {
+		let original = FulltextError::new("E_QUIESCENCE_FAILED", "worker ownership unproven");
+		assert_eq!(quiescence_error(original.clone()), original);
+		let storage = quiescence_error(FulltextError::new("E_STORAGE", "join failed"));
+		assert_eq!(storage.code, "E_QUIESCENCE_FAILED");
+		assert!(storage.message.contains("E_STORAGE: join failed"));
+	}
+
 	use std::sync::mpsc;
 	use tantivy::directory::error::LockError;
 

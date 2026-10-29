@@ -14,6 +14,11 @@ export interface RuntimeInfo {
 }
 
 export interface RuntimeLimits {
+  maxAggregationDepth: number
+  maxAggregationBuckets: number
+  maxAggregationMemoryBytes: number
+  maxSortKeyBytes: number
+  maxTermKeyBytes: number
   maxCommitPayloadBytes: number
   maxQueryTextBytes: number
   maxQueryTerms: number

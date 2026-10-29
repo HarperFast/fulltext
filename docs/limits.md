@@ -289,9 +289,92 @@ The native many-segment qualification demonstrates this flow. These Rust source/
 accompany the pre-1.0 package change from 0.5 to 0.6; they do not introduce a `searchPage` method on
 `Engine`.
 
+## Direct Rust API compatibility for the unreleased metadata APIs
+
+When migrating from released 0.7.x, ordinary `protocol::SearchRequest` literals add `sort: None`
+and `aggregations: Vec::new()`. Catalog callers use `catalog::SortRequest` and
+`catalog::AggregationRequest` (with child `aggregations: Vec::new()` for leaves). Sorted requests
+use `sort: Some(vec![sort_request, ...])`; `Engine::search` returns named results in
+`SearchResult.aggregations`. Obtain `SearchResult` through the engine rather than constructing
+it: its cached wire representation is crate-private.
+
+Exhaustive matches must handle `FilterExpression::Not(Box<FilterExpression>)` and
+`FilterComparator::{Exists, Missing}`. Presence clauses carry `values: Vec::new()`.
+`SearchResult` and the filter enums are source changes to the pre-1.0 Rust API; the JavaScript
+facade uses packed protocol 7, native ABI 11, and query API 6 with its matching addon.
+
 ## Source reference
 
 - [Native bounds and request decoding](../src/protocol.rs)
 - [Advertised runtime limits](../src/lib.rs)
 - [Analyzer, query, and collector behavior](../src/engine.rs)
 - [JavaScript preparation and mutation framing](../ts/native.ts)
+
+## Metadata collectors
+
+`runtimeInfo().limits` exposes aggregation depth, bucket count, native aggregation memory, sort-key
+bytes, and term-key bytes. The unreleased `maxAggregations` and `maxTermsSize` fields are removed
+with query API 6; request shape is governed by resource budgets rather than those fixed counts. Key preflights
+first use supported maximum lengths and per-segment document/dictionary counts. When that estimate
+exceeds its budget, a streaming dictionary scan measures maximum key lengths and retries the bound.
+Completed measurements are cached by immutable segment and field, with at most 1,024 entries per
+process. A completed scan populates the cache before its final deadline check, so a request that
+times out at that check can still help a later request. Cache eviction affects performance, not results. Cold scans check the request deadline every 1,024 keys and at completion,
+and retain only a maximum length; high cardinality alone does not exceed a qualification-count
+limit. Sorting first tries the contractual ID bound, measuring IDs only if that still cannot
+qualify the request. If the full-segment sort estimate still fails, a deadline-aware native Count
+pass measures the global matching count and uses it as an upper bound on retained hits across
+segments, together with maximum measured key lengths, to retry the sort budget.
+The sort continues to use native TopDocs. Reduce the window or terms size when retained keys exceed their budget;
+independent top-k requests do not produce a globally equivalent answer.
+
+| Resource                           | Bound                                                   | Enforcement                                                                                                                                                                                                                                                     |
+| ---------------------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sort fields / aggregation siblings | Encoded request budget; no small fixed count cap        | Sort keys must be distinct. Aggregation names are 1–128 UTF-8 bytes and unique among siblings.                                                                                                                                                                  |
+| Aggregation depth                  | 32 levels                                               | Independent facade, wire, validation, collector and result walkers reject deeper trees.                                                                                                                                                                         |
+| Terms size / explicit range count  | Positive u32 size; nonempty ranges within request bytes | Checked tenfold native candidate oversampling; terms remain approximate across segments. Large requested sizes can succeed on low-cardinality fields.                                                                                                           |
+| Returned aggregation buckets       | 1,024 across the entire tree                            | Native global bucket guard; overflow rejects with `E_RESOURCE_LIMIT`. No partial histogram/range response.                                                                                                                                                      |
+| Collector construction             | 16 MiB conservative admission estimate                  | Charges request nodes, range setup and segment count before constructing collectors. Nested state also charges possible parent instances, including stats vectors that Tantivy does not charge to its native guard.                                             |
+| Native aggregation structures      | 16 MiB estimated, shared across segment collectors      | Tantivy guard; not total process memory and not every decoded key.                                                                                                                                                                                              |
+| Decoded term keys                  | 16 MiB conservative preflight                           | Per-segment candidates are bounded by oversampling, dictionary size and observed values. Descendants multiply by possible parent instances; each candidate charges maximum key bytes plus overhead. Dictionary scans refine maximum lengths under the deadline. |
+| Retained metadata sort keys        | 64 MiB conservative preflight                           | Charges every requested key, vector storage, native top-k buffers, IDs and global decoded keys across segments. Existing 10,000-window and prefix limits apply.                                                                                                 |
+| Request / response                 | Existing 8 MiB each                                     | Input normalization charges bytes incrementally; result encoding charges all descendants. A conservative per-node output estimate and construction cost are checked before collection. Oversized output rejects with `E_RESULT_TOO_LARGE`.                      |
+| Numeric arithmetic                 | Finite input/output; representable histogram positions  | Invalid intervals/ranges reject with `E_INVALID_ARGUMENT`; arithmetic/capacity overflow rejects with `E_RESOURCE_LIMIT`.                                                                                                                                        |
+
+Sort dispatch uses native typed computers for one/two fields, native erased-type tuples for
+three/four fields, and runtime lists for five or more. Four-field native keys use nested pairs
+to retain configured comparators. All paths share the 64 MiB sort budget. Admission charges
+retained decoded keys across segments, fixed top-k/merge slots at actual executor concurrency,
+and dynamic scratch/key-vector storage. Global merging moves retained payloads; only up to two
+additional threshold payload copies are charged, independently of the result window. Dynamic
+scratch and threshold vectors are charged per active segment. This is a conservative admission
+estimate, not a process-residency bound.
+
+Histogram-parent admission first bounds actual possible bucket positions rather than charging every
+numeric value as a separate bucket. If dictionary and column bounds still cannot qualify a tree,
+bounded native histogram probes can refine those bounds using the original query and native
+ancestor-presence predicates. Probes share the deadline and native memory/bucket guards; they add
+collection work only on this admission fallback. An inconclusive probe retains the conservative
+bound. Nested histogram validation ignores documents missing an ancestor bucket field.
+
+Static construction costs, conservative per-node result estimates and known range-only bucket counts are checked
+before query construction or ranking. Actual bucket cardinality and serialized key bytes depend
+on matching data: native guards and encoding enforce those limits during/after collection. A high
+requested terms size is not itself a rejection reason; it can return a few categories or none.
+Pre-rejecting every possible oversized output would reinstate feature caps or reject empty/selective
+queries. These are bounded failures, not a promise that every rejected request avoids collection.
+
+The metadata collector checks the original request deadline before setup, at segment boundaries,
+every 1,024 visited matches, and around final merge. Native scorer setup, individual dictionary
+conversion, and native aggregation merge remain synchronous within those checkpoints. Sorted hits,
+exact totals and requested aggregates share one collection pass. Aggregation-only requests retain
+the ordinary ranked-hits path and use a separate full-set pass. When exact totals need counting,
+that pass also counts matches instead of running a third pass. Wire encoding, including the success envelope, stays inside the
+deadline and expensive-search permit, with a final deadline check before returning. This is a
+cooperative deadline, not a hard wall-clock or memory-residency guarantee. Deleted documents are
+excluded using the snapshot's deletion mask. Ordinary exact-total Count passes also use the deadline wrapper.
+
+String metadata adds a raw fast column. The writer stores repeated strings once per document
+to avoid redundant fast-column values, preserving first occurrence for sorting. Native terms
+aggregation independently counts each distinct string once per document. Upgrading a released index containing string metadata requires a
+rebuild to sidecar v8. Numeric/Boolean-only metadata keeps sidecar v7; text-only keeps v6.

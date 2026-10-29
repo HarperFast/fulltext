@@ -48,9 +48,9 @@ try {
 			reader.searchPage(query),
 			(error) => error.code === 'E_QUEUE_FULL' && /preparation/.test(error.message),
 		);
+		const completed = await pending;
 		assert.equal((await reader.searchPage({ text: 'widget' })).total, 3);
 		assert.equal((await reader.search({ text: 'widget' })).total, 3);
-		const completed = await pending;
 		if (completed.error) {
 			assert.equal(completed.error.code, 'E_QUEUE_FULL');
 			assert(!/preparation/.test(completed.error.message));
@@ -91,6 +91,40 @@ try {
 			(await reader.searchPage({ ...shared, continuation: second.continuation })).hits.map((hit) => hit.id),
 			['c'],
 		);
+	} else if (scenario === 'ordinary-isolation') {
+		assert.equal((await reader.search({ text: 'widget' })).total, 3);
+		let blockerSettled = false;
+		blocker = promisify(pbkdf2)('preparation', 'test', 4000000, 32, 'sha256').then(() => {
+			blockerSettled = true;
+		});
+		let preparationSettled = false;
+		const pending = reader.searchPage(query).then(
+			(result) => {
+				preparationSettled = true;
+				return { result };
+			},
+			(error) => {
+				preparationSettled = true;
+				return { error };
+			},
+		);
+		await assert.rejects(
+			reader.searchPage(query),
+			(error) => error.code === 'E_QUEUE_FULL' && /preparation/.test(error.message),
+		);
+		assert.equal(preparationSettled, false);
+		const ordinary = await reader.search({ text: 'widget' });
+		assert.equal(ordinary.total, 3);
+		assert.deepStrictEqual(
+			ordinary.hits.map((hit) => hit.id),
+			['a', 'b', 'c'],
+		);
+		assert.equal(blockerSettled, false, 'the UV worker must still be occupied during ordinary search');
+		assert.equal(preparationSettled, false, 'ordinary search must complete before traversal preparation');
+		await blocker;
+		const completed = await pending;
+		if (completed.error) throw completed.error;
+		assert.equal(completed.result.total, 0);
 	} else if (scenario === 'timeout') {
 		blocker = promisify(pbkdf2)('preparation', 'test', 1000000, 32, 'sha256');
 		await assert.rejects(

@@ -69,13 +69,19 @@ test('loads the artifact for the executing platform', async () => {
 	assert.deepStrictEqual(info, {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
-		nativeAbiVersion: 9,
-		queryApiVersion: 4,
+		nativeAbiVersion: 11,
+		queryApiVersion: 6,
 		queryClassIsolationMinimumSearchThreads: 2,
 		lifecycleApiVersion: 1,
 		mutationBatchApiVersion: 5,
 		storageBackends: ['native'],
 		limits: {
+			maxAggregationDepth: 32,
+			maxAggregationBuckets: 1_024,
+			maxAggregationMemoryBytes: 16 << 20,
+			maxSortKeyBytes: 64 << 20,
+			maxTermKeyBytes: 16 << 20,
+
 			maxCommitPayloadBytes,
 			maxQueryTextBytes: 64 * 1024,
 			maxQueryTerms: 64,

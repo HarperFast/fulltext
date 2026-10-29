@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub const SEARCH_TIMEOUT_MESSAGE: &str = "full-text search exceeded its execution budget";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FulltextError {
 	pub code: &'static str,
@@ -20,6 +22,19 @@ impl FulltextError {
 
 	pub fn native(error: impl fmt::Display) -> Self {
 		Self::new("E_NATIVE_FAILURE", error.to_string())
+	}
+}
+
+pub(crate) fn index_error(error: tantivy::TantivyError) -> FulltextError {
+	match error {
+		tantivy::TantivyError::LockFailure(tantivy::directory::error::LockError::LockBusy, _) => {
+			FulltextError::new("E_LOCK_BUSY", "another writer owns the Tantivy index lock")
+		}
+		tantivy::TantivyError::OpenDirectoryError(_)
+		| tantivy::TantivyError::OpenReadError(_)
+		| tantivy::TantivyError::OpenWriteError(_)
+		| tantivy::TantivyError::IoError(_) => FulltextError::new("E_STORAGE", error.to_string()),
+		other => FulltextError::native(other),
 	}
 }
 

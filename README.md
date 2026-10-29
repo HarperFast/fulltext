@@ -2,9 +2,12 @@
 
 Native Tantivy full-text indexing for Node.js.
 
-**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.7.0.** The engine is compiled into
-the native addon; no separate Tantivy installation is required. Upgrading from fulltext 0.6.x
-requires an index rebuild; see [Upgrading from 0.6.x](#upgrading-from-06x) before deploying.
+**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.7.0.** The engine is compiled
+into the native addon; no separate Tantivy installation is required. This source tree still has
+version 0.7.0 in its package manifests, but the metadata sorting, aggregation and new filter APIs
+documented here are unreleased and absent from the published 0.7.0 artifacts. See
+[Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
+before deploying a build from this tree.
 
 This repository is under active development. The native entry point provides a standalone Tantivy
 index backed by `MmapDirectory`. Applications own their source records and may reuse compatible
@@ -16,7 +19,7 @@ local index files or rebuild them from that authoritative data.
 - [Install](#installation) and [create your first index](#quick-start).
 - [Choose an API](#choose-an-api) and [understand search results](#reading-search-results).
 - [Configure analysis](#analyzer-and-field-configuration), [filters](#structured-filters), and [highlighting](#highlighting-and-snippets).
-- [Manage writes](#mutations-and-backpressure), [recover an index](#lifecycle-and-recovery), or [upgrade from 0.6.x](#upgrading-from-06x).
+- [Manage writes](#mutations-and-backpressure), [recover an index](#lifecycle-and-recovery), or [upgrade from 0.7.x](#upgrading-from-07x) / [0.6.x](#upgrading-from-06x).
 - Reference: [limits and recovery](docs/limits.md), [benchmarks](docs/benchmarks.md), and [backend internals](docs/native-backend-implementation.md).
 
 ## Capabilities
@@ -203,6 +206,11 @@ A search returns this shape (score shown for illustration):
 - `totalRelation: 'exact'` means `total` is the full match count. `'lower-bound'` means at least that many matches exist; it does not mean the returned hits are approximate.
 - Set `exactTotal: true` when a UI needs an exact count. It may require extra work across all matches. The default can still return an exact count when it is already known.
 
+Exact counting checks the execution budget during collection, including requests without
+metadata. Local qualification observed **+6.3% p50** for public exact-total queries and **+37%** for
+the dense-OR count stage. These synthetic results are not production latency bounds; see the
+[paired count measurements](docs/benchmarks.md#paired-native-collector-qualification).
+
 For example, `index.search({ text: 'waterproof', limit: 20, exactTotal: true })` requests the top
 20 hits and an exact count. `searchPage()` always returns exact totals; it adds a `continuation`
 only while another page remains. Match tracing has a separate `complete` flag: `false` means
@@ -300,7 +308,7 @@ Source projection, current-record validation, and Harper REST integration remain
 Filter fields are typed metadata stored in the Tantivy index alongside the analyzed text. They let
 Tantivy discard non-matching documents before returning ranked IDs, reducing source-record reads
 without changing BM25 scores. The caller's records remain authoritative; filter metadata is a
-derived copy used only to narrow search results.
+derived copy used to filter, sort, and aggregate search results.
 
 The library does not infer this metadata. Declare each field in `filterFields` when opening the
 index and supply its value in each upsert's `filters` object. A field omitted from `filterFields`
@@ -311,9 +319,9 @@ Declare only fields commonly combined with text search. Filter metadata increase
 mutation work, and changing its definition requires a new generation or rebuild. Filter fields are
 separate from analyzed text fields and may reuse the same logical name. String filters are exact
 and case-sensitive; number filters support exact and range comparisons; Boolean filters support
-exact comparison. Arrays add one value per element. Missing fields add no value. String values are
-limited to 65,530 UTF-8 bytes. Number fields are also stored as Tantivy fast fields to keep broad
-range filters from materializing term bitsets; this further increases index size.
+exact comparison. Arrays add one value per element; repeated string values are stored once, preserving first occurrence. This storage optimization avoids redundant fast-column values; native terms aggregation independently counts each distinct string once per document. Missing fields and empty arrays add no value. String values are
+limited to 65,530 UTF-8 bytes. Number fields are stored as Tantivy fast fields to keep broad
+range filters from materializing term bitsets. String fields have raw fast columns for sorting and facets; these columns increase indexing work and disk usage.
 
 ```js
 const result = await index.search({
@@ -328,11 +336,110 @@ const result = await index.search({
 });
 ```
 
-Supported comparators are `equals`, `in`, `lt`, `le`, `gt`, `ge`, and inclusive `between`.
+Supported comparators are `equals`, `in`, `lt`, `le`, `gt`, `ge`, inclusive `between`,
+and value-free `exists`/`missing`. Combine clauses with `and`, `or`, or unary `not`.
 Range comparators require a number field. Candidate IDs and structured filters may be combined;
 both must match. Filter definitions are part of the persisted index identity, so changing them
 requires a new generation or a rebuild from the authoritative source. Filter terms are present in
 the local Tantivy term dictionary and should be protected like the indexed text itself.
+
+### Negation and field presence
+
+Use `{ operator: 'not', clause: filter }` to exclude a filter match, and
+`{ field: 'brand', comparator: 'exists' }` or `comparator: 'missing'` without a `value`.
+Omitted fields and empty arrays are missing; `false`, zero, and the empty string are present.
+A comparison matches when any array element matches. Negating it means no element matches,
+including records where the field is missing. Filters remain score-neutral and share the existing
+nesting and clause limits.
+
+### Native metadata sorting and aggregations
+
+Declare metadata in `filterFields` and supply it through upsert `filters`, then request:
+
+```js
+const result = await index.search({
+	text: 'running shoes',
+	filter: { field: 'active', comparator: 'equals', value: true },
+	sort: { field: 'price', direction: 'asc', missing: 'last' },
+	limit: 10,
+	aggregations: [
+		{ name: 'brands', type: 'terms', field: 'brand', size: 10 },
+		{ name: 'prices', type: 'stats', field: 'price' },
+		{ name: 'priceBands', type: 'histogram', field: 'price', interval: 25 },
+		{ name: 'ranges', type: 'range', field: 'price', ranges: [{ to: 50 }, { from: 50, to: 100 }, { from: 100 }] },
+	],
+});
+console.log(result.hits, result.aggregations);
+```
+
+Sorting selects the globally correct window before pagination. Pass one sort object or an ordered,
+nonempty array of numeric/string sort objects. Each field has its own `asc`/`desc` direction and
+`first`/`last` missing placement; duplicate fields reject. For arrays it selects the caller's first
+value, rather than a minimum or maximum. Keys compare in request order, then raw UTF-8 ID ascending;
+returned scores keep their original relevance value. Sorted searches return exact totals, even
+without `exactTotal: true`. Omitting `sort` preserves relevance ordering. Boolean sorting and
+metadata-derived score adjustments are not supported.
+
+```js
+sort: [
+	{ field: 'brand', direction: 'asc', missing: 'last' },
+	{ field: 'price', direction: 'desc', missing: 'first' },
+];
+```
+
+Hits and all aggregations use the same query, candidate IDs, filters, and reader snapshot.
+Aggregations cover the full matching set, independently of `offset` and `limit`. Results are a
+named array in request order. Missing metadata contributes no value. Each bucket has `key` and
+`count`; range buckets also expose optional `from` and `to`.
+
+| Type        | Metadata | Result semantics                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `terms`     | String   | Up to `size` top categories, count descending with key ties. Each distinct value counts once per document. Native per-segment candidate selection is approximate: inspect `docCountErrorUpperBound` and `sumOtherDocCount`; a positive error bound can also mean globally important categories were omitted. These are bucket contributions, not a count of distinct omitted documents. |
+| `stats`     | Number   | `count`, `sum`, `min`, `max`, `avg` over all array values, including repeated values. Empty results have count/sum zero and min/max/avg null.                                                                                                                                                                                                                                           |
+| `histogram` | Number   | Populated interval buckets, numeric key ascending; ranges are `[key, key + interval)`. A document counts once per bucket, and can appear in multiple buckets.                                                                                                                                                                                                                           |
+| `range`     | Number   | Ascending contiguous, non-overlapping `[from, to)` ranges. Only first/last may omit their outside endpoint. Tantivy adds uncovered outer buckets; missing values remain excluded. A document counts once per bucket.                                                                                                                                                                    |
+
+Bucket requests (`terms`, `histogram`, `range`) accept child `aggregations`. Tantivy collects children
+within each parent bucket; the corresponding result bucket includes its named `aggregations` array.
+Buckets without children omit that property, preserving the flat result shape.
+Stats are leaves. Names must be unique among siblings; separate branches may reuse names.
+
+```js
+aggregations: [
+	{
+		name: 'brands',
+		type: 'terms',
+		field: 'brand',
+		size: 150,
+		aggregations: [{ name: 'prices', type: 'stats', field: 'price' }],
+	},
+];
+```
+
+There is no fixed limit of eight aggregations or 100 terms/ranges. Requests remain bounded by
+8 MiB of encoded input and 32 aggregation levels. Terms size is a positive u32; native candidate
+oversampling uses checked arithmetic. There are at most 1,024 returned buckets across the entire
+tree, a 16 MiB native aggregation guard, a separate 16 MiB decoded-term-key budget, a 64 MiB
+sort-key budget, and an 8 MiB response budget. Construction costs are checked before opening
+collectors. Nested parent buckets multiply intermediate costs, so a small final result can still
+exceed a budget. Histogram bounds may use an additional bounded native query pass to qualify
+selective requests. Actual bucket/output overflow is checked during collection/encoding.
+Reduce the request shape or terms size after `E_RESOURCE_LIMIT`; splitting global
+top-k requests is not equivalent. See [metadata resource policy](docs/limits.md#metadata-collectors).
+Non-finite aggregate results reject. Search never silently truncates histograms or ranges; terms
+retain Tantivy's explicitly approximate candidate-selection policy. Exact hit totals do not make
+terms an exact category census; do not use top-term counts for billing or reconciliation.
+
+`sort` and `aggregations` are supported by `search()`, including dedicated readers. `searchPage()`
+rejects both: its score/ID continuation cannot represent a metadata boundary. Use ordinary bounded
+offset pagination for sorted results. Aggregation-only requests preserve the normal hits path;
+aggregation collection is a separate bounded pass over the same snapshot. New catalog requests
+use the expensive-search lane and the original shared deadline.
+
+Permissions for aggregate contributions must be expressed in `filter` or `candidateIds` before
+collection. Removing unauthorized hits afterward cannot remove their bucket or numeric contribution.
+See the executable [metadata example](examples/metadata-search.mjs), including typed resource-error
+recovery and rejected metadata continuation, and the [premerge qualification](docs/metadata-premerge.md).
 
 ## Analyzer and field configuration
 
@@ -367,12 +474,32 @@ The public analyzer name and identity-sidecar version jointly identify persisted
 Any future filter or ordering change must use a new analyzer name or sidecar version so existing
 indexes fail closed and rebuild instead of silently changing recall.
 
+## Upgrading from 0.7.x
+
+The unreleased metadata APIs use query API version 6 and native ABI version 11. Deploy the
+JavaScript facade and native addon built from the same revision; the published 0.7.0 addon cannot
+serve these requests. Indexes with a string `filterFields` entry need rebuilding because string
+metadata now also uses raw fast fields. Open and inspection report `E_IDENTITY_MISMATCH` for the
+old schema. Indexes with only numeric/boolean filter fields, or no filter fields, retain their
+existing identity when the rest of the configuration is unchanged.
+
+1. Drain requests and close every reader and writer using the index path.
+2. With the new build, call `resetNativeFullTextIndex({ path, indexId })` using the existing logical
+   index ID. Reset retires the incompatible directory without editing its sidecar.
+3. Open a new generation and rebuild from authoritative source records. Publish its checkpoint
+   only after indexing covers that checkpoint; switch application reads after publication.
+4. Reclaim retired files through `reclaimRetiredNativeFullTextIndexes()` when they are no longer
+   needed. See the [reset/rebuild example](examples/reset-rebuild.mjs) and [lifecycle details](#lifecycle-and-recovery).
+
+Before downgrading, retire a rebuilt string-metadata index with the new build's reset API, then
+rebuild with the older package. Do not force compatibility by changing identity files. See the [tested metadata rebuild procedure](docs/metadata-migration.md) for the full sequence and a real previous-version qualification.
+
 ## Upgrading from 0.6.x
 
 Version 0.7.0 embeds Tantivy 0.27.0 and requires rebuilding existing indexes. The new English
 stemmer changes some terms (`added`: `ad` → `add`), so opening an old index with the same
 `english@2` configuration returns `E_IDENTITY_MISMATCH`. Inspection reports that incompatibility
-before search or mutation. The public analyzer name and query API are unchanged.
+before search or mutation. That release kept the public analyzer name and query API unchanged.
 
 Drain and close readers/writers, call `resetNativeFullTextIndex()` with the existing logical index ID,
 and rebuild from authoritative source records. Use the checkpoint-publication lifecycle to publish
@@ -406,10 +533,10 @@ Search and tracing share a maximum 30-second queue-plus-execution budget. Applic
 shorter remaining request budget through the second method argument; larger values are clamped to
 30 seconds. The budget determines whether queued or completed work is accepted; it is not a
 callback timer. If every eligible worker is already executing non-interruptible work, an expired
-queued request is rejected when a worker next examines it. Ordinary offset search is not
-interruptible, so an expired offset search is discarded after Tantivy returns. Traversal checks its
-deadline during collection. Match tracing
-checks its deadline while tokenizing and matching. With at least two search threads, one worker is
+queued request is rejected when a worker next examines it. Ordinary ranked-hit collection and
+individual synchronous Tantivy operations are not interruptible; expired results are discarded
+after control returns. Exact-count, metadata and traversal collectors check deadlines during
+collection. Match tracing checks its deadline while tokenizing and matching. With at least two search threads, one worker is
 reserved for ordinary bounded `any`/`all` BM25. The remaining workers prioritize phrase, prefix,
 fuzzy, unanchored-negation, exact-total, and trace work, then steal ordinary work when that queue is
 idle. A negation intersected with a positive ordinary clause stays in the ordinary lane. A
@@ -503,7 +630,13 @@ publisher between frames. Searches may still run concurrently with either writer
 ## Lifecycle and recovery
 
 `close()` rejects uncommitted data by default. Use `close({ mode: 'rollback' })` to discard it
-explicitly. `commit()` publishes mutations, and `reload()` makes the latest commit visible to this
+explicitly. Discard close joins the original Tantivy writer. It can finish indexing queued mutations
+and write unpublished segment files before discarding them; it does not advance the committed
+checkpoint. Reserve storage headroom and allow shutdown time for that work. A storage failure during
+this flush can prevent a proven join and reject with `E_QUIESCENCE_FAILED`; restart the process before
+resetting or reopening that path. A failed commit preparation can likewise leave worker ownership
+unproven, so a later close must not clear that restart requirement. Unpublished files are eligible for later native garbage collection.
+`commit()` publishes mutations, and `reload()` makes the latest commit visible to this
 handle's searches. A reload that cannot align Tantivy's snapshot with its checkpoint after three
 bounded attempts returns `E_RELOAD_FAILED`; callers can retry because the reader remains open.
 The failed attempt leaves the reader on its previous aligned snapshot and checkpoint.
@@ -611,10 +744,13 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 9 and packed protocol 5. The loader rejects older addon binaries. Native
-identity sidecar v6 identifies indexes without structured filter fields. Configuring filter fields
-uses sidecar v7, which also fingerprints their names and types. Older v1–v5 indexes remain
-identifiable for safe reset but cannot be reopened; rebuild them from the authoritative source.
+This API uses native ABI 11, query API 6, and packed protocol 7. The loader rejects older addon
+binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
+for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
+columns. Previously released string-metadata indexes must
+be retired and rebuilt from authoritative records; open and inspection reject their old identity.
+Reset recognizes v1–v8. Retire a v8 index with this version before downgrading: the 0.7.0 reset
+parser cannot recognize v8. Never rewrite a sidecar to bypass the rebuild boundary.
 
 ## Diagnostics and errors
 

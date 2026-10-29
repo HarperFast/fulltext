@@ -1,7 +1,7 @@
 # Native search collection
 
 Status: verified against Tantivy 0.27.0 source and local macOS arm64 tests · Owner: Harper
-Engineering · Last verified: 2026-10-26
+Engineering · Last verified: 2026-10-28
 
 `TraversalScoreTieCollector` owns its scorer loop so it can return `E_TIMEOUT` between document
 batches. Keep the ordinary `StableScoreTieCollector` independent: traversal-only boundary and
@@ -45,6 +45,34 @@ Identities 6/7 preserve the layouts of 4/5 while marking Tantivy 0.27's changed 
 Open and inspection compare the complete identity before opening Tantivy. Reset parses both old
 and new identities, allowing retirement without serving old tokens. `english@2` plus the sidecar
 revision is the persisted analysis contract; never rewrite the sidecar to reuse an incompatible index.
+
+## Writer close ownership
+
+Native handle close must retain the original writer until its indexing and merge threads have joined. In pinned
+Tantivy 0.27, `IndexWriter::rollback` replaces the writer; dropping the old writer joins indexing
+workers but does not join its old merges. Waiting on the replacement cannot establish quiescence
+for the original generation. Close therefore consumes the original writer through
+`wait_merging_threads`, which does not publish uncommitted mutations. Dispatch still requires
+explicit discard authorization for dirty handles. Reopen tests preserve committed records and
+payloads while discarding pending upserts and deletes; the gated merge regression holds close
+until the original merge can finish. Do not substitute delayed filesystem cleanup for this ownership
+invariant: reset and retirement depend on completed native I/O.
+
+Joining also drains indexing workers and finalizes pending segments. Discard close therefore pays
+I/O proportional to outstanding work and can leave unpublished files for native garbage collection.
+It needs storage headroom. If finalization fails, Tantivy may return before joining all workers or
+merges; the native outcome must remain unquiesced, producing `E_QUIESCENCE_FAILED` and retaining the
+path reservation until process restart. The indexing-write failure regression pins that conservative
+classification. A failed `prepare_commit` can also detach indexing workers before close begins;
+writer ownership uncertainty must remain sticky through later close attempts, even when joining
+the remaining native handles succeeds. Avoiding this discard I/O while preserving the original merge join would require
+an upstream native lifecycle hook.
+
+The public Rust `Writer::rollback` remains a direct, reusable-writer Tantivy operation, not a
+quiescence barrier. A Rust caller that explicitly rolls back has already replaced the writer;
+a subsequent close cannot join the earlier merges. Terminal Rust shutdown should consume `close`
+directly. Native handles no longer call that rollback primitive. Tracking a broader Rust rollback
+ownership contract remains separate from this native-handle fix.
 
 ## Request preparation
 
@@ -96,12 +124,85 @@ JavaScript’s UTF-16 sort establishes request identity. Native hit ordering use
 field and query-clause order because it can affect scores. Ordinary search keeps its existing
 encoding; Rust does not need to normalize candidates again.
 
+## Metadata collectors
+
+Observed: Rust and public Node tests pass locally on macOS arm64, 2026-10-28.
+
+`Engine::search_inner` validates catalog requests once before building the query on the supplied
+reader snapshot. Only `validate_requests` constructs `ValidatedCatalog`; its private fields and
+collection methods preserve that validation boundary. Sorting and recursive aggregation reuse the query;
+aggregation never runs over the returned hit page. Numeric and string sorts share `collect_sorted`,
+which composes native collectors rather than sorting wrapper-owned results.
+`native-metadata.test.mjs` pins filtered/candidate counts, retained-reader behavior, and every string
+sort direction/missing-order combination. Its sort-key memory regression checks native
+`E_RESOURCE_LIMIT` rejection with 1,199 short values and one 60 KB value, then verifies smaller
+sorted windows and ordinary searches still succeed.
+
+Only string metadata gains a fast column. The writer removes repeated strings per document
+as a storage optimization, preserving first occurrence. Native terms aggregation independently
+deduplicates document contributions; the writer set is not required for correct facet counts. `identity_bytes`
+emits v8 only for string configurations; numeric/Boolean-only v7 and text-only v6 remain
+compatible. The public identity-migration regression checks open, inspection, and reset.
+
+`catalog::DeadlineCollector` wraps metadata collectors and ordinary exact-total Count passes. Its deletion-aware loop keeps
+native top-k/aggregation ownership and checks the shared deadline every 1,024 visited matches.
+`deadline_interrupts_an_active_collection` verifies expiry after collection starts.
+`count_matches` returns native errors so each caller retains its error policy;
+`ordinary_exact_count_preserves_native_error_classification` pins ordinary storage, internal-query
+and timeout codes through the production count branch.
+The shared `error::index_error` maps storage failures consistently for ordinary and metadata
+searches; `metadata_collection_preserves_storage_error_classification` exercises native sorts,
+aggregation and combined count collection.
+
+Native aggregation structure accounting excludes some decoded keys. `sorted_catalog` and
+`aggregate` bound retained keys before creating collectors. Counts use segment live documents
+or dictionary cardinality; a deadline-bound streaming scan can qualify actual maximum key lengths when
+the supported-length estimate fails. Completed maxima use a 1,024-entry FIFO cache keyed by
+immutable segment ID and field. Merges create new segment IDs; deletes leave a conservative
+dictionary maximum, so neither invalidates a cached bound. A completed scan is cached before
+the final timeout check; interrupted scans never populate the cache. Scans run outside the cache
+mutex. A warm-cache qualification compares the mutex with an experimental reader/writer lock across
+eight indexes and up to eight callers; the measured gain missed the declared replacement threshold,
+so the mutex remains. Concurrent cold-miss amplification remains unqualified. Sorting retains the ID contract first,
+measuring IDs only when necessary. If that segment-wide estimate still fails, a deadline-aware
+native Count pass supplies a global matching count that bounds total retained hits across
+segments; the fallback combines it with maximum measured key lengths for the sort budget. Native Searcher and
+TopDocs still own collection. Terms retain native tenfold candidate oversampling.
+Sorted hits, count and aggregates share a native tuple collector; unsorted aggregates preserve
+the ordinary ranked-hits path; their exact totals share that aggregation pass.
+`exact_total_with_aggregations_uses_two_native_query_passes` guards this with real native query
+weights, contrasting two production passes with a separate three-pass control. Segment buffer
+accounting follows the actual executor concurrency while decoded fruits remain budgeted across
+all segments. Engine encodes bounded aggregates once, and native wire encoding
+including its success envelope finishes inside the request permit/deadline;
+`encode_results` bounds the response. Catalog resource tests pin rejection rather than
+partial output. See [metadata resource policy](../docs/limits.md#metadata-collectors).
+
+One- and two-field sorts use native typed computers; three and four fields use native
+erased-type tuples. Four fields use nested pairs because the pinned native flat four-tuple
+does not forward per-field comparators. Larger lists compose native per-field computers into a runtime list as the head of Tantivy's native ID/score tuple. Lazy threshold
+comparison avoids allocating rejected keys. TopDocs owns collection and merging. All paths share
+conservative admission, including retained decoded keys, at most two global threshold-key copies, and list-storage estimates.
+Global merging moves segment keys rather than cloning a second full window. Bucket
+aggregation children map directly to native `sub_aggregation` trees. Resource admission accounts
+for collector construction and possible parent instances before collection. Histogram parents use
+position spans, with native query-scoped probes when conservative admission fails. Histogram safety
+checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
+checks protect each recursive wire/API walker. Packed protocol 7, ABI 11 and query API 6 change
+in lockstep; this expansion does not change persisted identity v8.
+
+Sorted snapshot continuation and metadata-derived score adjustment remain outside this
+increment. Production latency, process-memory residency, and Harper integration are untested.
+
 ## Remaining limits
 
 Local verification covers macOS arm64; use the platform CI results for Linux and Windows. Individual
 Tantivy operations and query construction remain uninterruptible.
 
 ## Sources
+
+- [Metadata collectors and native tests](catalog.rs)
+- [Public metadata regressions](../test/native-metadata.test.mjs)
 
 - [Collector and native tests](engine.rs)
 - [Facade and token identity](../ts/native.ts)

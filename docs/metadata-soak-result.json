@@ -1,0 +1,222 @@
+{
+	"manifest": {
+		"kind": "metadata-mixed-soak",
+		"startedAt": "2026-10-29T04:03:04.813Z",
+		"revision": "9cd24e6d82b8542baff9fec3666a71b66696db5d",
+		"driverSha256": "43ea26cf8c86998037ef8a63c332690d3bbdcefcfa3d512bb9d34bd79605b05e",
+		"loadedAddons": [
+			{
+				"name": "fulltext.darwin-arm64.node",
+				"sha256": "5bef8c466a48c9c34d5443b36a12d67149fea23181c55344dd775cffa1fe165a"
+			}
+		],
+		"oracleSha256": "fad4815db2e79d420031ab27eeab8ddcfdc52ae6065c3d696dab32c886e06ffe",
+		"modulePath": "dist/native.js",
+		"runtime": {
+			"packageVersion": "0.7.0",
+			"tantivyVersion": "0.27.0",
+			"nativeAbiVersion": 11,
+			"queryApiVersion": 6,
+			"queryClassIsolationMinimumSearchThreads": 2,
+			"lifecycleApiVersion": 1,
+			"mutationBatchApiVersion": 5,
+			"storageBackends": ["native"],
+			"limits": {
+				"maxAggregationDepth": 32,
+				"maxAggregationBuckets": 1024,
+				"maxAggregationMemoryBytes": 16777216,
+				"maxSortKeyBytes": 67108864,
+				"maxTermKeyBytes": 16777216,
+				"maxCommitPayloadBytes": 65536,
+				"maxQueryTextBytes": 65536,
+				"maxQueryTerms": 64,
+				"maxQueryClauses": 256,
+				"maxCandidateIds": 1024,
+				"maxCandidateBytes": 1048576,
+				"maxRecordIdBytes": 4096,
+				"maxRecordVersionBytes": 4096,
+				"maxPrefixExpansions": 50,
+				"maxFuzzyTerms": 16,
+				"maxSearchWindow": 10000,
+				"maxSearchPageSize": 10000,
+				"maxFilterStringBytes": 65530,
+				"maxAutocompleteResults": 100,
+				"maxSearchRequestBytes": 8388608,
+				"maxSearchResponseBytes": 8388608,
+				"maxSearchBudgetMilliseconds": 30000,
+				"maxTraceRecords": 100,
+				"maxTraceSourceBytes": 1048576,
+				"maxTraceSpans": 1024,
+				"maxSynonymRules": 1024,
+				"maxSynonymReplacements": 16,
+				"maxSynonymBytes": 1048576
+			}
+		},
+		"machine": {
+			"platform": "darwin",
+			"architecture": "arm64",
+			"node": "v24.16.0",
+			"cpus": 14,
+			"totalMemory": 25769803776
+		},
+		"workload": {
+			"documents": 50000,
+			"readers": 8,
+			"mixedMilliseconds": 1800000,
+			"drainMilliseconds": 600000,
+			"writeInterval": 2000,
+			"sampleInterval": 1000,
+			"upsertsPerPublication": 100,
+			"deletesPerPublication": 10,
+			"restorePriorDeletes": true
+		},
+		"gates": {
+			"maxP95Milliseconds": 250,
+			"maxP99Milliseconds": 5000,
+			"minSuccessesPerSecond": 10,
+			"maxPeakRssGrowthBytes": 268435456,
+			"maxTailRssSpanBytes": 33554432,
+			"tailMilliseconds": 300000,
+			"unexpectedErrors": 0
+		},
+		"measurement": "Public addon, fixed-generation reader leases and source-derived oracles. Fixed latency histograms (0.1 ms bins), bounded recent samples, all samples streamed to disk. No forced GC. Segment observations read committed meta.json; disk samples every 10 seconds. Throughput includes validation and oracle preparation overhead. Mixed-phase query latency includes event-loop stalls from oracle preparation; measurements do not isolate native search latency."
+	},
+	"analysis": {
+		"accepted": false,
+		"error": "mixed: tail RSS span gate exceeded",
+		"completed": 2823976,
+		"publications": 901,
+		"mutations": 108110,
+		"elapsedSeconds": 2401.6205404579996,
+		"throughput": 1175.8626945543426,
+		"peakGrowthMiB": 128.421875,
+		"closeErrors": [],
+		"queries": [
+			{
+				"phase": "mixed",
+				"name": "ordinary-exact",
+				"completed": 520594,
+				"p95Milliseconds": 7.4,
+				"p99Milliseconds": 8.3,
+				"maxMilliseconds": 599.271791000152
+			},
+			{
+				"phase": "mixed",
+				"name": "price-sort",
+				"completed": 520592,
+				"p95Milliseconds": 7.4,
+				"p99Milliseconds": 8.3,
+				"maxMilliseconds": 325.15258300001733
+			},
+			{
+				"phase": "mixed",
+				"name": "nested-histogram",
+				"completed": 520594,
+				"p95Milliseconds": 8.1,
+				"p99Milliseconds": 9,
+				"maxMilliseconds": 601.1653330000117
+			},
+			{
+				"phase": "mixed",
+				"name": "runtime-five-sort",
+				"completed": 520594,
+				"p95Milliseconds": 7.9,
+				"p99Milliseconds": 8.7,
+				"maxMilliseconds": 601.577667000005
+			},
+			{
+				"phase": "drain",
+				"name": "ordinary-exact",
+				"completed": 185398,
+				"p95Milliseconds": 6.9,
+				"p99Milliseconds": 7.3,
+				"maxMilliseconds": 94.95645900024101
+			},
+			{
+				"phase": "drain",
+				"name": "price-sort",
+				"completed": 185402,
+				"p95Milliseconds": 7.4,
+				"p99Milliseconds": 7.6,
+				"maxMilliseconds": 75.94783299975097
+			},
+			{
+				"phase": "drain",
+				"name": "runtime-five-sort",
+				"completed": 185401,
+				"p95Milliseconds": 7.8,
+				"p99Milliseconds": 8.3,
+				"maxMilliseconds": 96.0188749996014
+			},
+			{
+				"phase": "drain",
+				"name": "nested-histogram",
+				"completed": 185401,
+				"p95Milliseconds": 7.9,
+				"p99Milliseconds": 8.4,
+				"maxMilliseconds": 95.1710000000894
+			}
+		],
+		"finalQueues": {
+			"searchQueuedCommands": "0",
+			"searchQueuedBytes": "0",
+			"writerQueuedCommands": "0",
+			"writerQueuedBytes": "0"
+		},
+		"tails": {
+			"mixed": {
+				"samples": 300,
+				"minimumMiB": 147.609375,
+				"maximumMiB": 261.984375,
+				"spanMiB": 114.375,
+				"lastMinusFirstMiB": 2.140625
+			},
+			"drain": {
+				"samples": 300,
+				"minimumMiB": 93.484375,
+				"maximumMiB": 132.453125,
+				"spanMiB": 38.96875,
+				"lastMinusFirstMiB": 37.15625
+			}
+		}
+	},
+	"independentPostfailureReopen": {
+		"kind": "independent-postfailure-reopen",
+		"checkpoint": "soak:901",
+		"sourceDocuments": 49990,
+		"cases": 4,
+		"accepted": true,
+		"scope": "Independent retained-index verification after failed RSS gate; does not change soak acceptance"
+	},
+	"artifactAvailability": "Raw samples, retained index and host telemetry remain local; fingerprints identify those files, not public archival availability.",
+	"artifacts": {
+		"manifest.json": {
+			"bytes": 2595,
+			"sha256": "11b62f68259e89b31f1cddd25c22d27314d20c0c5142d40bbc844a3dffcebd0d"
+		},
+		"samples.ndjson": {
+			"bytes": 1264136,
+			"sha256": "ce6d98559e4403d3c02ae2027627be7040a63862e69a0cfacf3c5f8e0f9a9e2b"
+		},
+		"failure.json": {
+			"bytes": 44272,
+			"sha256": "d2aefcdf3822dc8360e0a4ae4027d110928887f3df16a52008e23cc0897927ea"
+		},
+		"analysis.json": {
+			"bytes": 2385,
+			"sha256": "04547e3832b28b79d9a20d7e1a650b2ac127259eb15de6db8f704f44ebd9fc53"
+		},
+		"postfailure-reopen.json": {
+			"bytes": 246,
+			"sha256": "e513c4ffb2665dd93986fabce20eb88b7b0f89b922ff07ae83ac4b80827dde3e"
+		},
+		"host-memory.ndjson": {
+			"bytes": 177185,
+			"sha256": "45ffbc0950786eb5ce9e859cb467f116c13103ec72f29446fb523bb49bdd2072"
+		},
+		"top-memory-drain.txt": {
+			"bytes": 599,
+			"sha256": "3ec1d09e28083778ae8b03c5c167e05b5dbac73bc311aa57af610b0e068feb37"
+		}
+	}
+}
