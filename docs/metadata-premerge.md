@@ -1,6 +1,6 @@
 # Metadata premerge acceptance
 
-Status: local acceptance runs passed; historical RSS observation remains unexplained and requires review before merge. Owner: Harper Engineering · Last reviewed: 2026-10-28.
+Status: draft — short local gates passed; the 40-minute mixed soak failed its unchanged RSS-span gate. Review memory qualification before merge. Owner: Harper Engineering · Last reviewed: 2026-10-29.
 
 Merge qualification covers the public metadata contract, a representative local synthetic workload,
 and a local Harper Table source-journal reconstruction exercise. It does not qualify a production
@@ -18,6 +18,8 @@ service, deployed fulltext adapter, distributed replication, or a production lat
 | Timeout recovery     | Real 1 ms budgets may expire cooperatively; full-budget requests afterward return exact totals and drain queues.                                               | Verified: final count-load run; details below.                                                 |
 | Workload correctness | Compare metadata results with fixture-derived expected values at every tested caller width; normal requests have zero errors; timed failures recover.          | Verified: final quiet flat pairs and expanded observation passed the declared gates.           |
 | Local source handoff | Rebuild from actual Harper Table records, catch up the source journal, verify checkpoint-aligned cutover, and reconstruct rollback from retained source state. | Verified locally: checkpoints 7, 10 and 11, child-process reopen and old-build reconstruction. |
+
+| Mixed soak | Preserve exact results during publication and writer drain; satisfy declared latency, throughput and memory gates. | Failed RSS-span gate; correctness, latency and independent final-checkpoint reopen passed. |
 
 ## Declared workload gates
 
@@ -177,6 +179,51 @@ distributed replication, or production fulltext adapter. Stop qualification if a
 missing, a checkpoint advances before its mutations are indexed, or a reopened generation disagrees
 with source records.
 
+## Observed 40-minute mixed soak result
+
+Observed on 2026-10-29: **not accepted**. The unchanged 32 MiB final-five-minute resident set
+size (RSS) span gate failed. Keep this result alongside the earlier unexplained short-run flag;
+this observation does not explain that historical failure.
+
+| Measurement                        | Observed result                                  | Declared gate               |
+| ---------------------------------- | ------------------------------------------------ | --------------------------- |
+| Checked queries                    | 2,823,976; zero query/source-oracle errors       | Zero errors                 |
+| Publications / measured mutations  | 901 / 108,110                                    | Mixed writes for 30 minutes |
+| Total measured time / throughput   | 2,401.621 seconds / 1,175.863 queries per second | At least 10 per second      |
+| Worst phase/case p95 / p99         | 8.1 / 9.0 ms                                     | At most 250 / 5,000 ms      |
+| Sampled peak RSS growth            | 128.422 MiB                                      | At most 256 MiB             |
+| Mixed final-five-minute RSS span   | 114.375 MiB (147.609–261.984 MiB)                | At most 32 MiB              |
+| Drain final-five-minute RSS span   | 38.969 MiB (93.484–132.453 MiB)                  | At most 32 MiB              |
+| Final sampled search/writer queues | Zero commands and bytes                          | Drained                     |
+
+The mixed-window excursion includes a sharp RSS drop at minute 26.8 and rebound one sample later;
+its first-to-last change was +2.141 MiB. The drain window ended +37.156 MiB above its first sample.
+The symmetric span gate detects decreases as well as increases. Neither this run nor those
+endpoints establish a leak or leak absence. Heap capacity also changed substantially; the
+contribution of JavaScript collection, native allocation and host residency remains unproven.
+A later external host sampler observed substantial swap/compressed memory, but started after the
+mixed excursion and cannot establish its cause. Do not loosen the gate or relabel this run passed.
+
+Writer drain completed and failure cleanup reported no close errors. The driver exited nonzero
+at the mixed RSS assertion, before its normal final-reopen and index-removal path. A separate
+post-failure readonly reopen verified `soak:901`, all four query scenarios and hit versions against
+49,990 reconstructed source records. This independent check does not change soak acceptance.
+Raw samples independently establish the drain span, throughput and final queues; those later
+assertions were not reached by the failed driver.
+
+The local retained artifact directory is `fulltext-metadata-soak-20261029-01` under the operator's
+scratch parent. It contains the manifest, all one-second samples, failure diagnostics, retained
+native index, offline `analysis.json`, `postfailure-reopen.json`, and later external host samples.
+The run used the [reviewed soak revision](https://github.com/HarperFast/fulltext/commit/9cd24e6d82b8542baff9fec3666a71b66696db5d).
+Raw artifacts are local evidence, not a portable or publicly archived dataset. The committed
+[soak summary](metadata-soak-result.json) preserves the measurements and artifact fingerprints.
+
+Next: investigate on an isolated host with process physical/compressed footprint and allocator/GC
+telemetry captured from startup. Preserve the existing gate and distinguish retained allocation
+from changes in resident pages before deciding whether a different memory acceptance criterion
+is justified. Track that decision in
+[Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
+
 ## Longer mixed read/write soak procedure
 
 The source-only `benchmarks/metadata-soak.mjs` driver reuses the workload oracle. Defaults run
@@ -213,7 +260,8 @@ a passing rerun cannot explain an earlier failure. See [measurement invariants](
 
 ## Open items
 
-- Review the retained unexplained RSS observation before merge; final acceptance runs passed.
+- Resolve the failed long-soak memory qualification before merge; short acceptance runs passed.
+  The earlier unexplained RSS observation also remains retained.
   Earlier timings overlapping compilation are excluded from acceptance.
 - Qualify a consuming application's adapter, retention policy, downtime tolerance, distributed
   catch-up, and production cutover/rollback separately. No existing main/core/pro fulltext adapter
@@ -227,6 +275,8 @@ a passing rerun cannot explain an earlier failure. See [measurement invariants](
 - [Executable Harper Table qualification](../scripts/qualify-harper-metadata.mjs).
 - [Public count-load timeout driver](../benchmarks/metadata-count-load.mjs).
 - [Synthetic workload driver](../benchmarks/metadata-workload.mjs).
+- [Mixed soak driver](../benchmarks/metadata-soak.mjs), [shared source oracle](../benchmarks/metadata-oracle.mjs),
+  and [retained measurement summary](metadata-soak-result.json).
 - [Native close lifecycle and regression](../src/engine.rs).
 - [Public metadata contract](../README.md#native-metadata-sorting-and-aggregations).
 - [Resource policy](limits.md#metadata-collectors).
