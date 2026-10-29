@@ -506,7 +506,7 @@ indexes fail closed and rebuild instead of silently changing recall.
 
 ## Upgrading from 0.7.x
 
-The unreleased metadata APIs use query API version 6 and native ABI version 11. Deploy the
+The unreleased metadata APIs use query API version 6 and native ABI version 12. Deploy the
 JavaScript facade and native addon built from the same revision; the published 0.7.0 addon cannot
 serve these requests. Indexes with a string `filterFields` entry need rebuilding because string
 metadata now also uses raw fast fields. Open and inspection report `E_IDENTITY_MISMATCH` for the

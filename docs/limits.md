@@ -138,8 +138,8 @@ Retained readers need bounded lifetimes and counts, cleanup on every exit path, 
 routing, and explicit expiration on restart/rebuild. Native snapshots freeze indexed hits, not
 current source values or permissions. Current authorization and version checks remain necessary.
 
-The 64-term/256-clause configuration policy is tracked in [Make query term and clause limits
-configurable with bounded resource policy](https://github.com/HarperFast/fulltext/issues/63).
+The configurable 64-term/256-clause default policy is described in
+[query capacity](#query-capacity-policy).
 Long-token omission and language/analyzer changes require a versioned analyzer and rebuild rather
 than silently raising a constant.
 
