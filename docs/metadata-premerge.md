@@ -262,8 +262,15 @@ a passing rerun cannot explain an earlier failure. See [measurement invariants](
 - The Windows Node 22 workload smoke exceeded its unchanged 60-second child deadline in both
   [original and diagnostic rerun attempts](https://github.com/HarperFast/fulltext/actions/runs/40819482729).
   Prior Windows Node 22 and current Windows Node 24 runs completed in approximately 40 seconds.
-  Cause remains unproven. Coarse stage-start diagnostics now preserve elapsed times on success
-  and termination; inspect those before changing scheduling, fixtures or timeouts.
+  [The instrumented run](https://github.com/HarperFast/fulltext/actions/runs/40822179000) then exceeded
+  the same deadline on both Windows versions. Query cases finished in 1.1–1.3 seconds; long-key
+  pressure preparation reached 35.9–38.6 seconds, then close remained unfinished at the deadline.
+  A separate Windows Node 22 inspection/publication test returned `E_STORAGE` with access denied
+  writing a fieldnorm file; its cause is also unproven. The runner now reserves a serial batch for
+  the two qualification files, retaining fixtures, debug build and deadlines. This is a controlled
+  contention experiment, not a demonstrated fix. Preserve successful stage profiles and compare
+  actual ingestion/close durations; a green rerun or absent access-denied error does not establish
+  either cause or resolution.
 
 - Resolve the failed long-soak memory qualification before merge; short acceptance runs passed.
   The earlier unexplained RSS observation also remains retained.

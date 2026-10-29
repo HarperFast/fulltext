@@ -52,10 +52,12 @@ test(
 			context.diagnostic(error.stderr || error.message);
 			throw error;
 		});
+		context.diagnostic(stderr.trim());
 		const report = JSON.parse(stdout);
 		const diagnostics = stderr
 			.trim()
 			.split('\n')
+			.filter((line) => line.startsWith('{'))
 			.map((line) => JSON.parse(line));
 		const premeasurement = diagnostics.find(({ phase }) => phase === 'premeasurement-gates');
 		const stages = diagnostics.filter(({ phase }) => phase === 'progress');

@@ -23,14 +23,23 @@ if (files.length === 0) {
 }
 
 const isolatedFiles = files.filter((file) => path.basename(file).startsWith('native-worker.'));
-const concurrentFiles = files.filter((file) => !isolatedFiles.includes(file));
+const qualificationNames = new Set(['metadata-workload.test.mjs', 'metadata-soak.test.mjs']);
+const qualificationFiles = files.filter((file) => qualificationNames.has(path.basename(file)));
+if (phase === 'test' && qualificationFiles.length !== qualificationNames.size) {
+	throw new Error('Expected both metadata qualification test files in the serial batch');
+}
+const concurrentFiles = files.filter((file) => !isolatedFiles.includes(file) && !qualificationFiles.includes(file));
 const nodeMajorVersion = Number.parseInt(process.versions.node, 10);
 const isolatedTestTimeout = 900_000;
-for (const batch of [concurrentFiles, isolatedFiles]) {
+for (const batch of [concurrentFiles, qualificationFiles, isolatedFiles]) {
 	if (batch.length === 0) {
 		continue;
 	}
 	const arguments_ = ['--test'];
+	if (batch === qualificationFiles) {
+		console.log('Running metadata qualification files serially');
+		arguments_.push('--test-concurrency=1');
+	}
 	if (process.env.FULLTEXT_TEST_COVERAGE === '1') {
 		arguments_.push('--experimental-test-coverage', '--test-coverage-include=dist/**/*.js');
 	}

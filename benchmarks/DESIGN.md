@@ -33,3 +33,10 @@ query count or duration. Progress includes no native status and never polls a cl
 Only verified cleanup permits an accepted stdout report. The child-process test preserves progress
 on timeout and prints successful profiles too, so platform differences can be localized without
 changing the workload or deadline. A killed-child regression verifies named-stage retention.
+
+The Node test runner reserves a separate serial batch for the workload and soak qualification
+files. Their fixed child deadlines must not compete with other native test files. An exact-name
+count guard fails on a missing or duplicated qualification file; release and optimized phases
+remain separate. Native-worker tests retain their existing shared-process isolation batch.
+Keep successful stage profiles: a green isolated run alone does not establish why a concurrent
+run exceeded its deadline. Compare ingestion and close durations before attributing contention.
