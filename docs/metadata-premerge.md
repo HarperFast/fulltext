@@ -1,6 +1,6 @@
 # Metadata premerge acceptance
 
-Status: draft — short local gates passed; the 40-minute mixed soak failed its unchanged RSS-span gate. Review memory qualification before merge. Owner: Harper Engineering · Last reviewed: 2026-10-29.
+Status: draft — short local gates passed; the 40-minute mixed soak failed its unchanged RSS-span gate. Production Linux sustained-memory qualification is a nonblocking follow-up unless retention or inadequate headroom is demonstrated; macOS is a development platform. Owner: Harper Engineering · Last reviewed: 2026-10-29.
 
 Merge qualification covers the public metadata contract, a representative local synthetic workload,
 and a local Harper Table source-journal reconstruction exercise. It does not qualify a production
@@ -248,7 +248,7 @@ The artifact directory must be new. It retains `manifest.json`, streamed `sample
 driver/oracle hashes, loaded-addon identities where reported by Node, machine and runtime details,
 workload and gates. Samples include RSS, heap/external memory, queues, committed segment counts
 and periodic disk observations. Histograms and recent samples stay bounded in memory. No forced
-GC is performed. Instrumentation and source-oracle allocations remain part of process RSS. Mixed-phase query
+GC is performed. Instrumentation and source-oracle allocations remain part of process RSS. The oracle now encodes sort strings and IDs once per distinct value per preparation; historical runs used comparator-time Buffer allocation and retain their original fingerprints. Mixed-phase query
 latency includes event-loop stalls from source-oracle preparation; it does not isolate native latency.
 
 A pass is emitted only after close, final-checkpoint reopen/verification and native index cleanup.
@@ -271,9 +271,19 @@ a passing rerun cannot explain an earlier failure. See [measurement invariants](
   contention experiment, not a demonstrated fix. Preserve successful stage profiles and compare
   actual ingestion/close durations; a green rerun or absent access-denied error does not establish
   either cause or resolution.
+  [Current reviewed-head CI](https://github.com/HarperFast/fulltext/actions/runs/40823736210) subsequently
+  passed both Windows Node versions with unchanged deadlines: Node 22 close took 23.244 seconds
+  (cleanup complete at 46.026 seconds), Node 24 close took 20.389 seconds (43.573 seconds).
+  These profiles resolve the pending CI result, not the attribution of earlier failures.
 
-- Resolve the failed long-soak memory qualification before merge; short acceptance runs passed.
-  The earlier unexplained RSS observation also remains retained.
+- Preserve the failed macOS long-soak memory measurements and earlier unexplained observation.
+  Kyle clarified that macOS is not used in production; attribution there is a separate development-platform follow-up.
+  The Linux control passed unchanged gates; the instrumented Linux comparison failed its 32 MiB
+  drain RSS-span gate at 40.625 MiB. RSS variation correlated with V8 physical heap expansion,
+  without establishing cause or leak absence. Longer repeated-cycle Linux memory qualification is
+  nonblocking unless accumulating retention or inadequate headroom is demonstrated, tracked in
+  [Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
+  No failed run is relabeled accepted and no gate is relaxed.
   Earlier timings overlapping compilation are excluded from acceptance.
 - Qualify a consuming application's adapter, retention policy, downtime tolerance, distributed
   catch-up, and production cutover/rollback separately. No existing main/core/pro fulltext adapter

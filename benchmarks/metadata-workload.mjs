@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import { prepareOracle, validate } from './metadata-oracle.mjs';
+import { closeIndex } from './metadata-cleanup.mjs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -368,18 +369,23 @@ try {
 		qualification: 'pass',
 	};
 } finally {
-	try {
-		if (pressure) progress('long-keys-close');
-		await pressure?.close(completedReport ? undefined : { mode: 'rollback' });
-	} finally {
+	const closeErrors = [];
+	for (const [target, stage] of [
+		[pressure, 'long-keys-close'],
+		[index, 'catalog-close'],
+	]) {
+		if (!target) continue;
+		progress(stage);
 		try {
-			if (index) progress('catalog-close');
-			await index?.close(completedReport ? undefined : { mode: 'rollback' });
-		} finally {
-			progress('index-remove');
-			await rm(directory, { recursive: true, force: true });
+			await closeIndex(target, completedReport ? undefined : { mode: 'rollback' });
+		} catch (error) {
+			closeErrors.push(error);
 		}
 	}
+	if (closeErrors.length)
+		throw new AggregateError(closeErrors, `native cleanup failed; index retained at ${directory}`);
+	progress('index-remove');
+	await rm(directory, { recursive: true, force: true });
 }
 progress('cleanup-complete');
 console.log(JSON.stringify(completedReport, null, 2));

@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const execute = promisify(execFile);
+import { executeDriver } from './fixtures/metadata-driver-process.mjs';
+import { prepareOracle } from '../benchmarks/metadata-oracle.mjs';
 const driver = fileURLToPath(new URL('../benchmarks/metadata-workload.mjs', import.meta.url));
 
 test(
@@ -16,7 +18,8 @@ test(
 	async (context) => {
 		const scratch = await mkdtemp(path.join(tmpdir(), 'fulltext-workload-test-'));
 		context.after(() => rm(scratch, { recursive: true, force: true }));
-		const { stdout, stderr } = await execute(
+		const { stdout, stderr } = await executeDriver(
+			context,
 			process.execPath,
 			[
 				driver,
@@ -48,10 +51,7 @@ test(
 				'30000',
 			],
 			{ timeout: 60_000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1' } },
-		).catch((error) => {
-			context.diagnostic(error.stderr || error.message);
-			throw error;
-		});
+		);
 		context.diagnostic(stderr.trim());
 		const report = JSON.parse(stdout);
 		const diagnostics = stderr
@@ -208,8 +208,7 @@ test(
 		child.stderr.on('data', (chunk) => {
 			observed += chunk;
 			if (!killedAtStage && observed.includes('"stage":"catalog-open"')) {
-				killedAtStage = true;
-				child.kill();
+				killedAtStage = child.kill();
 			}
 		});
 		await assert.rejects(pending, (error) => {
@@ -220,9 +219,96 @@ test(
 				.split('\n')
 				.filter((line) => line.startsWith('{') && line.endsWith('}'))
 				.map((line) => JSON.parse(line));
-			assert(events.some(({ stage }) => stage === 'catalog-open'));
+			assert.strictEqual(events[0].phase, 'premeasurement-gates');
+			const stages = events.filter(({ phase }) => phase === 'progress');
+			assert(stages.some(({ stage }) => stage === 'addon-import'));
+			for (let i = 1; i < stages.length; i++)
+				assert(stages[i].elapsedMilliseconds >= stages[i - 1].elapsedMilliseconds);
 			assert(!events.some(({ stage }) => stage === 'cleanup-complete'));
 			return true;
 		});
 	},
 );
+
+test('workload diagnostics retain actual execFile timeout stderr', { timeout: 10_000 }, async () => {
+	const diagnostics = [];
+	await assert.rejects(
+		executeDriver(
+			{ diagnostic: (text) => diagnostics.push(text) },
+			process.execPath,
+			['--input-type=module', '-e', "console.error(JSON.stringify({ stage: 'waiting' })); setInterval(() => {}, 1000)"],
+			{ timeout: 1000 },
+		),
+		(error) => {
+			assert(error.killed);
+			assert.strictEqual(diagnostics.length, 1);
+			assert.strictEqual(diagnostics[0], error.stderr);
+			assert.strictEqual(JSON.parse(diagnostics[0]).stage, 'waiting');
+			return true;
+		},
+	);
+});
+
+test('workload retains indexes and reports resolved cleanup errors', { timeout: 30_000 }, async (context) => {
+	const scratch = await mkdtemp(path.join(tmpdir(), 'fulltext-workload-cleanup-test-'));
+	context.after(() => rm(scratch, { recursive: true, force: true }));
+	await assert.rejects(
+		execute(
+			process.execPath,
+			[
+				driver,
+				'--scratch',
+				scratch,
+				'--documents',
+				'20',
+				'--rounds',
+				'1',
+				'--queries',
+				'1',
+				'--concurrency',
+				'1',
+				'--features',
+				'flat',
+				'--min-throughput',
+				'1000000000000',
+				'--module',
+				fileURLToPath(new URL('./fixtures/metadata-close-failure.mjs', import.meta.url)),
+			],
+			{
+				timeout: 25_000,
+				env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1', FULLTEXT_TEST_CLOSE_KIND: 'writer' },
+			},
+		),
+		(error) => {
+			assert.strictEqual(error.stdout, '');
+			assert.match(error.stderr, /native cleanup failed/);
+			assert.match(error.stderr, /E_CLOSE_FAILED/);
+			return true;
+		},
+	);
+	assert((await readdir(scratch)).length > 0, 'cleanup failure must retain index evidence');
+});
+
+test('source oracle prepares string keys once while retaining raw UTF-8 ordering', () => {
+	let reads = 0;
+	const selected = Array.from({ length: 200 }, (_, i) => ({
+		id: `id-${i}`,
+		get brand() {
+			reads++;
+			return ['é', '\uE000', '\u{10000}', 'a'][i % 4];
+		},
+	}));
+	const scenario = { selected, request: { sort: { field: 'brand', direction: 'asc' } } };
+	prepareOracle(scenario);
+	assert(reads <= selected.length * 2, 'sort comparisons must reuse prepared keys');
+	const expected = [...selected].sort(
+		(a, b) =>
+			Buffer.compare(Buffer.from(a.brand), Buffer.from(b.brand)) ||
+			Buffer.compare(Buffer.from(a.id), Buffer.from(b.id)),
+	);
+	assert.deepStrictEqual(
+		scenario.expected.ids,
+		expected.slice(0, 10).map(({ id }) => id),
+	);
+	assert.strictEqual(scenario.expected.total, selected.length);
+});

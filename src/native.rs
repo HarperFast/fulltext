@@ -1996,6 +1996,9 @@ fn close_result(outcome: WriterCloseOutcome) -> Result<Vec<u8>> {
 }
 
 fn quiescence_error(error: FulltextError) -> FulltextError {
+	if error.code == "E_QUIESCENCE_FAILED" {
+		return error;
+	}
 	FulltextError::new(
 		"E_QUIESCENCE_FAILED",
 		format!("native writer teardown did not prove quiescence: {error}"),
@@ -3188,6 +3191,16 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn quiescence_errors_preserve_classification_without_duplicate_prefix() {
+		let original = FulltextError::new("E_QUIESCENCE_FAILED", "worker ownership unproven");
+		assert_eq!(quiescence_error(original.clone()), original);
+		let storage = quiescence_error(FulltextError::new("E_STORAGE", "join failed"));
+		assert_eq!(storage.code, "E_QUIESCENCE_FAILED");
+		assert!(storage.message.contains("E_STORAGE: join failed"));
+	}
+
 	use std::sync::mpsc;
 	use tantivy::directory::error::LockError;
 

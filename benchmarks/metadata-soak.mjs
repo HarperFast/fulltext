@@ -8,6 +8,7 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { prepareOracle, validate } from './metadata-oracle.mjs';
+import { closeIndex } from './metadata-cleanup.mjs';
 
 const argument = (name, fallback) => {
 	const at = process.argv.indexOf(name);
@@ -61,9 +62,11 @@ const manifest = {
 		cwd: fileURLToPath(new URL('..', import.meta.url)),
 	}).trim(),
 	driverSha256: await hash(fileURLToPath(import.meta.url)),
-	loadedAddons: await Promise.all(addonFiles.map(async (file) => ({ path: file, sha256: await hash(file) }))),
+	loadedAddons: await Promise.all(
+		addonFiles.map(async (file) => ({ name: path.basename(file), sha256: await hash(file) })),
+	),
 	oracleSha256: await hash(fileURLToPath(new URL('./metadata-oracle.mjs', import.meta.url))),
-	modulePath,
+	module: { name: path.basename(modulePath), sha256: await hash(modulePath) },
 	runtime,
 	machine: {
 		platform: process.platform,
@@ -260,7 +263,7 @@ function retire(lease) {
 	lease.retired = true;
 	if (lease.active || lease.closing) return;
 	lease.closing = true;
-	const operation = bounded(lease.reader.close(), 'reader close').then(() => leases.delete(lease));
+	const operation = bounded(closeIndex(lease.reader), 'reader close').then(() => leases.delete(lease));
 	closing.add(operation);
 	operation.then(
 		() => closing.delete(operation),
@@ -285,6 +288,8 @@ async function installReader() {
 }
 async function collectSample() {
 	const now = performance.now();
+	const samplePhase = phase;
+	const samplePhaseStarted = phaseStarted;
 	const memory = process.memoryUsage();
 	sampledPeak = Math.max(sampledPeak, memory.rss);
 	const statuses = [...leases].filter((lease) => !lease.closing).map((lease) => lease.reader.status());
@@ -316,9 +321,9 @@ async function collectSample() {
 		lastDiskAt = now;
 	}
 	const sample = {
-		phase,
+		phase: samplePhase,
 		elapsedMilliseconds: now - measuredStarted,
-		phaseElapsedMilliseconds: now - phaseStarted,
+		phaseElapsedMilliseconds: now - samplePhaseStarted,
 		memory,
 		completed,
 		publications,
@@ -337,10 +342,10 @@ async function collectSample() {
 	maximumSegments = Math.max(maximumSegments, sample.segments);
 	maximumDiskBytes = Math.max(maximumDiskBytes, disk.bytes);
 	await telemetry.write(stringify(sample) + '\n');
-	if (recent[phase]) {
-		recent[phase].push({ elapsedMilliseconds: now, rss: memory.rss, heap: memory.heapUsed });
-		while (recent[phase].length > 1 && recent[phase][0].elapsedMilliseconds < now - gates.tailMilliseconds)
-			recent[phase].shift();
+	if (recent[samplePhase]) {
+		recent[samplePhase].push({ elapsedMilliseconds: now, rss: memory.rss, heap: memory.heapUsed });
+		while (recent[samplePhase].length > 1 && recent[samplePhase][0].elapsedMilliseconds < now - gates.tailMilliseconds)
+			recent[samplePhase].shift();
 	}
 	assert(memory.rss - baseline.rss <= gates.maxPeakRssGrowthBytes, 'RSS peak-growth gate exceeded');
 	return sample;
@@ -430,7 +435,7 @@ try {
 	}
 	if (firstError) throw firstError;
 	writerClosing = true;
-	await bounded(writer.close(), 'writer drain');
+	await bounded(closeIndex(writer), 'writer drain');
 	writerClosed = true;
 	phase = 'drain';
 	phaseStarted = performance.now();
@@ -484,7 +489,7 @@ try {
 		for (const scenario of current.scenarios)
 			verify(await reopened.search(scenario.request, { remainingBudgetMilliseconds: budget }), scenario);
 	} finally {
-		await bounded(reopened.close(), 'reopened reader close');
+		await bounded(closeIndex(reopened), 'reopened reader close');
 	}
 	await telemetry.close();
 	telemetryClosed = true;
@@ -520,14 +525,14 @@ try {
 	const closeErrors = [];
 	for (const lease of leases) {
 		try {
-			await bounded(lease.reader.close(), 'failure reader close');
+			await bounded(closeIndex(lease.reader), 'failure reader close');
 		} catch (closeError) {
 			closeErrors.push(String(closeError));
 		}
 	}
 	if (writer && !writerClosed) {
 		try {
-			await bounded(writer.close({ mode: 'rollback' }), 'failure writer close');
+			await bounded(closeIndex(writer, { mode: 'rollback' }), 'failure writer close');
 		} catch (closeError) {
 			closeErrors.push(String(closeError));
 		}

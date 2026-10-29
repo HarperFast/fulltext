@@ -14,6 +14,8 @@ Source-oracle preparation and validation costs remain part of observed process b
 fixture does not attribute RSS growth solely to native allocations. Mixed-phase query latency
 also includes event-loop stalls while the next source oracle is prepared.
 
+A resolved close result carrying `cleanupError` is a qualification failure, even when native resources were released. Both drivers inspect every native close result before claiming cleanup. Sampling captures the phase and phase start with the memory observation, before asynchronous diagnostics. Sort-key encoding is prepared once per distinct string per oracle preparation, outside comparisons; it remains part of measured process behavior. Historical driver/oracle hashes distinguish prior allocation behavior.
+
 Successful reporting follows writer drain, query completion, reader close, final checkpoint reopen
 and source verification, then index-directory removal. Operational failures before cleanup retain the index and diagnostics, including close errors.
 A reporting failure after cleanup records that the index is absent; it never emits a successful

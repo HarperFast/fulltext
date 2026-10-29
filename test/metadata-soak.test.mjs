@@ -53,6 +53,7 @@ async function verifyRetainedSamples(artifacts) {
 	assert(samples.some(({ phase }) => phase === 'mixed'));
 	assert(samples.some(({ phase }) => phase === 'drain'));
 	for (const sample of samples) {
+		assert(sample.phaseElapsedMilliseconds >= 0, 'sample phase must match its measurement time');
 		assert(sample.memory.rss > 0);
 		assert(sample.memory.heapUsed > 0);
 		assert(Number.isInteger(sample.segments) && sample.segments > 0);
@@ -154,3 +155,30 @@ test('report artifact write failure cannot emit an accepted soak result', { time
 	await verifyRetainedSamples(artifacts);
 	await assert.rejects(access(path.join(artifacts, 'index')), { code: 'ENOENT' });
 });
+
+for (const kind of ['writer', 'reader'])
+	test(`soak rejects resolved ${kind} cleanup errors and retains evidence`, { timeout: 45_000 }, async (context) => {
+		const { artifacts, args } = await fixture(context);
+		await assert.rejects(
+			execute(
+				process.execPath,
+				[...args, '--module', fileURLToPath(new URL('./fixtures/metadata-close-failure.mjs', import.meta.url))],
+				{
+					timeout: 40_000,
+					maxBuffer: 4 << 20,
+					env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1', FULLTEXT_TEST_CLOSE_KIND: kind },
+				},
+			),
+			(error) => {
+				assert.strictEqual(error.stdout, '');
+				assert.match(error.stderr, /E_CLOSE_FAILED/);
+				return true;
+			},
+		);
+		const failure = await readJson(path.join(artifacts, 'failure.json'));
+		assert.strictEqual(failure.accepted, false);
+		assert.strictEqual(failure.error.code, 'E_CLOSE_FAILED');
+		assert.strictEqual(failure.indexRetained, path.join(artifacts, 'index'));
+		assert(Array.isArray(failure.closeErrors));
+		await assert.rejects(access(path.join(artifacts, 'report.json')), { code: 'ENOENT' });
+	});

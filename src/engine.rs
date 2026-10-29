@@ -2359,10 +2359,13 @@ impl Writer {
 	pub fn close(self) -> Result<()> {
 		let result = self.inner.wait_merging_threads().map_err(index_error);
 		if self.worker_ownership_unproven {
-			return Err(FulltextError::new(
-				"E_QUIESCENCE_FAILED",
-				"Tantivy commit preparation left worker ownership unproven; restart before reusing this generation",
-			));
+			let mut message =
+				"Tantivy commit preparation left worker ownership unproven; restart before reusing this generation"
+					.to_owned();
+			if let Err(error) = result {
+				message.push_str(&format!("; writer join also reported: {error}"));
+			}
+			return Err(FulltextError::new("E_QUIESCENCE_FAILED", message));
 		}
 		result
 	}

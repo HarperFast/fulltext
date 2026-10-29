@@ -6,12 +6,12 @@
 		"driverSha256": "43ea26cf8c86998037ef8a63c332690d3bbdcefcfa3d512bb9d34bd79605b05e",
 		"loadedAddons": [
 			{
-				"path": "/Users/kyle/WebstormProjects/fulltext/.Codex/worktrees/sorting-facets-filters/fulltext.darwin-arm64.node",
+				"name": "fulltext.darwin-arm64.node",
 				"sha256": "5bef8c466a48c9c34d5443b36a12d67149fea23181c55344dd775cffa1fe165a"
 			}
 		],
 		"oracleSha256": "fad4815db2e79d420031ab27eeab8ddcfdc52ae6065c3d696dab32c886e06ffe",
-		"modulePath": "/Users/kyle/WebstormProjects/fulltext/.Codex/worktrees/sorting-facets-filters/dist/native.js",
+		"modulePath": "dist/native.js",
 		"runtime": {
 			"packageVersion": "0.7.0",
 			"tantivyVersion": "0.27.0",

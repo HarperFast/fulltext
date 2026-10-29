@@ -6,19 +6,32 @@ export function prepareOracle(scenario) {
 			? scenario.request.sort
 			: [scenario.request.sort]
 		: [];
-	const ordered = [...scenario.selected].sort((a, b) => {
-		for (const sort of sorts) {
-			const cmp =
-				typeof a[sort.field] === 'number'
-					? a[sort.field] - b[sort.field]
-					: Buffer.compare(Buffer.from(a[sort.field]), Buffer.from(b[sort.field]));
-			if (cmp) return sort.direction === 'asc' ? cmp : -cmp;
+	const strings = new Map();
+	const bytes = (value) => {
+		let encoded = strings.get(value);
+		if (encoded === undefined) {
+			encoded = Buffer.from(value);
+			strings.set(value, encoded);
 		}
-		return Buffer.compare(Buffer.from(a.id), Buffer.from(b.id));
-	});
+		return encoded;
+	};
+	const ordered = scenario.selected
+		.map((row) => ({
+			row,
+			id: bytes(row.id),
+			keys: sorts.map((sort) => (typeof row[sort.field] === 'number' ? row[sort.field] : bytes(row[sort.field]))),
+		}))
+		.sort((a, b) => {
+			for (let i = 0; i < sorts.length; i++) {
+				const cmp = typeof a.keys[i] === 'number' ? a.keys[i] - b.keys[i] : Buffer.compare(a.keys[i], b.keys[i]);
+				if (cmp) return sorts[i].direction === 'asc' ? cmp : -cmp;
+			}
+			return Buffer.compare(a.id, b.id);
+		});
+
 	scenario.expected = {
 		total: scenario.selected.length,
-		ids: ordered.slice(0, 10).map((row) => row.id),
+		ids: ordered.slice(0, 10).map(({ row }) => row.id),
 		aggregations: (scenario.request.aggregations ?? []).map((request) => oracleAggregation(request, scenario.selected)),
 	};
 }
