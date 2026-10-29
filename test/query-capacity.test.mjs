@@ -241,6 +241,33 @@ test('zero-term trees charge structure globally, retain depth guards and reject 
 	}
 });
 
+test('text normalization snapshots array length and ignores caller iterators', async (context) => {
+	const { index } = await fixture(context, { maxQueryClauses: 2 });
+	await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'sentinel' } }] });
+	await index.commit();
+	await index.reload();
+	const leaf = { text: 'sentinel', fields: ['title'] };
+	const overridden = [leaf];
+	overridden[Symbol.iterator] = () => {
+		throw new Error('caller iterator must not be used');
+	};
+	const growing = [leaf];
+	Object.defineProperty(growing, 0, {
+		get() {
+			growing.push(...Array(4096).fill({ text: '' }));
+			return leaf;
+		},
+	});
+	for (const clauses of [overridden, growing]) {
+		const result = await index.search({ query: { operator: 'or', clauses } });
+		assert.deepStrictEqual(
+			result.hits.map((hit) => hit.id),
+			['one'],
+		);
+	}
+	assert.strictEqual(growing.length, 4097);
+});
+
 test('raw native admission enforces lowered structure and schema-field bounds before callbacks', async () => {
 	const directory = mkdtempSync(path.join(tmpdir(), 'fulltext-raw-structure-'));
 	const config = options(directory, { maxQueryClauses: 3 });

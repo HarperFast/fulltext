@@ -563,6 +563,8 @@ fn packed_budget(bytes: &[u8], magic: [u8; 4], operation: &str) -> Result<u32> {
 	Ok(budget)
 }
 
+/// Classifies under default query policy without a schema snapshot.
+/// Handles use `search_is_expensive_for_fields` with their own policy and field count.
 pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
 	search_is_expensive_for_fields(bytes, MAX_FIELDS, MAX_QUERY_TERMS, MAX_QUERY_CLAUSES)
 }

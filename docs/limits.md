@@ -295,6 +295,18 @@ Direct Rust `protocol::Limits` literals now also supply `max_query_terms: 64` an
 `max_query_clauses: 256` for default policy, or validated configured values. They are operational
 settings and do not alter persisted identity.
 
+Direct `Engine::search` now validates text structure before analysis, including a maximum depth of
+eight and 64 KiB of total raw leaf text. Empty `And`/`Or` nodes now reject with
+`E_INVALID_ARGUMENT`; previously direct Rust callers could receive an empty result. Raw text over
+64 KiB also now rejects for direct callers even if analysis would deduplicate it below the term
+limit. These bring direct Rust acceptance into line with packed requests. Replace an intentionally
+empty Boolean tree with an empty text leaf when an empty result is wanted.
+
+`protocol::decode_search` is policy-neutral and uses the supported 4,096-clause structural ceiling.
+`protocol::search_is_expensive` is a default-policy convenience classifier. Rust hosts with a known
+schema or another policy must use `search_is_expensive_for_fields` with the schema field count and
+effective term/clause limits; classification also enforces that policy's structural bound.
+
 When migrating from released 0.7.x, ordinary `protocol::SearchRequest` literals add `sort: None`
 and `aggregations: Vec::new()`. Catalog callers use `catalog::SortRequest` and
 `catalog::AggregationRequest` (with child `aggregations: Vec::new()` for leaves). Sorted requests
@@ -403,7 +415,10 @@ the index's declared text-field count.
 
 There is no independent 256-leaf/child text cap. Structured filter trees retain independent 256
 leaves/children and filter values; text and filter costs are not combined. Both tree types retain
-depth eight. The 64 KiB total raw-text and 8 MiB packed-request bounds also remain fixed. Tracing
+depth eight. The 64 KiB total raw-text and 8 MiB packed-request bounds also remain fixed. These
+bounds limit nodes and input bytes, not exact heap usage: repeated field lists become owned strings
+during decoding. Qualify memory for the chosen schema, policy and concurrent expensive permits;
+the finite 16-field fixture does not qualify a maximum-width schema. Tracing
 applies analyzed-term limits to its simple text clause, without compiling indexed clauses.
 
 Whole-query construction additionally permits at most 16,384 phrase term-field positions and

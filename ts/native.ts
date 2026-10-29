@@ -1395,16 +1395,18 @@ function normalizeExpression(
 		chargeSearchStructure(budget, 2);
 		return { operator: 'not', clause: normalizeExpression(expression.clause, depth + 1, budget) };
 	}
+	const children = expression.clauses;
 	if (
 		(expression.operator !== 'and' && expression.operator !== 'or') ||
-		!Array.isArray(expression.clauses) ||
-		expression.clauses.length === 0
+		!Array.isArray(children) ||
+		children.length === 0
 	) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'boolean search expressions require at least one clause');
 	}
-	chargeSearchStructure(budget, expression.clauses.length);
+	const count = children.length;
+	chargeSearchStructure(budget, count);
 	const clauses = [];
-	for (const clause of expression.clauses) clauses.push(normalizeExpression(clause, depth + 1, budget));
+	for (let i = 0; i < count; i++) clauses.push(normalizeExpression(children[i], depth + 1, budget));
 	return { operator: expression.operator, clauses };
 }
 
