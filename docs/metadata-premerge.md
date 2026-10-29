@@ -271,7 +271,8 @@ a passing rerun cannot explain an earlier failure. See [measurement invariants](
   contention experiment, not a demonstrated fix. Preserve successful stage profiles and compare
   actual ingestion/close durations; a green rerun or absent access-denied error does not establish
   either cause or resolution.
-  [Scheduling-revision CI](https://github.com/HarperFast/fulltext/actions/runs/40823736210) subsequently
+  [Scheduling-revision CI](https://github.com/HarperFast/fulltext/actions/runs/40823736210) at
+  [e9f097b](https://github.com/HarperFast/fulltext/commit/e9f097bd20059facf23295a21dd6e7efe166c4a6) subsequently
   passed both Windows Node versions with unchanged deadlines: Node 22 close took 23.244 seconds
   (cleanup complete at 46.026 seconds), Node 24 close took 20.389 seconds (43.573 seconds).
   These profiles resolve the pending CI result, not the attribution of earlier failures.
