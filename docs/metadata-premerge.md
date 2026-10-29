@@ -177,6 +177,37 @@ distributed replication, or production fulltext adapter. Stop qualification if a
 missing, a checkpoint advances before its mutations are indexed, or a reopened generation disagrees
 with source records.
 
+## Longer mixed read/write soak procedure
+
+The source-only `benchmarks/metadata-soak.mjs` driver reuses the workload oracle. Defaults run
+50,000 synthetic catalog records with eight concurrent readers, 100 upserts plus ten deletes
+approximately every two seconds, and restoration of the previous publication's deleted records.
+Thirty minutes of mixed reads/writes are followed by writer drain and ten minutes of reads.
+Queries cover exact ranked hits, price sorting, nested histogram/statistics buckets and a five-key
+runtime sort. Every response is checked against its leased reader's fixed published generation.
+
+Declare gates before measurement: per-phase/case p95 at most 250 ms, p99 at most 5,000 ms,
+overall throughput at least ten successful requests/second, sampled peak RSS growth at most
+256 MiB above the post-initialization baseline, and a final-five-minute RSS span at most 32 MiB
+in each phase. These are the existing local acceptance thresholds, extended in duration; they
+are not a production performance objective. Short CI smoke uses explicitly relaxed gates and
+checks correctness, evidence retention and cleanup.
+
+```sh
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/metadata-soak.mjs --artifacts /existing/scratch/new-soak-run
+```
+
+The artifact directory must be new. It retains `manifest.json`, streamed `samples.ndjson`, and
+`report.json` on success or `failure.json` on failure. The manifest records the tested revision,
+driver/oracle hashes, loaded-addon identities where reported by Node, machine and runtime details,
+workload and gates. Samples include RSS, heap/external memory, queues, committed segment counts
+and periodic disk observations. Histograms and recent samples stay bounded in memory. No forced
+GC is performed. Instrumentation and source-oracle allocations remain part of process RSS.
+
+A pass is emitted only after close, final-checkpoint reopen/verification and native index cleanup.
+Failures retain the native index and close diagnostics. Preserve every run, including failures;
+a passing rerun cannot explain an earlier failure. See [measurement invariants](../benchmarks/DESIGN.md).
+
 ## Open items
 
 - Review the retained unexplained RSS observation before merge; final acceptance runs passed.
