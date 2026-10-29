@@ -266,6 +266,40 @@ test('text normalization snapshots array length and ignores caller iterators', a
 		);
 	}
 	assert.strictEqual(growing.length, 4097);
+	let reads = 0;
+	const changingLength = new Proxy([leaf], {
+		get(target, key, receiver) {
+			return key === 'length' ? (++reads === 1 ? 1 : 4097) : Reflect.get(target, key, receiver);
+		},
+	});
+	assert.strictEqual((await index.search({ query: { operator: 'or', clauses: changingLength } })).total, 1);
+	assert.strictEqual(reads, 1);
+	for (const length of [NaN, -1, 1.5, Infinity, '1', undefined]) {
+		const lying = new Proxy([], {
+			get: (target, key, receiver) => (key === 'length' ? length : Reflect.get(target, key, receiver)),
+		});
+		let touched = false;
+		const later = Array(4097);
+		Object.defineProperty(later, 0, {
+			get() {
+				touched = true;
+				throw new Error('invalid count must reject before visiting the next sibling');
+			},
+		});
+		await assert.rejects(
+			index.search({
+				query: {
+					operator: 'or',
+					clauses: [
+						{ operator: 'or', clauses: lying },
+						{ operator: 'or', clauses: later },
+					],
+				},
+			}),
+			(error) => invalid(error) && /at least one clause/.test(error.message),
+		);
+		assert.strictEqual(touched, false);
+	}
 });
 
 test('raw native admission enforces lowered structure and schema-field bounds before callbacks', async () => {

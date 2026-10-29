@@ -414,9 +414,9 @@ These are one-run observations, not a previous-version speedup claim or universa
 
 The expanded seven-case run on the same local platform and Node version passed all 1,092 timed
 requests across 21 cells with the unchanged gates. All 24 short-budget attempts timed out;
-full-budget recovery and queue drain passed. Worst p99 was 170.089 ms for phrase construction at
-eight callers; sampled RSS growth was 163.578 MiB. At eight callers, the 300-branch tree had
-p95/p99 6.650/6.788 ms and the 2,048-branch tree 46.715/48.596 ms. This run includes the final
-fixed-count normalization walk and its iterator/growth regression coverage. These are separate-run
+full-budget recovery and queue drain passed. Worst p99 was 180.356 ms for phrase construction at
+eight callers; sampled RSS growth was 179.266 MiB. At eight callers, the 300-branch tree had
+p95/p99 6.408/6.531 ms and the 2,048-branch tree 48.264/52.272 ms. This run includes the final
+validated fixed-count normalization walk and its iterator/growth/invalid-length regression coverage. These are separate-run
 observations, not a controlled comparison with the original five-case run. The fingerprinted
-report is retained as `fulltext-structure-query-capacity-final.json` in the local qualification artifacts.
+report is retained as `fulltext-structure-query-capacity-validated-count.json` in the local qualification artifacts.

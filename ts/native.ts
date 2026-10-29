@@ -1396,14 +1396,10 @@ function normalizeExpression(
 		return { operator: 'not', clause: normalizeExpression(expression.clause, depth + 1, budget) };
 	}
 	const children = expression.clauses;
-	if (
-		(expression.operator !== 'and' && expression.operator !== 'or') ||
-		!Array.isArray(children) ||
-		children.length === 0
-	) {
+	const count = Array.isArray(children) ? children.length : 0;
+	if ((expression.operator !== 'and' && expression.operator !== 'or') || !Number.isSafeInteger(count) || count < 1) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'boolean search expressions require at least one clause');
 	}
-	const count = children.length;
 	chargeSearchStructure(budget, count);
 	const clauses = [];
 	for (let i = 0; i < count; i++) clauses.push(normalizeExpression(children[i], depth + 1, budget));
