@@ -18,8 +18,7 @@ service, deployed fulltext adapter, distributed replication, or a production lat
 | Timeout recovery     | Real 1 ms budgets may expire cooperatively; full-budget requests afterward return exact totals and drain queues.                                               | Verified: final count-load run; details below.                                                 |
 | Workload correctness | Compare metadata results with fixture-derived expected values at every tested caller width; normal requests have zero errors; timed failures recover.          | Verified: final quiet flat pairs and expanded observation passed the declared gates.           |
 | Local source handoff | Rebuild from actual Harper Table records, catch up the source journal, verify checkpoint-aligned cutover, and reconstruct rollback from retained source state. | Verified locally: checkpoints 7, 10 and 11, child-process reopen and old-build reconstruction. |
-
-| Mixed soak | Preserve exact results during publication and writer drain; satisfy declared latency, throughput and memory gates. | Failed RSS-span gate; correctness, latency and independent final-checkpoint reopen passed. |
+| Mixed soak           | Preserve exact results during publication and writer drain; satisfy declared latency, throughput and memory gates.                                             | Failed RSS-span gate; correctness, latency and independent final-checkpoint reopen passed.     |
 
 ## Declared workload gates
 
@@ -112,7 +111,7 @@ observation remains recorded above despite passing final acceptance runs.
 
 ## Verified consumer and lifecycle evidence
 
-Observed on 2026-10-28: the final full gate passed 126 Rust tests (five ignored), 421 Node tests
+Observed on 2026-10-29: the full gate with isolated npm user configuration passed 126 Rust tests (five ignored), 422 Node tests
 across four groups, and nine optimized expensive-lane tests. These runs cover first-value sorting,
 missing placement, UTF-8 ties, nested aggregation scope, omitted child properties, resource rejection
 and recovery. This is local macOS arm64 evidence, not platform-wide qualification.
@@ -259,6 +258,12 @@ may have no artifact. Preserve every run, including failures;
 a passing rerun cannot explain an earlier failure. See [measurement invariants](../benchmarks/DESIGN.md).
 
 ## Open items
+
+- The Windows Node 22 workload smoke exceeded its unchanged 60-second child deadline in both
+  [original and diagnostic rerun attempts](https://github.com/HarperFast/fulltext/actions/runs/40819482729).
+  Prior Windows Node 22 and current Windows Node 24 runs completed in approximately 40 seconds.
+  Cause remains unproven. Coarse stage-start diagnostics now preserve elapsed times on success
+  and termination; inspect those before changing scheduling, fixtures or timeouts.
 
 - Resolve the failed long-soak memory qualification before merge; short acceptance runs passed.
   The earlier unexplained RSS observation also remains retained.

@@ -280,8 +280,8 @@ try {
 			}
 		}
 
-	progress('histogram-pressure');
-	if (documents > 1024)
+	if (documents > 1024) {
+		progress('histogram-pressure');
 		await expectPressure(
 			'high-cardinality-histogram',
 			index,
@@ -292,6 +292,7 @@ try {
 			documents,
 			'product-000000000',
 		);
+	}
 	progress('long-keys-open');
 	pressure = await openNativeFullTextIndex(options(path.join(directory, 'long-keys')));
 	progress('long-keys-ingest');
@@ -368,11 +369,11 @@ try {
 	};
 } finally {
 	try {
-		progress('long-keys-close');
+		if (pressure) progress('long-keys-close');
 		await pressure?.close(completedReport ? undefined : { mode: 'rollback' });
 	} finally {
 		try {
-			progress('catalog-close');
+			if (index) progress('catalog-close');
 			await index?.close(completedReport ? undefined : { mode: 'rollback' });
 		} finally {
 			progress('index-remove');

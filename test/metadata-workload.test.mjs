@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -62,7 +62,6 @@ test(
 		assert.strictEqual(stages[0].stage, 'addon-import');
 		assert.strictEqual(stages.at(-1).stage, 'cleanup-complete');
 		for (let i = 1; i < stages.length; i++) assert(stages[i].elapsedMilliseconds >= stages[i - 1].elapsedMilliseconds);
-		context.diagnostic(JSON.stringify(stages));
 		assert.strictEqual(premeasurement.phase, 'premeasurement-gates');
 		assert.deepStrictEqual(premeasurement.gates, report.gates);
 		assert.strictEqual(report.qualification, 'pass');
@@ -172,57 +171,56 @@ test(
 	},
 );
 
-test('metadata workload retains its named stage when its child is terminated', { timeout: 15_000 }, async (context) => {
-	const scratch = await mkdtemp(path.join(tmpdir(), 'fulltext-workload-kill-test-'));
-	let child;
-	context.after(async () => {
-		if (child && child.exitCode === null && child.signalCode === null) child.kill();
-		await rm(scratch, { recursive: true, force: true });
-	});
-	let stderr = '',
-		stdout = '',
-		killedAtStage = false;
-	child = spawn(
-		process.execPath,
-		[
-			driver,
-			'--scratch',
-			scratch,
-			'--documents',
-			'20',
-			'--rounds',
-			'1',
-			'--queries',
-			'1',
-			'--concurrency',
-			'1',
-			'--features',
-			'flat',
-		],
-		{ env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1' }, stdio: ['ignore', 'pipe', 'pipe'] },
-	);
-	const closed = new Promise((resolve, reject) => {
-		child.once('error', reject);
-		child.once('close', (code, signal) => resolve({ code, signal }));
-	});
-	child.stdout.on('data', (chunk) => {
-		stdout += chunk;
-	});
-	child.stderr.on('data', (chunk) => {
-		stderr += chunk;
-		if (!killedAtStage && stderr.includes('"stage":"catalog-open"')) {
-			killedAtStage = true;
-			child.kill();
-		}
-	});
-	const result = await closed;
-	assert(killedAtStage);
-	assert(result.code !== 0 || result.signal);
-	assert.strictEqual(stdout, '');
-	const events = stderr
-		.split('\n')
-		.filter((line) => line.startsWith('{'))
-		.map((line) => JSON.parse(line));
-	assert(events.some(({ stage }) => stage === 'catalog-open'));
-	assert(!events.some(({ stage }) => stage === 'cleanup-complete'));
-});
+test(
+	'metadata workload retains its named stage in an execFile termination error',
+	{ timeout: 15_000 },
+	async (context) => {
+		const scratch = await mkdtemp(path.join(tmpdir(), 'fulltext-workload-kill-test-'));
+		let child;
+		context.after(async () => {
+			if (child && child.exitCode === null && child.signalCode === null) child.kill();
+			await rm(scratch, { recursive: true, force: true });
+		});
+		const pending = execute(
+			process.execPath,
+			[
+				driver,
+				'--scratch',
+				scratch,
+				'--documents',
+				'20',
+				'--rounds',
+				'1',
+				'--queries',
+				'1',
+				'--concurrency',
+				'1',
+				'--features',
+				'flat',
+			],
+			{ timeout: 10_000, env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1' } },
+		);
+		child = pending.child;
+		let observed = '',
+			killedAtStage = false;
+		child.stderr.on('data', (chunk) => {
+			observed += chunk;
+			if (!killedAtStage && observed.includes('"stage":"catalog-open"')) {
+				killedAtStage = true;
+				child.kill();
+			}
+		});
+		await assert.rejects(pending, (error) => {
+			assert(killedAtStage);
+			assert(error.killed);
+			assert.strictEqual(error.stdout, '');
+			const events = error.stderr
+				.split('\n')
+				.filter((line) => line.startsWith('{') && line.endsWith('}'))
+				.map((line) => JSON.parse(line));
+			assert(events.some(({ stage }) => stage === 'catalog-open'));
+			assert(!events.some(({ stage }) => stage === 'cleanup-complete'));
+			return true;
+		});
+	},
+);
