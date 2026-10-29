@@ -661,12 +661,12 @@ fn scan_search_expression(
 				));
 			}
 			let mut terms_upper = 0usize;
-			let mut construction_upper = 0usize;
+			let mut construction_upper = count;
 			let mut has_expensive_mode = false;
 			let mut has_positive_anchor = kind == 2;
 			for _ in 0..count {
 				let child = scan_search_expression(cursor, depth + 1, clause_count, text_bytes, raised_profile_fields)?;
-				terms_upper = terms_upper.saturating_add(child.terms_upper);
+				terms_upper = terms_upper.max(child.terms_upper);
 				construction_upper = construction_upper.saturating_add(child.construction_upper);
 				has_expensive_mode |= child.has_expensive_mode;
 				if kind == 1 {
@@ -686,7 +686,7 @@ fn scan_search_expression(
 			let child = scan_search_expression(cursor, depth + 1, clause_count, text_bytes, raised_profile_fields)?;
 			Ok(SearchCost {
 				terms_upper: child.terms_upper,
-				construction_upper: child.construction_upper,
+				construction_upper: child.construction_upper.saturating_add(2),
 				has_expensive_mode: child.has_expensive_mode,
 				has_positive_anchor: false,
 			})
@@ -1833,6 +1833,54 @@ mod tests {
 				search_is_expensive(bytes).unwrap_err().code,
 				search_is_expensive_for_fields(bytes, Some(2)).unwrap_err().code
 			);
+		}
+	}
+
+	#[test]
+	fn raised_capacity_accounts_for_boolean_construction_and_per_leaf_terms() {
+		fn leaf(text: &str) -> Vec<u8> {
+			let mut bytes = vec![0];
+			bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+			bytes.extend_from_slice(text.as_bytes());
+			bytes.extend_from_slice(&[0, 0, 0]);
+			bytes
+		}
+		fn group(kind: u8, children: &[Vec<u8>]) -> Vec<u8> {
+			let mut bytes = vec![kind];
+			bytes.extend_from_slice(&(children.len() as u16).to_le_bytes());
+			for child in children {
+				bytes.extend_from_slice(child);
+			}
+			bytes
+		}
+		fn expensive(expression: &[u8], fields: usize) -> bool {
+			let mut bytes = b"FTSQ\x07\x00".to_vec();
+			bytes.extend_from_slice(expression);
+			bytes.extend_from_slice(&[0, 0]);
+			bytes.extend_from_slice(&[0; 8]);
+			bytes.extend_from_slice(&0u32.to_le_bytes());
+			bytes.extend_from_slice(&1u32.to_le_bytes());
+			bytes.push(0);
+			bytes.extend_from_slice(&1000u32.to_le_bytes());
+			search_is_expensive_for_fields(&bytes, Some(fields)).unwrap()
+		}
+		for kind in [1, 2] {
+			assert!(!expensive(&group(kind, &vec![leaf("a"); 65]), 1));
+			assert!(!expensive(&group(kind, &vec![leaf("a"); 128]), 1));
+			assert!(expensive(&group(kind, &vec![leaf("a"); 129]), 1));
+			assert!(expensive(&group(kind, &vec![leaf("a"); 64]), 4));
+		}
+		let mut nested = leaf("a");
+		for _ in 0..7 {
+			nested = group(2, &[nested]);
+		}
+		assert!(expensive(&group(2, &vec![nested; 64]), 1));
+		let mut negated = vec![3];
+		negated.extend_from_slice(&leaf("!"));
+		for (count, expected) in [(84, false), (85, true)] {
+			let mut children = vec![leaf("a")];
+			children.extend(vec![negated.clone(); count]);
+			assert_eq!(expensive(&group(1, &children), 1), expected);
 		}
 	}
 

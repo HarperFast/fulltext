@@ -217,8 +217,40 @@ test('open rejects invalid policies in the facade and native decoder; capability
 			assert.throws(() => decodeResponse(loadAddon().__nativeValidateOpen(bytes)), invalid);
 		}
 	}
-	const legacy = encodeOpen(options('unused')).subarray(0, -8);
+	const bytes = encodeOpen(options('unused'));
+	const legacy = bytes.subarray(0, -8);
 	decodeResponse(loadAddon().__nativeValidateOpen(legacy)).finish();
+	for (let length = 1; length < 8; length++) {
+		assert.throws(
+			() => decodeResponse(loadAddon().__nativeValidateOpen(bytes.subarray(0, legacy.length + length))),
+			invalid,
+		);
+	}
+	assert.throws(
+		() => decodeResponse(loadAddon().__nativeValidateOpen(Buffer.concat([bytes, Buffer.from([0])]))),
+		invalid,
+	);
+});
+
+test('raised indexed queries retain late terms, later fields, and all/phrase constraints', async (context) => {
+	const { index } = await fixture(context, { maxQueryTerms: 256, maxQueryClauses: 512 });
+	const documents = [
+		{ id: 'early', fields: { title: 'word0' } },
+		{ id: 'late-title', fields: { title: 'word129' } },
+		{ id: 'late-body', fields: { body: 'word129' } },
+		{ id: 'all-body', fields: { body: words(130) } },
+		{ id: 'missing-last', fields: { title: words(129) } },
+		{ id: 'broken-phrase', fields: { body: `${words(129)} unrelated word129` } },
+	];
+	await index.applyMutationBatch({ upserts: documents });
+	await index.commit();
+	await index.reload();
+	const ids = async (mode, fields = ['title', 'body']) =>
+		(await index.search({ text: words(130), mode, fields, exactTotal: true })).hits.map((hit) => hit.id).sort();
+	assert.deepStrictEqual(await ids('any'), documents.map((document) => document.id).sort());
+	assert.deepStrictEqual(await ids('any', ['title']), ['early', 'late-title', 'missing-last']);
+	assert.deepStrictEqual(await ids('all'), ['all-body', 'broken-phrase']);
+	assert.deepStrictEqual(await ids('phrase'), ['all-body']);
 });
 
 test('prefix construction preserves empty expansions and remaining-clause errors', async (context) => {

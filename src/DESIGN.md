@@ -223,6 +223,8 @@ above that. Fuzzy traces compare at most 16 eligible alternatives. Branch-local 
 makes completion checks constant-time. Boundary and construction regressions live in `query-capacity.test.mjs` and the
 engine tests.
 
+Raised-policy admission compares maximum per-leaf term cost and summed compiled-clause cost against the default envelope. Boolean child counts and NOT’s two synthetic clauses are included, matching native query construction; term counts across independent leaves are not added. Protocol boundary tests and the two-handle optimized admission test enforce this distinction.
+
 Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
 non-ASCII input conservatively uses the expensive lane because normalization can expand text.
 Default-policy classification is unchanged. The optimized two-handle regression pins ordinary

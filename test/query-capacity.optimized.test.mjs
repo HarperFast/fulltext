@@ -29,7 +29,7 @@ test(
 					path: path.join(root, String(raised)),
 					indexId: 'capacity',
 					generation: 'one',
-					fields: [{ name: 'title', weight: 1 }],
+					fields: ['title', 'body', 'summary', 'details'].map((name) => ({ name, weight: 1 })),
 					filterFields: [],
 					analyzer: 'english@2',
 					positions: true,
@@ -55,7 +55,7 @@ test(
 					handle,
 					maxBatchBytes: config.limits.maxBatchBytes,
 					searchLimits: config.limits,
-					fieldNames: ['title'],
+					fieldNames: ['title', 'body', 'summary', 'details'],
 				});
 				opened.push({ index, handle });
 				await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'word0 word1' } }] });
@@ -65,7 +65,9 @@ test(
 			const [raised, ordinary] = opened;
 			addon.__testDelayNextOrdinarySearch(raised.handle, 1500);
 			addon.__testDelayNextExpensiveSearch(raised.handle, 1500);
-			const small = raised.index.search({ text: 'word0' });
+			const small = raised.index.search({
+				query: { operator: 'or', clauses: Array.from({ length: 65 }, () => ({ text: 'word0', fields: ['title'] })) },
+			});
 			try {
 				await waitFor(() => raised.index.status().searchQueuedCommands === 0n);
 				assert.strictEqual(
@@ -77,19 +79,28 @@ test(
 				await small;
 			}
 			assert.strictEqual(addon.__testExpensiveSearchState(raised.handle)[0], 1);
-			const text = Array.from({ length: 65 }, (_, i) => `word${i}`).join(' ');
-			const large = raised.index.search({ text });
-			try {
-				await waitFor(() => addon.__testExpensiveSearchState(raised.handle)[0] === 0);
-				await assert.rejects(
-					ordinary.index.search({ text: 'word0 word1', mode: 'phrase' }, { remainingBudgetMilliseconds: 10 }),
-					(error) => error.code === 'E_TIMEOUT',
-				);
-				assert.strictEqual((await ordinary.index.search({ text: 'word0' })).total, 1);
-			} finally {
-				await large;
+			for (const request of [
+				{ text: Array.from({ length: 65 }, (_, i) => `word${i}`).join(' '), fields: ['title'] },
+				{ query: { operator: 'or', clauses: Array.from({ length: 64 }, () => ({ text: 'word0' })) } },
+			]) {
+				addon.__testDelayNextExpensiveSearch(raised.handle, 1500);
+				const large = raised.index.search(request);
+				try {
+					await waitFor(() => addon.__testExpensiveSearchState(raised.handle)[0] === 0);
+					const blocked = ordinary.index
+						.search({ text: 'word0 word1', mode: 'phrase' }, { remainingBudgetMilliseconds: 500 })
+						.then(
+							(result) => ({ result }),
+							(error) => ({ error }),
+						);
+					await waitFor(() => addon.__testExpensiveSearchState(raised.handle)[1] > 0);
+					assert.strictEqual((await blocked).error?.code, 'E_TIMEOUT');
+					assert.strictEqual((await ordinary.index.search({ text: 'word0' })).total, 1);
+				} finally {
+					assert.strictEqual((await large).total, 1);
+				}
+				assert.strictEqual((await ordinary.index.search({ text: 'word0 word1', mode: 'phrase' })).total, 1);
 			}
-			assert.strictEqual((await ordinary.index.search({ text: 'word0 word1', mode: 'phrase' })).total, 1);
 		} finally {
 			for (const { index } of opened) assert(!(await index.close({ mode: 'rollback' })).cleanupError);
 			rmSync(root, { recursive: true, force: true });
