@@ -683,6 +683,12 @@ pub fn test_expensive_search_state(env: Env, handle: u32) -> boundary::Result<Ve
 				budget.expensive_search_waiters.load(Ordering::Acquire) as u32
 			}),
 			u32::from(runtime.ordinary_search_delay_milliseconds.load(Ordering::Acquire) != 0),
+			runtime.expensive_search_budget.as_ref().map_or(0, |budget| {
+				lock(&budget.expensive_search_wakes)
+					.values()
+					.map(|(_, demand)| demand)
+					.sum::<usize>() as u32
+			}),
 		])
 	})?
 }

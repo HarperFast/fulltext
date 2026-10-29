@@ -93,7 +93,7 @@ test(
 							(result) => ({ result }),
 							(error) => ({ error }),
 						);
-					await waitFor(() => addon.__testExpensiveSearchState(raised.handle)[1] > 0);
+					await waitFor(() => addon.__testExpensiveSearchState(raised.handle)[3] > 0);
 					assert.strictEqual((await blocked).error?.code, 'E_TIMEOUT');
 					assert.strictEqual((await ordinary.index.search({ text: 'word0' })).total, 1);
 				} finally {
