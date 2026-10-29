@@ -112,7 +112,7 @@ observation remains recorded above despite passing final acceptance runs.
 ## Verified consumer and lifecycle evidence
 
 Observed on 2026-10-29: the full gate with isolated npm user configuration passed 126 Rust tests (five ignored), 422 Node tests
-across four groups, and nine optimized expensive-lane tests. These runs cover first-value sorting,
+across five groups, and nine optimized expensive-lane tests. These runs cover first-value sorting,
 missing placement, UTF-8 ties, nested aggregation scope, omitted child properties, resource rejection
 and recovery. This is local macOS arm64 evidence, not platform-wide qualification.
 
