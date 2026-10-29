@@ -34,6 +34,16 @@ export function prepareOracle(scenario) {
 		ids: ordered.slice(0, 10).map(({ row }) => row.id),
 		aggregations: (scenario.request.aggregations ?? []).map((request) => oracleAggregation(request, scenario.selected)),
 	};
+	scenario.termKeys = new Map();
+	const rememberKeys = (results) => {
+		for (const result of results)
+			for (const bucket of result.buckets ?? []) {
+				if (result.type === 'terms') scenario.termKeys.set(bucket.key, Buffer.from(bucket.key));
+				rememberKeys(bucket.aggregations ?? []);
+			}
+	};
+	rememberKeys(scenario.expected.aggregations);
+	scenario.canonicalAggregations = canonical(scenario.expected.aggregations, scenario.termKeys);
 }
 export function validate(result, scenario) {
 	assert.strictEqual(result.total, scenario.expected.total);
@@ -42,17 +52,21 @@ export function validate(result, scenario) {
 		result.hits.map((hit) => hit.id),
 		scenario.expected.ids,
 	);
-	assert.deepStrictEqual(canonical(result.aggregations ?? []), canonical(scenario.expected.aggregations));
+	assert.deepStrictEqual(canonical(result.aggregations ?? [], scenario.termKeys), scenario.canonicalAggregations);
 }
-function canonical(results) {
+function canonical(results, keys) {
 	return results.map((result) => {
 		if (!result.buckets) return result;
 		const buckets = result.buckets.map((bucket) => ({
 			...bucket,
-			...(bucket.aggregations ? { aggregations: canonical(bucket.aggregations) } : {}),
+			...(bucket.aggregations ? { aggregations: canonical(bucket.aggregations, keys) } : {}),
 		}));
 		if (result.type === 'range') for (const bucket of buckets) delete bucket.key;
-		if (result.type === 'terms') buckets.sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key)));
+		if (result.type === 'terms') {
+			const encoded = buckets.map((bucket) => ({ bucket, key: keys.get(bucket.key) ?? Buffer.from(bucket.key) }));
+			encoded.sort((a, b) => Buffer.compare(a.key, b.key));
+			return { ...result, buckets: encoded.map(({ bucket }) => bucket) };
+		}
 		return { ...result, buckets };
 	});
 }

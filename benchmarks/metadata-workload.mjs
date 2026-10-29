@@ -155,6 +155,7 @@ let pressure;
 const measurements = [];
 const pressureResults = [];
 let completedReport;
+let workloadError;
 try {
 	progress('catalog-open');
 	index = await openNativeFullTextIndex(options(path.join(directory, 'catalog')));
@@ -368,6 +369,9 @@ try {
 		pressureResults,
 		qualification: 'pass',
 	};
+} catch (error) {
+	workloadError = error;
+	throw error;
 } finally {
 	const closeErrors = [];
 	for (const [target, stage] of [
@@ -383,7 +387,9 @@ try {
 		}
 	}
 	if (closeErrors.length)
-		throw new AggregateError(closeErrors, `native cleanup failed; index retained at ${directory}`);
+		throw new AggregateError(closeErrors, `native cleanup failed; index retained at ${directory}`, {
+			cause: workloadError,
+		});
 	progress('index-remove');
 	await rm(directory, { recursive: true, force: true });
 }

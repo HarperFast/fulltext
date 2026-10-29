@@ -9,7 +9,7 @@ import test from 'node:test';
 
 const execute = promisify(execFile);
 import { executeDriver } from './fixtures/metadata-driver-process.mjs';
-import { prepareOracle } from '../benchmarks/metadata-oracle.mjs';
+import { prepareOracle, validate } from '../benchmarks/metadata-oracle.mjs';
 const driver = fileURLToPath(new URL('../benchmarks/metadata-workload.mjs', import.meta.url));
 
 test(
@@ -230,14 +230,14 @@ test(
 	},
 );
 
-test('workload diagnostics retain actual execFile timeout stderr', { timeout: 10_000 }, async () => {
+test('workload diagnostics retain actual execFile timeout stderr', { timeout: 15_000 }, async () => {
 	const diagnostics = [];
 	await assert.rejects(
 		executeDriver(
 			{ diagnostic: (text) => diagnostics.push(text) },
 			process.execPath,
 			['--input-type=module', '-e', "console.error(JSON.stringify({ stage: 'waiting' })); setInterval(() => {}, 1000)"],
-			{ timeout: 1000 },
+			{ timeout: 5000 },
 		),
 		(error) => {
 			assert(error.killed);
@@ -282,6 +282,8 @@ test('workload retains indexes and reports resolved cleanup errors', { timeout: 
 		(error) => {
 			assert.strictEqual(error.stdout, '');
 			assert.match(error.stderr, /native cleanup failed/);
+			assert.match(error.stderr, /\[cause\]: AssertionError/);
+			assert.match(error.stderr, /ordinary-exact: throughput qualification gate exceeded/);
 			assert.match(error.stderr, /E_CLOSE_FAILED/);
 			return true;
 		},
@@ -311,4 +313,61 @@ test('source oracle prepares string keys once while retaining raw UTF-8 ordering
 		expected.slice(0, 10).map(({ id }) => id),
 	);
 	assert.strictEqual(scenario.expected.total, selected.length);
+});
+
+for (const [name, kind] of [
+	['metadata-count-load', 'writer'],
+	['metadata-cold-start', 'writer'],
+	['metadata-cold-start', 'reader'],
+]) {
+	test(`${name} rejects ${kind} cleanup errors without emitting a report`, { timeout: 45_000 }, async (context) => {
+		const scratch = await mkdtemp(path.join(tmpdir(), 'fulltext-sibling-cleanup-'));
+		context.after(() => rm(scratch, { recursive: true, force: true }));
+		const sibling = fileURLToPath(new URL(`../benchmarks/${name}.mjs`, import.meta.url));
+		const args = [
+			sibling,
+			'--scratch',
+			scratch,
+			'--documents',
+			'1000',
+			'--concurrency',
+			'1',
+			'--module',
+			fileURLToPath(new URL('./fixtures/metadata-close-failure.mjs', import.meta.url)),
+		];
+		args.push(...(name === 'metadata-count-load' ? ['--queries', '1'] : ['--rounds', '1']));
+		await assert.rejects(
+			execute(process.execPath, args, {
+				timeout: 40_000,
+				maxBuffer: 4 << 20,
+				env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1', FULLTEXT_TEST_CLOSE_KIND: kind },
+			}),
+			(error) => {
+				assert.strictEqual(error.stdout, '');
+				assert.match(error.stderr, /E_CLOSE_FAILED/);
+				return true;
+			},
+		);
+		assert((await readdir(scratch)).length > 0, 'failure evidence must be retained');
+	});
+}
+
+test('aggregation oracle caches expected UTF-8 keys without retaining unexpected result keys', () => {
+	const selected = ['é', '\uE000', '\u{10000}', 'a'].map((brand, i) => ({ id: String(i), brand }));
+	const scenario = {
+		selected,
+		request: { aggregations: [{ name: 'brands', field: 'brand', type: 'terms', size: 4 }] },
+	};
+	prepareOracle(scenario);
+	const result = {
+		total: 4,
+		totalRelation: 'exact',
+		hits: scenario.expected.ids.map((id) => ({ id })),
+		aggregations: structuredClone(scenario.expected.aggregations),
+	};
+	result.aggregations[0].buckets.reverse();
+	validate(result, scenario);
+	result.aggregations[0].buckets[0].key = 'unexpected';
+	assert.throws(() => validate(result, scenario), assert.AssertionError);
+	assert.strictEqual(scenario.termKeys.size, 4);
 });

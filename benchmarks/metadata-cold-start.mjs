@@ -1,3 +1,4 @@
+import { closeIndex } from './metadata-cleanup.mjs';
 import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -83,6 +84,8 @@ if (values.action === 'measure') {
 			peakRssBytes: Math.max(peak, after),
 		};
 	};
+	let report;
+	let primaryError;
 	try {
 		const cold = await run(budget !== undefined);
 		const recovery = await run(false);
@@ -93,10 +96,16 @@ if (values.action === 'measure') {
 			assert.strictEqual(status.searchQueuedCommands, 0n);
 			assert.strictEqual(status.searchQueuedBytes, 0n);
 		}
-		console.log(JSON.stringify({ parallel, shared, budgetMilliseconds: budget ?? null, cold, recovery, warm }));
+		report = { parallel, shared, budgetMilliseconds: budget ?? null, cold, recovery, warm };
+	} catch (error) {
+		primaryError = error;
+		throw error;
 	} finally {
-		await Promise.all(readers.map((reader) => reader.close()));
+		const outcomes = await Promise.allSettled(readers.map((reader) => closeIndex(reader)));
+		const errors = outcomes.filter(({ status }) => status === 'rejected').map(({ reason }) => reason);
+		if (errors.length) throw new AggregateError(errors, 'cold-start reader cleanup failed', { cause: primaryError });
 	}
+	console.log(JSON.stringify(report));
 } else {
 	assert(values.scratch, 'Pass --scratch pointing to an existing scratch parent');
 	const directory = await mkdtemp(path.join(path.resolve(values.scratch), 'fulltext-cold-start-'));
@@ -116,9 +125,11 @@ if (values.action === 'measure') {
 			maxBatchBytes: 1048576,
 		},
 	}));
+	let completedReport;
 	try {
 		for (const config of configs) {
 			const writer = await api.openNativeFullTextIndex(config);
+			let primaryError;
 			try {
 				for (let start = 0; start < documents; start += 256) {
 					const upserts = Array.from({ length: Math.min(256, documents - start) }, (_, offset) => {
@@ -130,8 +141,15 @@ if (values.action === 'measure') {
 					assert.deepStrictEqual(result.rejected, []);
 				}
 				await writer.publish('complete');
+			} catch (error) {
+				primaryError = error;
+				throw error;
 			} finally {
-				await writer.close({ mode: 'rollback' });
+				try {
+					await closeIndex(writer, { mode: 'rollback' });
+				} catch (error) {
+					throw new AggregateError([error], 'cold-start writer cleanup failed', { cause: primaryError });
+				}
 			}
 		}
 		const measurements = [];
@@ -157,29 +175,28 @@ if (values.action === 'measure') {
 						measurements.push({ round, ...JSON.parse(result) });
 					}
 				}
-		console.log(
-			JSON.stringify(
-				{
-					benchmark: 'metadata-cold-start',
-					runtime: {
-						node: process.version,
-						platform: process.platform,
-						arch: process.arch,
-						native: await api.runtimeInfo(),
-					},
-					documentsPerIndex: documents,
-					indexes: configs.length,
-					rounds,
-					concurrency,
-					method:
-						'Fresh child process per cohort; dictionary maximum cache cold, filesystem cache uncontrolled and likely warm. Candidate filter matches 16 of the unique string keys; size100 forces retained-key preflight even for this selective query. Shared cohorts target one index; independent cohorts target distinct indexes. Cold then recovery then20warm waves. CPU includes native threads; RSS sampled1ms. No production SLO implied.',
-					measurements,
+		completedReport = JSON.stringify(
+			{
+				benchmark: 'metadata-cold-start',
+				runtime: {
+					node: process.version,
+					platform: process.platform,
+					arch: process.arch,
+					native: await api.runtimeInfo(),
 				},
-				null,
-				2,
-			),
+				documentsPerIndex: documents,
+				indexes: configs.length,
+				rounds,
+				concurrency,
+				method:
+					'Fresh child process per cohort; dictionary maximum cache cold, filesystem cache uncontrolled and likely warm. Candidate filter matches 16 of the unique string keys; size100 forces retained-key preflight even for this selective query. Shared cohorts target one index; independent cohorts target distinct indexes. Cold then recovery then20warm waves. CPU includes native threads; RSS sampled1ms. No production SLO implied.',
+				measurements,
+			},
+			null,
+			2,
 		);
 	} finally {
-		await rm(directory, { recursive: true, force: true });
+		if (completedReport) await rm(directory, { recursive: true, force: true });
 	}
+	console.log(completedReport);
 }

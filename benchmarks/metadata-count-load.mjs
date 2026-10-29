@@ -1,3 +1,4 @@
+import { closeIndex } from './metadata-cleanup.mjs';
 import assert from 'node:assert';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
@@ -40,6 +41,8 @@ const config = {
 	},
 };
 let index;
+let completedReport;
+let primaryError;
 const report = [];
 try {
 	index = await openNativeFullTextIndex(config);
@@ -82,25 +85,31 @@ try {
 			await measure(name, request, expected, parallel, true);
 		}
 	}
-	console.log(
-		JSON.stringify(
-			{
-				benchmark: 'metadata-count-load',
-				revision: option('--revision', 'working-tree'),
-				runtime: { node: process.version, platform: process.platform, arch: process.arch, native: await runtimeInfo() },
-				config: { ...config, path: '<temporary-index>', documents, queries, concurrency, budgetMilliseconds: budget },
-				method:
-					'Closed-loop callers, three warmups; exact totals and distinct boundary scores asserted; filtered OR avoids stable-any path. CPU covers the Node process and native threads; RSS sampled every 5ms. Budget includes queue wait. Successful budgeted requests must also have exact totals. No production SLO is implied.',
-				measurements: report,
-			},
-			null,
-			2,
-		),
+	completedReport = JSON.stringify(
+		{
+			benchmark: 'metadata-count-load',
+			revision: option('--revision', 'working-tree'),
+			runtime: { node: process.version, platform: process.platform, arch: process.arch, native: await runtimeInfo() },
+			config: { ...config, path: '<temporary-index>', documents, queries, concurrency, budgetMilliseconds: budget },
+			method:
+				'Closed-loop callers, three warmups; exact totals and distinct boundary scores asserted; filtered OR avoids stable-any path. CPU covers the Node process and native threads; RSS sampled every 5ms. Budget includes queue wait. Successful budgeted requests must also have exact totals. No production SLO is implied.',
+			measurements: report,
+		},
+		null,
+		2,
 	);
+} catch (error) {
+	primaryError = error;
+	throw error;
 } finally {
-	await index?.close({ mode: 'rollback' });
+	try {
+		await closeIndex(index, { mode: 'rollback' });
+	} catch (error) {
+		throw new AggregateError([error], 'count-load cleanup failed', { cause: primaryError });
+	}
 	await rm(directory, { recursive: true, force: true });
 }
+console.log(completedReport);
 
 async function measure(name, request, expected, parallel, timed) {
 	for (let warmup = 0; warmup < 3; warmup++) assert.strictEqual((await index.search(request)).total, expected);
