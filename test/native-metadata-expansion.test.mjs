@@ -21,7 +21,6 @@ const bounded = (promise) => {
 };
 async function fixture(context, batches) {
 	const root = mkdtempSync(path.join(tmpdir(), 'fulltext-expanded-metadata-'));
-	context.after(() => rmSync(root, { recursive: true, force: true }));
 	const index = await bounded(
 		openNativeFullTextIndex({
 			path: path.join(root, 'index'),
@@ -47,7 +46,12 @@ async function fixture(context, batches) {
 			},
 		}),
 	);
-	context.after(() => index.close({ mode: 'rollback' }));
+	context.after(async () => {
+		const result = await index.close({ mode: 'rollback' });
+		if (result.cleanupError) throw result.cleanupError;
+		assert.strictEqual(index.status().state, 'closed', 'close must finish before removing the index directory');
+		rmSync(root, { recursive: true, force: true });
+	});
 	for (const batch of batches) {
 		await bounded(
 			index.applyMutationBatch({
