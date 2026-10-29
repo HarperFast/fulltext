@@ -2359,7 +2359,10 @@ impl Writer {
 	pub fn close(self) -> Result<()> {
 		let result = self.inner.wait_merging_threads().map_err(index_error);
 		if self.worker_ownership_unproven {
-			return Err(FulltextError::new("E_QUIESCENCE_FAILED", "a failed Tantivy commit preparation may have detached indexing workers; restart before reusing this generation"));
+			return Err(FulltextError::new(
+				"E_QUIESCENCE_FAILED",
+				"Tantivy commit preparation left worker ownership unproven; restart before reusing this generation",
+			));
 		}
 		result
 	}

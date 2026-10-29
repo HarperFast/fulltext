@@ -78,7 +78,7 @@ previous build and record its source revision separately.
 ## Executed result
 
 On 2026-10-28, the previous
-[base implementation (0b56087)](https://github.com/HarperFast/fulltext/pull/75/commits)
+[base implementation (0b56087)](https://github.com/HarperFast/fulltext/commit/0b5608778b2d80ed2a8dfbea79565d509837e7ff)
 (query API 4, native ABI 9) created both indexes. The
 [metadata implementation (a471b58)](https://github.com/HarperFast/fulltext/pull/75/commits)
 (query API 5, native ABI 10) passed every assertion above. Both builds embed Tantivy 0.27.0.

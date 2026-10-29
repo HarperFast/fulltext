@@ -70,7 +70,7 @@ latency guarantees.
 
 ### Observed string-metadata cost
 
-Three alternating optimized arm64 pairs compared [the baseline (0b56087)](https://github.com/HarperFast/fulltext/pull/75/commits)
+Three alternating optimized arm64 pairs compared [the baseline (0b56087)](https://github.com/HarperFast/fulltext/commit/0b5608778b2d80ed2a8dfbea79565d509837e7ff)
 with [the metadata writer (1adb751)](https://github.com/HarperFast/fulltext/pull/75/commits), using 10,000 documents,
 32 brands and 1,000 queries per case on the same host. Later changes preserve the writer behavior and
 schema for this scalar-string workload; repeated-string array ingestion was not measured. Median persisted bytes increased **7.0%**; median durable ingestion throughput
@@ -146,7 +146,7 @@ shortcuts.
 For the public exact-total route, run the paired metadata commands with
 `--distinct-scores --ordinary-only --documents 100000 --queries 300`. The fixture verifies that
 ranked hits do not tie at the filtered window boundary, ensuring the final Count path is used.
-Use the reviewed pre-Count-fix baseline [e7f5a07 (e7f5a07)](https://github.com/HarperFast/fulltext/pull/75/commits)
+Use the reviewed pre-Count-fix baseline [e7f5a07](https://github.com/HarperFast/fulltext/pull/75/commits)
 with its matching addon for this comparison. Ordinary filtered queries also run against query API 4
 baselines; only metadata cases require API 5. Three alternating pairs observed median p50 changes
 of **+6.3%** for ordinary exact totals and
@@ -165,7 +165,7 @@ wall time for warm dictionary preflight and full `aggregate_count` requests. Ful
 native counts and terms results.
 
 Three alternating optimized macOS arm64 pairs compared the preserved mutex baseline
-[03df642 (03df642)](https://github.com/HarperFast/fulltext/pull/75/commits), with this qualification added,
+[03df642](https://github.com/HarperFast/fulltext/pull/75/commits), with this qualification added,
 against a candidate changing only the cache lock to `RwLock`. Eight-caller preflight median p50 was
 **0.172958 ms** for both. Full aggregation changed from **0.739375 ms** to **0.710292 ms** (**−3.93%**).
 One-caller preflight changed from **0.046375 ms** to **0.046959 ms** (**+1.26%**).
@@ -265,7 +265,7 @@ likely warm. This does not measure disk-cold startup.
 ### Observed exact-count load results
 
 Three alternating optimized macOS arm64 process pairs compared the
-[previous implementation (0b56087)](https://github.com/HarperFast/fulltext/pull/75/commits)
+[previous implementation (0b56087)](https://github.com/HarperFast/fulltext/commit/0b5608778b2d80ed2a8dfbea79565d509837e7ff)
 with the [qualified runtime (a471b58)](https://github.com/HarperFast/fulltext/pull/75/commits)
 on 2026-10-28: 100,000 documents, two native search threads and 120 requests per cell.
 The table shows medians of three per-run statistics; p99 has few tail observations.
