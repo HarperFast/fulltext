@@ -1,4 +1,5 @@
 import assert from 'node:assert';
+import { prepareOracle, validate } from './metadata-oracle.mjs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -378,93 +379,6 @@ function percentiles(values) {
 	const sorted = [...values].sort((a, b) => a - b);
 	const percentile = (p) => sorted[Math.ceil(sorted.length * p) - 1];
 	return { p50Milliseconds: percentile(0.5), p95Milliseconds: percentile(0.95), p99Milliseconds: percentile(0.99) };
-}
-function prepareOracle(scenario) {
-	const sorts = scenario.request.sort
-		? Array.isArray(scenario.request.sort)
-			? scenario.request.sort
-			: [scenario.request.sort]
-		: [];
-	const ordered = [...scenario.selected].sort((a, b) => {
-		for (const sort of sorts) {
-			const cmp =
-				typeof a[sort.field] === 'number'
-					? a[sort.field] - b[sort.field]
-					: Buffer.compare(Buffer.from(a[sort.field]), Buffer.from(b[sort.field]));
-			if (cmp) return sort.direction === 'asc' ? cmp : -cmp;
-		}
-		return Buffer.compare(Buffer.from(a.id), Buffer.from(b.id));
-	});
-	scenario.expected = {
-		total: scenario.selected.length,
-		ids: ordered.slice(0, 10).map((row) => row.id),
-		aggregations: (scenario.request.aggregations ?? []).map((request) => oracleAggregation(request, scenario.selected)),
-	};
-}
-function validate(result, scenario) {
-	assert.strictEqual(result.total, scenario.expected.total);
-	assert.strictEqual(result.totalRelation, 'exact');
-	assert.deepStrictEqual(
-		result.hits.map((hit) => hit.id),
-		scenario.expected.ids,
-	);
-	assert.deepStrictEqual(canonical(result.aggregations ?? []), canonical(scenario.expected.aggregations));
-}
-function canonical(results) {
-	return results.map((result) => {
-		if (!result.buckets) return result;
-		const buckets = result.buckets.map((bucket) => ({
-			...bucket,
-			...(bucket.aggregations ? { aggregations: canonical(bucket.aggregations) } : {}),
-		}));
-		if (result.type === 'range') for (const bucket of buckets) delete bucket.key;
-		if (result.type === 'terms') buckets.sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key)));
-		return { ...result, buckets };
-	});
-}
-function oracleAggregation(request, selected) {
-	const base = { name: request.name, type: request.type };
-	if (request.type === 'stats') {
-		const values = selected.map((row) => row[request.field]);
-		const sum = values.reduce((a, b) => a + b, 0);
-		return {
-			...base,
-			count: values.length,
-			sum,
-			min: values.length ? values.reduce((a, b) => Math.min(a, b), Infinity) : null,
-			max: values.length ? values.reduce((a, b) => Math.max(a, b), -Infinity) : null,
-			avg: values.length ? sum / values.length : null,
-		};
-	}
-	const children = (rows) =>
-		request.aggregations?.length
-			? { aggregations: request.aggregations.map((child) => oracleAggregation(child, rows)) }
-			: {};
-	if (request.type === 'terms') {
-		const groups = new Map();
-		for (const row of selected) {
-			const key = row[request.field];
-			if (!groups.has(key)) groups.set(key, []);
-			groups.get(key).push(row);
-		}
-		return {
-			...base,
-			buckets: [...groups].map(([key, rows]) => ({ key, count: rows.length, ...children(rows) })),
-			sumOtherDocCount: 0,
-			docCountErrorUpperBound: 0,
-		};
-	}
-	return {
-		...base,
-		buckets: request.ranges.map((range) => {
-			const rows = selected.filter(
-				(row) =>
-					(range.from === undefined || row[request.field] >= range.from) &&
-					(range.to === undefined || row[request.field] < range.to),
-			);
-			return { key: `${range.from ?? '*'}-${range.to ?? '*'}`, ...range, count: rows.length, ...children(rows) };
-		}),
-	};
 }
 async function expectPressure(name, target, request, expectedTotal, expectedFirstId) {
 	await assert.rejects(target.search(request, { remainingBudgetMilliseconds: budget }), (error) => {
