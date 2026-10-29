@@ -62,6 +62,17 @@ console.error(
 		},
 	}),
 );
+const progressStarted = performance.now();
+const progress = (stage) =>
+	console.error(
+		JSON.stringify({
+			benchmark: 'metadata-workload',
+			phase: 'progress',
+			stage,
+			elapsedMilliseconds: performance.now() - progressStarted,
+		}),
+	);
+progress('addon-import');
 const modulePath = argument('--module', fileURLToPath(new URL('../dist/native.js', import.meta.url)));
 const { openNativeFullTextIndex, runtimeInfo } = await import(pathToFileURL(path.resolve(modulePath)).href);
 const directory = await mkdtemp(path.join(scratch, 'fulltext-metadata-workload-'));
@@ -144,7 +155,9 @@ const measurements = [];
 const pressureResults = [];
 let completedReport;
 try {
+	progress('catalog-open');
 	index = await openNativeFullTextIndex(options(path.join(directory, 'catalog')));
+	progress('catalog-ingest');
 	for (let start = 0; start < documents; start += 300) {
 		const batch = rows.slice(start, start + 300).map(({ id, ...filters }) => ({
 			id,
@@ -155,14 +168,19 @@ try {
 		assert.strictEqual(result.processed, batch.length);
 		assert.deepStrictEqual(result.rejected, []);
 	}
+	progress('catalog-commit');
 	await index.commit();
+	progress('catalog-reload');
 	await index.reload();
 	const postIndexBaseline = process.memoryUsage();
 	for (const scenario of cases) {
+		progress(`oracle:${scenario.name}`);
 		prepareOracle(scenario);
 		const request = { text: 'shoe', exactTotal: true, limit: 10, ...scenario.request };
+		progress(`warmup:${scenario.name}`);
 		for (let warmup = 0; warmup < 3; warmup++) validate(await index.search(request), scenario);
 		for (const parallel of concurrency) {
+			progress(`measure:${scenario.name}:${parallel}`);
 			const until = performance.now() + duration;
 			let round = 0;
 			do {
@@ -262,6 +280,7 @@ try {
 			}
 		}
 
+	progress('histogram-pressure');
 	if (documents > 1024)
 		await expectPressure(
 			'high-cardinality-histogram',
@@ -273,7 +292,9 @@ try {
 			documents,
 			'product-000000000',
 		);
+	progress('long-keys-open');
 	pressure = await openNativeFullTextIndex(options(path.join(directory, 'long-keys')));
+	progress('long-keys-ingest');
 	for (let start = 0; start < 300; start += 5) {
 		const batch = Array.from({ length: 5 }, (_, offset) => ({
 			id: `pressure-${start + offset}`,
@@ -283,10 +304,17 @@ try {
 		const result = await pressure.applyMutationBatch({ upserts: batch });
 		assert.strictEqual(result.processed, batch.length);
 		assert.deepStrictEqual(result.rejected, []);
-		if ((start + 5) % 75 === 0) await pressure.commit();
+		if ((start + 5) % 75 === 0) {
+			progress(`long-keys-commit:${start + 5}`);
+			await pressure.commit();
+			progress(`long-keys-ingest:${start + 5}`);
+		}
 	}
+	progress('long-keys-final-commit');
 	await pressure.commit();
+	progress('long-keys-reload');
 	await pressure.reload();
+	progress('long-keys-pressure');
 	await expectPressure(
 		'long-key-terms',
 		pressure,
@@ -297,6 +325,7 @@ try {
 		300,
 		'pressure-0',
 	);
+	progress('report-prepare');
 	completedReport = {
 		benchmark: 'metadata-workload',
 		revision: argument('--revision', 'working-tree'),
@@ -339,15 +368,19 @@ try {
 	};
 } finally {
 	try {
+		progress('long-keys-close');
 		await pressure?.close(completedReport ? undefined : { mode: 'rollback' });
 	} finally {
 		try {
+			progress('catalog-close');
 			await index?.close(completedReport ? undefined : { mode: 'rollback' });
 		} finally {
+			progress('index-remove');
 			await rm(directory, { recursive: true, force: true });
 		}
 	}
 }
+progress('cleanup-complete');
 console.log(JSON.stringify(completedReport, null, 2));
 
 function assertQualificationGate(passed, phase, gate, name, parallel, postIndexBaseline, details = {}) {

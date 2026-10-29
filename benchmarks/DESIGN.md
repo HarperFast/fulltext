@@ -24,3 +24,12 @@ Segment observations read the pinned Tantivy build's committed `meta.json`; they
 not a public storage interface. Disk size observations can race file retirement and are sampled
 rather than exact high-water guarantees. No forced garbage collection or memory release is part
 of the default qualification.
+
+## Workload smoke diagnostics
+
+`metadata-workload.mjs` writes coarse stage-begin events and elapsed time to stderr, outside timed
+rounds. The event count depends on the fixed case/caller-width list and pressure checkpoints, not
+query count or duration. Progress includes no native status and never polls a closing handle.
+Only verified cleanup permits an accepted stdout report. The child-process test preserves progress
+on timeout and prints successful profiles too, so platform differences can be localized without
+changing the workload or deadline. A killed-child regression verifies named-stage retention.
