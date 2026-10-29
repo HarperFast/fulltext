@@ -22,7 +22,8 @@ Each index has one bounded writer actor and a bounded search executor, while the
 governor provides checked aggregate admission across indexes. Native indexing and search execute on
 owned threads, independently of write and commit latency. Large traversal-query identities hash
 through WebCrypto on the shared libuv pool under separate bounded admission. Traversal checks its
-deadline between document batches; ordinary collection and individual Tantivy operations remain
+deadline between document batches. Exact-count and metadata collection check deadlines during
+collection; ordinary ranked-hit collection and individual synchronous Tantivy operations remain
 uninterruptible. Shared cross-index executors and multi-environment handles remain outside this
 contract.
 
@@ -422,8 +423,11 @@ caller may catch that distinct code and choose a documented fallback. Fuzzy-pref
 preview capability until the catalog-scale benchmark qualifies it. Request budgets cover
 queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing.
 Traversal also charges preparation against that budget and checks its deadline every 1,024 scorer
-advances. Ordinary collection, query construction, and individual Tantivy operations remain
-uninterruptible; an expired result is discarded after control returns. If all eligible workers are
+advances. Exact-count and metadata collectors also check deadlines during collection, including
+within a segment. Ordinary ranked-hit collection, query construction, and individual synchronous
+Tantivy operations remain uninterruptible; an expired result is discarded after control returns.
+See the [collector deadline policy](limits.md#metadata-collectors) for checkpoint granularity and
+synchronous work between checks. If all eligible workers are
 executing, an expired queued request is rejected
 when a worker next examines it rather than at the exact wall-clock deadline.
 
@@ -595,4 +599,5 @@ and establishes bounded off-event-loop execution.
 - A handle-lifetime response dispatcher that replaces the initial per-operation thread-safe
   callback as part of a future shared multi-environment runtime.
 - Fixed-host regression thresholds for representative application workloads.
-- Cancellation of ordinary offset-search collection and individual in-flight Tantivy operations.
+- Cancellation within ordinary ranked-hit collection and individual synchronous Tantivy operations.
+  Exact-count and metadata collection already check deadlines within segments.

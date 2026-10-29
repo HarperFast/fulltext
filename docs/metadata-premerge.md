@@ -116,6 +116,16 @@ across five groups, and nine optimized expensive-lane tests. These runs cover fi
 missing placement, UTF-8 ties, nested aggregation scope, omitted child properties, resource rejection
 and recovery. This is local macOS arm64 evidence, not platform-wide qualification.
 
+The final cleanup/oracle fixes at
+[the verified revision](https://github.com/HarperFast/fulltext/commit/b94b6a658b297602febed038a90fa83b3c34028b)
+passed the isolated `NPM_CONFIG_USERCONFIG=/dev/null npm run check`: **127 Rust tests** (five ignored)
+and **431 Node/worker/package tests**, including formatting, TypeScript, clippy and packed consumers.
+The focused 16-test qualification suite and production-addon count-load/cold-start cleanup smokes
+also passed. These smokes do not repeat sustained-memory qualification. All 14 non-skipped checks
+for that revision passed, including Linux x64/arm64, Windows and macOS Node 22/24; the two automated
+review jobs were skipped. See the [recorded checks and review evidence](https://github.com/HarperFast/fulltext/pull/75).
+The earlier counts above remain the historical qualification milestone.
+
 The exercise exposed a close-quiescence defect: rollback replaced the original native writer
 before its merge work was joined. The [close fix (33399a6)](https://github.com/HarperFast/fulltext/pull/75/commits)
 joins the original writer, discards unpublished changes and preserves the published checkpoint.
@@ -217,10 +227,13 @@ The run used the [reviewed soak revision](https://github.com/HarperFast/fulltext
 Raw artifacts are local evidence, not a portable or publicly archived dataset. The committed
 [soak summary](metadata-soak-result.json) preserves the measurements and artifact fingerprints.
 
-Next: investigate on an isolated host with process physical/compressed footprint and allocator/GC
-telemetry captured from startup. Preserve the existing gate and distinguish retained allocation
-from changes in resident pages before deciding whether a different memory acceptance criterion
-is justified. Track that decision in
+Subsequent Linux control and instrumented runs are summarized under [Open items](#open-items).
+The control passed; the instrumented comparison failed the drain RSS-span gate, with RSS variation
+correlated with V8 physical heap expansion. This does not establish causation or a native leak.
+Kyle clarified that macOS is not used in production. Isolated macOS attribution remains a separate
+development-platform follow-up; repeated-cycle Linux qualification is nonblocking unless
+accumulating retention or inadequate headroom is demonstrated. Preserve the failed measurements
+and unchanged gates. Track the follow-up in
 [Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
 
 ## Longer mixed read/write soak procedure

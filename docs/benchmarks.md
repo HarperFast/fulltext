@@ -318,8 +318,10 @@ scans or attribute CPU scaling to the mutex; native admission also limits shared
 Decision: retain the existing cache and admission behavior. The measured cold cost is visible but
 provides no evidence that scan coordination would improve the release materially. Revisit with a
 reproducing workload if first-search latency, CPU, or recovery violates a consuming application's
-budget. Linux/Windows, larger dictionaries/segment counts, disk-cold startup and sustained memory
-behavior remain unqualified; see [Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
+budget. These cold-start measurements cover macOS arm64 only; Linux/Windows cold-start performance,
+larger dictionaries/segment counts and disk-cold startup remain unqualified. Separate Linux
+sustained-memory evidence and its nonblocking follow-up are summarized in the
+[premerge guide](metadata-premerge.md#open-items); see [Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
 
 ## Runtime sort-list qualification
 
