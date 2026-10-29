@@ -1430,6 +1430,7 @@ impl Engine {
 	}
 
 	fn expression_query(&self, searcher: &Searcher, expression: &SearchExpression) -> Result<BuiltQuery> {
+		crate::protocol::validate_search_structure(expression, self.max_query_clauses, self.fields.len())?;
 		self.expression_query_inner(searcher, expression, &mut QueryConstructionBudget::default())
 	}
 
@@ -3478,6 +3479,93 @@ mod tests {
 				.clauses,
 			258
 		);
+	}
+
+	#[test]
+	fn direct_search_enforces_structure_before_analysis_or_recursive_construction() {
+		let mut configuration = config();
+		configuration.limits.max_query_clauses = 4096;
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let reader = engine.reader().unwrap();
+		let searcher = reader.searcher();
+		let empty = || expression("", SearchMode::Any, vec![]);
+		let mut request = SearchRequest {
+			sort: None,
+			aggregations: Vec::new(),
+			expression: SearchExpression::Or(vec![empty(); 4096]),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 10,
+			exact_total: true,
+			budget_milliseconds: 30_000,
+			traversal: false,
+			after: None,
+		};
+		assert_eq!(engine.search(&searcher, &request).unwrap().total, 0);
+		request.expression = SearchExpression::Or(vec![expression("the", SearchMode::Any, vec![]); 4096]);
+		assert_eq!(engine.search(&searcher, &request).unwrap().total, 0);
+		request.expression = SearchExpression::Or(vec![empty(); 4097]);
+		assert!(engine
+			.search(&searcher, &request)
+			.unwrap_err()
+			.message
+			.contains("structure exceeds 4096"));
+		request.expression = SearchExpression::And(vec![SearchExpression::Or(vec![empty(); 2048]); 2]);
+		assert!(engine
+			.search(&searcher, &request)
+			.unwrap_err()
+			.message
+			.contains("structure exceeds 4096"));
+		request.expression = SearchExpression::Or(Vec::new());
+		assert!(engine
+			.search(&searcher, &request)
+			.unwrap_err()
+			.message
+			.contains("at least one child"));
+		request.expression = expression(
+			&"x".repeat(crate::protocol::MAX_QUERY_TEXT_BYTES + 1),
+			SearchMode::Any,
+			vec![],
+		);
+		assert!(engine
+			.search(&searcher, &request)
+			.unwrap_err()
+			.message
+			.contains("65536 UTF-8 bytes"));
+		request.expression = empty();
+		for _ in 0..8 {
+			request.expression = SearchExpression::Not(Box::new(request.expression));
+		}
+		assert!(engine.search(&searcher, &request).is_ok());
+		for _ in 0..9992 {
+			request.expression = SearchExpression::Not(Box::new(request.expression));
+		}
+		assert!(engine
+			.search(&searcher, &request)
+			.unwrap_err()
+			.message
+			.contains("nesting exceeds 8"));
+		while let SearchExpression::Not(child) = request.expression {
+			request.expression = *child;
+		}
+		request.expression =
+			SearchExpression::Or(vec![expression("shoe", SearchMode::Any, vec!["title".to_owned()]); 300]);
+		assert!(engine.search(&searcher, &request).is_ok());
+		let defaults = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let reader = defaults.reader().unwrap();
+		assert!(defaults
+			.search(&reader.searcher(), &request)
+			.unwrap_err()
+			.message
+			.contains("structure exceeds 256"));
+		for clauses in [1, 2] {
+			configuration.limits.max_query_clauses = clauses;
+			let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+			let reader = engine.reader().unwrap();
+			request.expression = SearchExpression::Not(Box::new(empty()));
+			assert_eq!(engine.search(&reader.searcher(), &request).is_ok(), clauses == 2);
+		}
 	}
 
 	#[test]

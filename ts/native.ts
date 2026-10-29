@@ -686,7 +686,7 @@ export class NativeFullTextIndex {
 		traversal: boolean,
 	): Promise<SearchPageResult> {
 		const preparationStarted = traversal ? performance.now() : 0;
-		const expression = normalizeSearchExpression(request);
+		const expression = normalizeSearchExpression(request, this.#queryLimits.maxQueryClauses);
 		if (!traversal && request.continuation !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'continuation requires searchPage');
 		}
@@ -1347,6 +1347,7 @@ function asBuffer(value: Uint8Array): Buffer {
 
 function normalizeSearchExpression(
 	request: Pick<SearchRequest, 'text' | 'query' | 'mode' | 'operator' | 'fields'>,
+	maxClauses: number,
 ): import('./codec.js').PackedSearchExpression {
 	if (!request || typeof request !== 'object' || Array.isArray(request)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'search request must be an object');
@@ -1360,7 +1361,7 @@ function normalizeSearchExpression(
 		) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'query cannot be combined with text, mode, operator, or fields');
 		}
-		return normalizeExpression(request.query, 0);
+		return normalizeExpression(request.query, 0, { remaining: maxClauses, limit: maxClauses });
 	}
 	if (typeof request.text !== 'string') {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'search request requires text or query');
@@ -1372,7 +1373,11 @@ function normalizeSearchExpression(
 	};
 }
 
-function normalizeExpression(expression: SearchExpression, depth: number): import('./codec.js').PackedSearchExpression {
+function normalizeExpression(
+	expression: SearchExpression,
+	depth: number,
+	budget: { remaining: number; limit: number },
+): import('./codec.js').PackedSearchExpression {
 	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > maxExpressionDepth) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search expression');
 	}
@@ -1387,7 +1392,8 @@ function normalizeExpression(expression: SearchExpression, depth: number): impor
 		};
 	}
 	if (expression.operator === 'not') {
-		return { operator: 'not', clause: normalizeExpression(expression.clause, depth + 1) };
+		chargeSearchStructure(budget, 2);
+		return { operator: 'not', clause: normalizeExpression(expression.clause, depth + 1, budget) };
 	}
 	if (
 		(expression.operator !== 'and' && expression.operator !== 'or') ||
@@ -1396,10 +1402,16 @@ function normalizeExpression(expression: SearchExpression, depth: number): impor
 	) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'boolean search expressions require at least one clause');
 	}
-	return {
-		operator: expression.operator,
-		clauses: expression.clauses.map((clause) => normalizeExpression(clause, depth + 1)),
-	};
+	chargeSearchStructure(budget, expression.clauses.length);
+	const clauses = [];
+	for (const clause of expression.clauses) clauses.push(normalizeExpression(clause, depth + 1, budget));
+	return { operator: expression.operator, clauses };
+}
+
+function chargeSearchStructure(budget: { remaining: number; limit: number }, cost: number): void {
+	if (cost > budget.remaining)
+		throw new FulltextError('E_INVALID_ARGUMENT', `search structure exceeds ${budget.limit} compiled clauses`);
+	budget.remaining -= cost;
 }
 
 function normalizeFilterExpression(

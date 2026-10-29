@@ -42,6 +42,15 @@ const cases = [
 	{ name: 'max-compiled-clauses', request: { text, fields: ['field0', 'field1', 'field2', 'field3'] } },
 	{ name: 'max-phrase-positions', request: { text, mode: 'phrase' } },
 	{ name: 'max-fuzzy-automata', request: { text: fuzzyText, mode: 'fuzzy' } },
+	...[300, 2048].map((count) => ({
+		name: `text-tree-${count}-leaves`,
+		request: {
+			query: {
+				operator: 'or',
+				clauses: Array.from({ length: count }, (_, i) => ({ text: `word${i}`, fields: ['field0'] })),
+			},
+		},
+	})),
 ];
 let index;
 let defaultReader;

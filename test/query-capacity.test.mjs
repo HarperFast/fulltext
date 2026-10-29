@@ -9,7 +9,8 @@ import {
 	openNativeFullTextReader,
 	runtimeInfo,
 } from '@harperfast/fulltext/native';
-import { decodeResponse, encodeOpen } from '../dist/codec.js';
+import { decodeResponse, encodeOpen, encodeSearch } from '../dist/codec.js';
+import { invoke } from '../dist/invoke.js';
 import { loadAddon } from '../dist/load-addon.js';
 
 const words = (count) => Array.from({ length: count }, (_, i) => `word${i}`).join(' ');
@@ -133,7 +134,7 @@ test('raised term and compiled-clause policies preserve results through readers 
 	}
 });
 
-test('lowered policies apply to phrase, prefix, fuzzy and reader analysis without changing structural bounds', async (context) => {
+test('lowered policies apply to phrase, prefix, fuzzy and reader analysis while filter bounds stay fixed', async (context) => {
 	const { index, config } = await fixture(context, { maxQueryTerms: 2, maxQueryClauses: 3 });
 	for (const mode of ['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'])
 		await assert.rejects(index.search({ text: 'alpha bravo charlie', mode, fields: ['title'] }), invalid);
@@ -151,10 +152,128 @@ test('lowered policies apply to phrase, prefix, fuzzy and reader analysis withou
 		raised.search({ text: 'word0', filter: { field: 'category', comparator: 'in', value: Array(257).fill('sale') } }),
 		invalid,
 	);
+	await raised.search({ query: { operator: 'or', clauses: Array.from({ length: 257 }, () => ({ text: 'word0' })) } });
+});
+
+test('larger text trees follow compiled policy through writers, readers, paging and reopen', async (context) => {
+	const { index, config } = await fixture(context, { maxQueryClauses: 1024 });
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'first', fields: { title: 'word0' } },
+			{ id: 'last', fields: { title: 'word299' } },
+			{ id: 'outside', fields: { title: 'word300' } },
+		],
+	});
+	await index.publish('wide-tree:1');
+	const query = {
+		operator: 'or',
+		clauses: Array.from({ length: 300 }, (_, i) => ({ text: `word${i}`, fields: ['title'] })),
+	};
+	const result = await index.search({ query, exactTotal: true });
+	assert.strictEqual(result.total, 2);
+	assert.deepStrictEqual(result.hits.map((hit) => hit.id).sort(), ['first', 'last']);
+	assert(result.hits.every((hit) => Number.isFinite(hit.score)));
+	for (const limit of [256, 599, 600, 1024]) {
+		const reader = await openNativeFullTextReader({ ...config, limits: { ...config.limits, maxQueryClauses: limit } });
+		try {
+			if (limit < 600) await assert.rejects(reader.search({ query }), invalid);
+			else {
+				assert.deepStrictEqual(await reader.search({ query, exactTotal: true }), result);
+				const first = await reader.searchPage({ query, limit: 1 });
+				const next = await reader.searchPage({ query, limit: 1, continuation: first.continuation });
+				assert.deepStrictEqual([...first.hits, ...next.hits], result.hits);
+			}
+		} finally {
+			assert(!(await reader.close()).cleanupError);
+		}
+	}
+	await index.close();
+	const reopened = await openNativeFullTextIndex(config);
+	try {
+		assert.deepStrictEqual(await reopened.search({ query, exactTotal: true }), result);
+	} finally {
+		assert(!(await reopened.close()).cleanupError);
+	}
+});
+
+test('zero-term trees charge structure globally, retain depth guards and reject sparse inputs', async (context) => {
+	const { index, config } = await fixture(context, { maxQueryClauses: 4096 });
+	await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'sentinel' } }] });
+	await index.commit();
+	await index.reload();
+	const empty = (count) => ({ operator: 'or', clauses: Array.from({ length: count }, () => ({ text: '' })) });
+	assert.strictEqual((await index.search({ query: empty(4096) })).total, 0);
 	await assert.rejects(
-		raised.search({ query: { operator: 'or', clauses: Array.from({ length: 257 }, () => ({ text: 'word0' })) } }),
-		invalid,
+		index.search({ query: empty(4097) }),
+		(error) => invalid(error) && /structure/.test(error.message),
 	);
+	await assert.rejects(
+		index.search({ query: { operator: 'and', clauses: [empty(2048), empty(2048)] } }),
+		(error) => invalid(error) && /structure/.test(error.message),
+	);
+	let nested = { text: '' };
+	for (let i = 0; i < 8; i++) nested = { operator: 'not', clause: nested };
+	await index.search({ query: nested });
+	await assert.rejects(index.search({ query: { operator: 'not', clause: nested } }), invalid);
+	await assert.rejects(index.search({ query: { operator: 'or', clauses: Array(3) } }), invalid);
+	let touched = false;
+	const clauses = Array(4097);
+	Object.defineProperty(clauses, 0, {
+		get() {
+			touched = true;
+			throw new Error('descendant must not be visited');
+		},
+	});
+	await assert.rejects(
+		index.search({ query: { operator: 'or', clauses } }),
+		(error) => invalid(error) && /structure/.test(error.message),
+	);
+	assert.strictEqual(touched, false);
+	for (const limit of [1, 2]) {
+		const reader = await openNativeFullTextReader({ ...config, limits: { ...config.limits, maxQueryClauses: limit } });
+		try {
+			const search = reader.search({ query: { operator: 'not', clause: { text: '' } } });
+			if (limit === 1) await assert.rejects(search, invalid);
+			else assert.strictEqual((await search).total, 1);
+		} finally {
+			assert(!(await reader.close()).cleanupError);
+		}
+	}
+});
+
+test('raw native admission enforces lowered structure and schema-field bounds before callbacks', async () => {
+	const directory = mkdtempSync(path.join(tmpdir(), 'fulltext-raw-structure-'));
+	const config = options(directory, { maxQueryClauses: 3 });
+	const addon = loadAddon();
+	let handle;
+	try {
+		const opened = await invoke((callback) => addon.__nativeOpen(encodeOpen(config), callback));
+		handle = opened.u32();
+		assert.strictEqual(opened.u8(), 0);
+		opened.finish();
+		const frame = (expression) =>
+			encodeSearch({ expression, offset: 0, limit: 1, exactTotal: false, budgetMilliseconds: 5000 });
+		const leaf = { text: '', mode: 'any', fields: [] };
+		let callbacks = 0;
+		for (const [expression, message] of [
+			[{ operator: 'or', clauses: Array(4).fill(leaf) }, /structure exceeds 3/],
+			[{ ...leaf, fields: ['title', 'body', 'unavailable'] }, /field count exceeds 2/],
+		])
+			assert.throws(
+				() =>
+					addon.__nativeSearch(handle, frame(expression), () => {
+						callbacks++;
+					}),
+				(error) => invalid(error) && message.test(error.message),
+			);
+		assert.strictEqual(callbacks, 0);
+		await invoke((callback) =>
+			addon.__nativeSearch(handle, frame({ operator: 'or', clauses: Array(3).fill(leaf) }), callback),
+		);
+	} finally {
+		if (handle !== undefined) await invoke((callback) => addon.__nativeClose(handle, true, callback));
+		rmSync(directory, { recursive: true, force: true });
+	}
 });
 
 test('query construction has fixed whole-tree phrase and fuzzy safeguards', async (context) => {

@@ -458,8 +458,12 @@ ABI 12. Query API 6 and packed mutation/search version 7 remain unchanged; the o
 optional policy extension, with defaults when absent.
 
 The clause setting covers compiled text queries, including field multiplication and expansion.
-It does not raise the independent 256 search/filter leaves, Boolean children or filter `in` values.
-A lower clause setting can reject NOT or multi-field queries even when a one-term query succeeds.
+It also bounds text-tree structure before allocation: each AND/OR child costs one clause and each
+NOT costs two, even for empty or stopword-only branches. Analysis determines the remaining compiled
+cost. For example, 300 single-term, single-field OR branches need 600 clauses. There is no separate
+256-child text cap. Structured filters retain their independent 256 leaves/children and `in` values;
+text and filter costs are not combined. A lower clause setting can reject NOT or multi-field queries
+even when a one-term query succeeds.
 Tracing uses the term setting for its supported simple text clauses; it does not compile indexed
 text queries or reproduce their clause expansion. Existing fuzzy, prefix, text-byte, depth, queue,
 response and deadline limits remain in force. Invalid settings/term or clause overflow reject with

@@ -384,7 +384,8 @@ FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/query-capacity.mjs > query-capacit
 The driver creates an isolated synthetic 1,000-document index with 16 declared fields and text in
 one field. All cases request exact totals and therefore use expensive admission, including the small-query
 control. It checks 1,024 analyzed terms, 4,096 compiled clauses, 16,384 phrase
-term-field positions and 256 fuzzy term-field automata at 1/4/8 callers. Each cell has 12 rounds;
+term-field positions, 256 fuzzy term-field automata, and 300/2,048-branch text trees at 1/4/8 callers.
+The 2,048 single-term, single-field branches consume all 4,096 compiled clauses. Each cell has 12 rounds;
 all results must have exact source-derived totals, stable first IDs and finite scores. A default
 reader must match the raised-policy handle on a shared 64-term query. Twenty-four one-millisecond
 attempts may succeed correctly or time out; an eight-caller full-budget batch must recover and drain.
@@ -397,7 +398,7 @@ fairness; the separate optimized two-handle regression covers admission with one
 permit. This finite fixture does not qualify production concurrency, large multi-segment
 working sets or sustained memory.
 
-Observed locally on macOS arm64, Node 24.16.0, 2026-10-29: all 780 timed requests across 15 cells
+The original five-case run, observed locally on macOS arm64, Node 24.16.0, 2026-10-29: all 780 timed requests across 15 cells
 passed. All 24 short-budget attempts returned `E_TIMEOUT`; full-budget recovery passed. Worst p99
 was 202.311 ms for phrase construction at eight callers. Sampled RSS growth was 174.297 MiB.
 The JSON report records environment metadata and SHA-256 fingerprints of the driver and loaded addon.
@@ -410,3 +411,11 @@ These are one-run observations, not a previous-version speedup claim or universa
 | Maximum compiled clauses |  44.301 |  47.917 |
 | Maximum phrase positions | 180.635 | 202.311 |
 | Maximum fuzzy automata   |  14.737 |  15.517 |
+
+The expanded seven-case run on the same local platform and Node version passed all 1,092 timed
+requests across 21 cells with the unchanged gates. All 24 short-budget attempts timed out;
+full-budget recovery and queue drain passed. Worst p99 was 244.159 ms for phrase construction at
+eight callers; sampled RSS growth was 175.266 MiB. At eight callers, the 300-branch tree had
+p95/p99 6.761/7.529 ms and the 2,048-branch tree 53.873/55.894 ms. These are separate-run
+observations, not a controlled comparison with the original five-case run. The fingerprinted
+report is retained as `fulltext-structure-query-capacity.json` in the local qualification artifacts.

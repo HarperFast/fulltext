@@ -82,6 +82,9 @@ test(
 			for (const request of [
 				{ text: Array.from({ length: 65 }, (_, i) => `word${i}`).join(' '), fields: ['title'] },
 				{ query: { operator: 'or', clauses: Array.from({ length: 64 }, () => ({ text: 'word0' })) } },
+				{
+					query: { operator: 'or', clauses: Array.from({ length: 300 }, () => ({ text: 'word0', fields: ['title'] })) },
+				},
 			]) {
 				addon.__testDelayNextExpensiveSearch(raised.handle, 1500);
 				const large = raised.index.search(request);

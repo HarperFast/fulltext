@@ -212,9 +212,19 @@ Tantivy operations and query construction remain uninterruptible.
 ## Query capacity policy
 
 Operational open limits snapshot analyzed terms per leaf and compiled text clauses on each engine;
-they are absent from persisted identity. Structural tree/filter bounds remain fixed. The facade's
-frozen `queryLimits` getter reports the snapshot, not mutable caller options. Native validation
-remains authoritative for raw frames and direct Rust opens.
+they are absent from persisted identity. Text structure uses that clause budget; depth, bytes and
+structured-filter bounds remain fixed. The facade's frozen `queryLimits` getter reports the
+snapshot, not mutable caller options. Native validation remains authoritative for raw frames and
+direct Rust opens.
+
+`SearchStructureBudget` charges `S = sum(AND/OR child counts) + 2 × NOT count` before descending.
+The compiler charges those same edges plus nonnegative leaf costs, so `S <= compiled clauses`
+and AST nodes are at most `S + 1`. This protects allocation without duplicating Tantivy analysis.
+The Node normalizer charges before visiting children; the native admission scanner uses the actual
+handle policy and rejects field counts above the schema before scanning names. The unchanged
+`decode_search` API uses the supported 4,096-clause ceiling. Direct engine searches run the same
+nonallocating Rust prewalk before analysis. Empty and stopword-only leaves still consume structural
+edges. Conservative lexical admission estimates select a lane; they never reject as compiled cost.
 
 Phrase construction charges positions × fields across the request; fuzzy construction charges
 term-field automata across the tree. Their fixed bounds retain the default policy's implied upper
