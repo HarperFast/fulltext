@@ -464,7 +464,7 @@ enum TracePlan {
 		matcher: Option<FuzzyPrefixMatcher>,
 	},
 	Fuzzy {
-		exact: HashSet<String>,
+		exact: TraceTerms,
 		fuzzy: Vec<(String, String)>,
 	},
 }
