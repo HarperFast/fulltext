@@ -1343,7 +1343,7 @@ impl Engine {
 					}
 					let source_terms = analyzed_by_position.get(&token.position);
 					let exact_match =
-						source_terms.and_then(|tokens| tokens.iter().find(|term| exact.contains(**term)).copied());
+						source_terms.and_then(|tokens| tokens.iter().find(|term| exact.contains(term)).copied());
 					let fuzzy_match = if exact_match.is_none() {
 						fuzzy
 							.iter()
