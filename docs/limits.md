@@ -406,7 +406,7 @@ Phrase tracing checks its deadline while matching anchors/positions; its cost st
 source and phrase shape. Finite qualification does not make a hard callback-time guarantee.
 
 On higher-policy handles, the native scanner keeps conservatively small ASCII queries ordinary;
-text-byte/selected-field estimates exceeding default bounds, and non-ASCII text, use expensive
+ASCII token-run/selected-field estimates exceeding default bounds, and non-ASCII text, use expensive
 admission without analyzing on the event loop. Default-policy classification is unchanged. The
 query-capacity qualification driver reports process CPU, sampled RSS, latency and recovery at
 1/4/8 callers; this is not a production service objective or sustained-memory qualification.

@@ -3383,6 +3383,28 @@ mod tests {
 	}
 
 	#[test]
+	fn ascii_admission_bound_dominates_native_analyzer_token_counts() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let mut analyzer = engine.analyzer.clone();
+		for first in 0u8..=127 {
+			for second in 0u8..=127 {
+				let bytes = [b'a', first, second, b'b', b' ', first, b'c', second];
+				let text = std::str::from_utf8(&bytes).unwrap();
+				let mut stream = analyzer.token_stream(text);
+				let mut actual = 0;
+				while stream.advance() {
+					actual += 1;
+				}
+				assert!(
+					actual <= crate::protocol::ascii_query_term_upper(&bytes).unwrap(),
+					"{bytes:?}: {actual}"
+				);
+			}
+		}
+		assert_eq!(crate::protocol::ascii_query_term_upper("ﷺ".as_bytes()), None);
+	}
+
+	#[test]
 	fn query_capacity_defaults_and_configured_compiled_boundaries() {
 		let words = |count: usize| (0..count).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
 		let defaults = config();

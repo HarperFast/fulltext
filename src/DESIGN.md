@@ -222,7 +222,7 @@ bounds even when configured term/clause limits rise. Hash-set trace plans avoid 
 membership scans. Boundary and construction regressions live in `query-capacity.test.mjs` and the
 engine tests.
 
-Raised-policy admission estimates ordinary ASCII queries using text bytes and selected fields;
+Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
 non-ASCII input conservatively uses the expensive lane because normalization can expand text.
 Default-policy classification is unchanged. The optimized two-handle regression pins ordinary
 isolation and shared expensive permits. The optional open-frame extension preserves version-7

@@ -520,7 +520,7 @@ pub fn search_is_expensive_for_fields(bytes: &[u8], raised_profile_fields: Optio
 	Ok(traversal
 		|| catalog_is_expensive
 		|| (raised_profile_fields.is_some()
-			&& (text_bytes > MAX_QUERY_TERMS || cost.construction_upper > MAX_QUERY_CLAUSES))
+			&& (cost.terms_upper > MAX_QUERY_TERMS || cost.construction_upper > MAX_QUERY_CLAUSES))
 		|| cost.has_expensive_mode
 		|| !cost.has_positive_anchor
 		|| filter_is_expensive
@@ -585,7 +585,22 @@ fn scan_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut u
 	}
 }
 
+pub(crate) fn ascii_query_term_upper(text: &[u8]) -> Option<usize> {
+	let mut terms = 0;
+	let mut in_term = false;
+	for byte in text {
+		if !byte.is_ascii() {
+			return None;
+		}
+		let alphanumeric = byte.is_ascii_alphanumeric();
+		terms += usize::from(alphanumeric && !in_term);
+		in_term = alphanumeric;
+	}
+	Some(terms)
+}
+
 struct SearchCost {
+	terms_upper: usize,
 	construction_upper: usize,
 	has_expensive_mode: bool,
 	has_positive_anchor: bool,
@@ -614,8 +629,12 @@ fn scan_search_expression(
 			if *text_bytes > MAX_QUERY_TEXT_BYTES {
 				return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
 			}
-			let expensive = decode_search_mode(cursor.u8()?)?.is_expensive()
-				|| (raised_profile_fields.is_some() && !text.is_ascii());
+			let expensive = decode_search_mode(cursor.u8()?)?.is_expensive();
+			let terms_upper = if raised_profile_fields.is_some() {
+				ascii_query_term_upper(text).unwrap_or(usize::MAX)
+			} else {
+				0
+			};
 			let field_count = cursor.u16()? as usize;
 			if field_count > MAX_FIELDS || field_count > cursor.remaining() / 4 {
 				return Err(FulltextError::invalid("search field count exceeds its packed request"));
@@ -624,7 +643,8 @@ fn scan_search_expression(
 				let _ = cursor.bytes()?;
 			}
 			Ok(SearchCost {
-				construction_upper: text.len().saturating_mul(if field_count == 0 {
+				terms_upper,
+				construction_upper: terms_upper.saturating_mul(if field_count == 0 {
 					raised_profile_fields.unwrap_or(0)
 				} else {
 					field_count
@@ -640,11 +660,13 @@ fn scan_search_expression(
 					"boolean search expressions require 1 to 256 children",
 				));
 			}
+			let mut terms_upper = 0usize;
 			let mut construction_upper = 0usize;
 			let mut has_expensive_mode = false;
 			let mut has_positive_anchor = kind == 2;
 			for _ in 0..count {
 				let child = scan_search_expression(cursor, depth + 1, clause_count, text_bytes, raised_profile_fields)?;
+				terms_upper = terms_upper.saturating_add(child.terms_upper);
 				construction_upper = construction_upper.saturating_add(child.construction_upper);
 				has_expensive_mode |= child.has_expensive_mode;
 				if kind == 1 {
@@ -654,6 +676,7 @@ fn scan_search_expression(
 				}
 			}
 			Ok(SearchCost {
+				terms_upper,
 				construction_upper,
 				has_expensive_mode,
 				has_positive_anchor,
@@ -662,6 +685,7 @@ fn scan_search_expression(
 		3 => {
 			let child = scan_search_expression(cursor, depth + 1, clause_count, text_bytes, raised_profile_fields)?;
 			Ok(SearchCost {
+				terms_upper: child.terms_upper,
 				construction_upper: child.construction_upper,
 				has_expensive_mode: child.has_expensive_mode,
 				has_positive_anchor: false,
@@ -1793,12 +1817,12 @@ mod tests {
 			bytes.extend_from_slice(&1000u32.to_le_bytes());
 			bytes
 		}
-		for text in ["a", "shoe", "alpha beta"] {
+		for text in ["a", "shoe", "alpha beta", &"a".repeat(65)] {
 			let bytes = request(text);
 			assert!(!search_is_expensive(&bytes).unwrap());
 			assert!(!search_is_expensive_for_fields(&bytes, Some(2)).unwrap());
 		}
-		for (text, fields) in [("a".repeat(65), 1), ("shoe".to_owned(), 128), ("ﷺ".to_owned(), 1)] {
+		for (text, fields) in [("word ".repeat(65), 1), ("shoe".to_owned(), 257), ("ﷺ".to_owned(), 1)] {
 			let bytes = request(&text);
 			assert!(!search_is_expensive(&bytes).unwrap());
 			assert!(search_is_expensive_for_fields(&bytes, Some(fields)).unwrap());
