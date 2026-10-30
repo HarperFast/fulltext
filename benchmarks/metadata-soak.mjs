@@ -138,8 +138,11 @@ let writer,
 	writerClosing = false,
 	current,
 	firstError,
+	firstErrorOperation,
+	finalReaderCloseError,
 	stopping = false,
 	samplerStopping = false;
+let writerOperation = 'writer-open';
 let phase = 'setup',
 	epoch = 0,
 	publications = 0,
@@ -161,8 +164,12 @@ let disk = {},
 	lastDiskAt = -Infinity,
 	sampleTask,
 	workers = [];
-const fail = (error) => {
-	firstError ??= error;
+const describeCloseError = (error) => `${error.code ?? error.name}: ${error.message}`;
+const fail = (error, operation) => {
+	if (!firstError) {
+		firstError = error;
+		firstErrorOperation = operation;
+	}
 	stopping = true;
 	controller.abort();
 };
@@ -269,13 +276,16 @@ function retire(lease) {
 		() => closing.delete(operation),
 		(error) => {
 			closing.delete(operation);
-			fail(error);
+			fail(error, 'reader-close');
 		},
 	);
 }
 async function installReader() {
+	writerOperation = 'reader-oracle';
 	const expected = scenarios();
+	writerOperation = 'reader-open';
 	const reader = await api.openNativeFullTextReader(config);
+	writerOperation = 'reader-validation';
 	const lease = { reader, scenarios: expected, epoch, active: 0, retired: false, closing: false };
 	leases.add(lease);
 	maxReaders = Math.max(maxReaders, leases.size);
@@ -382,7 +392,7 @@ async function readLoop(number) {
 			}
 		}
 	} catch (error) {
-		fail(error);
+		fail(error, 'reader-search');
 	}
 }
 let finalReport,
@@ -391,19 +401,22 @@ try {
 	writer = await api.openNativeFullTextIndex(config);
 	const initial = [...truth.values()];
 	for (let start = 0; start < initial.length; start += 200) {
+		writerOperation = 'apply-mutation';
 		const result = await writer.applyMutationBatch({ upserts: initial.slice(start, start + 200).map(upsert) });
 		assert.deepStrictEqual(result.rejected, []);
 		assert.strictEqual(result.processed, Math.min(200, initial.length - start));
 	}
 	initial.length = 0;
+	writerOperation = 'publish';
 	await writer.publish('soak:0');
+	writerOperation = 'writer-reload';
 	await writer.reload();
 	await installReader();
 	baseline = process.memoryUsage();
 	sampledPeak = baseline.rss;
 	measuredStarted = phaseStarted = performance.now();
 	phase = 'mixed';
-	sampleTask = sampleLoop().catch(fail);
+	sampleTask = sampleLoop().catch((error) => fail(error, 'sample'));
 	workers = Array.from({ length: readers }, (_, n) => readLoop(n));
 	let deleted = [];
 	while (!firstError && performance.now() - phaseStarted < mixedMilliseconds) {
@@ -418,6 +431,7 @@ try {
 		}
 		deleted = Array.from({ length: 10 }, (_, n) => (base + 100 + n) % documents);
 		for (const n of deleted) changed.delete(idOf(n));
+		writerOperation = 'apply-mutation';
 		const result = await writer.applyMutationBatch({
 			upserts: [...changed.values()].map(upsert),
 			deletes: deleted.map(idOf),
@@ -427,13 +441,16 @@ try {
 		mutations += changed.size + deleted.length;
 		for (const [id, row] of changed) truth.set(id, row);
 		for (const n of deleted) truth.delete(idOf(n));
+		writerOperation = 'publish';
 		await writer.publish(`soak:${epoch}`);
+		writerOperation = 'writer-reload';
 		await writer.reload();
 		await installReader();
 		publications++;
 		await delay(Math.max(0, nextWrite - performance.now()), undefined, { signal: controller.signal });
 	}
 	if (firstError) throw firstError;
+	writerOperation = 'writer-close';
 	writerClosing = true;
 	await bounded(closeIndex(writer), 'writer drain');
 	writerClosed = true;
@@ -446,7 +463,9 @@ try {
 	await Promise.all(workers);
 	samplerStopping = true;
 	await sampleTask;
+	writerOperation = 'sample';
 	await collectSample();
+	writerOperation = 'acceptance-gates';
 	const results = reportSummaries();
 	for (const result of results) {
 		assert(result.completed > 0);
@@ -483,16 +502,29 @@ try {
 	}
 	await Promise.all(closing);
 	if (firstError) throw firstError;
+	writerOperation = 'final-reader-open';
 	const reopened = await api.openNativeFullTextReader(config);
+	writerOperation = 'final-reader-validation';
 	try {
 		assert.strictEqual(reopened.committedPayload, `soak:${epoch}`);
 		for (const scenario of current.scenarios)
 			verify(await reopened.search(scenario.request, { remainingBudgetMilliseconds: budget }), scenario);
+	} catch (error) {
+		fail(error, 'final-reader-validation');
+		throw error;
 	} finally {
-		await bounded(closeIndex(reopened), 'reopened reader close');
+		writerOperation = 'final-reader-close';
+		try {
+			await bounded(closeIndex(reopened), 'reopened reader close');
+		} catch (error) {
+			if (firstError) finalReaderCloseError = describeCloseError(error);
+			throw error;
+		}
 	}
+	writerOperation = 'telemetry-close';
 	await telemetry.close();
 	telemetryClosed = true;
+	writerOperation = 'index-remove';
 	await rm(indexPath, { recursive: true });
 	const report = {
 		...manifest,
@@ -513,33 +545,35 @@ try {
 		indexCleanup: 'closed, reopened and verified, then removed',
 		telemetry: 'samples.ndjson',
 	};
+	writerOperation = 'report-write';
 	await writeFile(path.join(artifacts, 'report.json'), stringify(report) + '\n', { flag: 'wx' });
 	finalReport = report;
 	log({ phase: 'accepted', completed, publications, mutations, tails, peakGrowthBytes: finalReport.peakGrowthBytes });
 } catch (error) {
 	finalReport = undefined;
-	fail(error);
+	fail(error, writerOperation);
 	await Promise.allSettled(workers);
 	samplerStopping = true;
 	if (sampleTask) await sampleTask;
-	const closeErrors = [];
+	const closeErrors = finalReaderCloseError ? [finalReaderCloseError] : [];
 	for (const lease of leases) {
 		try {
 			await bounded(closeIndex(lease.reader), 'failure reader close');
 		} catch (closeError) {
-			closeErrors.push(String(closeError));
+			closeErrors.push(describeCloseError(closeError));
 		}
 	}
 	if (writer && !writerClosed) {
 		try {
 			await bounded(closeIndex(writer, { mode: 'rollback' }), 'failure writer close');
 		} catch (closeError) {
-			closeErrors.push(String(closeError));
+			closeErrors.push(describeCloseError(closeError));
 		}
 	}
 	const failure = {
 		accepted: false,
 		error: { message: firstError.message, stack: firstError.stack, code: firstError.code },
+		operation: firstErrorOperation,
 		phase,
 		completed,
 		publications,

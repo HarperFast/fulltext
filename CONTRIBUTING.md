@@ -23,6 +23,16 @@ Rust tests exercise the engine and directory contract without Node.js. Node test
 load it through the public `./native` entry point, verify panic containment, and install the output
 of `npm pack` into a temporary consumer project.
 
+CI runs the primary checks on Node.js 22.18, 24, and 26 across Linux x64/arm64, macOS arm64,
+and Windows x64. Node.js 26 adds four matrix jobs, approximately 20–30 runner-minutes per run
+based on recent job durations. The public-repository hosted runner pool has no execution charge.
+
+CI retains synthetic soak manifests, failure reports, and memory/queue samples for 14 days after
+failure. Native index files and memory maps are not uploaded. Set `FULLTEXT_TEST_ARTIFACT_ROOT`
+to an empty scratch directory to retain these test fixtures locally; otherwise the tests remove
+their temporary directories. An artifact with an injected failure is expected in negative tests;
+use the failed test name and error to identify unexpected failures.
+
 ## Automated review
 
 Maintainers can apply the `claude-review` or `gemini-review` label to run the corresponding

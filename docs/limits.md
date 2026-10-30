@@ -14,25 +14,25 @@ rescans the matching set, so traversing a large result set can still exhaust the
 
 ## Query and result bounds
 
-These are fixed safety bounds in this release, not index configuration options. Requests that exceed
+Unless explicitly configurable below, these are fixed safety bounds in this release. Requests that exceed
 them fail; callers must not catch the error and substitute a smaller query while claiming equivalent
 results.
 
-| Bound                       | Value                                                | Effect and recovery                                                                                                                                                                                                                                                     |
-| --------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ordinary `offset + limit`   | 10,000                                               | Rejects deeper windows. Use `searchPage()` rather than increasing offsets.                                                                                                                                                                                              |
-| Traversal page `limit`      | 1–10,000                                             | Returns at most `limit` hits after merging; retains at most `limit + 1` candidates per segment, independent of traversal depth. Continue until the continuation is absent.                                                                                              |
-| Prefix/fuzzy-prefix hits    | 100, offset zero                                     | Applies to legacy `search()` only. Use `searchPage()` for subsequent prefix/fuzzy-prefix matches; its independent page and byte budgets apply.                                                                                                                          |
-| Candidate IDs               | 1,024 IDs and 1 MiB combined UTF-8 ID bytes          | Rejects larger candidate lists; it does not silently select the first 1,024. Use indexed structured filters where applicable. Splitting candidates requires caller-owned global ordering, totals, and merging; independent top-k batches are not a drop-in replacement. |
-| Query text                  | 64 KiB total UTF-8 bytes                             | Applies across Boolean leaf text. Narrow the query; do not truncate user text silently.                                                                                                                                                                                 |
-| Analyzed query terms        | 64                                                   | Applies per analyzed query leaf, not to the whole Boolean tree. The compiled clause budget also applies. Analysis can remove stop words or produce different terms from raw whitespace splitting.                                                                       |
-| Query/filter clauses        | 256                                                  | Query terms, selected fields, and expansions can multiply compiled clauses. A valid schema with 1,024 fields does not imply that an all-field query fits this budget. Select the fields needed by the query.                                                            |
-| Expression depth            | 8 edges from the root                                | Search and filter trees reject deeper nesting. Flatten equivalent Boolean groups where semantics permit.                                                                                                                                                                |
-| Exact prefix expansion      | 50 distinct terms per selected field across segments | Exceeding this rejects with `E_PREFIX_TOO_BROAD`; rankings are not silently truncated. A longer prefix or narrower field set may help. Candidate IDs and structured record filters do not narrow term-dictionary expansion.                                             |
-| Fuzzy-eligible terms        | 16                                                   | Rejects too many fuzzy terms. Fuzzy expansion and compiled-clause costs still apply below this cap.                                                                                                                                                                     |
-| Packed search/trace request | 8 MiB                                                | Rejects oversized frames. Other text, candidate, and source limits usually apply first.                                                                                                                                                                                 |
-| Search response             | 8 MiB                                                | Fails with `E_RESULT_TOO_LARGE`. Reduce `limit` and retry. A legal 10,000-hit page can exceed this bound when IDs/versions are large.                                                                                                                                   |
-| Queue plus execution budget | 30,000 ms maximum                                    | The facade defaults to this ceiling, clamps larger supplied budgets to it, rounds down fractional milliseconds, and uses at least 1 ms. Native frames outside 1–30,000 ms reject. `E_TIMEOUT` does not imply a hard callback-time bound.                                |
+| Bound                       | Value                                                     | Effect and recovery                                                                                                                                                                                                                                                     |
+| --------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ordinary `offset + limit`   | 10,000                                                    | Rejects deeper windows. Use `searchPage()` rather than increasing offsets.                                                                                                                                                                                              |
+| Traversal page `limit`      | 1–10,000                                                  | Returns at most `limit` hits after merging; retains at most `limit + 1` candidates per segment, independent of traversal depth. Continue until the continuation is absent.                                                                                              |
+| Prefix/fuzzy-prefix hits    | 100, offset zero                                          | Applies to legacy `search()` only. Use `searchPage()` for subsequent prefix/fuzzy-prefix matches; its independent page and byte budgets apply.                                                                                                                          |
+| Candidate IDs               | 1,024 IDs and 1 MiB combined UTF-8 ID bytes               | Rejects larger candidate lists; it does not silently select the first 1,024. Use indexed structured filters where applicable. Splitting candidates requires caller-owned global ordering, totals, and merging; independent top-k batches are not a drop-in replacement. |
+| Query text                  | 64 KiB total UTF-8 bytes                                  | Applies across Boolean leaf text. Narrow the query; do not truncate user text silently.                                                                                                                                                                                 |
+| Analyzed query terms        | 64 default, configurable at open                          | Applies per analyzed query leaf, not to the whole Boolean tree. The compiled clause budget also applies. Analysis can remove stop words or produce different terms from raw whitespace splitting.                                                                       |
+| Query/filter clauses        | 256 default; text structure uses configured clause budget | Query terms, selected fields, and expansions can multiply compiled clauses. A valid schema with 1,024 fields does not imply that an all-field query fits this budget. Select the fields needed by the query.                                                            |
+| Expression depth            | 8 edges from the root                                     | Search and filter trees reject deeper nesting. Flatten equivalent Boolean groups where semantics permit.                                                                                                                                                                |
+| Exact prefix expansion      | 50 distinct terms per selected field across segments      | Exceeding this rejects with `E_PREFIX_TOO_BROAD`; rankings are not silently truncated. A longer prefix or narrower field set may help. Candidate IDs and structured record filters do not narrow term-dictionary expansion.                                             |
+| Fuzzy-eligible terms        | 16                                                        | Rejects too many fuzzy terms. Fuzzy expansion and compiled-clause costs still apply below this cap.                                                                                                                                                                     |
+| Packed search/trace request | 8 MiB                                                     | Rejects oversized frames. Other text, candidate, and source limits usually apply first.                                                                                                                                                                                 |
+| Search response             | 8 MiB                                                     | Fails with `E_RESULT_TOO_LARGE`. Reduce `limit` and retry. A legal 10,000-hit page can exceed this bound when IDs/versions are large.                                                                                                                                   |
+| Queue plus execution budget | 30,000 ms maximum                                         | The facade defaults to this ceiling, clamps larger supplied budgets to it, rounds down fractional milliseconds, and uses at least 1 ms. Native frames outside 1–30,000 ms reject. `E_TIMEOUT` does not imply a hard callback-time bound.                                |
 
 Traversal snapshots the candidate list, checks original count and combined UTF-8 bytes against
 native-reported capacities, then sorts its unique IDs for identity. Duplicate count does not change
@@ -138,8 +138,8 @@ Retained readers need bounded lifetimes and counts, cleanup on every exit path, 
 routing, and explicit expiration on restart/rebuild. Native snapshots freeze indexed hits, not
 current source values or permissions. Current authorization and version checks remain necessary.
 
-The 64-term/256-clause configuration policy is tracked in [Make query term and clause limits
-configurable with bounded resource policy](https://github.com/HarperFast/fulltext/issues/63).
+The configurable 64-term/256-clause default policy is described in
+[query capacity](#query-capacity-policy).
 Long-token omission and language/analyzer changes require a versioned analyzer and rebuild rather
 than silently raising a constant.
 
@@ -291,6 +291,22 @@ accompany the pre-1.0 package change from 0.5 to 0.6; they do not introduce a `s
 
 ## Direct Rust API compatibility for the unreleased metadata APIs
 
+Direct Rust `protocol::Limits` literals now also supply `max_query_terms: 64` and
+`max_query_clauses: 256` for default policy, or validated configured values. They are operational
+settings and do not alter persisted identity.
+
+Direct `Engine::search` now validates text structure before analysis, including a maximum depth of
+eight and 64 KiB of total raw leaf text. Empty `And`/`Or` nodes now reject with
+`E_INVALID_ARGUMENT`; previously direct Rust callers could receive an empty result. Raw text over
+64 KiB also now rejects for direct callers even if analysis would deduplicate it below the term
+limit. These bring direct Rust acceptance into line with packed requests. Replace an intentionally
+empty Boolean tree with an empty text leaf when an empty result is wanted.
+
+`protocol::decode_search` is policy-neutral and uses the supported 4,096-clause structural ceiling.
+`protocol::search_is_expensive` is a default-policy convenience classifier. Rust hosts with a known
+schema or another policy must use `search_is_expensive_for_config` with the engine configuration;
+classification also enforces that policy's structural bound.
+
 When migrating from released 0.7.x, ordinary `protocol::SearchRequest` literals add `sort: None`
 and `aggregations: Vec::new()`. Catalog callers use `catalog::SortRequest` and
 `catalog::AggregationRequest` (with child `aggregations: Vec::new()` for leaves). Sorted requests
@@ -301,7 +317,7 @@ it: its cached wire representation is crate-private.
 Exhaustive matches must handle `FilterExpression::Not(Box<FilterExpression>)` and
 `FilterComparator::{Exists, Missing}`. Presence clauses carry `values: Vec::new()`.
 `SearchResult` and the filter enums are source changes to the pre-1.0 Rust API; the JavaScript
-facade uses packed protocol 7, native ABI 11, and query API 6 with its matching addon.
+facade uses packed protocol 7, native ABI 12, and query API 6 with its matching addon.
 
 ## Source reference
 
@@ -378,3 +394,42 @@ String metadata adds a raw fast column. The writer stores repeated strings once 
 to avoid redundant fast-column values, preserving first occurrence for sorting. Native terms
 aggregation independently counts each distinct string once per document. Upgrading a released index containing string metadata requires a
 rebuild to sidecar v8. Numeric/Boolean-only metadata keeps sidecar v7; text-only keeps v6.
+
+## Query capacity policy
+
+`limits.maxQueryTerms` accepts integers 1–1,024 and `limits.maxQueryClauses` accepts integers
+1–4,096, defaulting to 64/256 when omitted. These are host-selected operational settings, not
+persisted schema identity or search-request overrides. `queryLimits` reports each handle's frozen
+policy. Runtime capability metadata retains the default bounds and advertises supported ceilings
+separately. Apply one policy consistently across workers; reopen to change it without rebuilding.
+
+Terms are counted after analysis per text leaf: ordinary ANY/ALL deduplicates analyzed terms;
+phrase/prefix position analysis retains positions as before. Compiled text-clause accounting
+includes selected fields, fuzzy branches, prefix expansion and Boolean overhead. Before allocating
+text-tree children, the facade and native scanner charge each AND/OR child once and each NOT twice
+against that handle's clause budget. This structural lower bound also counts empty and stopword-only
+branches; native analysis determines the final compiled cost. A 300-branch, single-term, single-field
+OR needs 600 clauses. The decoder independently enforces the supported 4,096-clause ceiling, and
+direct Rust searches validate structure before compilation. Requested field counts cannot exceed
+the index's declared text-field count.
+
+There is no independent 256-leaf/child text cap. Structured filter trees retain independent 256
+leaves/children and filter values; text and filter costs are not combined. Both tree types retain
+depth eight. The 64 KiB total raw-text and 8 MiB packed-request bounds also remain fixed. These
+bounds limit nodes and input bytes, not exact heap usage: repeated field lists become owned strings
+during decoding. Qualify memory for the chosen schema, policy and concurrent expensive permits;
+the finite 16-field fixture does not qualify a maximum-width schema. Tracing
+applies analyzed-term limits to its simple text clause, without compiling indexed clauses.
+
+Whole-query construction additionally permits at most 16,384 phrase term-field positions and
+256 fuzzy term-field automata across all branches. These fixed guards preserve the default policy's
+implied construction bounds; raising term/clause policy does not raise them. Construction overflow
+rejects explicitly. Individual Tantivy setup operations remain synchronous between deadline checks.
+Phrase tracing checks its deadline while matching anchors/positions; its cost still depends on the
+source and phrase shape. Finite qualification does not make a hard callback-time guarantee.
+
+On higher-policy handles, the native scanner keeps conservatively small ASCII queries ordinary;
+ASCII token-run/selected-field estimates exceeding default bounds, and non-ASCII text, use expensive
+admission without analyzing on the event loop. Default-policy classification is unchanged. The
+query-capacity qualification driver reports process CPU, sampled RSS, latency and recovery at
+1/4/8 callers; this is not a production service objective or sustained-memory qualification.

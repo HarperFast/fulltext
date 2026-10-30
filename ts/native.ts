@@ -28,6 +28,7 @@ import {
 	maxTraceRecords,
 	maxExpressionDepth,
 	maxQueryClauses,
+	resolveQueryLimits,
 	encodeTrace,
 	MutationBatchFrameCursor,
 } from './codec.js';
@@ -70,6 +71,8 @@ export interface RuntimeInfo {
 
 		maxCommitPayloadBytes: number;
 		maxQueryTextBytes: number;
+		maxConfiguredQueryTerms: number;
+		maxConfiguredQueryClauses: number;
 		maxQueryTerms: number;
 		maxQueryClauses: number;
 		maxCandidateIds: number;
@@ -113,7 +116,14 @@ export interface NativeFullTextIndexOptions {
 	limits: NativeFullTextIndexLimits;
 }
 
+export interface QueryLimits {
+	readonly maxQueryTerms: number;
+	readonly maxQueryClauses: number;
+}
+
 export interface NativeFullTextIndexLimits {
+	maxQueryTerms?: number;
+	maxQueryClauses?: number;
 	indexingThreads: number;
 	searchThreads: number;
 	writerMemoryBytes: number;
@@ -355,6 +365,7 @@ export class NativeFullTextIndex {
 	#logicalMutationState: 'idle' | 'active' | 'incomplete' = 'idle';
 	#continuationKey?: Buffer;
 	#candidateLimits?: Pick<RuntimeInfo['limits'], 'maxCandidateIds' | 'maxCandidateBytes'>;
+	readonly #queryLimits: Readonly<QueryLimits>;
 	readonly #maxPreparationCommands: number;
 	readonly #maxPreparationBytes: number;
 	#preparationCommands = 0;
@@ -366,8 +377,12 @@ export class NativeFullTextIndex {
 		maxBatchBytes: number;
 		fieldNames: Iterable<string>;
 		filterFields?: Iterable<{ name: string; type: 'string' | 'number' | 'boolean' }>;
-		searchLimits?: Pick<NativeFullTextIndexLimits, 'maxQueuedCommands' | 'maxQueuedBytes'>;
+		searchLimits?: Pick<
+			NativeFullTextIndexLimits,
+			'maxQueuedCommands' | 'maxQueuedBytes' | 'maxQueryTerms' | 'maxQueryClauses'
+		>;
 	}) {
+		this.#queryLimits = Object.freeze(resolveQueryLimits(options.searchLimits));
 		const preparationCommands = options.searchLimits?.maxQueuedCommands ?? maxPreparationCommands;
 		const preparationBytes = options.searchLimits?.maxQueuedBytes ?? maxSearchRequestBytes;
 		for (const value of [preparationCommands, preparationBytes]) {
@@ -382,6 +397,10 @@ export class NativeFullTextIndex {
 		this.#maxBatchBytes = options.maxBatchBytes;
 		this.#fieldNames = new Set(options.fieldNames);
 		this.#filterFieldTypes = new Map(Array.from(options.filterFields ?? [], (field) => [field.name, field.type]));
+	}
+
+	get queryLimits(): Readonly<QueryLimits> {
+		return this.#queryLimits;
 	}
 
 	get committedPayload(): string | undefined {
@@ -667,7 +686,7 @@ export class NativeFullTextIndex {
 		traversal: boolean,
 	): Promise<SearchPageResult> {
 		const preparationStarted = traversal ? performance.now() : 0;
-		const expression = normalizeSearchExpression(request);
+		const expression = normalizeSearchExpression(request, this.#queryLimits.maxQueryClauses);
 		if (!traversal && request.continuation !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'continuation requires searchPage');
 		}
@@ -1009,6 +1028,10 @@ export class NativeFullTextReader {
 		this.#inner = inner;
 	}
 
+	get queryLimits(): Readonly<QueryLimits> {
+		return this.#inner.queryLimits;
+	}
+
 	get committedPayload(): string | undefined {
 		return this.#inner.committedPayload;
 	}
@@ -1324,6 +1347,7 @@ function asBuffer(value: Uint8Array): Buffer {
 
 function normalizeSearchExpression(
 	request: Pick<SearchRequest, 'text' | 'query' | 'mode' | 'operator' | 'fields'>,
+	maxClauses: number,
 ): import('./codec.js').PackedSearchExpression {
 	if (!request || typeof request !== 'object' || Array.isArray(request)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'search request must be an object');
@@ -1337,7 +1361,7 @@ function normalizeSearchExpression(
 		) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'query cannot be combined with text, mode, operator, or fields');
 		}
-		return normalizeExpression(request.query, 0);
+		return normalizeExpression(request.query, 0, { remaining: maxClauses, limit: maxClauses });
 	}
 	if (typeof request.text !== 'string') {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'search request requires text or query');
@@ -1349,7 +1373,11 @@ function normalizeSearchExpression(
 	};
 }
 
-function normalizeExpression(expression: SearchExpression, depth: number): import('./codec.js').PackedSearchExpression {
+function normalizeExpression(
+	expression: SearchExpression,
+	depth: number,
+	budget: { remaining: number; limit: number },
+): import('./codec.js').PackedSearchExpression {
 	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > maxExpressionDepth) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search expression');
 	}
@@ -1364,19 +1392,24 @@ function normalizeExpression(expression: SearchExpression, depth: number): impor
 		};
 	}
 	if (expression.operator === 'not') {
-		return { operator: 'not', clause: normalizeExpression(expression.clause, depth + 1) };
+		chargeSearchStructure(budget, 2);
+		return { operator: 'not', clause: normalizeExpression(expression.clause, depth + 1, budget) };
 	}
-	if (
-		(expression.operator !== 'and' && expression.operator !== 'or') ||
-		!Array.isArray(expression.clauses) ||
-		expression.clauses.length === 0
-	) {
+	const children = expression.clauses;
+	const count = Array.isArray(children) ? children.length : 0;
+	if ((expression.operator !== 'and' && expression.operator !== 'or') || !Number.isSafeInteger(count) || count < 1) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'boolean search expressions require at least one clause');
 	}
-	return {
-		operator: expression.operator,
-		clauses: expression.clauses.map((clause) => normalizeExpression(clause, depth + 1)),
-	};
+	chargeSearchStructure(budget, count);
+	const clauses = [];
+	for (let i = 0; i < count; i++) clauses.push(normalizeExpression(children[i], depth + 1, budget));
+	return { operator: expression.operator, clauses };
+}
+
+function chargeSearchStructure(budget: { remaining: number; limit: number }, cost: number): void {
+	if (cost > budget.remaining)
+		throw new FulltextError('E_INVALID_ARGUMENT', `search structure exceeds ${budget.limit} compiled clauses`);
+	budget.remaining -= cost;
 }
 
 function normalizeFilterExpression(

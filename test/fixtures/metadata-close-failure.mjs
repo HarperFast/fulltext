@@ -2,6 +2,7 @@ import { NativeFullTextIndex, NativeFullTextReader, runtimeInfo } from '../../di
 import { encodeOpen, decodeResponse } from '../../dist/codec.js';
 import { loadAddon } from '../../dist/load-addon.js';
 export { runtimeInfo };
+let writerClosed = false;
 
 async function open(options, readOnly) {
 	const addon = loadAddon();
@@ -25,7 +26,8 @@ async function open(options, readOnly) {
 	const handle = cursor.u32();
 	const payload = cursor.u8() ? cursor.string() : undefined;
 	cursor.finish();
-	if ((process.env.FULLTEXT_TEST_CLOSE_KIND === 'reader') === readOnly) addon.__testFailNextClose(handle, true);
+	if (process.env.FULLTEXT_TEST_CLOSE_KIND === (readOnly ? 'reader' : 'writer'))
+		addon.__testFailNextClose(handle, true);
 	const index = new NativeFullTextIndex({
 		handle,
 		committedPayload: payload,
@@ -34,6 +36,30 @@ async function open(options, readOnly) {
 		fieldNames: options.fields.map(({ name }) => name),
 		filterFields: options.filterFields,
 	});
+	if (!readOnly && process.env.FULLTEXT_TEST_CLOSE_KIND === 'publish') {
+		const publish = index.publish.bind(index);
+		let publications = 0;
+		index.publish = (...args) => {
+			if (++publications === 2) throw Object.assign(new Error('injected publication failure'), { code: 'E_STORAGE' });
+			return publish(...args);
+		};
+	}
+	if (['final-reader', 'final-reader-close'].includes(process.env.FULLTEXT_TEST_CLOSE_KIND)) {
+		if (!readOnly) {
+			const close = index.close.bind(index);
+			index.close = async (...args) => {
+				const result = await close(...args);
+				if (!result.cleanupError) writerClosed = true;
+				return result;
+			};
+		} else if (writerClosed) {
+			addon.__testFailNextClose(handle, true);
+			if (process.env.FULLTEXT_TEST_CLOSE_KIND === 'final-reader')
+				index.search = () => {
+					throw new Error('injected final reader validation failure');
+				};
+		}
+	}
 	return readOnly ? new NativeFullTextReader(index) : index;
 }
 export const openNativeFullTextIndex = (options) => open(options, false);

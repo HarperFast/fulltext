@@ -188,8 +188,8 @@ aggregation children map directly to native `sub_aggregation` trees. Resource ad
 for collector construction and possible parent instances before collection. Histogram parents use
 position spans, with native query-scoped probes when conservative admission fails. Histogram safety
 checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
-checks protect each recursive wire/API walker. Packed protocol 7, ABI 11 and query API 6 change
-in lockstep; this expansion does not change persisted identity v8.
+checks protect each recursive wire/API walker. Packed protocol 7 and query API 6 describe the expanded query contract; current ABI 12 additionally
+requires query-capacity open support. Neither change alters persisted identity v8.
 
 Sorted snapshot continuation and metadata-derived score adjustment remain outside this
 increment. Production latency, process-memory residency, and Harper integration are untested.
@@ -208,3 +208,39 @@ Tantivy operations and query construction remain uninterruptible.
 - [Facade and token identity](../ts/native.ts)
 - [Public API tests](../test/native-traversal.test.mjs)
 - [Pinned Tantivy version](../Cargo.toml)
+
+## Query capacity policy
+
+Operational open limits snapshot analyzed terms per leaf and compiled text clauses on each engine;
+they are absent from persisted identity. Text structure uses that clause budget; depth, bytes and
+structured-filter bounds remain fixed. The facade's frozen `queryLimits` getter reports the
+snapshot, not mutable caller options. Native validation remains authoritative for raw frames and
+direct Rust opens.
+
+`SearchStructureBudget` charges `S = sum(AND/OR child counts) + 2 × NOT count` before descending.
+The compiler charges those same edges plus nonnegative leaf costs, so `S <= compiled clauses`
+and AST nodes are at most `S + 1`. This protects allocation without duplicating Tantivy analysis.
+The Node normalizer charges before visiting children; the native admission scanner uses the actual
+handle policy and rejects field counts above the schema before scanning names. The unchanged
+`decode_search` API uses the supported 4,096-clause ceiling. Direct engine searches run the same
+nonallocating Rust prewalk before analysis. Empty and stopword-only leaves still consume structural
+edges. Conservative lexical admission estimates select a lane; they never reject as compiled cost.
+
+Phrase construction charges positions × fields across the request; fuzzy construction charges
+term-field automata across the tree. Their fixed bounds retain the default policy's implied upper
+bounds even when configured term/clause limits rise. Exact trace membership uses short vector comparisons for up to eight terms and hash lookup
+above that. Fuzzy traces compare at most 16 eligible alternatives. Branch-local found cardinality
+makes completion checks constant-time. Boundary and construction regressions live in `query-capacity.test.mjs` and the
+engine tests.
+
+Raised-policy admission compares maximum per-leaf term cost and summed compiled-clause cost against the default envelope. Boolean child counts and NOT’s two synthetic clauses are included, matching native query construction; term counts across independent leaves are not added. Protocol boundary tests and the two-handle optimized admission test enforce this distinction.
+
+Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
+non-ASCII input conservatively uses the expensive lane because normalization can expand text.
+Default-policy classification is unchanged. The optimized two-handle regression pins ordinary
+isolation and shared expensive permits. The optional open-frame extension preserves version-7
+mutation/search frames; ABI 12 requires a matching facade/addon.
+
+The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
+additional tail rejects. A future extension needs explicit framing/versioning rather than appending
+an ambiguous optional value.

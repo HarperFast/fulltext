@@ -37,8 +37,8 @@ use crate::error::{index_error, FulltextError, Result};
 use crate::protocol::{
 	validate_record_id, validate_search_window, EngineConfig, EngineIdentityConfig, FilterComparator, FilterExpression,
 	FilterFieldType, FilterValue, MutationBatch, SearchClause, SearchExpression, SearchMode, SearchRequest,
-	SynonymRule, TraceRecord, MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_QUERY_TERMS,
-	MAX_SEARCH_RESPONSE_BYTES, MAX_TRACE_SPANS,
+	SynonymRule, TraceRecord, MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_SEARCH_RESPONSE_BYTES,
+	MAX_TRACE_SPANS,
 };
 
 const ID_FIELD_NAME: &str = "__fulltext_id";
@@ -77,6 +77,8 @@ pub struct Engine {
 	index_analyzer: TextAnalyzer,
 	surface_index_analyzer: TextAnalyzer,
 	positions: bool,
+	max_query_terms: usize,
+	max_query_clauses: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +106,37 @@ struct EngineFilterField {
 struct BuiltQuery {
 	query: Box<dyn Query>,
 	clauses: usize,
+}
+
+const MAX_PHRASE_CONSTRUCTION_TERMS: usize = 64 * 256;
+const MAX_FUZZY_CONSTRUCTION_AUTOMATA: usize = 256;
+
+#[derive(Default)]
+struct QueryConstructionBudget {
+	phrase_terms: usize,
+	fuzzy_automata: usize,
+}
+
+impl QueryConstructionBudget {
+	fn phrase(&mut self, terms: usize, fields: usize) -> Result<()> {
+		self.phrase_terms = self.phrase_terms.saturating_add(terms.saturating_mul(fields));
+		if self.phrase_terms > MAX_PHRASE_CONSTRUCTION_TERMS {
+			return Err(FulltextError::invalid(format!(
+				"phrase construction exceeds {MAX_PHRASE_CONSTRUCTION_TERMS} term-field positions"
+			)));
+		}
+		Ok(())
+	}
+
+	fn fuzzy(&mut self, terms: usize, fields: usize) -> Result<()> {
+		self.fuzzy_automata = self.fuzzy_automata.saturating_add(terms.saturating_mul(fields));
+		if self.fuzzy_automata > MAX_FUZZY_CONSTRUCTION_AUTOMATA {
+			return Err(FulltextError::invalid(format!(
+				"fuzzy construction exceeds {MAX_FUZZY_CONSTRUCTION_AUTOMATA} automata"
+			)));
+		}
+		Ok(())
+	}
 }
 
 type StableScoreTieHit = ((Score, String), DocAddress);
@@ -389,16 +422,51 @@ struct SourceToken {
 	position: usize,
 }
 
+enum TraceTerms {
+	Small(Vec<String>),
+	Large(HashSet<String>),
+}
+
+impl FromIterator<String> for TraceTerms {
+	fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+		let terms: Vec<_> = iter.into_iter().collect();
+		if terms.len() <= 8 {
+			Self::Small(terms)
+		} else {
+			Self::Large(terms.into_iter().collect())
+		}
+	}
+}
+
+impl TraceTerms {
+	fn len(&self) -> usize {
+		match self {
+			Self::Small(terms) => terms.len(),
+			Self::Large(terms) => terms.len(),
+		}
+	}
+
+	fn contains(&self, term: &str) -> bool {
+		match self {
+			Self::Small(terms) => terms.iter().any(|candidate| candidate == term),
+			Self::Large(terms) => terms.contains(term),
+		}
+	}
+}
+
 enum TracePlan {
-	Any(Vec<String>),
-	All(Vec<String>),
+	Any(TraceTerms),
+	All(TraceTerms),
 	Phrase(Vec<(usize, String)>),
 	Prefix {
-		completed: Vec<String>,
+		completed: TraceTerms,
 		prefix: String,
 		matcher: Option<FuzzyPrefixMatcher>,
 	},
-	Fuzzy(Vec<(String, String)>),
+	Fuzzy {
+		exact: TraceTerms,
+		fuzzy: Vec<(String, String)>,
+	},
 }
 
 struct FuzzyPrefixMatcher {
@@ -443,15 +511,14 @@ impl FuzzyPrefixMatcher {
 
 impl TracePlan {
 	fn record_matches(&self, found: &HashSet<String>) -> bool {
+		// Each trace branch inserts only its own distinct terms or its private match marker.
 		match self {
-			Self::Any(terms) if terms.is_empty() => false,
-			Self::Any(terms) => terms.iter().any(|term| found.contains(term)),
-			Self::All(terms) => !terms.is_empty() && terms.iter().all(|term| found.contains(term)),
+			Self::Any(_) | Self::Fuzzy { .. } => !found.is_empty(),
+			Self::All(terms) => terms.len() != 0 && found.len() == terms.len(),
 			Self::Phrase(terms) => !terms.is_empty() && found.contains("__phrase"),
 			Self::Prefix { completed, prefix, .. } => {
-				!prefix.is_empty() && found.contains("__prefix") && completed.iter().all(|term| found.contains(term))
+				!prefix.is_empty() && found.contains("__prefix") && found.len() == completed.len() + 1
 			}
-			Self::Fuzzy(terms) => !terms.is_empty() && terms.iter().any(|(term, _)| found.contains(term)),
 		}
 	}
 }
@@ -501,6 +568,7 @@ impl Engine {
 	}
 
 	pub fn open<D: Directory + Clone>(directory: D, config: &EngineConfig) -> Result<Self> {
+		crate::protocol::validate_query_limits(config.limits.max_query_terms, config.limits.max_query_clauses)?;
 		let canonical = canonical_identity(&config.identity)?;
 		let identity = canonical.config;
 		let analyzer = canonical.analyzer;
@@ -570,6 +638,8 @@ impl Engine {
 			index_analyzer,
 			surface_index_analyzer,
 			positions: identity.positions,
+			max_query_terms: config.limits.max_query_terms,
+			max_query_clauses: config.limits.max_query_clauses,
 		})
 	}
 
@@ -1068,8 +1138,12 @@ impl Engine {
 
 	fn trace_plan(&self, request: &SearchClause) -> Result<TracePlan> {
 		match request.mode {
-			SearchMode::Any => Ok(TracePlan::Any(self.analyze(&request.text, false, true)?)),
-			SearchMode::All => Ok(TracePlan::All(self.analyze(&request.text, false, true)?)),
+			SearchMode::Any => Ok(TracePlan::Any(
+				self.analyze(&request.text, false, true)?.into_iter().collect(),
+			)),
+			SearchMode::All => Ok(TracePlan::All(
+				self.analyze(&request.text, false, true)?.into_iter().collect(),
+			)),
 			SearchMode::Phrase => {
 				if !self.positions {
 					return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
@@ -1078,7 +1152,9 @@ impl Engine {
 			}
 			SearchMode::Prefix | SearchMode::FuzzyPrefix => {
 				if request.text.chars().last().is_some_and(char::is_whitespace) {
-					return Ok(TracePlan::All(self.analyze(&request.text, false, true)?));
+					return Ok(TracePlan::All(
+						self.analyze(&request.text, false, true)?.into_iter().collect(),
+					));
 				}
 				let (completed, prefix) = self.final_surface_term(&request.text)?;
 				let prefix = prefix.unwrap_or_default();
@@ -1096,7 +1172,7 @@ impl Engine {
 				let matcher = (request.mode == SearchMode::FuzzyPrefix && fuzzy_eligible(&prefix))
 					.then(|| FuzzyPrefixMatcher::new(&prefix, self.id_field));
 				Ok(TracePlan::Prefix {
-					completed,
+					completed: completed.into_iter().collect(),
 					prefix,
 					matcher,
 				})
@@ -1113,7 +1189,13 @@ impl Engine {
 						"fuzzy search contains more than {MAX_FUZZY_TERMS} eligible terms"
 					)));
 				}
-				Ok(TracePlan::Fuzzy(terms))
+				Ok(TracePlan::Fuzzy {
+					exact: terms.iter().map(|(term, _)| term.clone()).collect(),
+					fuzzy: terms
+						.into_iter()
+						.filter(|(_, surface)| fuzzy_eligible(surface))
+						.collect(),
+				})
 			}
 		}
 	}
@@ -1245,7 +1327,7 @@ impl Engine {
 					}
 				}
 			}
-			TracePlan::Fuzzy(terms) => {
+			TracePlan::Fuzzy { exact, fuzzy } => {
 				let (surface, surface_truncated) = Self::source_tokens(surface_source_analyzer, value, deadline)?;
 				analysis_truncated |= surface_truncated;
 				let mut analyzed_by_position = HashMap::<usize, Vec<&str>>::new();
@@ -1259,25 +1341,29 @@ impl Engine {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
-					for (analyzed_term, surface_term) in terms {
-						let analyzed_matches = analyzed_by_position.get(&token.position).is_some_and(|tokens| {
-							tokens.iter().any(|token| {
-								*token == analyzed_term
-									|| (fuzzy_eligible(surface_term) && within_one_edit(analyzed_term, token))
+					let source_terms = analyzed_by_position.get(&token.position);
+					let exact_match =
+						source_terms.and_then(|tokens| tokens.iter().find(|term| exact.contains(term)).copied());
+					let fuzzy_match = if exact_match.is_none() {
+						fuzzy
+							.iter()
+							.find(|(analyzed_term, surface_term)| {
+								source_terms.is_some_and(|tokens| {
+									tokens.iter().any(|term| within_one_edit(analyzed_term, term))
+								}) || within_one_edit(surface_term, &token.text)
 							})
-						});
-						if analyzed_matches
-							|| (fuzzy_eligible(surface_term) && within_one_edit(surface_term, &token.text))
-						{
-							found.insert(analyzed_term.clone());
-							spans_truncated |= push_trace_span(
-								&mut spans,
-								&mut seen_spans,
-								source_span(&utf16_offsets, token.start, token.end),
-								max_spans,
-							);
-							break;
-						}
+							.map(|(term, _)| term.as_str())
+					} else {
+						None
+					};
+					if let Some(term) = exact_match.or(fuzzy_match) {
+						found.insert(term.to_owned());
+						spans_truncated |= push_trace_span(
+							&mut spans,
+							&mut seen_spans,
+							source_span(&utf16_offsets, token.start, token.end),
+							max_spans,
+						);
 					}
 					if spans_truncated && plan.record_matches(&found) {
 						break;
@@ -1344,12 +1430,22 @@ impl Engine {
 	}
 
 	fn expression_query(&self, searcher: &Searcher, expression: &SearchExpression) -> Result<BuiltQuery> {
+		crate::protocol::validate_search_structure(expression, self.max_query_clauses, self.fields.len())?;
+		self.expression_query_inner(searcher, expression, &mut QueryConstructionBudget::default())
+	}
+
+	fn expression_query_inner(
+		&self,
+		searcher: &Searcher,
+		expression: &SearchExpression,
+		budget: &mut QueryConstructionBudget,
+	) -> Result<BuiltQuery> {
 		match expression {
-			SearchExpression::Clause(clause) => self.clause_query(searcher, clause),
-			SearchExpression::And(children) => self.boolean_query(searcher, children, Occur::Must),
-			SearchExpression::Or(children) => self.boolean_query(searcher, children, Occur::Should),
+			SearchExpression::Clause(clause) => self.clause_query(searcher, clause, budget),
+			SearchExpression::And(children) => self.boolean_query(searcher, children, Occur::Must, budget),
+			SearchExpression::Or(children) => self.boolean_query(searcher, children, Occur::Should, budget),
 			SearchExpression::Not(child) => {
-				let child = self.expression_query(searcher, child)?;
+				let child = self.expression_query_inner(searcher, child, budget)?;
 				self.check_total_clause_count(child.clauses, 2)?;
 				Ok(BuiltQuery {
 					query: Box::new(ConstScoreQuery::new(
@@ -1365,11 +1461,17 @@ impl Engine {
 		}
 	}
 
-	fn boolean_query(&self, searcher: &Searcher, children: &[SearchExpression], occur: Occur) -> Result<BuiltQuery> {
+	fn boolean_query(
+		&self,
+		searcher: &Searcher,
+		children: &[SearchExpression],
+		occur: Occur,
+		budget: &mut QueryConstructionBudget,
+	) -> Result<BuiltQuery> {
 		let mut clauses = children.len();
 		let mut queries = Vec::with_capacity(children.len());
 		for child in children {
-			let child = self.expression_query(searcher, child)?;
+			let child = self.expression_query_inner(searcher, child, budget)?;
 			self.check_total_clause_count(clauses, child.clauses)?;
 			clauses += child.clauses;
 			queries.push((occur, child.query));
@@ -1380,15 +1482,20 @@ impl Engine {
 		})
 	}
 
-	fn clause_query(&self, searcher: &Searcher, clause: &SearchClause) -> Result<BuiltQuery> {
+	fn clause_query(
+		&self,
+		searcher: &Searcher,
+		clause: &SearchClause,
+		budget: &mut QueryConstructionBudget,
+	) -> Result<BuiltQuery> {
 		let fields = self.selected_fields(&clause.fields)?;
 		let (query, clauses) = match clause.mode {
 			SearchMode::Any => self.term_query(&clause.text, &fields, Occur::Should)?,
 			SearchMode::All => self.term_query(&clause.text, &fields, Occur::Must)?,
-			SearchMode::Phrase => self.phrase_query(&clause.text, &fields)?,
-			SearchMode::Prefix => self.prefix_query(searcher, &clause.text, &fields, false)?,
-			SearchMode::Fuzzy => self.fuzzy_query(&clause.text, &fields)?,
-			SearchMode::FuzzyPrefix => self.prefix_query(searcher, &clause.text, &fields, true)?,
+			SearchMode::Phrase => self.phrase_query(&clause.text, &fields, budget)?,
+			SearchMode::Prefix => self.prefix_query(searcher, &clause.text, &fields, false, budget)?,
+			SearchMode::Fuzzy => self.fuzzy_query(&clause.text, &fields, budget)?,
+			SearchMode::FuzzyPrefix => self.prefix_query(searcher, &clause.text, &fields, true, budget)?,
 		};
 		Ok(BuiltQuery { query, clauses })
 	}
@@ -1402,15 +1509,17 @@ impl Engine {
 		let mut stream = analyzer.token_stream(text);
 		let mut terms = Vec::new();
 		let mut seen = HashSet::new();
-		stream.process(&mut |token| {
+		while stream.advance() {
+			let token = stream.token();
 			if !deduplicate || seen.insert(token.text.clone()) {
+				if terms.len() == self.max_query_terms {
+					return Err(FulltextError::invalid(format!(
+						"search text produces more than {} terms",
+						self.max_query_terms
+					)));
+				}
 				terms.push(token.text.clone());
 			}
-		});
-		if terms.len() > MAX_QUERY_TERMS {
-			return Err(FulltextError::invalid(format!(
-				"search text produces more than {MAX_QUERY_TERMS} terms"
-			)));
 		}
 		Ok(terms)
 	}
@@ -1422,9 +1531,10 @@ impl Engine {
 		while stream.advance() {
 			let token = stream.token();
 			terms.push((token.position, token.text.clone()));
-			if terms.len() > MAX_QUERY_TERMS {
+			if terms.len() > self.max_query_terms {
 				return Err(FulltextError::invalid(format!(
-					"search text produces more than {MAX_QUERY_TERMS} terms"
+					"search text produces more than {} terms",
+					self.max_query_terms
 				)));
 			}
 		}
@@ -1462,7 +1572,12 @@ impl Engine {
 		))
 	}
 
-	fn phrase_query(&self, text: &str, fields: &[&EngineField]) -> Result<(Box<dyn Query>, usize)> {
+	fn phrase_query(
+		&self,
+		text: &str,
+		fields: &[&EngineField],
+		budget: &mut QueryConstructionBudget,
+	) -> Result<(Box<dyn Query>, usize)> {
 		if !self.positions {
 			return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
 		}
@@ -1471,6 +1586,7 @@ impl Engine {
 			return Ok((Box::new(EmptyQuery), 0));
 		}
 		self.check_clause_count(1, fields.len())?;
+		budget.phrase(terms.len(), fields.len())?;
 		if terms.len() == 1 {
 			return Ok((self.term_group(&terms[0].1, fields), fields.len()));
 		}
@@ -1490,7 +1606,12 @@ impl Engine {
 		Ok((Box::new(BooleanQuery::new(alternatives)), fields.len()))
 	}
 
-	fn fuzzy_query(&self, text: &str, fields: &[&EngineField]) -> Result<(Box<dyn Query>, usize)> {
+	fn fuzzy_query(
+		&self,
+		text: &str,
+		fields: &[&EngineField],
+		budget: &mut QueryConstructionBudget,
+	) -> Result<(Box<dyn Query>, usize)> {
 		let surface = self.analyze(text, true, true)?;
 		let mut pairs = Vec::new();
 		for surface_term in surface {
@@ -1509,6 +1630,7 @@ impl Engine {
 			)));
 		}
 		self.check_clause_count(pairs.len(), fields.len().saturating_mul(3))?;
+		budget.fuzzy(fuzzy_terms, fields.len())?;
 		let exact_bonus = fields.iter().map(|field| field.weight).fold(0.0f32, f32::max) * 0.25 + 1.0;
 		let clause_count = pairs.len().saturating_mul(fields.len().saturating_mul(3));
 		let clauses = pairs
@@ -1538,6 +1660,7 @@ impl Engine {
 		text: &str,
 		fields: &[&EngineField],
 		fuzzy: bool,
+		budget: &mut QueryConstructionBudget,
 	) -> Result<(Box<dyn Query>, usize)> {
 		self.require_surface_fields(fields)?;
 		if text.chars().last().is_some_and(char::is_whitespace) {
@@ -1555,22 +1678,35 @@ impl Engine {
 			)));
 		}
 		let completed_clause_count = completed.len().saturating_mul(fields.len());
+		let fuzzy_clause_count = usize::from(fuzzy && fuzzy_eligible(&surface_prefix)) * fields.len();
+		let known_clause_count = completed_clause_count.saturating_add(fuzzy_clause_count);
+		if known_clause_count > self.max_query_clauses {
+			return Err(FulltextError::new(
+				"E_PREFIX_TOO_BROAD",
+				format!("prefix query exceeds {} clauses", self.max_query_clauses),
+			));
+		}
 		let mut clauses = Vec::with_capacity(completed.len() + 1);
 		for term in completed {
 			clauses.push((Occur::Must, self.term_group(&term, fields)));
 		}
-		let (exact_prefix, prefix_clause_count) = self.expanded_prefix_group(searcher, &surface_prefix, fields)?;
-		let fuzzy_clause_count = usize::from(fuzzy && fuzzy_eligible(&surface_prefix)) * fields.len();
+		let (exact_prefix, prefix_clause_count) = self.expanded_prefix_group(
+			searcher,
+			&surface_prefix,
+			fields,
+			self.max_query_clauses - known_clause_count,
+		)?;
 		if completed_clause_count
 			.saturating_add(prefix_clause_count)
 			.saturating_add(fuzzy_clause_count)
-			> MAX_QUERY_CLAUSES
+			> self.max_query_clauses
 		{
 			return Err(FulltextError::new(
 				"E_PREFIX_TOO_BROAD",
-				format!("prefix query exceeds {MAX_QUERY_CLAUSES} clauses"),
+				format!("prefix query exceeds {} clauses", self.max_query_clauses),
 			));
 		}
+		budget.fuzzy(usize::from(fuzzy && fuzzy_eligible(&surface_prefix)), fields.len())?;
 		let final_group = if fuzzy && fuzzy_eligible(&surface_prefix) {
 			let exact_bonus = fields.iter().map(|field| field.weight).fold(0.0f32, f32::max) * 0.25 + 1.0;
 			let exact_for_bonus = exact_prefix.box_clone();
@@ -1672,6 +1808,7 @@ impl Engine {
 		searcher: &Searcher,
 		prefix: &str,
 		fields: &[&EngineField],
+		remaining_clauses: usize,
 	) -> Result<(Box<dyn Query>, usize)> {
 		let mut alternatives = Vec::new();
 		for field in fields {
@@ -1696,6 +1833,12 @@ impl Engine {
 							format!("prefix expands to more than {MAX_PREFIX_EXPANSIONS} terms"),
 						));
 					}
+					if alternatives.len().saturating_add(terms.len()) > remaining_clauses {
+						return Err(FulltextError::new(
+							"E_PREFIX_TOO_BROAD",
+							format!("prefix query exceeds {} clauses", self.max_query_clauses),
+						));
+					}
 				}
 			}
 			for term in terms {
@@ -1704,12 +1847,6 @@ impl Engine {
 					IndexRecordOption::WithFreqs,
 				));
 				alternatives.push(boosted(query, field.weight));
-				if alternatives.len() > MAX_QUERY_CLAUSES {
-					return Err(FulltextError::new(
-						"E_PREFIX_TOO_BROAD",
-						format!("prefix query exceeds {MAX_QUERY_CLAUSES} clauses"),
-					));
-				}
 			}
 		}
 		let clause_count = alternatives.len();
@@ -1891,18 +2028,20 @@ impl Engine {
 	}
 
 	fn check_clause_count(&self, groups: usize, alternatives: usize) -> Result<()> {
-		if groups.saturating_mul(alternatives) > MAX_QUERY_CLAUSES {
+		if groups.saturating_mul(alternatives) > self.max_query_clauses {
 			return Err(FulltextError::invalid(format!(
-				"search query exceeds {MAX_QUERY_CLAUSES} clauses"
+				"search query exceeds {} clauses",
+				self.max_query_clauses
 			)));
 		}
 		Ok(())
 	}
 
 	fn check_total_clause_count(&self, clauses: usize, additional: usize) -> Result<()> {
-		if clauses.saturating_add(additional) > MAX_QUERY_CLAUSES {
+		if clauses.saturating_add(additional) > self.max_query_clauses {
 			return Err(FulltextError::invalid(format!(
-				"search query exceeds {MAX_QUERY_CLAUSES} clauses"
+				"search query exceeds {} clauses",
+				self.max_query_clauses
 			)));
 		}
 		Ok(())
@@ -2339,13 +2478,16 @@ impl Writer {
 		// Tantivy can detach unjoined workers when prepare_commit fails.
 		let previously_unproven = self.worker_ownership_unproven;
 		self.worker_ownership_unproven = true;
-		let mut commit = self.inner.prepare_commit().map_err(index_error)?;
+		let mut commit = self
+			.inner
+			.prepare_commit()
+			.map_err(|error| commit_error("prepare_commit", error))?;
 		self.worker_ownership_unproven = previously_unproven;
 		if let Some(payload) = payload {
 			commit.set_payload(payload);
 		}
 		self.checkpoint_required |= payload.is_some();
-		let opstamp = commit.commit().map_err(index_error)?;
+		let opstamp = commit.commit().map_err(|error| commit_error("commit", error))?;
 		Ok(opstamp)
 	}
 
@@ -3119,6 +3261,12 @@ fn count_error(error: tantivy::TantivyError) -> FulltextError {
 	}
 }
 
+fn commit_error(operation: &str, error: tantivy::TantivyError) -> FulltextError {
+	let mut error = index_error(error);
+	error.message = format!("Tantivy {operation}: {}", error.message);
+	error
+}
+
 pub(crate) fn recovery_index_error(error: tantivy::TantivyError) -> FulltextError {
 	match error {
 		tantivy::TantivyError::DataCorruption(_) => FulltextError::new("E_INDEX_CORRUPT", error.to_string()),
@@ -3263,6 +3411,8 @@ mod tests {
 				filter_fields: Vec::new(),
 			},
 			limits: Limits {
+				max_query_terms: crate::protocol::MAX_QUERY_TERMS,
+				max_query_clauses: MAX_QUERY_CLAUSES,
 				indexing_threads: 1,
 				search_threads: 2,
 				writer_memory_bytes: 15_000_000,
@@ -3271,6 +3421,169 @@ mod tests {
 				max_batch_bytes: 1 << 20,
 			},
 		}
+	}
+
+	#[test]
+	fn ascii_admission_bound_dominates_native_analyzer_token_counts() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let mut analyzer = engine.analyzer.clone();
+		for first in 0u8..=127 {
+			for second in 0u8..=127 {
+				let bytes = [b'a', first, second, b'b', b' ', first, b'c', second];
+				let text = std::str::from_utf8(&bytes).unwrap();
+				let mut stream = analyzer.token_stream(text);
+				let mut actual = 0;
+				while stream.advance() {
+					actual += 1;
+				}
+				assert!(
+					actual <= crate::protocol::ascii_query_term_upper(&bytes).unwrap(),
+					"{bytes:?}: {actual}"
+				);
+			}
+		}
+		assert_eq!(crate::protocol::ascii_query_term_upper("ﷺ".as_bytes()), None);
+	}
+
+	#[test]
+	fn query_capacity_defaults_and_configured_compiled_boundaries() {
+		let words = |count: usize| (0..count).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
+		let defaults = config();
+		let engine = Engine::open(RamDirectory::create(), &defaults).unwrap();
+		assert_eq!(engine.analyze(&words(64), false, true).unwrap().len(), 64);
+		assert_eq!(
+			engine.analyze(&words(65), false, true).unwrap_err().code,
+			"E_INVALID_ARGUMENT"
+		);
+		assert_eq!(
+			engine.analyze(&"word0 ".repeat(10_000), false, true).unwrap(),
+			vec!["word0"]
+		);
+		let mut raised = config();
+		raised.limits.max_query_terms = 256;
+		let engine = Engine::open(RamDirectory::create(), &raised).unwrap();
+		let reader = engine.reader().unwrap();
+		assert_eq!(
+			engine
+				.expression_query(&reader.searcher(), &expression(&words(128), SearchMode::Any, vec![]))
+				.unwrap()
+				.clauses,
+			256
+		);
+		assert_eq!(
+			engine
+				.expression_query(&reader.searcher(), &expression(&words(129), SearchMode::Any, vec![]))
+				.err()
+				.unwrap()
+				.code,
+			"E_INVALID_ARGUMENT"
+		);
+		raised.limits.max_query_clauses = 512;
+		let engine = Engine::open(RamDirectory::create(), &raised).unwrap();
+		let reader = engine.reader().unwrap();
+		assert_eq!(
+			engine
+				.expression_query(&reader.searcher(), &expression(&words(129), SearchMode::Any, vec![]))
+				.unwrap()
+				.clauses,
+			258
+		);
+	}
+
+	#[test]
+	fn direct_search_enforces_structure_before_analysis_or_recursive_construction() {
+		let mut configuration = config();
+		configuration.limits.max_query_clauses = 4096;
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let reader = engine.reader().unwrap();
+		let searcher = reader.searcher();
+		let empty = || expression("", SearchMode::Any, vec![]);
+		let mut request = SearchRequest {
+			sort: None,
+			aggregations: Vec::new(),
+			expression: SearchExpression::Or(vec![empty(); 4096]),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 10,
+			exact_total: true,
+			budget_milliseconds: 30_000,
+			traversal: false,
+			after: None,
+		};
+		assert_eq!(engine.search(&searcher, &request).unwrap().total, 0);
+		request.expression = SearchExpression::Or(vec![expression("the", SearchMode::Any, vec![]); 4096]);
+		assert_eq!(engine.search(&searcher, &request).unwrap().total, 0);
+		request.expression = SearchExpression::Or(vec![empty(); 4097]);
+		assert!(engine
+			.search(&searcher, &request)
+			.unwrap_err()
+			.message
+			.contains("structure exceeds 4096"));
+		request.expression = SearchExpression::And(vec![SearchExpression::Or(vec![empty(); 2048]); 2]);
+		assert!(engine
+			.search(&searcher, &request)
+			.unwrap_err()
+			.message
+			.contains("structure exceeds 4096"));
+		request.expression = SearchExpression::Or(Vec::new());
+		assert!(engine
+			.search(&searcher, &request)
+			.unwrap_err()
+			.message
+			.contains("at least one child"));
+		request.expression = expression(
+			&"x".repeat(crate::protocol::MAX_QUERY_TEXT_BYTES + 1),
+			SearchMode::Any,
+			vec![],
+		);
+		assert!(engine
+			.search(&searcher, &request)
+			.unwrap_err()
+			.message
+			.contains("65536 UTF-8 bytes"));
+		request.expression = empty();
+		for _ in 0..8 {
+			request.expression = SearchExpression::Not(Box::new(request.expression));
+		}
+		assert!(engine.search(&searcher, &request).is_ok());
+		for _ in 0..9992 {
+			request.expression = SearchExpression::Not(Box::new(request.expression));
+		}
+		assert!(engine
+			.search(&searcher, &request)
+			.unwrap_err()
+			.message
+			.contains("nesting exceeds 8"));
+		while let SearchExpression::Not(child) = request.expression {
+			request.expression = *child;
+		}
+		request.expression =
+			SearchExpression::Or(vec![expression("shoe", SearchMode::Any, vec!["title".to_owned()]); 300]);
+		assert!(engine.search(&searcher, &request).is_ok());
+		let defaults = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let reader = defaults.reader().unwrap();
+		assert!(defaults
+			.search(&reader.searcher(), &request)
+			.unwrap_err()
+			.message
+			.contains("structure exceeds 256"));
+		for clauses in [1, 2] {
+			configuration.limits.max_query_clauses = clauses;
+			let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+			let reader = engine.reader().unwrap();
+			request.expression = SearchExpression::Not(Box::new(empty()));
+			assert_eq!(engine.search(&reader.searcher(), &request).is_ok(), clauses == 2);
+		}
+	}
+
+	#[test]
+	fn construction_budgets_accumulate_without_exceeding_default_implied_bounds() {
+		let mut budget = QueryConstructionBudget::default();
+		budget.phrase(64, 256).unwrap();
+		assert_eq!(budget.phrase(1, 1).unwrap_err().code, "E_INVALID_ARGUMENT");
+		budget.fuzzy(16, 16).unwrap();
+		assert_eq!(budget.fuzzy(1, 1).unwrap_err().code, "E_INVALID_ARGUMENT");
 	}
 
 	fn expression(text: &str, mode: SearchMode, fields: Vec<String>) -> SearchExpression {
@@ -3695,7 +4008,10 @@ mod tests {
 		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
 		let fields = engine.fields.iter().collect::<Vec<_>>();
 		assert_eq!(
-			engine.phrase_query("shoe", &fields).unwrap_err().code,
+			engine
+				.phrase_query("shoe", &fields, &mut QueryConstructionBudget::default())
+				.unwrap_err()
+				.code,
 			"E_INVALID_ARGUMENT"
 		);
 	}
@@ -5257,7 +5573,10 @@ mod tests {
 		let engine = Engine::open(directory.clone(), &config).unwrap();
 		let mut writer = engine.writer(&config).unwrap();
 		directory.fail_after_next_atomic_write();
-		assert!(writer.commit_with_payload(Some("uncertain")).is_err());
+		let error = writer.commit_with_payload(Some("uncertain")).unwrap_err();
+		assert_eq!(error.code, "E_STORAGE");
+		assert!(error.message.starts_with("Tantivy commit: "), "{error}");
+		assert!(error.message.contains("injected ambiguous atomic write"));
 		assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("uncertain"));
 		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
 	}
@@ -5936,6 +6255,10 @@ mod tests {
 			blocked.release();
 			closer.join().unwrap();
 			assert_eq!(preparation_error.code, "E_STORAGE");
+			assert!(
+				preparation_error.message.starts_with("Tantivy prepare_commit: "),
+				"{preparation_error}"
+			);
 			assert!(blocked_at_close_return);
 			assert!(
 				!quiesced,

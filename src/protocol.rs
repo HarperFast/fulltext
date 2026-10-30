@@ -35,6 +35,8 @@ pub struct FilterFieldConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Limits {
+	pub max_query_terms: usize,
+	pub max_query_clauses: usize,
 	pub indexing_threads: usize,
 	pub search_threads: usize,
 	pub writer_memory_bytes: usize,
@@ -145,7 +147,103 @@ pub struct MutationBatch {
 pub const MAX_QUERY_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_QUERY_TERMS: usize = 64;
 pub const MAX_QUERY_CLAUSES: usize = 256;
+pub const MAX_CONFIGURED_QUERY_TERMS: usize = 1_024;
+pub const MAX_CONFIGURED_QUERY_CLAUSES: usize = 4_096;
+
+pub fn validate_query_limits(terms: usize, clauses: usize) -> Result<()> {
+	if terms == 0 || terms > MAX_CONFIGURED_QUERY_TERMS {
+		return Err(FulltextError::invalid(format!(
+			"maxQueryTerms must be between 1 and {MAX_CONFIGURED_QUERY_TERMS}"
+		)));
+	}
+	if clauses == 0 || clauses > MAX_CONFIGURED_QUERY_CLAUSES {
+		return Err(FulltextError::invalid(format!(
+			"maxQueryClauses must be between 1 and {MAX_CONFIGURED_QUERY_CLAUSES}"
+		)));
+	}
+	Ok(())
+}
 pub const MAX_EXPRESSION_DEPTH: usize = 8;
+
+pub(crate) struct SearchStructureBudget {
+	limit: usize,
+	remaining: usize,
+	text_bytes: usize,
+	fields: usize,
+}
+
+impl SearchStructureBudget {
+	pub(crate) fn new(limit: usize, fields: usize) -> Result<Self> {
+		validate_query_limits(MAX_QUERY_TERMS, limit)?;
+		Ok(Self {
+			limit,
+			remaining: limit,
+			text_bytes: 0,
+			fields,
+		})
+	}
+
+	pub(crate) fn depth(&self, depth: usize) -> Result<()> {
+		if depth > MAX_EXPRESSION_DEPTH {
+			return Err(FulltextError::invalid(format!(
+				"search expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
+			)));
+		}
+		Ok(())
+	}
+
+	pub(crate) fn charge(&mut self, cost: usize) -> Result<()> {
+		self.remaining = self.remaining.checked_sub(cost).ok_or_else(|| {
+			FulltextError::invalid(format!("search structure exceeds {} compiled clauses", self.limit))
+		})?;
+		Ok(())
+	}
+
+	pub(crate) fn children(&mut self, count: usize) -> Result<()> {
+		if count == 0 {
+			return Err(FulltextError::invalid(
+				"boolean search expressions require at least one child",
+			));
+		}
+		self.charge(count)
+	}
+
+	pub(crate) fn leaf(&mut self, text_bytes: usize, fields: usize) -> Result<()> {
+		self.text_bytes = self.text_bytes.saturating_add(text_bytes);
+		if self.text_bytes > MAX_QUERY_TEXT_BYTES {
+			return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
+		}
+		if fields > self.fields {
+			return Err(FulltextError::invalid(format!(
+				"search field count exceeds {} fields",
+				self.fields
+			)));
+		}
+		Ok(())
+	}
+}
+
+pub(crate) fn validate_search_structure(expression: &SearchExpression, clauses: usize, fields: usize) -> Result<()> {
+	fn visit(expression: &SearchExpression, depth: usize, budget: &mut SearchStructureBudget) -> Result<()> {
+		budget.depth(depth)?;
+		match expression {
+			SearchExpression::Clause(clause) => budget.leaf(clause.text.len(), clause.fields.len()),
+			SearchExpression::And(children) | SearchExpression::Or(children) => {
+				budget.children(children.len())?;
+				for child in children {
+					visit(child, depth + 1, budget)?;
+				}
+				Ok(())
+			}
+			SearchExpression::Not(child) => {
+				budget.charge(2)?;
+				visit(child, depth + 1, budget)
+			}
+		}
+	}
+	visit(expression, 0, &mut SearchStructureBudget::new(clauses, fields)?)
+}
+
 pub const MAX_CANDIDATE_IDS: usize = 1_024;
 pub const MAX_CANDIDATE_BYTES: usize = 1 << 20;
 pub const MAX_PREFIX_EXPANSIONS: usize = 50;
@@ -322,7 +420,9 @@ fn validate_path(path: String) -> Result<String> {
 
 fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
 	let identity = decode_engine_identity_config(cursor)?;
-	let limits = Limits {
+	let mut limits = Limits {
+		max_query_terms: MAX_QUERY_TERMS,
+		max_query_clauses: MAX_QUERY_CLAUSES,
 		indexing_threads: cursor.u16()? as usize,
 		search_threads: cursor.u16()? as usize,
 		writer_memory_bytes: cursor.u64_usize()?,
@@ -330,6 +430,10 @@ fn decode_engine_config(cursor: &mut Cursor<'_>) -> Result<EngineConfig> {
 		max_queued_bytes: cursor.u64_usize()?,
 		max_batch_bytes: cursor.u64_usize()?,
 	};
+	if cursor.remaining() != 0 {
+		limits.max_query_terms = cursor.u32()? as usize;
+		limits.max_query_clauses = cursor.u32()? as usize;
+	}
 	validate_config(EngineConfig { identity, limits })
 }
 
@@ -459,11 +563,33 @@ fn packed_budget(bytes: &[u8], magic: [u8; 4], operation: &str) -> Result<u32> {
 	Ok(budget)
 }
 
+/// Classifies under default query policy without a schema snapshot.
+/// Handles use `search_is_expensive_for_config` with their engine configuration.
 pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
+	classify_search(bytes, MAX_FIELDS, MAX_QUERY_TERMS, MAX_QUERY_CLAUSES)
+}
+
+pub fn search_is_expensive_for_config(bytes: &[u8], config: &EngineConfig) -> Result<bool> {
+	classify_search(
+		bytes,
+		config.identity.fields.len(),
+		config.limits.max_query_terms,
+		config.limits.max_query_clauses,
+	)
+}
+
+fn classify_search(
+	bytes: &[u8],
+	schema_fields: usize,
+	max_query_terms: usize,
+	max_query_clauses: usize,
+) -> Result<bool> {
+	validate_query_limits(max_query_terms, max_query_clauses)?;
+	let raised_profile_fields =
+		(max_query_terms > MAX_QUERY_TERMS || max_query_clauses > MAX_QUERY_CLAUSES).then_some(schema_fields);
 	let mut cursor = Cursor::new(bytes, *b"FTSQ")?;
-	let mut clause_count = 0usize;
-	let mut text_bytes = 0usize;
-	let cost = scan_search_expression(&mut cursor, 0, &mut clause_count, &mut text_bytes)?;
+	let mut structure = SearchStructureBudget::new(max_query_clauses, schema_fields)?;
+	let cost = scan_search_expression(&mut cursor, 0, &mut structure, raised_profile_fields)?;
 	let has_candidates = cursor.boolean()?;
 	let candidate_count = if has_candidates { cursor.u16()? as usize } else { 0 };
 	if candidate_count > MAX_CANDIDATE_IDS || candidate_count > cursor.remaining() / 4 {
@@ -485,6 +611,8 @@ pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
 	let (traversal, _) = decode_search_traversal(&mut cursor)?;
 	Ok(traversal
 		|| catalog_is_expensive
+		|| (raised_profile_fields.is_some()
+			&& (cost.terms_upper > MAX_QUERY_TERMS || cost.construction_upper > MAX_QUERY_CLAUSES))
 		|| cost.has_expensive_mode
 		|| !cost.has_positive_anchor
 		|| filter_is_expensive
@@ -549,7 +677,23 @@ fn scan_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut u
 	}
 }
 
+pub(crate) fn ascii_query_term_upper(text: &[u8]) -> Option<usize> {
+	let mut terms = 0;
+	let mut in_term = false;
+	for byte in text {
+		if !byte.is_ascii() {
+			return None;
+		}
+		let alphanumeric = byte.is_ascii_alphanumeric();
+		terms += usize::from(alphanumeric && !in_term);
+		in_term = alphanumeric;
+	}
+	Some(terms)
+}
+
 struct SearchCost {
+	terms_upper: usize,
+	construction_upper: usize,
 	has_expensive_mode: bool,
 	has_positive_anchor: bool,
 }
@@ -557,49 +701,49 @@ struct SearchCost {
 fn scan_search_expression(
 	cursor: &mut Cursor<'_>,
 	depth: usize,
-	clause_count: &mut usize,
-	text_bytes: &mut usize,
+	structure: &mut SearchStructureBudget,
+	raised_profile_fields: Option<usize>,
 ) -> Result<SearchCost> {
-	if depth > MAX_EXPRESSION_DEPTH {
-		return Err(FulltextError::invalid(format!(
-			"search expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
-		)));
-	}
+	structure.depth(depth)?;
 	match cursor.u8()? {
 		0 => {
-			*clause_count += 1;
-			if *clause_count > MAX_QUERY_CLAUSES {
-				return Err(FulltextError::invalid("search expression exceeds 256 clauses"));
-			}
 			let text = cursor.bytes()?;
-			*text_bytes = text_bytes.saturating_add(text.len());
-			if *text_bytes > MAX_QUERY_TEXT_BYTES {
-				return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
-			}
 			let expensive = decode_search_mode(cursor.u8()?)?.is_expensive();
 			let field_count = cursor.u16()? as usize;
 			if field_count > MAX_FIELDS || field_count > cursor.remaining() / 4 {
 				return Err(FulltextError::invalid("search field count exceeds its packed request"));
 			}
+			structure.leaf(text.len(), field_count)?;
+			let terms_upper = if raised_profile_fields.is_some() {
+				ascii_query_term_upper(text).unwrap_or(usize::MAX)
+			} else {
+				0
+			};
 			for _ in 0..field_count {
 				let _ = cursor.bytes()?;
 			}
 			Ok(SearchCost {
+				terms_upper,
+				construction_upper: terms_upper.saturating_mul(if field_count == 0 {
+					raised_profile_fields.unwrap_or(0)
+				} else {
+					field_count
+				}),
 				has_expensive_mode: expensive,
 				has_positive_anchor: true,
 			})
 		}
 		kind @ (1 | 2) => {
 			let count = cursor.u16()? as usize;
-			if count == 0 || count > MAX_QUERY_CLAUSES {
-				return Err(FulltextError::invalid(
-					"boolean search expressions require 1 to 256 children",
-				));
-			}
+			structure.children(count)?;
+			let mut terms_upper = 0usize;
+			let mut construction_upper = count;
 			let mut has_expensive_mode = false;
 			let mut has_positive_anchor = kind == 2;
 			for _ in 0..count {
-				let child = scan_search_expression(cursor, depth + 1, clause_count, text_bytes)?;
+				let child = scan_search_expression(cursor, depth + 1, structure, raised_profile_fields)?;
+				terms_upper = terms_upper.max(child.terms_upper);
+				construction_upper = construction_upper.saturating_add(child.construction_upper);
 				has_expensive_mode |= child.has_expensive_mode;
 				if kind == 1 {
 					has_positive_anchor |= child.has_positive_anchor;
@@ -608,13 +752,18 @@ fn scan_search_expression(
 				}
 			}
 			Ok(SearchCost {
+				terms_upper,
+				construction_upper,
 				has_expensive_mode,
 				has_positive_anchor,
 			})
 		}
 		3 => {
-			let child = scan_search_expression(cursor, depth + 1, clause_count, text_bytes)?;
+			structure.charge(2)?;
+			let child = scan_search_expression(cursor, depth + 1, structure, raised_profile_fields)?;
 			Ok(SearchCost {
+				terms_upper: child.terms_upper,
+				construction_upper: child.construction_upper.saturating_add(2),
 				has_expensive_mode: child.has_expensive_mode,
 				has_positive_anchor: false,
 			})
@@ -715,9 +864,8 @@ pub fn decode_batch(bytes: &[u8]) -> Result<MutationBatch> {
 
 pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 	let mut cursor = Cursor::new(bytes, *b"FTSQ")?;
-	let mut clause_count = 0usize;
-	let mut text_bytes = 0usize;
-	let expression = decode_search_expression(&mut cursor, 0, &mut clause_count, &mut text_bytes)?;
+	let mut structure = SearchStructureBudget::new(MAX_CONFIGURED_QUERY_CLAUSES, MAX_FIELDS)?;
+	let expression = decode_search_expression(&mut cursor, 0, &mut structure)?;
 	let has_candidates = cursor.boolean()?;
 	let candidate_count = if has_candidates { cursor.u16()? as usize } else { 0 };
 	if candidate_count > MAX_CANDIDATE_IDS {
@@ -1011,31 +1159,19 @@ fn decode_filter_expression(cursor: &mut Cursor<'_>, depth: usize, clauses: &mut
 fn decode_search_expression(
 	cursor: &mut Cursor<'_>,
 	depth: usize,
-	clause_count: &mut usize,
-	text_bytes: &mut usize,
+	structure: &mut SearchStructureBudget,
 ) -> Result<SearchExpression> {
-	if depth > MAX_EXPRESSION_DEPTH {
-		return Err(FulltextError::invalid(format!(
-			"search expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
-		)));
-	}
+	structure.depth(depth)?;
 	let kind = cursor.u8()?;
 	match kind {
 		0 => {
-			*clause_count += 1;
-			if *clause_count > MAX_QUERY_CLAUSES {
-				return Err(FulltextError::invalid("search expression exceeds 256 clauses"));
-			}
-			let text = cursor.string()?;
-			*text_bytes = text_bytes.saturating_add(text.len());
-			if *text_bytes > MAX_QUERY_TEXT_BYTES {
-				return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
-			}
+			let text = cursor.bytes()?;
 			let mode = decode_search_mode(cursor.u8()?)?;
 			let field_count = cursor.u16()? as usize;
-			if field_count > MAX_FIELDS {
-				return Err(FulltextError::invalid("search field count exceeds 1024"));
-			}
+			structure.leaf(text.len(), field_count)?;
+			let text = std::str::from_utf8(text)
+				.map_err(|_| FulltextError::invalid("packed string is not valid UTF-8"))?
+				.to_owned();
 			let mut fields = Vec::with_capacity(field_count);
 			for _ in 0..field_count {
 				fields.push(cursor.string()?);
@@ -1044,14 +1180,10 @@ fn decode_search_expression(
 		}
 		1 | 2 => {
 			let count = cursor.u16()? as usize;
-			if count == 0 || count > MAX_QUERY_CLAUSES {
-				return Err(FulltextError::invalid(
-					"boolean search expressions require 1 to 256 children",
-				));
-			}
+			structure.children(count)?;
 			let mut children = Vec::with_capacity(count);
 			for _ in 0..count {
-				children.push(decode_search_expression(cursor, depth + 1, clause_count, text_bytes)?);
+				children.push(decode_search_expression(cursor, depth + 1, structure)?);
 			}
 			Ok(if kind == 1 {
 				SearchExpression::And(children)
@@ -1059,12 +1191,14 @@ fn decode_search_expression(
 				SearchExpression::Or(children)
 			})
 		}
-		3 => Ok(SearchExpression::Not(Box::new(decode_search_expression(
-			cursor,
-			depth + 1,
-			clause_count,
-			text_bytes,
-		)?))),
+		3 => {
+			structure.charge(2)?;
+			Ok(SearchExpression::Not(Box::new(decode_search_expression(
+				cursor,
+				depth + 1,
+				structure,
+			)?)))
+		}
 		_ => Err(FulltextError::invalid("unknown search expression type")),
 	}
 }
@@ -1186,6 +1320,7 @@ fn decode_search_mode(value: u8) -> Result<SearchMode> {
 fn validate_config(config: EngineConfig) -> Result<EngineConfig> {
 	validate_identity_config(&config.identity)?;
 	let limits = &config.limits;
+	validate_query_limits(limits.max_query_terms, limits.max_query_clauses)?;
 	if limits.indexing_threads == 0 || limits.search_threads == 0 || limits.max_queued_commands == 0 {
 		return Err(FulltextError::invalid(
 			"thread and queue command limits must be greater than zero",
@@ -1694,6 +1829,8 @@ mod tests {
 			filter_fields: Vec::new(),
 		};
 		let limits = Limits {
+			max_query_terms: MAX_QUERY_TERMS,
+			max_query_clauses: MAX_QUERY_CLAUSES,
 			indexing_threads: 1,
 			search_threads: 1,
 			writer_memory_bytes: 15_000_000,
@@ -1725,6 +1862,199 @@ mod tests {
 		bytes.extend_from_slice(&1u32.to_le_bytes());
 		bytes.push(0xff);
 		assert_eq!(decode_search(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+	}
+
+	fn search_config(fields: usize) -> EngineConfig {
+		EngineConfig {
+			identity: EngineIdentityConfig {
+				index_id: "products".to_owned(),
+				generation: "one".to_owned(),
+				fields: (0..fields)
+					.map(|i| FieldConfig {
+						name: format!("field{i}"),
+						weight: 1.0,
+					})
+					.collect(),
+				analyzer: "english@2".to_owned(),
+				stop_words: false,
+				positions: true,
+				surface_terms: true,
+				synonyms: Vec::new(),
+				filter_fields: Vec::new(),
+			},
+			limits: Limits {
+				max_query_terms: MAX_QUERY_TERMS,
+				max_query_clauses: MAX_QUERY_CLAUSES,
+				indexing_threads: 1,
+				search_threads: 1,
+				writer_memory_bytes: 15_000_000,
+				max_queued_commands: 1,
+				max_queued_bytes: 1024,
+				max_batch_bytes: 1024,
+			},
+		}
+	}
+
+	#[test]
+	fn raised_capacity_classification_keeps_small_ascii_queries_ordinary() {
+		fn request(text: &str) -> Vec<u8> {
+			let mut bytes = b"FTSQ\x07\x00".to_vec();
+			bytes.push(0);
+			bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+			bytes.extend_from_slice(text.as_bytes());
+			bytes.extend_from_slice(&[0, 0, 0, 0, 0]);
+			bytes.extend_from_slice(&[0; 8]);
+			bytes.extend_from_slice(&0u32.to_le_bytes());
+			bytes.extend_from_slice(&1u32.to_le_bytes());
+			bytes.push(0);
+			bytes.extend_from_slice(&1000u32.to_le_bytes());
+			bytes
+		}
+		let mut config = search_config(2);
+		config.limits.max_query_terms = MAX_QUERY_TERMS + 1;
+		config.limits.max_query_clauses = MAX_CONFIGURED_QUERY_CLAUSES;
+		for text in ["a", "shoe", "alpha beta", &"a".repeat(65)] {
+			let bytes = request(text);
+			assert!(!search_is_expensive(&bytes).unwrap());
+			assert!(!search_is_expensive_for_config(&bytes, &config).unwrap());
+		}
+		for (text, fields) in [("word ".repeat(65), 1), ("shoe".to_owned(), 257), ("ﷺ".to_owned(), 1)] {
+			config.identity.fields = search_config(fields).identity.fields;
+			let bytes = request(&text);
+			assert!(!search_is_expensive(&bytes).unwrap());
+			assert!(search_is_expensive_for_config(&bytes, &config).unwrap());
+		}
+		for length in 0..6 {
+			let bytes = &request("shoe")[..length];
+			assert_eq!(
+				search_is_expensive(bytes).unwrap_err().code,
+				search_is_expensive_for_config(bytes, &config).unwrap_err().code
+			);
+		}
+	}
+
+	#[test]
+	fn raised_capacity_accounts_for_boolean_construction_and_per_leaf_terms() {
+		fn leaf(text: &str) -> Vec<u8> {
+			let mut bytes = vec![0];
+			bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+			bytes.extend_from_slice(text.as_bytes());
+			bytes.extend_from_slice(&[0, 0, 0]);
+			bytes
+		}
+		fn group(kind: u8, children: &[Vec<u8>]) -> Vec<u8> {
+			let mut bytes = vec![kind];
+			bytes.extend_from_slice(&(children.len() as u16).to_le_bytes());
+			for child in children {
+				bytes.extend_from_slice(child);
+			}
+			bytes
+		}
+		fn expensive(expression: &[u8], fields: usize) -> bool {
+			let mut bytes = b"FTSQ\x07\x00".to_vec();
+			bytes.extend_from_slice(expression);
+			bytes.extend_from_slice(&[0, 0]);
+			bytes.extend_from_slice(&[0; 8]);
+			bytes.extend_from_slice(&0u32.to_le_bytes());
+			bytes.extend_from_slice(&1u32.to_le_bytes());
+			bytes.push(0);
+			bytes.extend_from_slice(&1000u32.to_le_bytes());
+			let mut config = search_config(fields);
+			config.limits.max_query_terms = MAX_QUERY_TERMS + 1;
+			config.limits.max_query_clauses = MAX_CONFIGURED_QUERY_CLAUSES;
+			search_is_expensive_for_config(&bytes, &config).unwrap()
+		}
+		for kind in [1, 2] {
+			assert!(!expensive(&group(kind, &vec![leaf("a"); 65]), 1));
+			assert!(!expensive(&group(kind, &vec![leaf("a"); 128]), 1));
+			assert!(expensive(&group(kind, &vec![leaf("a"); 129]), 1));
+			assert!(expensive(&group(kind, &vec![leaf("a"); 64]), 4));
+		}
+		let mut nested = leaf("a");
+		for _ in 0..7 {
+			nested = group(2, &[nested]);
+		}
+		assert!(expensive(&group(2, &vec![nested; 64]), 1));
+		let mut negated = vec![3];
+		negated.extend_from_slice(&leaf("!"));
+		for (count, expected) in [(84, false), (85, true)] {
+			let mut children = vec![leaf("a")];
+			children.extend(vec![negated.clone(); count]);
+			assert_eq!(expensive(&group(1, &children), 1), expected);
+		}
+	}
+
+	#[test]
+	fn text_structure_uses_host_policy_and_decoder_ceiling_before_descendants() {
+		fn leaf(text: &str) -> Vec<u8> {
+			let mut bytes = vec![0];
+			bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+			bytes.extend_from_slice(text.as_bytes());
+			bytes.extend_from_slice(&[0, 0, 0]);
+			bytes
+		}
+		fn group(count: usize, child: &[u8]) -> Vec<u8> {
+			let mut bytes = vec![2];
+			bytes.extend_from_slice(&(count as u16).to_le_bytes());
+			for _ in 0..count {
+				bytes.extend_from_slice(child);
+			}
+			bytes
+		}
+		fn request(expression: &[u8]) -> Vec<u8> {
+			let mut bytes = b"FTSQ\x07\x00".to_vec();
+			bytes.extend_from_slice(expression);
+			bytes.extend_from_slice(&[0; 10]);
+			bytes.extend_from_slice(&0u32.to_le_bytes());
+			bytes.extend_from_slice(&1u32.to_le_bytes());
+			bytes.push(0);
+			bytes.extend_from_slice(&1000u32.to_le_bytes());
+			bytes
+		}
+		let mut config = search_config(1);
+		config.limits.max_query_clauses = 1024;
+		let wide = request(&group(300, &leaf("shoe")));
+		assert!(search_is_expensive(&wide)
+			.unwrap_err()
+			.message
+			.contains("structure exceeds 256"));
+		assert!(search_is_expensive_for_config(&wide, &config).unwrap());
+		assert!(
+			matches!(decode_search(&wide).unwrap().expression, SearchExpression::Or(children) if children.len() == 300)
+		);
+		config.limits.max_query_clauses = 4096;
+		let ceiling = request(&group(4096, &leaf("")));
+		assert!(search_is_expensive_for_config(&ceiling, &config).unwrap());
+		assert!(decode_search(&ceiling).is_ok());
+		for expression in [group(4097, &[]), group(2, &group(2048, &leaf("")))] {
+			let bytes = request(&expression);
+			for error in [
+				search_is_expensive_for_config(&bytes, &config).unwrap_err(),
+				decode_search(&bytes).unwrap_err(),
+			] {
+				assert_eq!(error.code, "E_INVALID_ARGUMENT");
+				assert!(error.message.contains("structure exceeds 4096"));
+			}
+		}
+		let mut negated = vec![3];
+		negated.extend(leaf(""));
+		config.limits.max_query_clauses = 2;
+		assert!(search_is_expensive_for_config(&request(&negated), &config).unwrap());
+		config.limits.max_query_clauses = 1;
+		assert!(search_is_expensive_for_config(&request(&negated), &config)
+			.unwrap_err()
+			.message
+			.contains("structure exceeds 1"));
+		config = search_config(2);
+		config.limits.max_query_clauses = 4096;
+		let mut fields = leaf("");
+		let length = fields.len();
+		fields[length - 2..].copy_from_slice(&3u16.to_le_bytes());
+		fields.extend_from_slice(&[0; 12]);
+		assert!(search_is_expensive_for_config(&request(&fields), &config)
+			.unwrap_err()
+			.message
+			.contains("field count exceeds 2"));
 	}
 
 	#[test]
