@@ -139,6 +139,7 @@ let writer,
 	current,
 	firstError,
 	firstErrorOperation,
+	finalReaderCloseError,
 	stopping = false,
 	samplerStopping = false;
 let writerOperation = 'writer-open';
@@ -512,7 +513,12 @@ try {
 		throw error;
 	} finally {
 		writerOperation = 'final-reader-close';
-		await bounded(closeIndex(reopened), 'reopened reader close');
+		try {
+			await bounded(closeIndex(reopened), 'reopened reader close');
+		} catch (error) {
+			finalReaderCloseError = String(error);
+			throw error;
+		}
 	}
 	writerOperation = 'telemetry-close';
 	await telemetry.close();
@@ -548,7 +554,7 @@ try {
 	await Promise.allSettled(workers);
 	samplerStopping = true;
 	if (sampleTask) await sampleTask;
-	const closeErrors = [];
+	const closeErrors = finalReaderCloseError ? [finalReaderCloseError] : [];
 	for (const lease of leases) {
 		try {
 			await bounded(closeIndex(lease.reader), 'failure reader close');

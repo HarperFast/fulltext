@@ -227,6 +227,7 @@ test('soak retains validation error when final reader close also fails', { timeo
 	assert.strictEqual(failure.accepted, false);
 	assert.strictEqual(failure.operation, 'final-reader-validation');
 	assert.match(failure.error.message, /injected final reader validation failure/);
+	assert(failure.closeErrors.some((error) => error.includes('E_CLOSE_FAILED')));
 	assert.strictEqual(failure.indexRetained, path.join(artifacts, 'index'));
 	await assert.rejects(access(path.join(artifacts, 'report.json')), { code: 'ENOENT' });
 });
