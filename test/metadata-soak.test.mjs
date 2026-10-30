@@ -13,7 +13,7 @@ const driver = fileURLToPath(new URL('../benchmarks/metadata-soak.mjs', import.m
 const cases = ['ordinary-exact', 'price-sort', 'nested-histogram', 'runtime-five-sort'];
 const readJson = async (file) => JSON.parse(await readFile(file, 'utf8'));
 async function fixture(context) {
-	const artifactRoot = process.env.FULLTEXT_TEST_ARTIFACT_ROOT;
+	const artifactRoot = process.env.FULLTEXT_TEST_ARTIFACT_ROOT || undefined;
 	if (artifactRoot) await mkdir(artifactRoot, { recursive: true });
 	const root = await mkdtemp(path.join(artifactRoot ?? tmpdir(), 'fulltext-soak-test-'));
 	if (!artifactRoot) context.after(() => rm(root, { recursive: true, force: true }));

@@ -13,8 +13,6 @@ jobs:
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
-    env:
-      FULLTEXT_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/fulltext-test-artifacts
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +55,8 @@ jobs:
       - run: npm run format:check
       - run: npm run lint
       - run: npm test
+        env:
+          FULLTEXT_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/fulltext-test-artifacts
       - name: Qualify snapshot traversal smoke
         run: node scripts/run-local.mjs benchmarks/traversal.mjs --smoke
       - run: git diff --exit-code -- ts/addon.d.ts
