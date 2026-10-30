@@ -564,12 +564,21 @@ fn packed_budget(bytes: &[u8], magic: [u8; 4], operation: &str) -> Result<u32> {
 }
 
 /// Classifies under default query policy without a schema snapshot.
-/// Handles use `search_is_expensive_for_fields` with their own policy and field count.
+/// Handles use `search_is_expensive_for_config` with their engine configuration.
 pub fn search_is_expensive(bytes: &[u8]) -> Result<bool> {
-	search_is_expensive_for_fields(bytes, MAX_FIELDS, MAX_QUERY_TERMS, MAX_QUERY_CLAUSES)
+	classify_search(bytes, MAX_FIELDS, MAX_QUERY_TERMS, MAX_QUERY_CLAUSES)
 }
 
-pub fn search_is_expensive_for_fields(
+pub fn search_is_expensive_for_config(bytes: &[u8], config: &EngineConfig) -> Result<bool> {
+	classify_search(
+		bytes,
+		config.identity.fields.len(),
+		config.limits.max_query_terms,
+		config.limits.max_query_clauses,
+	)
+}
+
+fn classify_search(
 	bytes: &[u8],
 	schema_fields: usize,
 	max_query_terms: usize,
@@ -1855,6 +1864,37 @@ mod tests {
 		assert_eq!(decode_search(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
 	}
 
+	fn search_config(fields: usize) -> EngineConfig {
+		EngineConfig {
+			identity: EngineIdentityConfig {
+				index_id: "products".to_owned(),
+				generation: "one".to_owned(),
+				fields: (0..fields)
+					.map(|i| FieldConfig {
+						name: format!("field{i}"),
+						weight: 1.0,
+					})
+					.collect(),
+				analyzer: "english@2".to_owned(),
+				stop_words: false,
+				positions: true,
+				surface_terms: true,
+				synonyms: Vec::new(),
+				filter_fields: Vec::new(),
+			},
+			limits: Limits {
+				max_query_terms: MAX_QUERY_TERMS,
+				max_query_clauses: MAX_QUERY_CLAUSES,
+				indexing_threads: 1,
+				search_threads: 1,
+				writer_memory_bytes: 15_000_000,
+				max_queued_commands: 1,
+				max_queued_bytes: 1024,
+				max_batch_bytes: 1024,
+			},
+		}
+	}
+
 	#[test]
 	fn raised_capacity_classification_keeps_small_ascii_queries_ordinary() {
 		fn request(text: &str) -> Vec<u8> {
@@ -1870,28 +1910,25 @@ mod tests {
 			bytes.extend_from_slice(&1000u32.to_le_bytes());
 			bytes
 		}
+		let mut config = search_config(2);
+		config.limits.max_query_terms = MAX_QUERY_TERMS + 1;
+		config.limits.max_query_clauses = MAX_CONFIGURED_QUERY_CLAUSES;
 		for text in ["a", "shoe", "alpha beta", &"a".repeat(65)] {
 			let bytes = request(text);
 			assert!(!search_is_expensive(&bytes).unwrap());
-			assert!(
-				!search_is_expensive_for_fields(&bytes, 2, MAX_QUERY_TERMS + 1, MAX_CONFIGURED_QUERY_CLAUSES).unwrap()
-			);
+			assert!(!search_is_expensive_for_config(&bytes, &config).unwrap());
 		}
 		for (text, fields) in [("word ".repeat(65), 1), ("shoe".to_owned(), 257), ("ﷺ".to_owned(), 1)] {
+			config.identity.fields = search_config(fields).identity.fields;
 			let bytes = request(&text);
 			assert!(!search_is_expensive(&bytes).unwrap());
-			assert!(
-				search_is_expensive_for_fields(&bytes, fields, MAX_QUERY_TERMS + 1, MAX_CONFIGURED_QUERY_CLAUSES)
-					.unwrap()
-			);
+			assert!(search_is_expensive_for_config(&bytes, &config).unwrap());
 		}
 		for length in 0..6 {
 			let bytes = &request("shoe")[..length];
 			assert_eq!(
 				search_is_expensive(bytes).unwrap_err().code,
-				search_is_expensive_for_fields(bytes, 2, MAX_QUERY_TERMS + 1, MAX_CONFIGURED_QUERY_CLAUSES)
-					.unwrap_err()
-					.code
+				search_is_expensive_for_config(bytes, &config).unwrap_err().code
 			);
 		}
 	}
@@ -1922,7 +1959,10 @@ mod tests {
 			bytes.extend_from_slice(&1u32.to_le_bytes());
 			bytes.push(0);
 			bytes.extend_from_slice(&1000u32.to_le_bytes());
-			search_is_expensive_for_fields(&bytes, fields, MAX_QUERY_TERMS + 1, MAX_CONFIGURED_QUERY_CLAUSES).unwrap()
+			let mut config = search_config(fields);
+			config.limits.max_query_terms = MAX_QUERY_TERMS + 1;
+			config.limits.max_query_clauses = MAX_CONFIGURED_QUERY_CLAUSES;
+			search_is_expensive_for_config(&bytes, &config).unwrap()
 		}
 		for kind in [1, 2] {
 			assert!(!expensive(&group(kind, &vec![leaf("a"); 65]), 1));
@@ -1971,22 +2011,25 @@ mod tests {
 			bytes.extend_from_slice(&1000u32.to_le_bytes());
 			bytes
 		}
+		let mut config = search_config(1);
+		config.limits.max_query_clauses = 1024;
 		let wide = request(&group(300, &leaf("shoe")));
 		assert!(search_is_expensive(&wide)
 			.unwrap_err()
 			.message
 			.contains("structure exceeds 256"));
-		assert!(search_is_expensive_for_fields(&wide, 1, 64, 1024).unwrap());
+		assert!(search_is_expensive_for_config(&wide, &config).unwrap());
 		assert!(
 			matches!(decode_search(&wide).unwrap().expression, SearchExpression::Or(children) if children.len() == 300)
 		);
+		config.limits.max_query_clauses = 4096;
 		let ceiling = request(&group(4096, &leaf("")));
-		assert!(search_is_expensive_for_fields(&ceiling, 1, 64, 4096).unwrap());
+		assert!(search_is_expensive_for_config(&ceiling, &config).unwrap());
 		assert!(decode_search(&ceiling).is_ok());
 		for expression in [group(4097, &[]), group(2, &group(2048, &leaf("")))] {
 			let bytes = request(&expression);
 			for error in [
-				search_is_expensive_for_fields(&bytes, 1, 64, 4096).unwrap_err(),
+				search_is_expensive_for_config(&bytes, &config).unwrap_err(),
 				decode_search(&bytes).unwrap_err(),
 			] {
 				assert_eq!(error.code, "E_INVALID_ARGUMENT");
@@ -1995,16 +2038,20 @@ mod tests {
 		}
 		let mut negated = vec![3];
 		negated.extend(leaf(""));
-		assert!(search_is_expensive_for_fields(&request(&negated), 1, 64, 2).unwrap());
-		assert!(search_is_expensive_for_fields(&request(&negated), 1, 64, 1)
+		config.limits.max_query_clauses = 2;
+		assert!(search_is_expensive_for_config(&request(&negated), &config).unwrap());
+		config.limits.max_query_clauses = 1;
+		assert!(search_is_expensive_for_config(&request(&negated), &config)
 			.unwrap_err()
 			.message
 			.contains("structure exceeds 1"));
+		config = search_config(2);
+		config.limits.max_query_clauses = 4096;
 		let mut fields = leaf("");
 		let length = fields.len();
 		fields[length - 2..].copy_from_slice(&3u16.to_le_bytes());
 		fields.extend_from_slice(&[0; 12]);
-		assert!(search_is_expensive_for_fields(&request(&fields), 2, 64, 4096)
+		assert!(search_is_expensive_for_config(&request(&fields), &config)
 			.unwrap_err()
 			.message
 			.contains("field count exceeds 2"));

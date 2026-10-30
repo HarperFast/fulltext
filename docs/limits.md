@@ -304,8 +304,8 @@ empty Boolean tree with an empty text leaf when an empty result is wanted.
 
 `protocol::decode_search` is policy-neutral and uses the supported 4,096-clause structural ceiling.
 `protocol::search_is_expensive` is a default-policy convenience classifier. Rust hosts with a known
-schema or another policy must use `search_is_expensive_for_fields` with the schema field count and
-effective term/clause limits; classification also enforces that policy's structural bound.
+schema or another policy must use `search_is_expensive_for_config` with the engine configuration;
+classification also enforces that policy's structural bound.
 
 When migrating from released 0.7.x, ordinary `protocol::SearchRequest` literals add `sort: None`
 and `aggregations: Vec::new()`. Catalog callers use `catalog::SortRequest` and
