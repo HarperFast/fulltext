@@ -17,8 +17,8 @@ async function observe(context, args, options) {
 }
 const scenario = fileURLToPath(new URL('./fixtures/native-worker-scenario.mjs', import.meta.url));
 
-test('worker fixture preserves a real reopen error and its index evidence', { timeout: 65_000 }, async () => {
-	const result = await execute(process.execPath, [scenario, 'apply'], {
+test('worker fixture preserves a real reopen error and its index evidence', { timeout: 65_000 }, async (context) => {
+	const result = await observe(context, [scenario, 'apply'], {
 		timeout: 60_000,
 		env: {
 			...process.env,
@@ -26,17 +26,18 @@ test('worker fixture preserves a real reopen error and its index evidence', { ti
 			FULLTEXT_TEST_WORKER_REOPEN_ID: 'different-index-identity',
 		},
 	}).then(
-		() => assert.fail('the real native reopen must reject the incompatible identity'),
+		(result) => ({ ...result, code: 0 }),
 		(error) => error,
 	);
-	assert.strictEqual(result.code, 1);
-	assert.match(result.stderr, /E_IDENTITY_MISMATCH/);
 	const directory = /^apply:path:(.+)$/m.exec(result.stderr)?.[1]?.trim();
-	assert(directory, result.stderr);
 	try {
+		assert.strictEqual(result.code, 1, result.stderr);
+		assert.match(result.stderr, /E_IDENTITY_MISMATCH/);
+		assert(directory, result.stderr);
 		assert(existsSync(directory), 'a failed reopen must retain the index rather than delete its evidence');
 	} finally {
-		await rm(directory, { recursive: true, force: true });
+		if (directory && Number.isInteger(result.code) && !result.signal)
+			await rm(directory, { recursive: true, force: true });
 	}
 });
 

@@ -1852,7 +1852,7 @@ fn writer_loop_inner(
 			.writer_execution_nanoseconds
 			.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
 		#[cfg(feature = "test-panic")]
-		writer_diagnostic(runtime.handle, diagnostic_operation, "writer-end", started.elapsed());
+		let diagnostic_elapsed = started.elapsed();
 		match outcome {
 			Ok(WriterOutcome::Continue(result)) => settle(completion, result),
 			Ok(WriterOutcome::Stop(outcome)) => {
@@ -1869,6 +1869,8 @@ fn writer_loop_inner(
 						)));
 					}
 				}
+				#[cfg(feature = "test-panic")]
+				writer_diagnostic(runtime.handle, diagnostic_operation, "writer-end", diagnostic_elapsed);
 				return;
 			}
 			Ok(WriterOutcome::Poison(result, poison)) => {
@@ -1900,9 +1902,13 @@ fn writer_loop_inner(
 						)));
 					}
 				}
+				#[cfg(feature = "test-panic")]
+				writer_diagnostic(runtime.handle, diagnostic_operation, "writer-end", diagnostic_elapsed);
 				return;
 			}
 		}
+		#[cfg(feature = "test-panic")]
+		writer_diagnostic(runtime.handle, diagnostic_operation, "writer-end", diagnostic_elapsed);
 	}
 	let cleanup_runtime = runtime.clone();
 	if catch_unwind(AssertUnwindSafe(move || {
@@ -1942,9 +1948,9 @@ pub(crate) fn finish_writer_close(writer: &mut Option<Writer>, read_only: bool) 
 
 fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>) -> WriterCloseOutcome {
 	#[cfg(feature = "test-panic")]
-	let started = Instant::now();
-	#[cfg(feature = "test-panic")]
 	writer_diagnostic(_runtime.handle, "close", "close-start", Duration::ZERO);
+	#[cfg(feature = "test-panic")]
+	let started = Instant::now();
 	let outcome = finish_writer_close(writer, _runtime.read_only);
 	#[cfg(feature = "test-panic")]
 	writer_diagnostic(_runtime.handle, "close", "close-end", started.elapsed());
