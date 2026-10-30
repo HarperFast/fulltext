@@ -50,7 +50,15 @@ test(
 				'--budget-ms',
 				'30000',
 			],
-			{ timeout: 60_000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1' } },
+			{
+				timeout: 60_000,
+				maxBuffer: 4 * 1024 * 1024,
+				env: {
+					...process.env,
+					FULLTEXT_PREFER_LOCAL_BUILD: '1',
+					...(process.platform === 'win32' ? { FULLTEXT_TEST_WRITER_DIAGNOSTICS: '1' } : {}),
+				},
+			},
 		);
 		context.diagnostic(stderr.trim());
 		const report = JSON.parse(stdout);
@@ -174,7 +182,7 @@ test(
 );
 
 test(
-	'metadata workload retains its named stage in an execFile termination error',
+	'metadata workload retains native writer evidence in an execFile termination error',
 	{ timeout: 15_000 },
 	async (context) => {
 		const scratch = await mkdtemp(path.join(tmpdir(), 'fulltext-workload-kill-test-'));
@@ -200,20 +208,24 @@ test(
 				'--features',
 				'flat',
 			],
-			{ timeout: 10_000, env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1' } },
+			{
+				timeout: 10_000,
+				env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1', FULLTEXT_TEST_WRITER_DIAGNOSTICS: '1' },
+			},
 		);
 		child = pending.child;
 		let observed = '',
 			killedAtStage = false;
 		child.stderr.on('data', (chunk) => {
 			observed += chunk;
-			if (!killedAtStage && observed.includes('"stage":"catalog-open"')) {
+			if (!killedAtStage && observed.includes('"operation":"commit","stage":"writer-start"')) {
 				killedAtStage = child.kill();
 			}
 		});
 		await assert.rejects(pending, (error) => {
 			assert(killedAtStage);
 			assert(error.killed);
+			assert.match(error.stderr, /fulltext-writer-diagnostic .*"operation":"commit","stage":"writer-start"/);
 			assert.strictEqual(error.stdout, '');
 			const events = error.stderr
 				.split('\n')

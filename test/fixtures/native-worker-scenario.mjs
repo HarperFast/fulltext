@@ -5,34 +5,43 @@ import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 
 import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
+import { closeIndex } from '../../benchmarks/metadata-cleanup.mjs';
+import { startWriterDiagnostics, writeWriterDiagnostic } from '../../benchmarks/writer-diagnostics.mjs';
 
 const scenario = process.argv[2];
 const moduleUrl = new URL('../../dist/native.js', import.meta.url).href;
 
-if (scenario === 'apply') {
-	await runApply();
-} else if (scenario === 'opening') {
-	await runOpening();
-} else if (scenario === 'multiple') {
-	await runMultiple();
-} else if (scenario === 'foreign') {
-	await runForeignEnvironment();
-} else if (scenario === 'sequence') {
-	await runApply();
-	await runOpening();
-	await runMultiple();
-	await runForeignEnvironment();
-} else if (scenario === 'apply-stress') {
-	for (let attempt = 1; attempt <= 5; attempt++) {
-		mark(`apply:${attempt}:starting`);
+const diagnostics = startWriterDiagnostics('native-worker-scenario');
+try {
+	if (scenario === 'apply') {
 		await runApply();
+	} else if (scenario === 'opening') {
+		await runOpening();
+	} else if (scenario === 'multiple') {
+		await runMultiple();
+	} else if (scenario === 'foreign') {
+		await runForeignEnvironment();
+	} else if (scenario === 'sequence') {
+		await runApply();
+		await runOpening();
+		await runMultiple();
+		await runForeignEnvironment();
+	} else if (scenario === 'apply-stress') {
+		for (let attempt = 1; attempt <= 5; attempt++) {
+			mark(`apply:${attempt}:starting`);
+			await runApply();
+		}
+	} else {
+		throw new Error(`unknown native worker scenario: ${scenario}`);
 	}
-} else {
-	throw new Error(`unknown native worker scenario: ${scenario}`);
+} finally {
+	diagnostics.stop();
 }
 
 async function runApply() {
 	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-'));
+	mark(`apply:path:${indexPath}`);
+	let quiescent = false;
 	try {
 		const worker = startWorker({ indexPath });
 		await waitForMessage(worker, 'applying');
@@ -41,15 +50,17 @@ async function runApply() {
 		mark('apply:reopening');
 		const index = await waitForOpen(indexPath);
 		assert.strictEqual((await index.search({ text: 'worker owned product', exactTotal: true })).total, 0);
-		await index.close();
+		await closeIndex(index);
+		quiescent = true;
 		mark('apply:closed');
 	} finally {
-		rmSync(indexPath, { recursive: true, force: true });
+		removeQuiescentFixtures([indexPath], quiescent);
 	}
 }
 
 async function runOpening() {
 	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-open-'));
+	let quiescent = false;
 	try {
 		const worker = startWorker({ indexPath, mode: 'opening' });
 		await waitForMessage(worker, 'opening');
@@ -57,32 +68,40 @@ async function runOpening() {
 		await worker.terminate();
 		mark('opening:reopening');
 		const index = await waitForOpen(indexPath);
-		await index.close();
+		await closeIndex(index);
+		quiescent = true;
 		mark('opening:closed');
 	} finally {
-		rmSync(indexPath, { recursive: true, force: true });
+		removeQuiescentFixtures([indexPath], quiescent);
 	}
 }
 
 async function runMultiple() {
 	const indexPaths = Array.from({ length: 3 }, () => mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-many-')));
+	let quiescent = false;
 	try {
 		const worker = startWorker({ indexPaths, mode: 'multiple' });
 		await waitForMessage(worker, 'multiple-open');
 		mark('multiple:terminating');
 		await worker.terminate();
 		mark('multiple:reopening');
-		const indexes = await Promise.all(indexPaths.map(waitForOpen));
-		await Promise.all(indexes.map((index) => index.close()));
+		const opened = await Promise.allSettled(indexPaths.map(waitForOpen));
+		const closed = await Promise.allSettled(
+			opened.filter(({ status }) => status === 'fulfilled').map(({ value }) => closeIndex(value)),
+		);
+		const errors = [...opened, ...closed].filter(({ status }) => status === 'rejected').map(({ reason }) => reason);
+		if (errors.length) throw new AggregateError(errors, 'multiple-index reopen or close failed', { cause: errors[0] });
+		quiescent = true;
 		mark('multiple:closed');
 	} finally {
-		indexPaths.forEach((indexPath) => rmSync(indexPath, { recursive: true, force: true }));
+		removeQuiescentFixtures(indexPaths, quiescent);
 	}
 }
 
 async function runForeignEnvironment() {
 	const indexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-owner-'));
 	const callerIndexPath = mkdtempSync(path.join(tmpdir(), 'harper-fulltext-worker-caller-'));
+	let quiescent = false;
 	try {
 		const owner = startWorker({ indexPath, mode: 'owner' });
 		const ownerExit = waitForExit(owner);
@@ -96,11 +115,11 @@ async function runForeignEnvironment() {
 		owner.postMessage('close');
 		assert.strictEqual(await ownerExit, 0);
 		const index = await waitForOpen(indexPath);
-		await index.close();
+		await closeIndex(index);
+		quiescent = true;
 		mark('foreign:closed');
 	} finally {
-		rmSync(indexPath, { recursive: true, force: true });
-		rmSync(callerIndexPath, { recursive: true, force: true });
+		removeQuiescentFixtures([indexPath, callerIndexPath], quiescent);
 	}
 }
 
@@ -136,7 +155,15 @@ function waitForExit(worker) {
 }
 
 function mark(stage) {
+	diagnostics.stage(stage);
 	process.stderr.write(`${stage}\n`);
+}
+
+function removeQuiescentFixtures(paths, quiescent) {
+	for (const directory of paths) {
+		if (quiescent) rmSync(directory, { recursive: true, force: true });
+		else writeWriterDiagnostic({ name: 'native-worker-scenario', stage: 'retained-index', directory });
+	}
 }
 
 async function waitForOpen(indexPath) {
@@ -145,7 +172,7 @@ async function waitForOpen(indexPath) {
 		try {
 			return await openNativeFullTextIndex({
 				path: indexPath,
-				indexId: 'worker-products',
+				indexId: process.env.FULLTEXT_TEST_WORKER_REOPEN_ID ?? 'worker-products',
 				generation: 'generation-1',
 				fields: [{ name: 'title' }],
 				analyzer: 'english@2',

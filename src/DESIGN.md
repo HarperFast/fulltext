@@ -95,6 +95,12 @@ a subsequent close cannot join the earlier merges. Terminal Rust shutdown should
 directly. Native handles no longer call that rollback primitive. Tracking a broader Rust rollback
 ownership contract remains separate from this native-handle fix.
 
+## Test-only writer diagnostics
+
+`FULLTEXT_TEST_WRITER_DIAGNOSTICS=1` is captured on native open entry and emits fixed writer/close/cleanup stages only in the `test-panic` addon. Records carry handle, process, epoch time and operation duration; prefixed single-buffer writes ignore output failures. Production builds omit the native trace code. The worker fixture retains directories whenever successful quiescent reopen/close is unproven, preserving the primary failure; partial multiple-index opens are settled and closed before reporting errors.
+
+The workload heartbeat reuses public status counters: queued commands identify admission waits; commit opstamp, uncommitted mutations and completed execution metrics distinguish native completion from pending JavaScript delivery. Executing work with low process CPU still requires further native stack/file evidence; this is not a deadlock diagnosis. The original Windows failure occurred in the debug test phase before production rebuild. Keep workloads and deadlines unchanged; instrumented observations do not establish production performance or explain a prior failure merely because the next run passes.
+
 ## Request preparation
 
 Query identities up to 64 KiB hash synchronously; larger ones use WebCrypto. This threshold changes

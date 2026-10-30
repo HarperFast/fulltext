@@ -1,3 +1,4 @@
+import { closeIndex } from '../../benchmarks/metadata-cleanup.mjs';
 import { parentPort, workerData } from 'node:worker_threads';
 
 const { encodeMutationBatch, openNativeFullTextIndex } = await import(workerData.moduleUrl);
@@ -90,7 +91,7 @@ async function runForeignCall() {
 	} catch (error) {
 		parentPort.postMessage({ type: 'foreign-result', code: error.code, message: error.message });
 	} finally {
-		await ownIndex.close();
+		await closeIndex(ownIndex);
 	}
 }
 
