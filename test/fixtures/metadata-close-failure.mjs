@@ -44,7 +44,7 @@ async function open(options, readOnly) {
 			return publish(...args);
 		};
 	}
-	if (process.env.FULLTEXT_TEST_CLOSE_KIND === 'final-reader') {
+	if (['final-reader', 'final-reader-close'].includes(process.env.FULLTEXT_TEST_CLOSE_KIND)) {
 		if (!readOnly) {
 			const close = index.close.bind(index);
 			index.close = async (...args) => {
@@ -54,9 +54,10 @@ async function open(options, readOnly) {
 			};
 		} else if (writerClosed) {
 			addon.__testFailNextClose(handle, true);
-			index.search = () => {
-				throw new Error('injected final reader validation failure');
-			};
+			if (process.env.FULLTEXT_TEST_CLOSE_KIND === 'final-reader')
+				index.search = () => {
+					throw new Error('injected final reader validation failure');
+				};
 		}
 	}
 	return readOnly ? new NativeFullTextReader(index) : index;

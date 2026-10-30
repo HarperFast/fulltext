@@ -164,6 +164,7 @@ let disk = {},
 	lastDiskAt = -Infinity,
 	sampleTask,
 	workers = [];
+const describeCloseError = (error) => `${error.code ?? error.name}: ${error.message}`;
 const fail = (error, operation) => {
 	if (!firstError) {
 		firstError = error;
@@ -516,7 +517,7 @@ try {
 		try {
 			await bounded(closeIndex(reopened), 'reopened reader close');
 		} catch (error) {
-			finalReaderCloseError = `${error.code ?? error.name}: ${error.message}`;
+			if (firstError) finalReaderCloseError = describeCloseError(error);
 			throw error;
 		}
 	}
@@ -559,14 +560,14 @@ try {
 		try {
 			await bounded(closeIndex(lease.reader), 'failure reader close');
 		} catch (closeError) {
-			closeErrors.push(String(closeError));
+			closeErrors.push(describeCloseError(closeError));
 		}
 	}
 	if (writer && !writerClosed) {
 		try {
 			await bounded(closeIndex(writer, { mode: 'rollback' }), 'failure writer close');
 		} catch (closeError) {
-			closeErrors.push(String(closeError));
+			closeErrors.push(describeCloseError(closeError));
 		}
 	}
 	const failure = {
