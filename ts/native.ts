@@ -1426,6 +1426,12 @@ function normalizeExpression(
 			fields: expression.fields ?? [],
 		};
 	}
+	if (
+		('fuzzyDistance' in expression && expression.fuzzyDistance !== undefined) ||
+		('fuzzyTranspositions' in expression && expression.fuzzyTranspositions !== undefined)
+	) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'fuzzy controls belong on search clauses, not Boolean groups');
+	}
 	if (expression.operator === 'not') {
 		chargeSearchStructure(budget, 2);
 		return { operator: 'not', clause: normalizeExpression(expression.clause, depth + 1, budget) };

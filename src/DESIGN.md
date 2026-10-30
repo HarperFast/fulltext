@@ -42,6 +42,8 @@ and its UTF-16 spans independently of indexed stems.
 ## Query controls and source membership
 
 `QueryOptions` resolves fuzzy distance 0–2/default 1 and transpositions default true per leaf.
+The facade rejects supplied fuzzy controls on Boolean groups before reading their children;
+controls belong to text leaves and are never inherited.
 Protocol 8 encodes u8/bool after each mode; ABI 13/query API 7 require a matching facade. Options
 are absent from persisted identity and included in continuation digests. Nondefault fuzzy traces
 lazily use requested native automata on the existing analyzed/surface branches, sharing a matcher

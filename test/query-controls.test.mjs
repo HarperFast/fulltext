@@ -133,6 +133,48 @@ test('invalid options reject consistently, including explicit defaults on unrela
 	assert.deepStrictEqual(ids(await index.search({ text: 'amber' })), ['saved']);
 });
 
+test('Boolean groups reject misplaced fuzzy controls before normalizing their children', async (context) => {
+	const { index } = await fixture(context, [{ id: 'near', fields: { title: 'ambxr' } }]);
+	const leaf = { text: 'amber', mode: 'fuzzy' };
+	for (const group of [
+		{ operator: 'and', clauses: [leaf] },
+		{ operator: 'or', clauses: [leaf] },
+		{ operator: 'not', clause: leaf },
+	]) {
+		for (const controls of [
+			{ fuzzyDistance: 0 },
+			{ fuzzyDistance: 1 },
+			{ fuzzyDistance: 2 },
+			{ fuzzyDistance: null },
+			{ fuzzyTranspositions: true },
+			{ fuzzyTranspositions: false },
+			{ fuzzyTranspositions: null },
+		]) {
+			const misplaced = { ...group, ...controls };
+			for (const query of [misplaced, { operator: 'or', clauses: [misplaced] }]) {
+				await assert.rejects(index.search({ query }), invalid);
+				await assert.rejects(index.searchPage({ query }), invalid);
+			}
+		}
+		await assert.doesNotReject(
+			index.search({ query: { ...group, fuzzyDistance: undefined, fuzzyTranspositions: undefined } }),
+		);
+	}
+	const inaccessible = {
+		operator: 'and',
+		fuzzyDistance: 0,
+		get clauses() {
+			throw new Error('invalid group must reject before reading children');
+		},
+	};
+	await assert.rejects(index.search({ query: inaccessible }), invalid);
+	assert.deepStrictEqual(ids(await index.search({ query: { operator: 'or', clauses: [leaf] } })), ['near']);
+	assert.deepStrictEqual(
+		ids(await index.search({ query: { operator: 'or', clauses: [{ ...leaf, fuzzyDistance: 0 }] } })),
+		[],
+	);
+});
+
 test('malformed packed query options reject at native decoding and leave the reader usable', async (context) => {
 	const { handle, addon, index } = await fixture(context, [{ id: 'saved', fields: { title: 'amber quartz' } }]);
 	for (const trace of [false, true]) {
@@ -163,7 +205,12 @@ test('malformed packed query options reject at native decoding and leave the rea
 test('controls retain field selection, Unicode tracing and independent fuzzy Boolean leaves', async (context) => {
 	const records = [
 		{ id: 'unicode', fields: { title: '😀 caféteria', body: 'abcdef' }, filters: { enabled: true } },
-		{ id: 'other', fields: { title: 'abcxef', body: 'abxxef' } },
+		{ id: 'one-edit-body', fields: { title: 'caféteria', body: 'abcxef' }, filters: { enabled: true } },
+		{ id: 'wrong-body-field', fields: { title: 'abcdef caféteria', body: 'unrelated' }, filters: { enabled: true } },
+		{ id: 'wrong-title-field', fields: { title: 'unrelated', body: 'abcdef caféteria' }, filters: { enabled: true } },
+		{ id: 'swapped-title', fields: { title: 'caféterxi', body: 'abcdef' }, filters: { enabled: true } },
+		{ id: 'two-edit-title', fields: { title: 'caféteryz', body: 'abcdef' }, filters: { enabled: true } },
+		{ id: 'disabled-match', fields: { title: 'caféteria', body: 'abcdef' }, filters: { enabled: false } },
 	];
 	const { index } = await fixture(context, records);
 	const query = {
@@ -182,6 +229,13 @@ test('controls retain field selection, Unicode tracing and independent fuzzy Boo
 	assert.strictEqual(filtered.total, 1);
 	const request = { text: 'caféterix', mode: 'fuzzy', fuzzyDistance: 1, fuzzyTranspositions: false, fields: ['title'] };
 	const traced = await index.traceMatches(request, records);
+	assert.strictEqual(traced.complete, true);
+	assert.deepStrictEqual(traced.records.map(({ id }) => id).sort(), [
+		'disabled-match',
+		'one-edit-body',
+		'unicode',
+		'wrong-body-field',
+	]);
 	assert.deepStrictEqual(traced.records.find(({ id }) => id === 'unicode').values, [
 		{ field: 'title', valueIndex: 0, spans: [{ start: 3, end: 12 }] },
 	]);

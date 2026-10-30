@@ -51,6 +51,9 @@ run exceeded its deadline. Compare ingestion and close durations before attribut
 
 ## Fuzzy controls
 
+The `benchmark:query-controls` command builds production artifacts before running. Direct driver
+invocation is reserved for explicitly prepared artifacts, including paired baseline comparisons.
+
 `query-controls.mjs` uses source-derived edit families, not the engine's returned matches, as its
 correctness oracle. The distance-one and distance-two profiles run in fresh processes at equal
 construction work-unit admission; field counts differ deliberately. They are not equivalent

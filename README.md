@@ -175,7 +175,8 @@ Fuzzy controls belong to each simple request or Boolean text leaf, and to the si
 | `fuzzyTranspositions` | `fuzzy`, `fuzzy-prefix` | `true`  | Boolean; adjacent swaps cost one edit when enabled.      |
 
 Supplying a fuzzy control on another mode rejects even when its value is the default. A root
-`query` cannot be combined with simple leaf options. Controls do not change index identity or
+`query` cannot be combined with simple leaf options. Boolean `and`/`or`/`not` groups reject supplied
+fuzzy controls; put controls on their text leaves. Controls do not change index identity or
 require rebuilding; continuation tokens bind their resolved values.
 Existing eligibility, exact-match ranking and field weights still apply. Distance 2 can increase
 native construction and dictionary work; its production memory capacity is unqualified. Consumers should enable caller-supplied distance 2 only after qualifying their corpus and concurrency.

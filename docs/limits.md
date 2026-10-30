@@ -83,7 +83,8 @@ existing index.
 (default true) in fuzzy and fuzzy-prefix modes. Controls apply independently to simple requests,
 Boolean leaves and simple trace requests. The JavaScript facade rejects a supplied control on
 another mode, including explicit defaults; typed Rust and raw frames reject nondefault irrelevant
-controls. A root `query` cannot carry simple leaf options. Runtime limits advertise `maxFuzzyDistance`.
+controls. A root `query` cannot carry simple leaf options. Boolean `and`/`or`/`not` groups reject
+supplied fuzzy controls instead of inheriting them into children. Runtime limits advertise `maxFuzzyDistance`.
 Changing controls requires no rebuild. Traversal identity includes resolved controls.
 
 Distance 2 increases potential automaton and dictionary work, including broader matches from
