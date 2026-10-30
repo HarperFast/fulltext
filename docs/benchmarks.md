@@ -420,3 +420,46 @@ p95/p99 6.408/6.531 ms and the 2,048-branch tree 48.264/52.272 ms. This run incl
 validated fixed-count normalization walk and its iterator/growth/invalid-length regression coverage. These are separate-run
 observations, not a controlled comparison with the original five-case run. The fingerprinted
 report is retained as `fulltext-structure-query-capacity-validated-count.json` in the local qualification artifacts.
+
+## Fuzzy-control qualification
+
+Build optimized artifacts and run `FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/query-controls.mjs`.
+The finite synthetic fixture checks distance 0/1/2, transpositions on/off, full/prefix matching,
+Unicode source traces and independent expected IDs against 1,000 documents with a broad dictionary.
+Each case runs at 1/4/8 callers. A long-term case exercises 64 native distance-two automata,
+consuming all 256 weighted construction units. One-millisecond attempts may succeed correctly or
+return `E_TIMEOUT`; recovery and queue drain must succeed. Gates remain p99 <= 5,000 ms and sampled
+RSS growth <= 256 MiB. Failures retain atomic progress/failure JSON and the index; they never emit
+an accepted stdout report. The reports include runtime, policy and driver/facade/codec/addon hashes.
+
+Fresh-process controls use `--profile=distance-1` and `--profile=distance-2`. Both declare 16 fields,
+index the same 1,000 documents and use sixteen distinct 39-character query terms. Distance one
+uses 16 fields (256 automata); distance two uses four fields (64 automata at four units each).
+This compares equal construction admission, not identical native work or a universal cost bound.
+
+Observed once per profile on macOS arm64 / Node 24.16.0, 2026-10-30:
+
+| Profile                              | Worst cell p99 | Peak sampled RSS growth | 1 ms timeouts / recovery | Gate result |
+| ------------------------------------ | -------------: | ----------------------: | ------------------------ | ----------- |
+| Saved pre-change addon, distance one |      31.556 ms |             301.516 MiB | 3 / passed               | Failed RSS  |
+| Current addon, distance one          |      31.674 ms |             355.750 MiB | 3 / passed               | Failed RSS  |
+| Current addon, distance two          |      29.319 ms |             544.516 MiB | 3 / passed               | Failed RSS  |
+
+The saved ABI-12 baseline uses its existing distance-one/transpositions-on defaults; its older
+facade ignores the newly added controls. Every completed query matched the source oracle; all
+profiles recovered and drained. The initial
+shorter-term matrix passed 1,911 measured requests with worst p99 3.506 ms and RSS growth
+32.406 MiB, before the deliberately expensive long-term case was added. All 75 short-budget
+attempts succeeded in that initial run, so it observed no cancellation. Its success does not
+qualify the strengthened fixture. The first strengthened full run also failed its RSS gate;
+its original error and retained index were preserved, but it predated numeric failure telemetry.
+
+These failures are not relabeled accepted. The baseline failure demonstrates an existing
+construction-memory concern; the larger observed distance-two peak warrants follow-up and does
+not establish a leak or its cause. Native DFA transition payload, construction temporaries,
+concurrent queries and allocator retention can all contribute. No forced GC or allocator tuning
+was used. RSS is sampled process memory, not a native-only allocation measurement or a hard peak.
+This finite development-platform evidence does not qualify Linux deployment headroom or sustained
+memory. Production-oriented follow-up remains in
+[Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
+Fuzzy-prefix remains preview; no ranking/eligibility defaults or production qualification claims change.
