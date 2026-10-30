@@ -63,6 +63,8 @@ test(
 			.map((line) => JSON.parse(line.slice('fulltext-process-diagnostic '.length)))
 			.find(({ stage }) => stage === 'js-commit-resolved');
 		assert.strictEqual(resolved.native.uncommittedMutations, '0');
+		assert.strictEqual(resolved.native.documentSource, undefined);
+		assert(!result.stderr.includes('must-not-be-recorded'));
 		assert(BigInt(resolved.native.commitOpstamp) > 0n);
 		const worker = await execute(process.execPath, [scenario, 'apply'], { timeout: 60_000, env });
 		const cleanup = nativeEvents(worker.stderr);

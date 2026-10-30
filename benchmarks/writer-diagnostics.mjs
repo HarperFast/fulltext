@@ -9,6 +9,21 @@ export function writeWriterDiagnostic(record) {
 	} catch {}
 }
 
+export function writerStatusSnapshot(status) {
+	if (!status) return undefined;
+	return {
+		state: status.state,
+		uncommittedMutations: status.uncommittedMutations,
+		writerQueuedCommands: status.writerQueuedCommands,
+		writerQueuedBytes: status.writerQueuedBytes,
+		commitOpstamp: status.commitOpstamp,
+		metrics: {
+			writerQueueNanoseconds: status.metrics.writerQueueNanoseconds,
+			writerExecutionNanoseconds: status.metrics.writerExecutionNanoseconds,
+		},
+	};
+}
+
 export function startWriterDiagnostics(name, status = () => undefined) {
 	let stage;
 	let timer;

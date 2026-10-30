@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { openNativeFullTextIndex } from '../../dist/native.js';
 import { closeIndex } from '../../benchmarks/metadata-cleanup.mjs';
-import { startWriterDiagnostics, writeWriterDiagnostic } from '../../benchmarks/writer-diagnostics.mjs';
+import {
+	startWriterDiagnostics,
+	writeWriterDiagnostic,
+	writerStatusSnapshot,
+} from '../../benchmarks/writer-diagnostics.mjs';
 
 const mode = process.argv[2];
 if (mode === 'closed-stderr') {
@@ -29,7 +33,7 @@ if (mode === 'closed-stderr') {
 } else {
 	const directory = await mkdtemp(path.join(tmpdir(), 'fulltext-writer-diagnostic-'));
 	let index;
-	const diagnostics = startWriterDiagnostics('native-writer-child', () => index?.status());
+	const diagnostics = startWriterDiagnostics('native-writer-child', () => writerStatusSnapshot(index?.status()));
 	try {
 		index = await openNativeFullTextIndex({
 			path: directory,
@@ -48,7 +52,11 @@ if (mode === 'closed-stderr') {
 		});
 		await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { title: 'amber' } }] });
 		await index.commit();
-		writeWriterDiagnostic({ stage: 'js-commit-resolved', timestamp: Date.now(), native: index.status() });
+		writeWriterDiagnostic({
+			stage: 'js-commit-resolved',
+			timestamp: Date.now(),
+			native: writerStatusSnapshot({ ...index.status(), documentSource: 'must-not-be-recorded' }),
+		});
 		await index.reload();
 		assert.strictEqual((await index.search({ text: 'amber', exactTotal: true })).total, 1);
 	} finally {

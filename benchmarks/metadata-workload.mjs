@@ -1,7 +1,7 @@
 import assert from 'node:assert';
 import { prepareOracle, validate } from './metadata-oracle.mjs';
 import { closeIndex } from './metadata-cleanup.mjs';
-import { startWriterDiagnostics } from './writer-diagnostics.mjs';
+import { startWriterDiagnostics, writerStatusSnapshot } from './writer-diagnostics.mjs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -161,8 +161,8 @@ const pressureResults = [];
 let completedReport;
 let workloadError;
 writerDiagnostics = startWriterDiagnostics('metadata-workload', () => ({
-	catalog: index?.status(),
-	pressure: pressure?.status(),
+	catalog: writerStatusSnapshot(index?.status()),
+	pressure: writerStatusSnapshot(pressure?.status()),
 }));
 try {
 	progress('catalog-open');
