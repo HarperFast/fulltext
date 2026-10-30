@@ -57,7 +57,7 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	queryApiVersion: 6;
+	queryApiVersion: 7;
 	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
 	mutationBatchApiVersion: 5;
@@ -81,6 +81,7 @@ export interface RuntimeInfo {
 		maxRecordVersionBytes: number;
 		maxPrefixExpansions: number;
 		maxFuzzyTerms: number;
+		maxFuzzyDistance: number;
 		maxSearchWindow: number;
 		maxSearchPageSize: number;
 		maxFilterStringBytes: number;
@@ -227,7 +228,14 @@ export type SearchMode =
 	/** Preview until catalog-scale performance qualification is complete. */
 	| 'fuzzy-prefix';
 
-export interface SearchClause {
+export interface QueryOptions {
+	/** Maximum edits from 0 through 2; defaults to 1. Distance 2 is preview: qualify corpus and concurrency before exposing it to callers. Only valid in fuzzy modes. */
+	fuzzyDistance?: number;
+	/** Count adjacent transpositions as one edit; defaults to true. Only valid in fuzzy modes. */
+	fuzzyTranspositions?: boolean;
+}
+
+export interface SearchClause extends QueryOptions {
 	text: string;
 	mode?: SearchMode;
 	operator?: 'any' | 'all';
@@ -251,7 +259,7 @@ export type FilterExpression =
 	| { operator: 'not'; clause: FilterExpression }
 	| { operator: 'and' | 'or'; clauses: FilterExpression[] };
 
-export interface SearchRequest {
+export interface SearchRequest extends QueryOptions {
 	sort?: SortRequest | SortRequest[];
 	aggregations?: AggregationRequest[];
 	text?: string;
@@ -276,7 +284,7 @@ export interface SearchPageResult extends SearchResult {
 	continuation?: string;
 }
 
-export interface TraceSearchRequest {
+export interface TraceSearchRequest extends QueryOptions {
 	text: string;
 	mode?: SearchMode;
 	operator?: 'any' | 'all';
@@ -836,6 +844,7 @@ export class NativeFullTextIndex {
 	): Promise<TraceMatchesResult> {
 		if (typeof request.text !== 'string') throw new FulltextError('E_INVALID_ARGUMENT', 'traceMatches requires text');
 		const text = request.text;
+		const queryOptions = normalizeQueryOptions(request);
 		if (request.mode !== undefined && request.operator !== undefined) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 		}
@@ -885,7 +894,7 @@ export class NativeFullTextIndex {
 				this.#handle,
 				encodeTrace({
 					text,
-					mode: request.mode ?? request.operator ?? 'any',
+					...queryOptions,
 					fields: request.fields ?? [],
 					candidateIds: request.candidateIds,
 					records: packedRecords,
@@ -1329,7 +1338,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			queryApiVersion: info.queryApiVersion as 6,
+			queryApiVersion: info.queryApiVersion as 7,
 			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
 			mutationBatchApiVersion: 5,
@@ -1345,8 +1354,32 @@ function asBuffer(value: Uint8Array): Buffer {
 	return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
 }
 
+function normalizeQueryOptions(request: QueryOptions & { mode?: SearchMode; operator?: 'any' | 'all' }) {
+	const mode = request.mode ?? request.operator ?? 'any';
+	const fuzzyDistance = request.fuzzyDistance;
+	const fuzzyTranspositions = request.fuzzyTranspositions;
+	if (
+		(fuzzyDistance !== undefined || fuzzyTranspositions !== undefined) &&
+		mode !== 'fuzzy' &&
+		mode !== 'fuzzy-prefix'
+	) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'fuzzy options require fuzzy or fuzzy-prefix mode');
+	}
+	if (fuzzyDistance !== undefined && (!Number.isInteger(fuzzyDistance) || fuzzyDistance < 0 || fuzzyDistance > 2)) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'fuzzyDistance must be an integer between 0 and 2');
+	}
+	if (fuzzyTranspositions !== undefined && typeof fuzzyTranspositions !== 'boolean') {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'fuzzyTranspositions must be a boolean');
+	}
+	return {
+		mode,
+		fuzzyDistance: fuzzyDistance ?? 1,
+		fuzzyTranspositions: fuzzyTranspositions ?? true,
+	};
+}
+
 function normalizeSearchExpression(
-	request: Pick<SearchRequest, 'text' | 'query' | 'mode' | 'operator' | 'fields'>,
+	request: Pick<SearchRequest, 'text' | 'query' | 'mode' | 'operator' | 'fields' | keyof QueryOptions>,
 	maxClauses: number,
 ): import('./codec.js').PackedSearchExpression {
 	if (!request || typeof request !== 'object' || Array.isArray(request)) {
@@ -1357,9 +1390,11 @@ function normalizeSearchExpression(
 			request.text !== undefined ||
 			request.mode !== undefined ||
 			request.operator !== undefined ||
-			request.fields !== undefined
+			request.fields !== undefined ||
+			request.fuzzyDistance !== undefined ||
+			request.fuzzyTranspositions !== undefined
 		) {
-			throw new FulltextError('E_INVALID_ARGUMENT', 'query cannot be combined with text, mode, operator, or fields');
+			throw new FulltextError('E_INVALID_ARGUMENT', 'query cannot be combined with simple search clause options');
 		}
 		return normalizeExpression(request.query, 0, { remaining: maxClauses, limit: maxClauses });
 	}
@@ -1368,7 +1403,7 @@ function normalizeSearchExpression(
 	}
 	return {
 		text: request.text,
-		mode: request.mode ?? request.operator ?? 'any',
+		...normalizeQueryOptions(request),
 		fields: request.fields ?? [],
 	};
 }
@@ -1387,9 +1422,15 @@ function normalizeExpression(
 		}
 		return {
 			text: expression.text,
-			mode: expression.mode ?? expression.operator ?? 'any',
+			...normalizeQueryOptions(expression),
 			fields: expression.fields ?? [],
 		};
+	}
+	if (
+		('fuzzyDistance' in expression && expression.fuzzyDistance !== undefined) ||
+		('fuzzyTranspositions' in expression && expression.fuzzyTranspositions !== undefined)
+	) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'fuzzy controls belong on search clauses, not Boolean groups');
 	}
 	if (expression.operator === 'not') {
 		chargeSearchStructure(budget, 2);

@@ -34,7 +34,7 @@ separate search server.
 | `all`                       | Require every analyzed query term to match.                                | Terms may match across selected fields.                                          |
 | `phrase`                    | Match terms in order at their analyzed positions.                          | Requires `positions: true` (the default).                                        |
 | `prefix`                    | Autocomplete: match completed terms and the final unfinished term.         | Requires `surfaceTerms: true`; expansion is bounded.                             |
-| `fuzzy`                     | Match misspelled terms with up to one edit, including transpositions.      | Eligibility and term limits apply; this is not arbitrary spelling correction.    |
+| `fuzzy`                     | Match misspelled terms with configurable edits and transpositions.         | Eligibility and term limits apply; this is not arbitrary spelling correction.    |
 | `fuzzy-prefix` **preview**  | Combine final-term autocomplete with typo tolerance.                       | Requires `surfaceTerms: true`; catalog-scale qualification remains pending.      |
 | Boolean queries and filters | Combine text clauses, restrict candidate IDs, or filter declared metadata. | Filters narrow results without adding relevance scores.                          |
 | Ranked traversal            | Continue through a large result set in a retained snapshot.                | Use `searchPage()` with a read-only handle.                                      |
@@ -165,6 +165,21 @@ continue through all accepted prefix matches. Fuzzy and prefix work has fixed te
 expansion, request, result, and execution ceilings. Prefix expansion fails with `E_PREFIX_TOO_BROAD` instead of silently
 truncating the term set and returning incomplete rankings. `fuzzy-prefix` is a preview capability
 until catalog-scale benchmark qualification is complete.
+
+Fuzzy controls belong to each simple request or Boolean text leaf, and to the simple
+`traceMatches()` request:
+
+| Option                | Modes                   | Default | Accepted values                                          |
+| --------------------- | ----------------------- | ------- | -------------------------------------------------------- |
+| `fuzzyDistance`       | `fuzzy`, `fuzzy-prefix` | `1`     | Integer 0–2; zero disables edits; distance 2 is preview. |
+| `fuzzyTranspositions` | `fuzzy`, `fuzzy-prefix` | `true`  | Boolean; adjacent swaps cost one edit when enabled.      |
+
+Supplying a fuzzy control on another mode rejects even when its value is the default. A root
+`query` cannot be combined with simple leaf options. Boolean `and`/`or`/`not` groups reject supplied
+fuzzy controls; put controls on their text leaves. Controls do not change index identity or
+require rebuilding; continuation tokens bind their resolved values.
+Existing eligibility, exact-match ranking and field weights still apply. Distance 2 can increase
+native construction and dictionary work; its production memory capacity is unqualified. Consumers should enable caller-supplied distance 2 only after qualifying their corpus and concurrency.
 
 Record IDs are limited to 4,096 UTF-8 bytes, keeping deterministic tie-page sorting memory bounded.
 An upsert may include an opaque `version` string of up to 4,096 UTF-8 bytes. The version is returned
@@ -454,8 +469,8 @@ When constructing `NativeFullTextIndex` directly around a native handle, supply 
 in `searchLimits`; the constructor validates it but cannot inspect the native handle’s policy.
 Search requests cannot raise them. Apply the same policy to every worker serving a logical index;
 changing it requires reopening handles but no index rebuild. The facade and native addon must match
-ABI 12. Query API 6 and packed mutation/search version 7 remain unchanged; the open frame has an
-optional policy extension, with defaults when absent.
+ABI 13, query API 7, and packed protocol 8. The open frame retains its optional policy extension,
+with defaults when absent.
 
 The clause setting covers compiled text queries, including field multiplication and expansion.
 It also bounds text-tree structure before allocation: each AND/OR child costs one clause and each
@@ -472,7 +487,7 @@ response and deadline limits remain in force. Invalid settings/term or clause ov
 Higher-policy handles retain ordinary admission for conservatively small ASCII requests. Larger or
 non-ASCII requests use the expensive lane; this can change latency and admission even when the
 analyzed query is small. Fixed whole-request construction guards also bound phrase positions and
-fuzzy automata. See [query capacity safeguards](docs/limits.md#query-capacity-policy) and qualify the
+weighted fuzzy construction work. See [query capacity safeguards](docs/limits.md#query-capacity-policy) and qualify the
 chosen policy on the consuming application's workload before rollout.
 
 ## Analyzer and field configuration
@@ -510,7 +525,7 @@ indexes fail closed and rebuild instead of silently changing recall.
 
 ## Upgrading from 0.7.x
 
-The unreleased metadata APIs use query API version 6 and native ABI version 12. Deploy the
+The unreleased metadata and query-control APIs use query API version 7 and native ABI version 13. Deploy the
 JavaScript facade and native addon built from the same revision; the published 0.7.0 addon cannot
 serve these requests. Indexes with a string `filterFields` entry need rebuilding because string
 metadata now also uses raw fast fields. Open and inspection report `E_IDENTITY_MISMATCH` for the
@@ -557,6 +572,15 @@ const traced = await index.traceMatches(
 ```
 
 Tracing evaluates only the supplied current values; it does not expand the live index dictionary.
+Fuzzy tracing retains its analyzed and current-source surface branches; indexed full-fuzzy membership
+uses analyzed terms. A source-surface highlight therefore need not imply indexed membership.
+Nondefault fuzzy policies use native automata, except distance zero uses equality/prefix checks
+without a DFA. Identical analyzed/surface query terms share a matcher. Distance 1 with
+transpositions retains its existing full-fuzzy trace path.
+
+Fuzzy automaton construction is synchronous between deadline checks; an individual operation
+can overrun the cooperative budget.
+
 Analysis is limited to 262,144 emitted tokens per value after synonym expansion. When that token
 ceiling, a span ceiling, or the response ceiling is reached, `complete` is false and later matches
 may be omitted.
@@ -778,7 +802,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 12, query API 6, and packed protocol 7. The loader rejects older addon
+This API uses native ABI 13, query API 7, and packed protocol 8. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
 columns. Previously released string-metadata indexes must

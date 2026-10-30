@@ -73,13 +73,33 @@ existing index.
 | Long-token filter              | Keeps only terms shorter than 40 UTF-8 bytes after lowercase/folding/possessive processing                     | An ASCII token of 39 bytes is indexed; 40- and 41-byte ASCII tokens are omitted. Ordinary queries containing only omitted terms return no hits, not an oversize-query error. Use structured exact filters for identifiers.                                                                                                                                               |
 | Unicode normalization boundary | 30 non-starters                                                                                                | Inserts the Unicode Stream-Safe joiner boundary for excessive combining sequences; this can change token boundaries.                                                                                                                                                                                                                                                     |
 | Prefix minimum                 | 3 Unicode characters; fuzzy prefix minimum 4                                                                   | Short nonempty final prefixes reject. A trailing-space prefix query follows the completed-term path instead.                                                                                                                                                                                                                                                             |
-| Fuzzy eligibility              | At least 4 characters, alphabetic content, no numeric characters or `-`, `_`, `/` in the analyzed surface term | Ineligible terms follow exact matching. Eligible terms use edit distance 1 with transpositions. This is a matching rule, not a user-selected fuzziness setting.                                                                                                                                                                                                          |
+| Fuzzy eligibility              | At least 4 characters, alphabetic content, no numeric characters or `-`, `_`, `/` in the analyzed surface term | Ineligible terms follow exact matching. Eligible terms use requested distance 0–2 (default 1) and transposition policy (default true). Controls do not change eligibility.                                                                                                                                                                                               |
 | Fuzzy score bias               | Fuzzy branch constant score 0.25 times field weight; exact bonus uses `max(field weight) * 0.25 + 1`           | Favors exact matches; field weights remain configurable. Changing these coefficients changes ranking and continuation boundaries. Finite weights can still overflow a computed f32 score: both search paths reject with `E_INVALID_ARGUMENT` before returning hits or a continuation. Close and reopen with lower field weights; rebuilding indexed data is unnecessary. |
 | Analyzer identity              | `english@2`, optional stop words and index-time synonyms                                                       | Stop words, stemming, normalization, and synonym expansion affect recall and BM25 scores. An analyzer/filter-order change needs a new analyzer or persisted identity version and a rebuild; silently changing these constants would mix incompatible terms.                                                                                                              |
+
+## Query controls
+
+`fuzzyDistance` accepts integers 0–2 (default 1) and `fuzzyTranspositions` accepts a boolean
+(default true) in fuzzy and fuzzy-prefix modes. Controls apply independently to simple requests,
+Boolean leaves and simple trace requests. The JavaScript facade rejects a supplied control on
+another mode, including explicit defaults; typed Rust and raw frames reject nondefault irrelevant
+controls. A root `query` cannot carry simple leaf options. Boolean `and`/`or`/`not` groups reject
+supplied fuzzy controls instead of inheriting them into children. Runtime limits advertise `maxFuzzyDistance`.
+Changing controls requires no rebuild. Traversal identity includes resolved controls.
+
+Distance 2 increases potential automaton and dictionary work, including broader matches from
+short eligible prefixes; qualify it for the corpus and concurrency. The fuzzy-prefix minimum
+remains four Unicode characters. The 50-term expansion guard bounds exact-prefix enumeration;
+the native fuzzy automaton branch has no equivalent expansion-count cap at distance one or two.
+Distance 2 is preview: consumers should qualify their corpus and concurrency before exposing caller-supplied distance 2. Finite synthetic qualification does not establish production capacity. Native construction can overrun a cooperative deadline before the next check.
 
 ## Tracing and snippets
 
 Tracing is explanation of supplied current source, not an independent proof of indexed-query completeness.
+
+Fuzzy tracing retains
+analyzed and current-source surface branches, while indexed full-fuzzy membership uses analyzed
+terms. Source-surface matches are not a guarantee of indexed membership.
 
 | Bound                            | Value                                                     | Effect and recovery                                                                                                                                                         |
 | -------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -317,7 +337,18 @@ it: its cached wire representation is crate-private.
 Exhaustive matches must handle `FilterExpression::Not(Box<FilterExpression>)` and
 `FilterComparator::{Exists, Missing}`. Presence clauses carry `values: Vec::new()`.
 `SearchResult` and the filter enums are source changes to the pre-1.0 Rust API; the JavaScript
-facade uses packed protocol 7, native ABI 12, and query API 6 with its matching addon.
+facade uses packed protocol 8, native ABI 13, and query API 7 with its matching addon.
+
+Direct Rust `SearchClause` literals also supply `options: QueryOptions::default()` or validated
+fuzzy controls. Shared semantic checks cover candidate count/bytes before deduplication,
+finite filter numbers, continuation score/ID, legacy prefix offset zero/limit 100, and trace
+record count, duplicate IDs and source bytes. Empty candidate sets do not bypass these checks.
+Search window, candidates, options, text structure and continuation syntax validate before snapshot
+equality. Schema-aware query construction follows a valid snapshot and checks filter finiteness;
+packed decoding rejects nonfinite filters during decoding. A valid stale continuation therefore
+retains snapshot-before-schema/query ordering, while malformed inputs can have different error
+precedence across entry points. Trace validates its own supported semantics rather than executing
+search pagination, catalog or filter options.
 
 ## Source reference
 
@@ -422,8 +453,12 @@ the finite 16-field fixture does not qualify a maximum-width schema. Tracing
 applies analyzed-term limits to its simple text clause, without compiling indexed clauses.
 
 Whole-query construction additionally permits at most 16,384 phrase term-field positions and
-256 fuzzy term-field automata across all branches. These fixed guards preserve the default policy's
-implied construction bounds; raising term/clause policy does not raise them. Construction overflow
+256 fuzzy construction work units across all branches. Each term-field automaton charges one
+unit at distance 1 and four units at distance 2. Distance-zero search reuses the exact-match branch
+and constructs no fuzzy automata, so it consumes no fuzzy construction units. The four-unit estimate
+rounds up the measured
+maximum sampled distance-two/distance-one reachable-DFA-state ratio of 3.854; it is not a hard memory bound. These guards preserve
+the default policy's implied construction bounds; raising term/clause policy does not raise them. Construction overflow
 rejects explicitly. Individual Tantivy setup operations remain synchronous between deadline checks.
 Phrase tracing checks its deadline while matching anchors/positions; its cost still depends on the
 source and phrase shape. Finite qualification does not make a hard callback-time guarantee.

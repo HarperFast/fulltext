@@ -133,10 +133,14 @@ and 0.081 → 0.079 ms for shallow padded versions. The no-version shallow contr
 
 Fuzzy-prefix tracing reuses Tantivy's prefix automaton, prepared lazily after exact-prefix checks.
 UTF-16 spans, eligibility and current-source matching remain wrapper policy. Full fuzzy tracing
-retains its allocation-free predicate, checked against native dictionary automata: preparing up to
+at default distance 1 with transpositions retains its allocation-free predicate, checked against
+native dictionary automata: preparing up to
 32 analyzed/surface DFAs regressed short sixteen-term traces in three paired optimized runs
 (median p50 0.0554 → 0.1874 ms). That exceeded the preset small-request threshold of both 10% and
-0.1 ms; broader reuse is deferred rather than adding a matcher cache.
+0.1 ms; that default path remains unchanged. Other requested policies lazily use native DFAs for
+the existing analyzed/surface branches, sharing one matcher when those query terms are identical.
+Distance zero uses equality/prefix checks without preparing a DFA. Source-surface matching still need not imply indexed
+analyzed membership; no persistent matcher cache is introduced.
 
 ```sh
 FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/trace-matching.mjs /path/to/build label

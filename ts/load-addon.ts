@@ -30,6 +30,7 @@ interface NativeRuntimeInfo {
 		maxRecordVersionBytes: number;
 		maxPrefixExpansions: number;
 		maxFuzzyTerms: number;
+		maxFuzzyDistance: number;
 		maxSearchWindow: number;
 		maxSearchPageSize: number;
 		maxFilterStringBytes: number;
@@ -78,7 +79,7 @@ interface NativeAddonApi {
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 12;
+const expectedNativeAbiVersion = 13;
 const packageManifest = require('../package.json') as { name: string; version: string };
 let loadedAddon: NativeAddonApi | undefined;
 let runtimeUsesGlibc: boolean | undefined;
@@ -208,7 +209,7 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 			`Fulltext native ABI ${info.nativeAbiVersion} from ${artifactPath} does not match ${expectedNativeAbiVersion}`,
 		);
 	}
-	if (info.queryApiVersion !== 6) {
+	if (info.queryApiVersion !== 7) {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',
 			`Fulltext query API ${info.queryApiVersion} from ${artifactPath} is not supported`,

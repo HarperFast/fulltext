@@ -48,3 +48,16 @@ count guard fails on a missing or duplicated qualification file; release and opt
 remain separate. Native-worker tests retain their existing shared-process isolation batch.
 Keep successful stage profiles: a green isolated run alone does not establish why a concurrent
 run exceeded its deadline. Compare ingestion and close durations before attributing contention.
+
+## Fuzzy controls
+
+The `benchmark:query-controls` command builds production artifacts before running. Direct driver
+invocation is reserved for explicitly prepared artifacts, including paired baseline comparisons.
+
+`query-controls.mjs` uses source-derived edit families, not the engine's returned matches, as its
+correctness oracle. The distance-one and distance-two profiles run in fresh processes at equal
+construction work-unit admission; field counts differ deliberately. They are not equivalent
+native allocation workloads. Atomic progress snapshots precede latency/RSS assertions, and
+post-setup failure snapshots retain completed rows, observed memory, runtime and hashes before reporting
+failure. A failed resource gate cannot become an accepted stdout report. Preserve failures and
+compare unchanged-default controls before attributing a regression to the new options.

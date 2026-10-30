@@ -420,3 +420,163 @@ p95/p99 6.408/6.531 ms and the 2,048-branch tree 48.264/52.272 ms. This run incl
 validated fixed-count normalization walk and its iterator/growth/invalid-length regression coverage. These are separate-run
 observations, not a controlled comparison with the original five-case run. The fingerprinted
 report is retained as `fulltext-structure-query-capacity-validated-count.json` in the local qualification artifacts.
+
+## Fuzzy-control qualification
+
+Build optimized artifacts and run `FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/query-controls.mjs`.
+The finite synthetic fixture checks distance 0/1/2, transpositions on/off, full/prefix matching,
+Unicode source traces and independent expected IDs against 1,000 documents with a broad dictionary.
+Each case runs at 1/4/8 callers. A long-term case exercises 64 native distance-two automata,
+consuming all 256 weighted construction units. One-millisecond attempts may succeed correctly or
+return `E_TIMEOUT`; recovery and queue drain must succeed. Gates remain p99 <= 5,000 ms and sampled
+RSS growth <= 256 MiB. Failures retain atomic progress/failure JSON and the index; they never emit
+an accepted stdout report. The reports include runtime, policy and driver/facade/codec/addon hashes.
+
+Fresh-process controls use `--profile=distance-1` and `--profile=distance-2`. Both declare 16 fields,
+index the same 1,000 documents and use sixteen distinct 39-character query terms. Distance one
+uses 16 fields (256 automata); distance two uses four fields (64 automata at four units each).
+This compares equal construction admission, not identical native work or a universal cost bound.
+
+Observed once per profile on macOS arm64 / Node 24.16.0, 2026-10-30:
+
+| Profile                              | Worst cell p99 | Peak sampled RSS growth | 1 ms timeouts / recovery | Gate result |
+| ------------------------------------ | -------------: | ----------------------: | ------------------------ | ----------- |
+| Saved pre-change addon, distance one |      31.556 ms |             301.516 MiB | 3 / passed               | Failed RSS  |
+| Current addon, distance one          |      31.674 ms |             355.750 MiB | 3 / passed               | Failed RSS  |
+| Current addon, distance two          |      29.319 ms |             544.516 MiB | 3 / passed               | Failed RSS  |
+
+The saved ABI-12 baseline uses its existing distance-one/transpositions-on defaults; its older
+facade ignores the newly added controls. Every completed query matched the source oracle; all
+profiles recovered and drained. The initial
+shorter-term matrix passed 1,911 measured requests with worst p99 3.506 ms and RSS growth
+32.406 MiB, before the deliberately expensive long-term case was added. All 75 short-budget
+attempts succeeded in that initial run, so it observed no cancellation. Its success does not
+qualify the strengthened fixture. The first strengthened full run also failed its RSS gate;
+its original error and retained index were preserved, but it predated numeric failure telemetry.
+
+These failures are not relabeled accepted. The baseline failure demonstrates an existing
+construction-memory concern; the larger observed distance-two peak warrants follow-up and does
+not establish a leak or its cause. Native DFA transition payload, construction temporaries,
+concurrent queries and allocator retention can all contribute. No forced GC or allocator tuning
+was used. RSS is sampled process memory, not a native-only allocation measurement or a hard peak.
+This finite development-platform evidence does not qualify Linux deployment headroom or sustained
+memory. Production-oriented follow-up remains in
+[Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
+Fuzzy-prefix remains preview; no ranking/eligibility defaults or production qualification claims change.
+
+### Native DFA construction probe
+
+An optimized Rust-only probe on local macOS arm64 used pinned Tantivy 0.27:
+
+```sh
+cargo test --release --locked --lib measure_native_fuzzy_dfa_construction -- --ignored --nocapture
+```
+
+The retained `fulltext-query-controls-fuzzy-dfa.log` contains 72 constructor samples: six terms,
+distances 0/1/2, transpositions off/on, and full/prefix automata. It enumerates reachable DFA
+states and estimates transition-table payload as `reachableStates × 1,024` bytes (256 u32
+transitions per state). This excludes construction temporaries, other native structures, allocator
+retention and dictionary traversal. The probe constructs native terms directly; its numeric and
+overlong terms deliberately bypass public analyzer/eligibility rules. It is not a public-query
+capacity measurement, and Node.js is not involved.
+
+Representative full-match samples with transpositions enabled:
+
+| Native term                | Distance-one states | Distance-two states | Distance-one estimated transition bytes | Distance-two estimated transition bytes |
+| -------------------------- | ------------------: | ------------------: | --------------------------------------: | --------------------------------------: |
+| `abcd`                     |                  36 |                 103 |                                  36,864 |                                 105,472 |
+| `abcdefgh`                 |                  64 |                 215 |                                  65,536 |                                 220,160 |
+| `abcdefghijklmnop`         |                 120 |                 439 |                                 122,880 |                                 449,536 |
+| 39-character varied ASCII  |                 281 |               1,083 |                                 287,744 |                               1,108,992 |
+| 39 repetitions of `a`      |                 205 |                 409 |                                 209,920 |                                 418,816 |
+| 42-character mixed Unicode |               1,980 |               7,511 |                               2,027,520 |                               7,691,264 |
+
+The varied ASCII term is `abcdefghijklmnopqrstuvwxyz0123456789abc`; the Unicode term is
+`éκόσμος𐐨東京café` repeated three times. The maximum distance-two/distance-one reachable-state
+ratio across sampled matching policies was 3.85409252669, from the varied ASCII full matcher.
+That state/payload ratio, rather than elapsed time, motivates rounding the distance-two
+construction charge to four units versus one at distance 1 within the existing 256-unit budget.
+The final distance-zero search path reuses exact-bonus queries without constructing fuzzy automata
+or spending fuzzy construction units; the distance-zero rows above measure the native constructor,
+not that optimized path.
+For context, the varied ASCII transposition-enabled full constructor took 0.036167 ms at distance
+one and 0.144584 ms at distance two in this run; single constructor timings do not establish a
+latency bound. The four-unit policy is an admission estimate, not a hard memory or time limit.
+
+Four-character fuzzy prefixes remain accepted at distance two; they can admit a broader dictionary
+than default distance one. No minimum-length change or production-capacity claim follows from this
+probe. Large concurrent dictionary/RSS behavior remains unqualified beyond the finite observations
+and failed memory gates above.
+
+### Fuzzy-prefix dictionary breadth
+
+```sh
+npm run benchmark:query-controls -- --profile=breadth
+```
+
+The local optimized production-addon report `fulltext-query-controls-breadth.json` observed
+macOS arm64 / Node 24.16.0 on 2026-10-30. Its 1,000 documents contain 32,000 distinct twelve-character
+terms beginning with `shaa`; suffixes exclude `o` and `e`. Query `shoe` has zero exact-prefix
+expansions. The independent complete-universe check verified no distance-one fuzzy-prefix matches
+and all 1,000 documents at distance two. The latter reflects native distance-two prefix semantics:
+a four-character query can retain an effective two-character root while accepting two edits.
+The public minimum remains four Unicode characters.
+
+| Observation                             | Result                                                                                  |
+| --------------------------------------- | --------------------------------------------------------------------------------------- |
+| Measured requests / cells               | 195 / 15, at 1/4/8 callers                                                              |
+| Worst cell p99                          | 61.155375 ms                                                                            |
+| Peak sampled RSS growth                 | 4.078125 MiB                                                                            |
+| One-millisecond attempts                | Three `E_TIMEOUT`, all in distance-two fuzzy-prefix; other attempts completed correctly |
+| Recovery / queue drain                  | Passed after every cancellation group                                                   |
+| Declared latency / sampled-memory gates | Passed                                                                                  |
+
+The 50-term expansion cap applies to exact-prefix enumeration. Native fuzzy automaton branches
+at both distance one and distance two have no equivalent expansion-count cap. Native construction
+and dictionary work remain cooperative: an individual uninterruptible operation can overshoot its
+budget before the next check. This finite breadth pass does not qualify arbitrary dictionaries,
+Linux capacity or sustained concurrent RSS, and does not erase the failed long-term memory gates
+above. No new prefix minimum or expansion cap follows without production evidence.
+
+### Default trace regression check
+
+Three alternating optimized local runs compared the saved default trace path with the fuzzy-control
+implementation across all eight retained driver cases. All passed the preset p50/p95 regression
+gates (both 10% and 0.1 ms for small requests; 10% for large requests). Selected median-of-run
+p50 values in milliseconds:
+
+| Default full-fuzzy case                  |   Before |    After |
+| ---------------------------------------- | -------: | -------: |
+| Sixteen inflected terms, twenty tokens   | 0.041750 | 0.042209 |
+| Sixteen terms, 10,000 nonmatching tokens | 5.079083 | 5.111083 |
+
+Default distance-one/transposition-enabled full tracing retains its original predicate. Newly
+requested policies use lazy native DFAs; distance zero avoids DFA construction, and identical
+analyzed/surface query terms share one matcher. These finite local comparisons qualify the
+retained driver cases rather than production latency or memory.
+
+### Repeated default-policy memory control
+
+Fresh-process paired controls use the same driver, ABI-12 baseline and ABI-13 current addon,
+distance-one/transpositions-on profile and unchanged gates. Pair order is baseline/current,
+current/baseline, baseline/current.
+
+| Pair | Baseline RSS growth | Current RSS growth | Baseline / current RSS gate |
+| ---- | ------------------: | -----------------: | --------------------------- |
+| 1    |         394.438 MiB |        246.484 MiB | failed / passed             |
+| 2    |         269.875 MiB |        262.016 MiB | failed / failed             |
+| 3    |         366.563 MiB |        307.328 MiB | failed / failed             |
+
+All six runs returned correct results, observed three one-millisecond timeouts, recovered and
+drained. Worst cell p99 ranged from 28.449–36.263 ms for baseline and 27.834–29.070 ms for current.
+The original single-run +54 MiB current-versus-baseline difference did not repeat in these pairs.
+This does not prove leak absence or identify allocator/OS behavior; sampled process RSS varies and
+both revisions still exceed the preset resource gate. Preserve the original failed rows and all
+five new failures; the one passing current run does not qualify the workload generally.
+
+The final matcher-sharing build also passed all eight default trace cases in another three paired
+runs under the same dual 10%/+0.1 ms median-p50 regression criterion. Sixteen inflected full-fuzzy
+terms over twenty source tokens measured 0.041375 → 0.042959 ms; the 10,000-token full-fuzzy case
+measured 4.987292 → 5.038625 ms. These are finite default-policy controls, not new-policy speedup claims.
+One separate distance-two/transpositions-off trace measured p50 0.474709 ms for the sixteen-term,
+twenty-token case, including native DFA preparation for the requested nondefault policy.

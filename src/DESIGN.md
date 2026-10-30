@@ -33,11 +33,32 @@ Result collection keeps document addresses until final page selection. All four 
 validates IDs across its retained TopDocs window; skipped version metadata is not proactively
 validated, matching stable collection and traversal. Keep optional version data out of ranking.
 
-Fuzzy-prefix traces lazily reuse `FuzzyTermQuery::automaton()` after exact-prefix checks. Full
+Fuzzy-prefix traces lazily reuse `FuzzyTermQuery::automaton()` after exact-prefix checks. Default distance-1/transposition-enabled full
 fuzzy traces retain the allocation-free predicate: preparing analyzed/surface DFAs regressed
 short sixteen-term traces in paired optimized measurements. Native dictionary parity tests cover
 both predicates. Trace preserves its current-source surface branch, including `running`/`runnin`,
 and its UTF-16 spans independently of indexed stems.
+
+## Query controls and source membership
+
+`QueryOptions` resolves fuzzy distance 0–2/default 1 and transpositions default true per leaf.
+The facade rejects supplied fuzzy controls on Boolean groups before reading their children;
+controls belong to text leaves and are never inherited.
+Protocol 8 encodes u8/bool after each mode; ABI 13/query API 7 require a matching facade. Options
+are absent from persisted identity and included in continuation digests. Nondefault fuzzy traces
+lazily use requested native automata on the existing analyzed/surface branches, sharing a matcher
+when query terms are identical. Distance zero uses equality/prefix checks without a DFA. Current-source
+surface membership still need not equal indexed analyzed membership. Individual native construction
+remains uninterruptible between deadline checks. Distance-2 production capacity remains unqualified.
+
+[Shared semantic checks](request_validation.rs) protect decoded and direct Rust entry points:
+candidate counts/bytes before deduplication, finite filter numbers and continuation boundaries,
+legacy prefix windows, and trace count/duplicates/source bytes. Search window, candidates, options,
+text structure and continuation syntax validate before snapshot equality. Schema-aware query
+construction follows a valid snapshot and checks filter finiteness; packed decoding rejects
+nonfinite filters earlier. Preserve snapshot-before-schema/query ordering for valid stale
+continuations without promising identical malformed-input error precedence across entry points.
+Trace keeps its own supported semantics, without executing search catalog/filter/window fields.
 
 ## Persisted analyzer revision
 
@@ -188,8 +209,8 @@ aggregation children map directly to native `sub_aggregation` trees. Resource ad
 for collector construction and possible parent instances before collection. Histogram parents use
 position spans, with native query-scoped probes when conservative admission fails. Histogram safety
 checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
-checks protect each recursive wire/API walker. Packed protocol 7 and query API 6 describe the expanded query contract; current ABI 12 additionally
-requires query-capacity open support. Neither change alters persisted identity v8.
+checks protect each recursive wire/API walker. Current packed protocol 8, query API 7 and ABI 13
+include metadata, query-capacity open support and per-leaf matching controls. Neither change alters persisted identity v8.
 
 Sorted snapshot continuation and metadata-derived score adjustment remain outside this
 increment. Production latency, process-memory residency, and Harper integration are untested.
@@ -227,8 +248,12 @@ nonallocating Rust prewalk before analysis. Empty and stopword-only leaves still
 edges. Conservative lexical admission estimates select a lane; they never reject as compiled cost.
 
 Phrase construction charges positions × fields across the request; fuzzy construction charges
-term-field automata across the tree. Their fixed bounds retain the default policy's implied upper
-bounds even when configured term/clause limits rise. Exact trace membership uses short vector comparisons for up to eight terms and hash lookup
+weighted term-field automata across the tree: distance 1 charges one work unit, distance 2
+charges four, within the existing 256-unit cap. Distance zero reuses exact-bonus queries without
+fuzzy automata or fuzzy construction charges. Score-bit parity against the previous native query
+composition and query-tree regressions protect this lowering. The four-unit estimate rounds up the measured
+maximum sampled distance-two/distance-one reachable-DFA-state ratio of 3.854 and is not a hard memory bound. Fixed construction bounds
+retain the default policy's implied upper bounds even when configured term/clause limits rise. Exact trace membership uses short vector comparisons for up to eight terms and hash lookup
 above that. Fuzzy traces compare at most 16 eligible alternatives. Branch-local found cardinality
 makes completion checks constant-time. Boundary and construction regressions live in `query-capacity.test.mjs` and the
 engine tests.
@@ -238,8 +263,8 @@ Raised-policy admission compares maximum per-leaf term cost and summed compiled-
 Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
 non-ASCII input conservatively uses the expensive lane because normalization can expand text.
 Default-policy classification is unchanged. The optimized two-handle regression pins ordinary
-isolation and shared expensive permits. The optional open-frame extension preserves version-7
-mutation/search frames; ABI 12 requires a matching facade/addon.
+isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 13
+require a matching facade/addon.
 
 The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
 additional tail rejects. A future extension needs explicit framing/versioning rather than appending
