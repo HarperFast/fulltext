@@ -22,7 +22,7 @@ jobs:
             target: linux-x64-gnu
           - os: ubuntu-22.04-arm
             target: linux-arm64-gnu
-          - os: macos-14
+          - os: macos-15
             target: darwin-arm64
           - os: windows-latest
             target: win32-x64-msvc
@@ -119,7 +119,7 @@ jobs:
             target: linux-x64-gnu
           - os: ubuntu-22.04-arm
             target: linux-arm64-gnu
-          - os: macos-14
+          - os: macos-15
             target: darwin-arm64
           - os: windows-latest
             target: win32-x64-msvc
