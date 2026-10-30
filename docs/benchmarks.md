@@ -551,3 +551,29 @@ Default distance-one/transposition-enabled full tracing retains its original pre
 requested policies use lazy native DFAs; distance zero avoids DFA construction, and identical
 analyzed/surface query terms share one matcher. These finite local comparisons qualify the
 retained driver cases rather than production latency or memory.
+
+### Repeated default-policy memory control
+
+A review-requested check ran three additional fresh-process pairs with the same final driver,
+ABI-12 baseline and ABI-13 current addon. Each pair used the distance-one/transpositions-on profile
+and the unchanged gates. Pair order alternated baseline/current, current/baseline, baseline/current.
+
+| Pair | Baseline RSS growth | Current RSS growth | Baseline / current RSS gate |
+| ---- | ------------------: | -----------------: | --------------------------- |
+| 1    |         394.438 MiB |        246.484 MiB | failed / passed             |
+| 2    |         269.875 MiB |        262.016 MiB | failed / failed             |
+| 3    |         366.563 MiB |        307.328 MiB | failed / failed             |
+
+All six runs returned correct results, observed three one-millisecond timeouts, recovered and
+drained. Worst cell p99 ranged from 28.449–36.263 ms for baseline and 27.834–29.070 ms for current.
+The original single-run +54 MiB current-versus-baseline difference did not repeat in these pairs.
+This does not prove leak absence or identify allocator/OS behavior; sampled process RSS varies and
+both revisions still exceed the preset resource gate. Preserve the original failed rows and all
+five new failures; the one passing current run does not qualify the workload generally.
+
+The final matcher-sharing build also passed all eight default trace cases in another three paired
+runs under the same dual 10%/+0.1 ms median-p50 regression criterion. Sixteen inflected full-fuzzy
+terms over twenty source tokens measured 0.041375 → 0.042959 ms; the 10,000-token full-fuzzy case
+measured 4.987292 → 5.038625 ms. These are finite default-policy controls, not new-policy speedup claims.
+One separate distance-two/transpositions-off trace measured p50 0.474709 ms for the sixteen-term,
+twenty-token case, including native DFA preparation for the requested nondefault policy.
