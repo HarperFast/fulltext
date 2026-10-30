@@ -13,6 +13,8 @@ jobs:
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    env:
+      FULLTEXT_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/fulltext-test-artifacts
     strategy:
       fail-fast: false
       matrix:
@@ -21,18 +23,26 @@ jobs:
             node: '22.18.0'
           - os: ubuntu-latest
             node: '24'
+          - os: ubuntu-latest
+            node: '26'
           - os: ubuntu-22.04-arm
             node: '22.18.0'
           - os: ubuntu-22.04-arm
             node: '24'
+          - os: ubuntu-22.04-arm
+            node: '26'
           - os: macos-15
             node: '22.18.0'
           - os: macos-15
             node: '24'
+          - os: macos-15
+            node: '26'
           - os: windows-latest
             node: '22.18.0'
           - os: windows-latest
             node: '24'
+          - os: windows-latest
+            node: '26'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -50,6 +60,17 @@ jobs:
       - name: Qualify snapshot traversal smoke
         run: node scripts/run-local.mjs benchmarks/traversal.mjs --smoke
       - run: git diff --exit-code -- ts/addon.d.ts
+      - name: Retain synthetic soak failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-failure-${{ matrix.os }}-node-${{ matrix.node }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/fulltext-test-artifacts/fulltext-soak-test-*/artifacts/manifest.json
+            ${{ runner.temp }}/fulltext-test-artifacts/fulltext-soak-test-*/artifacts/failure.json
+            ${{ runner.temp }}/fulltext-test-artifacts/fulltext-soak-test-*/artifacts/samples.ndjson
+          if-no-files-found: ignore
+          retention-days: 14
 
   supply-chain:
     name: Supply chain and native linkage

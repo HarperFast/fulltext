@@ -13,8 +13,10 @@ const driver = fileURLToPath(new URL('../benchmarks/metadata-soak.mjs', import.m
 const cases = ['ordinary-exact', 'price-sort', 'nested-histogram', 'runtime-five-sort'];
 const readJson = async (file) => JSON.parse(await readFile(file, 'utf8'));
 async function fixture(context) {
-	const root = await mkdtemp(path.join(tmpdir(), 'fulltext-soak-test-'));
-	context.after(() => rm(root, { recursive: true, force: true }));
+	const artifactRoot = process.env.FULLTEXT_TEST_ARTIFACT_ROOT;
+	if (artifactRoot) await mkdir(artifactRoot, { recursive: true });
+	const root = await mkdtemp(path.join(artifactRoot ?? tmpdir(), 'fulltext-soak-test-'));
+	if (!artifactRoot) context.after(() => rm(root, { recursive: true, force: true }));
 	const artifacts = path.join(root, 'artifacts');
 	const args = [
 		driver,
@@ -182,3 +184,49 @@ for (const kind of ['writer', 'reader'])
 		assert(Array.isArray(failure.closeErrors));
 		await assert.rejects(access(path.join(artifacts, 'report.json')), { code: 'ENOENT' });
 	});
+
+test('soak records publication failure before any completed publication', { timeout: 45_000 }, async (context) => {
+	const { artifacts, args } = await fixture(context);
+	await assert.rejects(
+		execute(
+			process.execPath,
+			[...args, '--module', fileURLToPath(new URL('./fixtures/metadata-close-failure.mjs', import.meta.url))],
+			{
+				timeout: 40_000,
+				maxBuffer: 4 << 20,
+				env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1', FULLTEXT_TEST_CLOSE_KIND: 'publish' },
+			},
+		),
+		(error) => /injected publication failure/.test(error.stderr),
+	);
+	const failure = await readJson(path.join(artifacts, 'failure.json'));
+	assert.strictEqual(failure.accepted, false);
+	assert.strictEqual(failure.error.code, 'E_STORAGE');
+	assert.strictEqual(failure.operation, 'publish');
+	assert.strictEqual(failure.publications, 0);
+	assert.strictEqual(failure.mutations, 110);
+	assert.deepStrictEqual(failure.closeErrors, []);
+	await access(path.join(artifacts, 'index', 'meta.json'));
+});
+
+test('soak retains validation error when final reader close also fails', { timeout: 45_000 }, async (context) => {
+	const { artifacts, args } = await fixture(context);
+	await assert.rejects(
+		execute(
+			process.execPath,
+			[...args, '--module', fileURLToPath(new URL('./fixtures/metadata-close-failure.mjs', import.meta.url))],
+			{
+				timeout: 40_000,
+				maxBuffer: 4 << 20,
+				env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1', FULLTEXT_TEST_CLOSE_KIND: 'final-reader' },
+			},
+		),
+		(error) => /injected final reader validation failure/.test(error.stderr),
+	);
+	const failure = await readJson(path.join(artifacts, 'failure.json'));
+	assert.strictEqual(failure.accepted, false);
+	assert.strictEqual(failure.operation, 'final-reader-validation');
+	assert.match(failure.error.message, /injected final reader validation failure/);
+	assert.strictEqual(failure.indexRetained, path.join(artifacts, 'index'));
+	await assert.rejects(access(path.join(artifacts, 'report.json')), { code: 'ENOENT' });
+});

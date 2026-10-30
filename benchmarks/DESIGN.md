@@ -22,6 +22,12 @@ A reporting failure after cleanup records that the index is absent; it never emi
 report. Setup failures before the manifest cannot promise artifacts. Do not substitute cleanup retries for
 native quiescence.
 
+Failure reports retain the first failing operation independently of later abort/close errors.
+Commit errors distinguish Tantivy preparation from final publication while retaining their error
+code and original message. These labels localize failures; they do not identify the native file
+or establish an operating-system cause. The optional test artifact root retains synthetic
+fixtures, and CI uploads only the manifest, failure JSON and streamed samples after a failed job.
+
 Segment observations read the pinned Tantivy build's committed `meta.json`; they are diagnostics,
 not a public storage interface. Disk size observations can race file retirement and are sampled
 rather than exact high-water guarantees. No forced garbage collection or memory release is part

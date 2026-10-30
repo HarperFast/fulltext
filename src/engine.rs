@@ -2478,13 +2478,16 @@ impl Writer {
 		// Tantivy can detach unjoined workers when prepare_commit fails.
 		let previously_unproven = self.worker_ownership_unproven;
 		self.worker_ownership_unproven = true;
-		let mut commit = self.inner.prepare_commit().map_err(index_error)?;
+		let mut commit = self
+			.inner
+			.prepare_commit()
+			.map_err(|error| commit_error("prepare_commit", error))?;
 		self.worker_ownership_unproven = previously_unproven;
 		if let Some(payload) = payload {
 			commit.set_payload(payload);
 		}
 		self.checkpoint_required |= payload.is_some();
-		let opstamp = commit.commit().map_err(index_error)?;
+		let opstamp = commit.commit().map_err(|error| commit_error("commit", error))?;
 		Ok(opstamp)
 	}
 
@@ -3256,6 +3259,12 @@ fn count_error(error: tantivy::TantivyError) -> FulltextError {
 		}
 		_ => index_error(error),
 	}
+}
+
+fn commit_error(operation: &str, error: tantivy::TantivyError) -> FulltextError {
+	let mut error = index_error(error);
+	error.message = format!("Tantivy {operation}: {}", error.message);
+	error
 }
 
 pub(crate) fn recovery_index_error(error: tantivy::TantivyError) -> FulltextError {
@@ -5564,7 +5573,10 @@ mod tests {
 		let engine = Engine::open(directory.clone(), &config).unwrap();
 		let mut writer = engine.writer(&config).unwrap();
 		directory.fail_after_next_atomic_write();
-		assert!(writer.commit_with_payload(Some("uncertain")).is_err());
+		let error = writer.commit_with_payload(Some("uncertain")).unwrap_err();
+		assert_eq!(error.code, "E_STORAGE");
+		assert!(error.message.starts_with("Tantivy commit: "), "{error}");
+		assert!(error.message.contains("injected ambiguous atomic write"));
 		assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("uncertain"));
 		assert_eq!(writer.commit().unwrap_err().code, "E_CHECKPOINT_REQUIRED");
 	}
@@ -6243,6 +6255,10 @@ mod tests {
 			blocked.release();
 			closer.join().unwrap();
 			assert_eq!(preparation_error.code, "E_STORAGE");
+			assert!(
+				preparation_error.message.starts_with("Tantivy prepare_commit: "),
+				"{preparation_error}"
+			);
 			assert!(blocked_at_close_return);
 			assert!(
 				!quiesced,
