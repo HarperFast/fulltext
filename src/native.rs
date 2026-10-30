@@ -35,7 +35,7 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 static WRITER_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
 
 #[cfg(feature = "test-panic")]
-fn writer_diagnostic(handle: u32, operation: &str, stage: &str, elapsed: Duration) {
+fn writer_diagnostic(handle: u32, operation: &'static str, stage: &'static str, elapsed: Duration) {
 	if WRITER_DIAGNOSTICS.get().copied() != Some(true) {
 		return;
 	}
@@ -1758,7 +1758,6 @@ fn writer_loop_inner(
 			.writer_queue_nanoseconds
 			.fetch_add(duration_ns(queued.enqueued.elapsed()), Ordering::Relaxed);
 		let WriterCommand { operation, completion } = queued.value;
-		let started = Instant::now();
 		#[cfg(feature = "test-panic")]
 		let diagnostic_operation = match &operation {
 			WriterOperation::Apply(_) => "apply",
@@ -1769,6 +1768,7 @@ fn writer_loop_inner(
 		};
 		#[cfg(feature = "test-panic")]
 		writer_diagnostic(runtime.handle, diagnostic_operation, "writer-start", Duration::ZERO);
+		let started = Instant::now();
 		let outcome = catch_unwind(AssertUnwindSafe(|| match operation {
 			WriterOperation::Apply(bytes) => {
 				match decode_batch(&bytes).and_then(|batch| active_writer(&writer)?.prepare(batch)) {
@@ -3270,6 +3270,8 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 
 #[cfg(test)]
 mod tests {
+	use super::*;
+
 	#[cfg(feature = "test-panic")]
 	#[test]
 	fn writer_diagnostics_ignore_failed_writes() {
@@ -3284,7 +3286,6 @@ mod tests {
 		}
 		super::write_writer_diagnostic(&mut Failed, b"diagnostic\n");
 	}
-	use super::*;
 
 	#[test]
 	fn quiescence_errors_preserve_classification_without_duplicate_prefix() {

@@ -381,7 +381,7 @@ try {
 	workloadError = error;
 	throw error;
 } finally {
-	writerDiagnostics.stop();
+	writerDiagnostics.detachStatus();
 	const closeErrors = [];
 	for (const [target, stage] of [
 		[pressure, 'long-keys-close'],
@@ -395,6 +395,7 @@ try {
 			closeErrors.push(error);
 		}
 	}
+	writerDiagnostics.stop();
 	if (closeErrors.length)
 		throw new AggregateError(closeErrors, `native cleanup failed; index retained at ${directory}`, {
 			cause: workloadError,

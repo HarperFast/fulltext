@@ -17,6 +17,17 @@ if (mode === 'closed-stderr') {
 	writeWriterDiagnostic({ stage: 'closed-output' });
 	writeSync(1, JSON.stringify({ complete: true }));
 	process.exit(0);
+} else if (mode === 'detached-status') {
+	let polls = 0;
+	const diagnostics = startWriterDiagnostics('detached-status', () => {
+		polls++;
+		return { marker: 'must-not-be-polled' };
+	});
+	diagnostics.detachStatus();
+	await new Promise((resolve) => setTimeout(resolve, 5_200));
+	diagnostics.stop();
+	assert.strictEqual(polls, 0);
+	console.log(JSON.stringify({ complete: true }));
 } else if (mode === 'status-error') {
 	await new Promise((resolve, reject) => {
 		const timeout = setTimeout(() => reject(new Error('heartbeat did not run')), 10_000);

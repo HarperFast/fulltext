@@ -54,6 +54,9 @@ export function startWriterDiagnostics(name, status = () => undefined) {
 		stage(value) {
 			stage = value;
 		},
+		detachStatus() {
+			status = () => undefined;
+		},
 		stop() {
 			clearInterval(timer);
 		},
