@@ -1,7 +1,7 @@
 import { encodeCatalog, type SortRequest, type AggregationRequest } from './catalog.js';
 import { FulltextError, type FulltextErrorCode } from './errors.js';
 
-const protocolVersion = 7;
+const protocolVersion = 8;
 export const maxStringBytes = 1 << 20;
 export const maxFilterStringBytes = 65_530;
 export const maxCommitPayloadBytes = 64 * 1024;
@@ -402,6 +402,8 @@ function deleteFrameIdCapacity(maxBytes: number): number {
 export interface PackedSearchClause {
 	text: string;
 	mode: 'any' | 'all' | 'phrase' | 'prefix' | 'fuzzy' | 'fuzzy-prefix';
+	fuzzyDistance?: number;
+	fuzzyTranspositions?: boolean;
 	fields: string[];
 }
 
@@ -432,9 +434,7 @@ export interface PackedSearchRequest {
 	traversal?: { after?: { snapshot: string; score: number; id: string } };
 }
 
-export interface PackedTraceRequest {
-	text: string;
-	mode: PackedSearchClause['mode'];
+export interface PackedTraceRequest extends PackedSearchClause {
 	fields: string[];
 	candidateIds?: string[];
 	records: Array<{ id: string; fields: Array<{ name: string; values: string[] }> }>;
@@ -841,6 +841,7 @@ function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpr
 		writer.u8(0, 'expression type');
 		writer.string(expression.text);
 		writer.u8(['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'].indexOf(expression.mode), 'mode');
+		encodeQueryOptions(writer, expression);
 		writer.u16(expression.fields.length, 'fields.length');
 		for (const field of expression.fields) writer.string(field);
 		return;
@@ -855,6 +856,22 @@ function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpr
 	for (const clause of expression.clauses) encodeSearchExpression(writer, clause, depth + 1);
 }
 
+function encodeQueryOptions(writer: ByteWriter, clause: PackedSearchClause): void {
+	const fuzzyDistance = clause.fuzzyDistance ?? 1;
+	const fuzzyTranspositions = clause.fuzzyTranspositions ?? true;
+	if (
+		!Number.isInteger(fuzzyDistance) ||
+		fuzzyDistance < 0 ||
+		fuzzyDistance > 2 ||
+		typeof fuzzyTranspositions !== 'boolean' ||
+		(clause.mode !== 'fuzzy' && clause.mode !== 'fuzzy-prefix' && (fuzzyDistance !== 1 || !fuzzyTranspositions))
+	) {
+		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid packed query options');
+	}
+	writer.u8(fuzzyDistance, 'fuzzyDistance');
+	writer.boolean(fuzzyTranspositions);
+}
+
 export function encodeTrace(request: PackedTraceRequest): Buffer {
 	validateCandidateIds(request.candidateIds);
 	for (const record of request.records) validateRecordId(record.id);
@@ -862,6 +879,7 @@ export function encodeTrace(request: PackedTraceRequest): Buffer {
 	writer.header('FTTM');
 	writer.string(request.text);
 	writer.u8(['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'].indexOf(request.mode), 'mode');
+	encodeQueryOptions(writer, request);
 	writer.u16(request.fields.length, 'fields.length');
 	for (const field of request.fields) writer.string(field);
 	writer.boolean(request.candidateIds !== undefined);

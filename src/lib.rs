@@ -7,6 +7,7 @@ mod directory_harness;
 pub mod engine;
 pub mod error;
 pub mod protocol;
+mod request_validation;
 
 #[cfg(feature = "node-api")]
 mod boundary;
@@ -24,7 +25,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "test-panic")]
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const NATIVE_ABI_VERSION: u32 = 12;
+pub const NATIVE_ABI_VERSION: u32 = 13;
 pub const TANTIVY_VERSION: &str = "0.27.0";
 
 #[cfg(feature = "node-api")]
@@ -48,6 +49,7 @@ pub struct RuntimeLimits {
 	pub max_record_version_bytes: u32,
 	pub max_prefix_expansions: u32,
 	pub max_fuzzy_terms: u32,
+	pub max_fuzzy_distance: u32,
 	pub max_search_window: u32,
 	pub max_search_page_size: u32,
 	pub max_filter_string_bytes: u32,
@@ -82,7 +84,7 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 		package_version: env!("CARGO_PKG_VERSION").to_owned(),
 		tantivy_version: TANTIVY_VERSION.to_owned(),
 		native_abi_version: NATIVE_ABI_VERSION,
-		query_api_version: 6,
+		query_api_version: 7,
 		query_class_isolation_minimum_search_threads: 2,
 		storage_backends: vec!["native".to_owned()],
 		limits: RuntimeLimits {
@@ -104,6 +106,7 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 			max_record_version_bytes: protocol::MAX_RECORD_VERSION_BYTES as u32,
 			max_prefix_expansions: protocol::MAX_PREFIX_EXPANSIONS as u32,
 			max_fuzzy_terms: protocol::MAX_FUZZY_TERMS as u32,
+			max_fuzzy_distance: protocol::MAX_FUZZY_DISTANCE as u32,
 			max_search_window: protocol::MAX_SEARCH_WINDOW as u32,
 			max_search_page_size: protocol::MAX_SEARCH_PAGE_SIZE as u32,
 			max_filter_string_bytes: tantivy::tokenizer::MAX_TOKEN_LEN as u32,

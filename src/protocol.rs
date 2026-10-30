@@ -3,11 +3,11 @@ use crate::catalog::{
 };
 use crate::error::{FulltextError, Result};
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 const MAX_STRING_BYTES: usize = 1 << 20;
 pub const MAX_RECORD_ID_BYTES: usize = 4 << 10;
 pub const MAX_RECORD_VERSION_BYTES: usize = 4 << 10;
-const MAX_FIELDS: usize = 1_024;
+pub(crate) const MAX_FIELDS: usize = 1_024;
 pub const MAX_SYNONYM_RULES: usize = 1_024;
 pub const MAX_SYNONYM_REPLACEMENTS: usize = 16;
 pub const MAX_SYNONYM_BYTES: usize = 1 << 20;
@@ -309,10 +309,53 @@ impl SearchMode {
 	}
 }
 
+pub const MAX_FUZZY_DISTANCE: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryOptions {
+	pub fuzzy_distance: u8,
+	pub fuzzy_transpositions: bool,
+}
+
+impl Default for QueryOptions {
+	fn default() -> Self {
+		Self {
+			fuzzy_distance: 1,
+			fuzzy_transpositions: true,
+		}
+	}
+}
+
+impl QueryOptions {
+	pub fn validate(self, mode: SearchMode) -> Result<()> {
+		if self.fuzzy_distance > MAX_FUZZY_DISTANCE {
+			return Err(FulltextError::invalid("fuzzy distance must be between 0 and 2"));
+		}
+		if !matches!(mode, SearchMode::Fuzzy | SearchMode::FuzzyPrefix)
+			&& (self.fuzzy_distance != 1 || !self.fuzzy_transpositions)
+		{
+			return Err(FulltextError::invalid(
+				"fuzzy options require fuzzy or fuzzyPrefix mode",
+			));
+		}
+		Ok(())
+	}
+}
+
+fn decode_query_options(cursor: &mut Cursor<'_>, mode: SearchMode) -> Result<QueryOptions> {
+	let options = QueryOptions {
+		fuzzy_distance: cursor.u8()?,
+		fuzzy_transpositions: cursor.boolean()?,
+	};
+	options.validate(mode)?;
+	Ok(options)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchClause {
 	pub text: String,
 	pub mode: SearchMode,
+	pub options: QueryOptions,
 	pub fields: Vec<String>,
 }
 
@@ -708,7 +751,9 @@ fn scan_search_expression(
 	match cursor.u8()? {
 		0 => {
 			let text = cursor.bytes()?;
-			let expensive = decode_search_mode(cursor.u8()?)?.is_expensive();
+			let mode = decode_search_mode(cursor.u8()?)?;
+			let _ = decode_query_options(cursor, mode)?;
+			let expensive = mode.is_expensive();
 			let field_count = cursor.u16()? as usize;
 			if field_count > MAX_FIELDS || field_count > cursor.remaining() / 4 {
 				return Err(FulltextError::invalid("search field count exceeds its packed request"));
@@ -906,15 +951,7 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 			"search budget must be between 1 and {MAX_SEARCH_BUDGET_MILLISECONDS} milliseconds"
 		)));
 	}
-	validate_search_window(offset, limit, traversal, sort.is_some() || !aggregations.is_empty())?;
-	if contains_prefix(&expression) && !traversal && (offset != 0 || limit > MAX_AUTOCOMPLETE_RESULTS) {
-		return Err(FulltextError::invalid(if sort.is_some() || !aggregations.is_empty() {
-			"prefix search with sort or aggregations requires offset zero and a limit no greater than 100; metadata continuation is not supported"
-		} else {
-			"prefix search requires offset zero and a limit no greater than 100; use searchPage for subsequent matches"
-		}));
-	}
-	Ok(SearchRequest {
+	let request = SearchRequest {
 		sort,
 		aggregations,
 		expression,
@@ -926,7 +963,9 @@ pub fn decode_search(bytes: &[u8]) -> Result<SearchRequest> {
 		budget_milliseconds,
 		traversal,
 		after,
-	})
+	};
+	crate::request_validation::validate_search_admission(&request)?;
+	Ok(request)
 }
 
 fn catalog_count(cursor: &mut Cursor<'_>, minimum_bytes: usize) -> Result<usize> {
@@ -1167,6 +1206,7 @@ fn decode_search_expression(
 		0 => {
 			let text = cursor.bytes()?;
 			let mode = decode_search_mode(cursor.u8()?)?;
+			let options = decode_query_options(cursor, mode)?;
 			let field_count = cursor.u16()? as usize;
 			structure.leaf(text.len(), field_count)?;
 			let text = std::str::from_utf8(text)
@@ -1176,7 +1216,12 @@ fn decode_search_expression(
 			for _ in 0..field_count {
 				fields.push(cursor.string()?);
 			}
-			Ok(SearchExpression::Clause(SearchClause { text, mode, fields }))
+			Ok(SearchExpression::Clause(SearchClause {
+				text,
+				mode,
+				options,
+				fields,
+			}))
 		}
 		1 | 2 => {
 			let count = cursor.u16()? as usize;
@@ -1203,14 +1248,6 @@ fn decode_search_expression(
 	}
 }
 
-fn contains_prefix(expression: &SearchExpression) -> bool {
-	match expression {
-		SearchExpression::Clause(clause) => matches!(clause.mode, SearchMode::Prefix | SearchMode::FuzzyPrefix),
-		SearchExpression::And(children) | SearchExpression::Or(children) => children.iter().any(contains_prefix),
-		SearchExpression::Not(child) => contains_prefix(child),
-	}
-}
-
 pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 	let mut cursor = Cursor::new(bytes, *b"FTTM")?;
 	let text = cursor.string()?;
@@ -1218,6 +1255,7 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 		return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
 	}
 	let mode = decode_search_mode(cursor.u8()?)?;
+	let options = decode_query_options(&mut cursor, mode)?;
 	let field_count = cursor.u16()? as usize;
 	if field_count > MAX_FIELDS || field_count > cursor.remaining() / 4 {
 		return Err(FulltextError::invalid("trace field count exceeds its packed request"));
@@ -1287,11 +1325,16 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 			"trace budget must be between 1 and {MAX_SEARCH_BUDGET_MILLISECONDS} milliseconds"
 		)));
 	}
-	Ok(TraceRequest {
+	let request = TraceRequest {
 		search: SearchRequest {
 			sort: None,
 			aggregations: Vec::new(),
-			expression: SearchExpression::Clause(SearchClause { text, mode, fields }),
+			expression: SearchExpression::Clause(SearchClause {
+				text,
+				mode,
+				options,
+				fields,
+			}),
 			candidate_ids: has_candidates.then_some(candidate_ids),
 			filter: None,
 			offset: 0,
@@ -1302,7 +1345,9 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 			after: None,
 		},
 		records,
-	})
+	};
+	crate::request_validation::validate_trace_admission(&request.search, &request.records)?;
+	Ok(request)
 }
 
 fn decode_search_mode(value: u8) -> Result<SearchMode> {
@@ -1711,7 +1756,7 @@ mod tests {
 
 	#[test]
 	fn reset_frame_contains_only_path_and_logical_index_id() {
-		let mut bytes = b"FTRX\x07\x00".to_vec();
+		let mut bytes = b"FTRX\x08\x00".to_vec();
 		for value in ["/tmp/index", "products"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -1731,8 +1776,121 @@ mod tests {
 	}
 
 	#[test]
+	fn query_options_round_trip_across_search_scanner_and_trace() {
+		for (mode_tag, mode) in [
+			(0, SearchMode::Any),
+			(1, SearchMode::All),
+			(2, SearchMode::Phrase),
+			(3, SearchMode::Prefix),
+			(4, SearchMode::Fuzzy),
+			(5, SearchMode::FuzzyPrefix),
+		] {
+			let mut policies = vec![QueryOptions::default()];
+			if matches!(mode, SearchMode::Fuzzy | SearchMode::FuzzyPrefix) {
+				for fuzzy_distance in 0..=2 {
+					for fuzzy_transpositions in [false, true] {
+						policies.push(QueryOptions {
+							fuzzy_distance,
+							fuzzy_transpositions,
+						});
+					}
+				}
+			}
+			for options in policies {
+				let mut clause = 5u32.to_le_bytes().to_vec();
+				clause.extend_from_slice(b"alpha");
+				clause.push(mode_tag);
+				clause.extend_from_slice(&[options.fuzzy_distance, u8::from(options.fuzzy_transpositions), 0, 0]);
+				let mut search = b"FTSQ\x08\x00".to_vec();
+				search.push(0);
+				search.extend_from_slice(&clause);
+				search.extend_from_slice(&[0; 10]);
+				search.extend_from_slice(&0u32.to_le_bytes());
+				search.extend_from_slice(&1u32.to_le_bytes());
+				search.push(0);
+				search.extend_from_slice(&100u32.to_le_bytes());
+				let decoded = decode_search(&search).unwrap();
+				assert!(
+					matches!(decoded.expression, SearchExpression::Clause(ref leaf) if leaf.options == options && leaf.mode == mode)
+				);
+				search_is_expensive(&search).unwrap();
+				let mut trace = b"FTTM\x08\x00".to_vec();
+				trace.extend_from_slice(&clause);
+				trace.extend_from_slice(&[0; 3]);
+				trace.extend_from_slice(&100u32.to_le_bytes());
+				assert_eq!(decode_trace(&trace).unwrap().search.expression, decoded.expression);
+				for length in 0..search.len() {
+					assert!(decode_search(&search[..length]).is_err());
+					if length < 7 + clause.len() {
+						assert!(search_is_expensive(&search[..length]).is_err());
+					}
+				}
+				for length in 0..trace.len() {
+					assert!(decode_trace(&trace[..length]).is_err());
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn query_options_reject_out_of_range_and_irrelevant_policies() {
+		for (mode, options) in [
+			(
+				SearchMode::Fuzzy,
+				QueryOptions {
+					fuzzy_distance: 3,
+					..QueryOptions::default()
+				},
+			),
+			(
+				SearchMode::Any,
+				QueryOptions {
+					fuzzy_distance: 0,
+					..QueryOptions::default()
+				},
+			),
+			(
+				SearchMode::Phrase,
+				QueryOptions {
+					fuzzy_distance: 0,
+					..QueryOptions::default()
+				},
+			),
+			(
+				SearchMode::Prefix,
+				QueryOptions {
+					fuzzy_transpositions: false,
+					..QueryOptions::default()
+				},
+			),
+		] {
+			assert_eq!(options.validate(mode).unwrap_err().code, "E_INVALID_ARGUMENT");
+		}
+		for (mode_tag, distance, transpositions) in [(4, 3, 1), (0, 0, 1), (2, 0, 1), (3, 1, 0), (4, 1, 2)] {
+			let mut leaf = vec![0];
+			leaf.extend_from_slice(&0u32.to_le_bytes());
+			leaf.push(mode_tag);
+			leaf.extend_from_slice(&[distance, transpositions, 0, 0]);
+			let mut cursor = Cursor {
+				bytes: &leaf,
+				offset: 0,
+			};
+			let mut structure = SearchStructureBudget::new(MAX_QUERY_CLAUSES, MAX_FIELDS).unwrap();
+			assert!(decode_search_expression(&mut cursor, 0, &mut structure).is_err());
+			cursor.offset = 0;
+			let mut structure = SearchStructureBudget::new(MAX_QUERY_CLAUSES, MAX_FIELDS).unwrap();
+			assert!(scan_search_expression(&mut cursor, 0, &mut structure, None).is_err());
+			let mut trace = b"FTTM\x08\x00".to_vec();
+			trace.extend_from_slice(&leaf[1..]);
+			trace.extend_from_slice(&[0; 3]);
+			trace.extend_from_slice(&100u32.to_le_bytes());
+			assert!(decode_trace(&trace).is_err());
+		}
+	}
+
+	#[test]
 	fn inspection_frame_is_distinct_and_rejects_trailing_limits() {
-		let mut bytes = b"FTIP\x07\x00".to_vec();
+		let mut bytes = b"FTIP\x08\x00".to_vec();
 		for value in ["/tmp/index", "products", "one", "english@2"] {
 			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(value.as_bytes());
@@ -1756,7 +1914,7 @@ mod tests {
 
 	#[test]
 	fn rejects_counts_before_allocating() {
-		let mut bytes = b"FTMB\x07\x00".to_vec();
+		let mut bytes = b"FTMB\x08\x00".to_vec();
 		bytes.extend_from_slice(&u32::MAX.to_le_bytes());
 		bytes.extend_from_slice(&0u32.to_le_bytes());
 		assert_eq!(decode_batch(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
@@ -1800,7 +1958,7 @@ mod tests {
 
 	#[test]
 	fn distinguishes_batch_size_from_invalid_encoding() {
-		let bytes = b"FTMB\x07\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+		let bytes = b"FTMB\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 		assert_eq!(
 			validate_batch_header(bytes, bytes.len() - 1).unwrap_err().code,
 			"E_BATCH_TOO_LARGE"
@@ -1898,11 +2056,11 @@ mod tests {
 	#[test]
 	fn raised_capacity_classification_keeps_small_ascii_queries_ordinary() {
 		fn request(text: &str) -> Vec<u8> {
-			let mut bytes = b"FTSQ\x07\x00".to_vec();
+			let mut bytes = b"FTSQ\x08\x00".to_vec();
 			bytes.push(0);
 			bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(text.as_bytes());
-			bytes.extend_from_slice(&[0, 0, 0, 0, 0]);
+			bytes.extend_from_slice(&[0, 1, 1, 0, 0, 0, 0]);
 			bytes.extend_from_slice(&[0; 8]);
 			bytes.extend_from_slice(&0u32.to_le_bytes());
 			bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -1939,7 +2097,7 @@ mod tests {
 			let mut bytes = vec![0];
 			bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(text.as_bytes());
-			bytes.extend_from_slice(&[0, 0, 0]);
+			bytes.extend_from_slice(&[0, 1, 1, 0, 0]);
 			bytes
 		}
 		fn group(kind: u8, children: &[Vec<u8>]) -> Vec<u8> {
@@ -1951,7 +2109,7 @@ mod tests {
 			bytes
 		}
 		fn expensive(expression: &[u8], fields: usize) -> bool {
-			let mut bytes = b"FTSQ\x07\x00".to_vec();
+			let mut bytes = b"FTSQ\x08\x00".to_vec();
 			bytes.extend_from_slice(expression);
 			bytes.extend_from_slice(&[0, 0]);
 			bytes.extend_from_slice(&[0; 8]);
@@ -1990,7 +2148,7 @@ mod tests {
 			let mut bytes = vec![0];
 			bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
 			bytes.extend_from_slice(text.as_bytes());
-			bytes.extend_from_slice(&[0, 0, 0]);
+			bytes.extend_from_slice(&[0, 1, 1, 0, 0]);
 			bytes
 		}
 		fn group(count: usize, child: &[u8]) -> Vec<u8> {
@@ -2002,7 +2160,7 @@ mod tests {
 			bytes
 		}
 		fn request(expression: &[u8]) -> Vec<u8> {
-			let mut bytes = b"FTSQ\x07\x00".to_vec();
+			let mut bytes = b"FTSQ\x08\x00".to_vec();
 			bytes.extend_from_slice(expression);
 			bytes.extend_from_slice(&[0; 10]);
 			bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -2060,7 +2218,7 @@ mod tests {
 	#[test]
 	fn classifies_negation_and_exact_totals_as_expensive() {
 		fn request(expression: &[u8], exact_total: bool) -> Vec<u8> {
-			let mut bytes = b"FTSQ\x07\x00".to_vec();
+			let mut bytes = b"FTSQ\x08\x00".to_vec();
 			bytes.extend_from_slice(expression);
 			bytes.push(0);
 			bytes.push(0);
@@ -2071,7 +2229,7 @@ mod tests {
 			bytes.extend_from_slice(&100u32.to_le_bytes());
 			bytes
 		}
-		let leaf = [0, 1, 0, 0, 0, b'a', 0, 0, 0];
+		let leaf = [0, 1, 0, 0, 0, b'a', 0, 1, 1, 0, 0];
 		assert!(!search_is_expensive(&request(&leaf, false)).unwrap());
 		assert!(search_is_expensive(&request(&leaf, true)).unwrap());
 		let mut negated = vec![3];
@@ -2087,7 +2245,7 @@ mod tests {
 		assert!(search_is_expensive(&request(&unanchored_or, false)).unwrap());
 
 		let filtered_request = |comparator: u8| {
-			let mut bytes = b"FTSQ\x07\x00".to_vec();
+			let mut bytes = b"FTSQ\x08\x00".to_vec();
 			bytes.extend_from_slice(&leaf);
 			bytes.push(0);
 			bytes.push(1);
@@ -2108,7 +2266,7 @@ mod tests {
 		assert!(!search_is_expensive(&filtered_request(0)).unwrap());
 		assert!(search_is_expensive(&filtered_request(2)).unwrap());
 
-		let mut many_exact_filters = b"FTSQ\x07\x00".to_vec();
+		let mut many_exact_filters = b"FTSQ\x08\x00".to_vec();
 		many_exact_filters.extend_from_slice(&leaf);
 		many_exact_filters.push(0);
 		many_exact_filters.push(1);
@@ -2133,14 +2291,14 @@ mod tests {
 
 	#[test]
 	fn rejects_nested_counts_before_allocating() {
-		let mut fields = b"FTMB\x07\x00".to_vec();
+		let mut fields = b"FTMB\x08\x00".to_vec();
 		fields.extend_from_slice(&1u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&0u32.to_le_bytes());
 		fields.extend_from_slice(&u16::MAX.to_le_bytes());
 		assert_eq!(decode_batch(&fields).unwrap_err().code, "E_INVALID_ARGUMENT");
 
-		let mut values = b"FTMB\x07\x00".to_vec();
+		let mut values = b"FTMB\x08\x00".to_vec();
 		values.extend_from_slice(&1u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());
 		values.extend_from_slice(&0u32.to_le_bytes());

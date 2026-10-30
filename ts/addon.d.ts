@@ -31,6 +31,7 @@ export interface RuntimeLimits {
   maxRecordVersionBytes: number
   maxPrefixExpansions: number
   maxFuzzyTerms: number
+  maxFuzzyDistance: number
   maxSearchWindow: number
   maxSearchPageSize: number
   maxFilterStringBytes: number
