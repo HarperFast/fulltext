@@ -169,16 +169,16 @@ until catalog-scale benchmark qualification is complete.
 Fuzzy controls belong to each simple request or Boolean text leaf, and to the simple
 `traceMatches()` request:
 
-| Option                | Modes                   | Default | Accepted values                                     |
-| --------------------- | ----------------------- | ------- | --------------------------------------------------- |
-| `fuzzyDistance`       | `fuzzy`, `fuzzy-prefix` | `1`     | Integer 0–2; zero disables edits.                   |
-| `fuzzyTranspositions` | `fuzzy`, `fuzzy-prefix` | `true`  | Boolean; adjacent swaps cost one edit when enabled. |
+| Option                | Modes                   | Default | Accepted values                                          |
+| --------------------- | ----------------------- | ------- | -------------------------------------------------------- |
+| `fuzzyDistance`       | `fuzzy`, `fuzzy-prefix` | `1`     | Integer 0–2; zero disables edits; distance 2 is preview. |
+| `fuzzyTranspositions` | `fuzzy`, `fuzzy-prefix` | `true`  | Boolean; adjacent swaps cost one edit when enabled.      |
 
 Supplying a fuzzy control on another mode rejects even when its value is the default. A root
 `query` cannot be combined with simple leaf options. Controls do not change index identity or
 require rebuilding; continuation tokens bind their resolved values.
 Existing eligibility, exact-match ranking and field weights still apply. Distance 2 can increase
-native construction and dictionary work; qualify it for your corpus and concurrency.
+native construction and dictionary work; its production memory capacity is unqualified. Consumers should enable caller-supplied distance 2 only after qualifying their corpus and concurrency.
 
 Record IDs are limited to 4,096 UTF-8 bytes, keeping deterministic tie-page sorting memory bounded.
 An upsert may include an opaque `version` string of up to 4,096 UTF-8 bytes. The version is returned

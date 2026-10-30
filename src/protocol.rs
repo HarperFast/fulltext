@@ -335,7 +335,7 @@ impl QueryOptions {
 			&& (self.fuzzy_distance != 1 || !self.fuzzy_transpositions)
 		{
 			return Err(FulltextError::invalid(
-				"fuzzy options require fuzzy or fuzzyPrefix mode",
+				"fuzzy options require fuzzy or fuzzy-prefix mode",
 			));
 		}
 		Ok(())

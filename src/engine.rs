@@ -128,6 +128,9 @@ impl QueryConstructionBudget {
 	}
 
 	fn fuzzy(&mut self, terms: usize, fields: usize, distance: u8) -> Result<()> {
+		if distance == 0 {
+			return Ok(());
+		}
 		let weight = if distance == 2 { 4 } else { 1 };
 		self.fuzzy_work_units = self
 			.fuzzy_work_units
@@ -1688,6 +1691,9 @@ impl Engine {
 					(Occur::Must, exact.box_clone()),
 					(Occur::Must, Box::new(ConstScoreQuery::new(exact, exact_bonus))),
 				]));
+				if options.fuzzy_distance == 0 {
+					return Ok((Occur::Should, exact_branch));
+				}
 				let fuzzy = self.fuzzy_group(&analyzed, fields, false, options)?;
 				Ok((
 					Occur::Should,
@@ -1766,10 +1772,14 @@ impl Engine {
 					Box::new(ConstScoreQuery::new(exact_for_bonus, exact_bonus)),
 				),
 			]));
-			Box::new(DisjunctionMaxQuery::new(vec![
-				exact_branch,
-				self.fuzzy_group(&surface_prefix, fields, true, options)?,
-			])) as Box<dyn Query>
+			if options.fuzzy_distance == 0 {
+				exact_branch
+			} else {
+				Box::new(DisjunctionMaxQuery::new(vec![
+					exact_branch,
+					self.fuzzy_group(&surface_prefix, fields, true, options)?,
+				])) as Box<dyn Query>
+			}
 		} else {
 			exact_prefix
 		};
@@ -3655,7 +3665,7 @@ mod tests {
 		for distance in [0, 1] {
 			let mut budget = QueryConstructionBudget::default();
 			budget.fuzzy(16, 16, distance).unwrap();
-			assert_eq!(budget.fuzzy_work_units, 256);
+			assert_eq!(budget.fuzzy_work_units, if distance == 0 { 0 } else { 256 });
 		}
 		let mut budget = QueryConstructionBudget::default();
 		assert!(budget
@@ -3714,6 +3724,8 @@ mod tests {
 			];
 			engine.expression_query(&searcher, &group(leaves.clone())).unwrap();
 			leaves.push(leaf(1, SearchMode::Fuzzy, 0));
+			engine.expression_query(&searcher, &group(leaves.clone())).unwrap();
+			leaves.push(leaf(1, SearchMode::Fuzzy, 1));
 			assert!(engine
 				.expression_query(&searcher, &group(leaves))
 				.err()
@@ -3800,6 +3812,179 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	#[test]
+	fn zero_distance_elides_fuzzy_construction_preserving_native_score_bits() {
+		let mut configuration = config();
+		configuration.identity.surface_terms = true;
+		configuration.identity.fields[0].weight = 2.75;
+		configuration.identity.fields[1].weight = 0.5;
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let mut writer = engine.writer(&configuration).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for records in [
+			[
+				("one", "waterproof trail", "waterproof"),
+				("two", "waterprof trail", "catalog"),
+			],
+			[
+				("three", "waterproof waterproof trail", "catalog"),
+				("four", "catalog trail", "waterproof"),
+			],
+		] {
+			writer
+				.apply(MutationBatch {
+					upserts: records
+						.into_iter()
+						.map(|(id, title, description)| crate::protocol::Upsert {
+							id: id.to_owned(),
+							version: None,
+							fields: vec![
+								("title".to_owned(), vec![title.to_owned()]),
+								("description".to_owned(), vec![description.to_owned()]),
+							],
+							filters: Vec::new(),
+						})
+						.collect(),
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let searcher = engine.reader().unwrap().searcher();
+		assert_eq!(searcher.segment_readers().len(), 2);
+		let fields = engine.fields.iter().collect::<Vec<_>>();
+		let exact_bonus = fields.iter().map(|field| field.weight).fold(0.0f32, f32::max) * 0.25 + 1.0;
+		let exact_with_bonus = |exact: Box<dyn Query>| -> Box<dyn Query> {
+			Box::new(BooleanQuery::new(vec![
+				(Occur::Must, exact.box_clone()),
+				(Occur::Must, Box::new(ConstScoreQuery::new(exact, exact_bonus))),
+			]))
+		};
+		let score_bits = |query: &dyn Query| {
+			let mut hits = searcher
+				.search(query, &TopDocs::with_limit(20).order_by_score())
+				.unwrap()
+				.into_iter()
+				.map(|(score, address)| (address, score.to_bits()))
+				.collect::<Vec<_>>();
+			hits.sort_unstable();
+			hits
+		};
+		for transpositions in [false, true] {
+			let options = QueryOptions {
+				fuzzy_distance: 0,
+				fuzzy_transpositions: transpositions,
+			};
+			let former_group = |term: &str, prefix: bool, exact: Box<dyn Query>| -> Box<dyn Query> {
+				let fuzzy = DisjunctionMaxQuery::new(
+					fields
+						.iter()
+						.map(|field| {
+							let term = Term::from_field_text(
+								if prefix {
+									field.surface_field.unwrap()
+								} else {
+									field.field
+								},
+								term,
+							);
+							let query: Box<dyn Query> = if prefix {
+								Box::new(FuzzyTermQuery::new_prefix(term, 0, transpositions))
+							} else {
+								Box::new(FuzzyTermQuery::new(term, 0, transpositions))
+							};
+							Box::new(BoostQuery::new(
+								Box::new(ConstScoreQuery::new(query, 0.25)),
+								field.weight,
+							)) as Box<dyn Query>
+						})
+						.collect(),
+				);
+				Box::new(DisjunctionMaxQuery::new(vec![exact_with_bonus(exact), Box::new(fuzzy)]))
+			};
+			for (prefix, text) in [
+				(false, "waterproof"),
+				(false, "waterproof trail"),
+				(true, "waterpro"),
+				(true, "trail waterpro"),
+			] {
+				let mut budget = QueryConstructionBudget::default();
+				let (current, _) = if prefix {
+					engine
+						.prefix_query(&searcher, text, &fields, true, options, &mut budget)
+						.unwrap()
+				} else {
+					engine.fuzzy_query(text, &fields, options, &mut budget).unwrap()
+				};
+				let former: Box<dyn Query> = if prefix {
+					let (completed, prefix) = engine.final_surface_term(text).unwrap();
+					let prefix = prefix.unwrap();
+					let (exact, _) = engine
+						.expanded_prefix_group(
+							&searcher,
+							&prefix,
+							&fields,
+							MAX_QUERY_CLAUSES - (completed.len() + 1) * fields.len(),
+						)
+						.unwrap();
+					let mut clauses = completed
+						.iter()
+						.map(|term| (Occur::Must, engine.term_group(term, &fields)))
+						.collect::<Vec<_>>();
+					clauses.push((Occur::Must, former_group(&prefix, true, exact)));
+					Box::new(BooleanQuery::new(clauses))
+				} else {
+					let clauses = engine
+						.analyze(text, true, true)
+						.unwrap()
+						.into_iter()
+						.map(|surface| {
+							let analyzed = engine.analyze(&surface, false, false).unwrap();
+							let term = &analyzed[0];
+							(
+								Occur::Should,
+								former_group(term, false, engine.term_group(term, &fields)),
+							)
+						})
+						.collect();
+					Box::new(BooleanQuery::new(clauses))
+				};
+				assert_eq!(
+					score_bits(current.as_ref()),
+					score_bits(former.as_ref()),
+					"{text:?}, transpositions={transpositions}"
+				);
+				assert!(!score_bits(current.as_ref()).is_empty());
+				assert_eq!(
+					searcher.search(current.as_ref(), &tantivy::collector::Count).unwrap(),
+					searcher.search(former.as_ref(), &tantivy::collector::Count).unwrap()
+				);
+				assert_eq!(
+					budget.fuzzy_work_units, 0,
+					"distance zero must not construct fuzzy automata: {text:?}"
+				);
+				assert!(format!("{former:?}").contains("FuzzyTermQuery"));
+				assert!(!format!("{current:?}").contains("FuzzyTermQuery"));
+				let root = current.downcast_ref::<BooleanQuery>().unwrap();
+				let branches = if prefix {
+					&root.clauses()[root.clauses().len() - 1..]
+				} else {
+					root.clauses()
+				};
+				for (_, branch) in branches {
+					let exact_branch = branch
+						.downcast_ref::<BooleanQuery>()
+						.expect("distance zero must directly retain the exact bonus branch");
+					assert_eq!(exact_branch.clauses().len(), 2);
+					assert!(exact_branch.clauses()[1].1.is::<ConstScoreQuery>());
+				}
+			}
+		}
+		writer.close().unwrap();
 	}
 
 	#[test]

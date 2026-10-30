@@ -8,6 +8,7 @@ import { NativeFullTextIndex, openNativeFullTextIndex } from '@harperfast/fullte
 import { encodeOpen, encodeSearch, encodeTrace } from '../dist/codec.js';
 import { invoke } from '../dist/invoke.js';
 import { loadAddon } from '../dist/load-addon.js';
+import { closeIndex } from '../benchmarks/metadata-cleanup.mjs';
 
 const invalid = (error) => error.code === 'E_INVALID_ARGUMENT';
 const ids = (result) => result.hits.map(({ id }) => id).sort();
@@ -50,7 +51,7 @@ async function fixture(context, documents, extra = {}) {
 		filterFields: options.filterFields,
 	});
 	context.after(async () => {
-		await index.close({ mode: 'rollback' });
+		await closeIndex(index, { mode: 'rollback' });
 		await rm(directory, { recursive: true, force: true });
 	});
 	await index.applyMutationBatch({ upserts: documents });
@@ -63,7 +64,7 @@ async function fixture(context, documents, extra = {}) {
 			return index;
 		},
 		async reopen() {
-			await index.close();
+			await closeIndex(index);
 			index = await openNativeFullTextIndex(options);
 		},
 	};
@@ -224,5 +225,75 @@ test('fuzzy options are snapshotted once and continuation identity uses resolved
 		await assert.doesNotReject(
 			index.searchPage({ ...request, fuzzyDistance: 1, fuzzyTranspositions: true, continuation: page.continuation }),
 		);
+	}
+});
+
+test('nondefault fuzzy traces retain current-source surface matches independently of indexed stems', async (context) => {
+	const records = [{ id: 'inflected', fields: { title: 'running' } }];
+	const { index } = await fixture(context, records);
+	for (const fuzzyDistance of [0, 1, 2]) {
+		const request = { text: 'runnin', mode: 'fuzzy', fuzzyDistance, fuzzyTranspositions: false };
+		const result = await index.search({ ...request, exactTotal: true });
+		assert.deepStrictEqual(result.hits, []);
+		assert.strictEqual(result.total, 0);
+		const traced = await index.traceMatches(request, records);
+		assert.strictEqual(traced.complete, true);
+		assert.deepStrictEqual(
+			traced.records,
+			fuzzyDistance === 0
+				? []
+				: [
+						{
+							id: 'inflected',
+							values: [{ field: 'title', valueIndex: 0, spans: [{ start: 0, end: 7 }] }],
+						},
+					],
+		);
+	}
+});
+
+test('distance-zero fuzzy search preserves exact scores through paging and rejected-request recovery', async (context) => {
+	const { index } = await fixture(
+		context,
+		[
+			{ id: 'one', fields: { title: 'cobalt amber', body: 'amber' } },
+			{ id: 'two', fields: { title: 'cobalt amber', body: 'cobalt amber' } },
+			{ id: 'three', fields: { title: 'cobalt amber amber', body: 'amber' } },
+		],
+		{
+			fields: [
+				{ name: 'title', weight: 3 },
+				{ name: 'body', weight: 0.5 },
+			],
+		},
+	);
+	await index.applyMutationBatch({ upserts: [{ id: 'four', fields: { title: 'cobalt amber', body: 'amber amber' } }] });
+	await index.commit();
+	await index.reload();
+	for (const mode of ['fuzzy', 'fuzzy-prefix']) {
+		const request = {
+			text: mode === 'fuzzy' ? 'amber' : 'cobalt amber',
+			mode,
+			fuzzyDistance: 0,
+			fuzzyTranspositions: false,
+		};
+		const expected = await index.search({ ...request, exactTotal: true });
+		assert.strictEqual(expected.total, 4);
+		assert.deepStrictEqual(expected, await index.search({ ...request, fuzzyDistance: 1, exactTotal: true }));
+		const hits = [];
+		let continuation;
+		do {
+			const page = await index.searchPage({ ...request, limit: 1, continuation });
+			assert.strictEqual(page.total, expected.total);
+			hits.push(...page.hits);
+			continuation = page.continuation;
+			if (continuation) {
+				await assert.rejects(index.searchPage({ ...request, fuzzyDistance: 1, limit: 1, continuation }), invalid);
+			}
+			assert(hits.length <= expected.total);
+		} while (continuation);
+		assert.deepStrictEqual(hits, expected.hits);
+		await assert.rejects(index.search({ ...request, fuzzyDistance: 3 }), invalid);
+		assert.deepStrictEqual(await index.search({ ...request, exactTotal: true }), expected);
 	}
 });

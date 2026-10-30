@@ -246,8 +246,10 @@ nonallocating Rust prewalk before analysis. Empty and stopword-only leaves still
 edges. Conservative lexical admission estimates select a lane; they never reject as compiled cost.
 
 Phrase construction charges positions × fields across the request; fuzzy construction charges
-weighted term-field automata across the tree: distance 0/1 charges one work unit, distance 2
-charges four, within the existing 256-unit cap. The four-unit estimate rounds up the measured
+weighted term-field automata across the tree: distance 1 charges one work unit, distance 2
+charges four, within the existing 256-unit cap. Distance zero reuses exact-bonus queries without
+fuzzy automata or fuzzy construction charges. Score-bit parity against the previous native query
+composition and query-tree regressions protect this lowering. The four-unit estimate rounds up the measured
 maximum sampled distance-two/distance-one reachable-DFA-state ratio of 3.854 and is not a hard memory bound. Fixed construction bounds
 retain the default policy's implied upper bounds even when configured term/clause limits rise. Exact trace membership uses short vector comparisons for up to eight terms and hash lookup
 above that. Fuzzy traces compare at most 16 eligible alternatives. Branch-local found cardinality

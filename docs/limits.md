@@ -90,7 +90,7 @@ Distance 2 increases potential automaton and dictionary work, including broader 
 short eligible prefixes; qualify it for the corpus and concurrency. The fuzzy-prefix minimum
 remains four Unicode characters. The 50-term expansion guard bounds exact-prefix enumeration;
 the native fuzzy automaton branch has no equivalent expansion-count cap at distance one or two.
-Finite synthetic qualification does not establish production capacity. Native construction can overrun a cooperative deadline before the next check.
+Distance 2 is preview: consumers should qualify their corpus and concurrency before exposing caller-supplied distance 2. Finite synthetic qualification does not establish production capacity. Native construction can overrun a cooperative deadline before the next check.
 
 ## Tracing and snippets
 
@@ -453,7 +453,9 @@ applies analyzed-term limits to its simple text clause, without compiling indexe
 
 Whole-query construction additionally permits at most 16,384 phrase term-field positions and
 256 fuzzy construction work units across all branches. Each term-field automaton charges one
-unit at distance 0/1 and four units at distance 2. The four-unit estimate rounds up the measured
+unit at distance 1 and four units at distance 2. Distance-zero search reuses the exact-match branch
+and constructs no fuzzy automata, so it consumes no fuzzy construction units. The four-unit estimate
+rounds up the measured
 maximum sampled distance-two/distance-one reachable-DFA-state ratio of 3.854; it is not a hard memory bound. These guards preserve
 the default policy's implied construction bounds; raising term/clause policy does not raise them. Construction overflow
 rejects explicitly. Individual Tantivy setup operations remain synchronous between deadline checks.

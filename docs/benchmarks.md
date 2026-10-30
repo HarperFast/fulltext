@@ -495,7 +495,10 @@ The varied ASCII term is `abcdefghijklmnopqrstuvwxyz0123456789abc`; the Unicode 
 `éκόσμος𐐨東京café` repeated three times. The maximum distance-two/distance-one reachable-state
 ratio across sampled matching policies was 3.85409252669, from the varied ASCII full matcher.
 That state/payload ratio, rather than elapsed time, motivates rounding the distance-two
-construction charge to four units versus one at distance 0/1 within the existing 256-unit budget.
+construction charge to four units versus one at distance 1 within the existing 256-unit budget.
+The final distance-zero search path reuses exact-bonus queries without constructing fuzzy automata
+or spending fuzzy construction units; the distance-zero rows above measure the native constructor,
+not that optimized path.
 For context, the varied ASCII transposition-enabled full constructor took 0.036167 ms at distance
 one and 0.144584 ms at distance two in this run; single constructor timings do not establish a
 latency bound. The four-unit policy is an admission estimate, not a hard memory or time limit.
@@ -554,7 +557,7 @@ retained driver cases rather than production latency or memory.
 
 ### Repeated default-policy memory control
 
-A review-requested check ran three additional fresh-process pairs with the same final driver,
+Three additional fresh-process pairs ran with the same final driver,
 ABI-12 baseline and ABI-13 current addon. Each pair used the distance-one/transpositions-on profile
 and the unchanged gates. Pair order alternated baseline/current, current/baseline, baseline/current.
 

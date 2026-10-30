@@ -21,7 +21,6 @@ const breadth = args[0] === '--profile=breadth';
 const profileDistance = args.length && !breadth ? Number(args[0].slice(-1)) : undefined;
 const documents = 1_000;
 const rounds = 6;
-// Both focused profiles use the same schema, dictionary, and raised clause policy.
 const fields = Array.from({ length: profileDistance === undefined ? 5 : 16 }, (_, i) => `field${i}`);
 const families = [
 	{ name: 'ascii', query: 'abcdef', terms: ['abcdef', 'abcxef', 'abxxef', 'abdcef', 'abcdefzzz'] },
@@ -211,7 +210,6 @@ try {
 		const text = Array.from({ length: 32 }, (_, j) => dictionaryTerm(i * 32 + j)).join(' ');
 		upserts.push({ id: `dictionary-${i}`, fields: Object.fromEntries(fields.map((field) => [field, text])) });
 	}
-	// Bound each mutation frame independently of the search qualification.
 	for (let start = 0; start < upserts.length; start += 100) {
 		await index.applyMutationBatch({ upserts: upserts.slice(start, start + 100) });
 	}
