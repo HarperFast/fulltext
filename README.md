@@ -2,10 +2,10 @@
 
 Native Tantivy full-text indexing for Node.js.
 
-**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.7.0.** The engine is compiled
+**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.8.0.** The engine is compiled
 into the native addon; no separate Tantivy installation is required. This source tree still has
-version 0.7.0 in its package manifests, but the metadata sorting, aggregation and new filter APIs
-documented here are unreleased and absent from the published 0.7.0 artifacts. See
+version 0.8.0 in its package manifests. The metadata sorting, aggregation, new filter and query-control
+APIs documented here remain unreleased until publication; they are absent from the published 0.7.0 artifacts. See
 [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
 before deploying a build from this tree.
 
@@ -840,7 +840,7 @@ import { runtimeInfo } from '@harperfast/fulltext/native';
 
 const { packageVersion, tantivyVersion } = await runtimeInfo();
 console.log({ packageVersion, tantivyVersion });
-// { packageVersion: '0.7.0', tantivyVersion: '0.27.0' }
+// { packageVersion: '0.8.0', tantivyVersion: '0.27.0' }
 ```
 
 The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an
