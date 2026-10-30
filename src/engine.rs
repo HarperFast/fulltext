@@ -5650,16 +5650,25 @@ mod tests {
 			writer.commit().unwrap();
 		}
 		let searcher = engine.reader().unwrap().searcher();
-		for (text, mode) in [
-			(terms.join(" "), SearchMode::Any),
-			(terms.join(" "), SearchMode::All),
-			("waterproof trail".to_owned(), SearchMode::Phrase),
-			("waterproo".to_owned(), SearchMode::Prefix),
-			("waterproff".to_owned(), SearchMode::Fuzzy),
+		for (text, mode, distance) in [
+			(terms.join(" "), SearchMode::Any, 1),
+			(terms.join(" "), SearchMode::All, 1),
+			("waterproof trail".to_owned(), SearchMode::Phrase, 1),
+			("waterproo".to_owned(), SearchMode::Prefix, 1),
+			("waterproff".to_owned(), SearchMode::Fuzzy, 1),
+			("waterproof trail".to_owned(), SearchMode::Fuzzy, 0),
+			("trail waterpro".to_owned(), SearchMode::FuzzyPrefix, 0),
 		] {
-			let built = engine
-				.expression_query(&searcher, &expression(&text, mode, Vec::new()))
-				.unwrap();
+			let clause = SearchExpression::Clause(SearchClause {
+				text: text.clone(),
+				mode,
+				options: QueryOptions {
+					fuzzy_distance: distance,
+					..QueryOptions::default()
+				},
+				fields: Vec::new(),
+			});
+			let built = engine.expression_query(&searcher, &clause).unwrap();
 			let weight = built
 				.query
 				.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))

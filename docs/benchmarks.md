@@ -557,9 +557,9 @@ retained driver cases rather than production latency or memory.
 
 ### Repeated default-policy memory control
 
-Three additional fresh-process pairs ran with the same final driver,
-ABI-12 baseline and ABI-13 current addon. Each pair used the distance-one/transpositions-on profile
-and the unchanged gates. Pair order alternated baseline/current, current/baseline, baseline/current.
+Fresh-process paired controls use the same driver, ABI-12 baseline and ABI-13 current addon,
+distance-one/transpositions-on profile and unchanged gates. Pair order is baseline/current,
+current/baseline, baseline/current.
 
 | Pair | Baseline RSS growth | Current RSS growth | Baseline / current RSS gate |
 | ---- | ------------------: | -----------------: | --------------------------- |

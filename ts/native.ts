@@ -229,7 +229,7 @@ export type SearchMode =
 	| 'fuzzy-prefix';
 
 export interface QueryOptions {
-	/** Maximum edits from 0 through 2; defaults to 1. Only valid in fuzzy modes. */
+	/** Maximum edits from 0 through 2; defaults to 1. Distance 2 is preview: qualify corpus and concurrency before exposing it to callers. Only valid in fuzzy modes. */
 	fuzzyDistance?: number;
 	/** Count adjacent transpositions as one edit; defaults to true. Only valid in fuzzy modes. */
 	fuzzyTranspositions?: boolean;

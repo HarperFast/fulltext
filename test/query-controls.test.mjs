@@ -270,9 +270,13 @@ test('distance-zero fuzzy search preserves exact scores through paging and rejec
 	await index.applyMutationBatch({ upserts: [{ id: 'four', fields: { title: 'cobalt amber', body: 'amber amber' } }] });
 	await index.commit();
 	await index.reload();
-	for (const mode of ['fuzzy', 'fuzzy-prefix']) {
+	for (const [mode, text] of [
+		['fuzzy', 'amber'],
+		['fuzzy', 'cobalt amber'],
+		['fuzzy-prefix', 'cobalt amber'],
+	]) {
 		const request = {
-			text: mode === 'fuzzy' ? 'amber' : 'cobalt amber',
+			text,
 			mode,
 			fuzzyDistance: 0,
 			fuzzyTranspositions: false,
