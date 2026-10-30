@@ -3,10 +3,10 @@
 Status: draft release; Kyle approved the API/migration direction on 2026-10-28. Local procedure
 qualification passed, including a controlled local Harper Table catch-up/cutover rehearsal. Production cutover remains untested.
 
-The branch is unreleased. Its manifests still use the previous package version. Before publishing,
-release preparation must choose a new version and align the root package, Cargo package and exact
-platform dependencies. Do not install the published 0.7.0 package expecting this metadata API.
-Version alignment is tracked in [Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
+The source manifests prepare version 0.8.0, aligning the root package, Cargo package, exact platform
+dependencies and lockfiles. This version remains unreleased until publication. Do not install the
+published 0.7.0 package expecting this metadata API. Publication verification remains part of
+[Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
 
 ## Decide whether to rebuild
 
@@ -123,7 +123,7 @@ rehearsal does not establish distributed replication or production adapter behav
 ## Open items
 
 - Production-specific concurrent cutover, checkpoint catch-up and rollback qualification.
-- Cross-platform installed package qualification and release version alignment.
+- Cross-platform installed release-artifact qualification and publication verification.
 
 ## Sources
 

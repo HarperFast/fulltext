@@ -3,7 +3,7 @@
 Native Tantivy full-text indexing for Node.js.
 
 **Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.8.0.** The engine is compiled
-into the native addon; no separate Tantivy installation is required. This source tree still has
+into the native addon; no separate Tantivy installation is required. This source tree has
 version 0.8.0 in its package manifests. The metadata sorting, aggregation, new filter and query-control
 APIs documented here remain unreleased until publication; they are absent from the published 0.7.0 artifacts. See
 [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
