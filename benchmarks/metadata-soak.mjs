@@ -516,7 +516,7 @@ try {
 		try {
 			await bounded(closeIndex(reopened), 'reopened reader close');
 		} catch (error) {
-			finalReaderCloseError = String(error);
+			finalReaderCloseError = `${error.code ?? error.name}: ${error.message}`;
 			throw error;
 		}
 	}
