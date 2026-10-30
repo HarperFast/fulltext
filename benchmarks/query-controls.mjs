@@ -10,14 +10,15 @@ import { fileURLToPath } from 'node:url';
 import { openNativeFullTextIndex, runtimeInfo } from '../dist/native.js';
 import { closeIndex } from './metadata-cleanup.mjs';
 
-// Declared before setup; no forced GC or threshold selection from observed results.
 const gates = { maxP99Milliseconds: 5_000, maxRssGrowthBytes: 256 << 20 };
 const args = process.argv.slice(2);
 assert(
-	args.length <= 1 && args.every((arg) => ['--profile=distance-1', '--profile=distance-2'].includes(arg)),
-	'usage: query-controls.mjs [--profile=distance-1|--profile=distance-2]',
+	args.length <= 1 &&
+		args.every((arg) => ['--profile=distance-1', '--profile=distance-2', '--profile=breadth'].includes(arg)),
+	'usage: query-controls.mjs [--profile=distance-1|--profile=distance-2|--profile=breadth]',
 );
-const profileDistance = args.length ? Number(args[0].slice(-1)) : undefined;
+const breadth = args[0] === '--profile=breadth';
+const profileDistance = args.length && !breadth ? Number(args[0].slice(-1)) : undefined;
 const documents = 1_000;
 const rounds = 6;
 // Both focused profiles use the same schema, dictionary, and raised clause policy.
@@ -35,18 +36,18 @@ const fixtures = families.flatMap((family) =>
 );
 const dictionaryTerm = (i) => {
 	let suffix = '';
+	const letters = breadth ? 'abcdfghijklmnpqrstuvwxyz' : 'abcdefghijklmnopqrstuvwxyz';
 	for (let position = 0; position < 8; position++) {
-		suffix += String.fromCharCode(97 + (i % 26));
-		i = Math.floor(i / 26);
+		suffix += letters[i % letters.length];
+		i = Math.floor(i / letters.length);
 	}
-	return `qrst${suffix}`;
+	return `${breadth ? 'shaa' : 'qrst'}${suffix}`;
 };
 const cases = [];
 for (const mode of ['fuzzy', 'fuzzy-prefix']) {
 	for (const fuzzyDistance of [0, 1, 2]) {
 		for (const fuzzyTranspositions of [false, true]) {
 			for (const family of families) {
-				// The oracle is constructed from deliberate edits, independently of engine output.
 				const expected = [`${family.name}-exact`];
 				if (fuzzyDistance >= 1) expected.push(`${family.name}-one`);
 				if (fuzzyDistance >= 2) expected.push(`${family.name}-two`);
@@ -102,11 +103,36 @@ const constructionCase = {
 	// Every indexed term is at least 27 characters shorter; two edits cannot bridge that gap.
 	expected: [],
 };
-const workloads = profileDistance === undefined ? [constructionCase, ...cases, boundaryCase] : [constructionCase];
+const breadthIds = Array.from({ length: documents }, (_, i) => `dictionary-${i}`).sort();
+const breadthCases = [
+	{
+		name: 'breadth/exact-prefix/zero-expansions',
+		request: { text: 'shoe', mode: 'prefix', fields: ['field0'] },
+		expected: [],
+	},
+	...['fuzzy', 'fuzzy-prefix'].flatMap((mode) =>
+		[1, 2].map((fuzzyDistance) => {
+			const matchesAll = mode === 'fuzzy-prefix' && fuzzyDistance === 2;
+			return {
+				name: `breadth/${mode}/distance-${fuzzyDistance}`,
+				request: { text: 'shoe', mode, fuzzyDistance, fuzzyTranspositions: true, fields: ['field0'] },
+				expected: matchesAll ? breadthIds.slice(0, 100) : [],
+				expectedTotal: matchesAll ? documents : 0,
+				verifyUniverse: matchesAll,
+			};
+		}),
+	),
+];
+const workloads = breadth
+	? breadthCases
+	: profileDistance === undefined
+		? [constructionCase, ...cases, boundaryCase]
+		: [constructionCase];
 const root = await mkdtemp(path.join(tmpdir(), 'fulltext-query-controls-'));
 const telemetry = {
 	schemaVersion: 1,
 	profileDistance: profileDistance ?? null,
+	profile: breadth ? 'breadth' : profileDistance === undefined ? 'matrix' : `distance-${profileDistance}`,
 	gates,
 	root,
 	environment: {
@@ -117,8 +143,19 @@ const telemetry = {
 	},
 	documents,
 	fields: fields.length,
-	longConstructionTerms: 16,
-	longConstructionTermCharacters: 39,
+	longConstructionTerms: breadth ? null : 16,
+	longConstructionTermCharacters: breadth ? null : 39,
+	...(breadth
+		? {
+				breadth: {
+					query: 'shoe',
+					dictionaryPrefix: 'shaa',
+					uniqueTerms: documents * 32,
+					suffixExcludes: ['o', 'e'],
+					exactPrefixExpansions: 0,
+				},
+			}
+		: {}),
 	rows: [],
 	cancellation: [],
 };
@@ -169,8 +206,8 @@ try {
 			...(profileDistance === undefined ? {} : { maxQueryClauses: 4096 }),
 		},
 	});
-	const upserts = [...fixtures];
-	for (let i = fixtures.length; i < documents; i++) {
+	const upserts = breadth ? [] : [...fixtures];
+	for (let i = upserts.length; i < documents; i++) {
 		const text = Array.from({ length: 32 }, (_, j) => dictionaryTerm(i * 32 + j)).join(' ');
 		upserts.push({ id: `dictionary-${i}`, fields: Object.fromEntries(fields.map((field) => [field, text])) });
 	}
@@ -199,7 +236,7 @@ try {
 		const pending = index.search({ ...entry.request, limit: 100, exactTotal: true }, options);
 		const preparationMilliseconds = performance.now() - start;
 		const result = await pending;
-		assert.strictEqual(result.total, entry.expected.length, entry.name);
+		assert.strictEqual(result.total, entry.expectedTotal ?? entry.expected.length, entry.name);
 		assert.strictEqual(result.totalRelation, 'exact', entry.name);
 		assert.deepStrictEqual(result.hits.map(({ id }) => id).sort(), entry.expected, entry.name);
 		assert(
@@ -216,6 +253,12 @@ try {
 	const rows = telemetry.rows;
 	for (const entry of workloads) {
 		console.error(`query-controls: ${entry.name}`);
+		if (entry.verifyUniverse) {
+			const page = await index.searchPage({ ...entry.request, limit: documents });
+			assert.deepStrictEqual(page.hits.map(({ id }) => id).sort(), breadthIds, `${entry.name}: complete universe`);
+			assert.strictEqual(page.continuation, undefined);
+			telemetry.breadth.completeUniverseVerified = true;
+		}
 		if (cases.includes(entry)) {
 			const trace = await index.traceMatches(entry.request, fixtures);
 			assert.strictEqual(trace.complete, true, entry.name);
@@ -259,7 +302,7 @@ try {
 			assert(p99 <= gates.maxP99Milliseconds, `${entry.name}: p99 ${p99}ms exceeds gate`);
 		}
 	}
-	if (profileDistance === undefined) {
+	if (profileDistance === undefined && !breadth) {
 		await assert.rejects(
 			index.search({ ...boundaryRequest(5), limit: 100 }),
 			(error) => error.code === 'E_INVALID_ARGUMENT' && /construction work units/.test(error.message),
@@ -287,9 +330,12 @@ try {
 	telemetry.cancellationObserved = cancellationObserved;
 	if (!cancellationObserved)
 		console.error('query-controls: no timeout observed; recovery checked after successful budgeted requests only');
-	await Promise.all(
-		Array.from({ length: 8 }, () => run(profileDistance === undefined ? boundaryCase : constructionCase)),
-	);
+	const recoveryCase = breadth
+		? breadthCases.find(({ verifyUniverse }) => verifyUniverse)
+		: profileDistance === undefined
+			? boundaryCase
+			: constructionCase;
+	await Promise.all(Array.from({ length: 8 }, () => run(recoveryCase)));
 	assert.strictEqual(index.status().searchQueuedCommands, 0n);
 	assert.strictEqual(index.status().searchQueuedBytes, 0n);
 	clearInterval(sampler);
@@ -322,13 +368,15 @@ try {
 		cancellation,
 		cancellationObserved,
 		profileDistance: profileDistance ?? null,
-		longConstructionTerms: longTerms.length,
-		longConstructionTermCharacters: 39,
+		profile: telemetry.profile,
+		...(breadth ? { breadth: telemetry.breadth } : {}),
+		longConstructionTerms: breadth ? null : longTerms.length,
+		longConstructionTermCharacters: breadth ? null : 39,
 		constructionBudget: {
 			maximumWorkUnits: 256,
 			distance2Charge: 4,
-			boundaryAutomata: profileDistance === 1 ? 256 : 64,
-			excessRejected: profileDistance === undefined ? true : null,
+			boundaryAutomata: breadth ? null : profileDistance === 1 ? 256 : 64,
+			excessRejected: profileDistance === undefined && !breadth ? true : null,
 		},
 		note: 'Finite local optimized synthetic qualification, not production evidence. No forced GC. Preparation measures synchronous facade dispatch/encoding, not native-only construction; request latency includes native work and queueing. Sampled RSS is not a hard peak or retained-memory proof. CPU is process-wide. One-millisecond attempts may succeed; all successful attempts must match the independent oracle. Recovery follows every cancellation group.',
 	};

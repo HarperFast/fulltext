@@ -44,7 +44,8 @@ and its UTF-16 spans independently of indexed stems.
 `QueryOptions` resolves fuzzy distance 0–2/default 1 and transpositions default true per leaf.
 Protocol 8 encodes u8/bool after each mode; ABI 13/query API 7 require a matching facade. Options
 are absent from persisted identity and included in continuation digests. Nondefault fuzzy traces
-lazily use requested native automata on the existing analyzed/surface branches; current-source
+lazily use requested native automata on the existing analyzed/surface branches, sharing a matcher
+when query terms are identical. Distance zero uses equality/prefix checks without a DFA. Current-source
 surface membership still need not equal indexed analyzed membership. Individual native construction
 remains uninterruptible between deadline checks. Distance-2 production capacity remains unqualified.
 
@@ -247,7 +248,7 @@ edges. Conservative lexical admission estimates select a lane; they never reject
 Phrase construction charges positions × fields across the request; fuzzy construction charges
 weighted term-field automata across the tree: distance 0/1 charges one work unit, distance 2
 charges four, within the existing 256-unit cap. The four-unit estimate rounds up the measured
-maximum DFA preparation ratio of 3.854 and is not a hard memory bound. Fixed construction bounds
+maximum sampled distance-two/distance-one reachable-DFA-state ratio of 3.854 and is not a hard memory bound. Fixed construction bounds
 retain the default policy's implied upper bounds even when configured term/clause limits rise. Exact trace membership uses short vector comparisons for up to eight terms and hash lookup
 above that. Fuzzy traces compare at most 16 eligible alternatives. Branch-local found cardinality
 makes completion checks constant-time. Boundary and construction regressions live in `query-capacity.test.mjs` and the

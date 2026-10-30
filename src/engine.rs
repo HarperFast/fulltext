@@ -494,6 +494,9 @@ impl FuzzyMatcher {
 		if candidate == self.text || (self.prefix && candidate.starts_with(&self.text)) {
 			return Ok(true);
 		}
+		if self.options.fuzzy_distance == 0 {
+			return Ok(false);
+		}
 
 		let automaton = self
 			.automaton
@@ -522,20 +525,44 @@ impl FuzzyMatcher {
 struct FuzzyTraceTerm {
 	analyzed: String,
 	surface: String,
-	matchers: Option<(FuzzyMatcher, FuzzyMatcher)>,
+	matchers: Option<NativeFuzzyTraceMatchers>,
+}
+
+struct NativeFuzzyTraceMatchers {
+	analyzed: FuzzyMatcher,
+	surface: Option<FuzzyMatcher>,
+}
+
+impl NativeFuzzyTraceMatchers {
+	fn surface_matcher(&self) -> &FuzzyMatcher {
+		self.surface.as_ref().unwrap_or(&self.analyzed)
+	}
 }
 
 impl FuzzyTraceTerm {
+	fn new(analyzed: String, surface: String, field: Field, options: QueryOptions) -> Self {
+		let matchers =
+			(options.fuzzy_distance != 1 || !options.fuzzy_transpositions).then(|| NativeFuzzyTraceMatchers {
+				analyzed: FuzzyMatcher::new(&analyzed, field, options, false),
+				surface: (analyzed != surface).then(|| FuzzyMatcher::new(&surface, field, options, false)),
+			});
+		Self {
+			analyzed,
+			surface,
+			matchers,
+		}
+	}
+
 	fn matches(&self, analyzed: Option<&Vec<&str>>, surface: &str) -> Result<bool> {
-		if let Some((analyzed_matcher, surface_matcher)) = &self.matchers {
+		if let Some(matchers) = &self.matchers {
 			if let Some(terms) = analyzed {
 				for term in terms {
-					if analyzed_matcher.matches(term)? {
+					if matchers.analyzed.matches(term)? {
 						return Ok(true);
 					}
 				}
 			}
-			return surface_matcher.matches(surface);
+			return matchers.surface_matcher().matches(surface);
 		}
 		Ok(
 			analyzed.is_some_and(|terms| terms.iter().any(|term| within_one_edit(&self.analyzed, term)))
@@ -1071,16 +1098,12 @@ impl Engine {
 			{
 				continue;
 			}
-			let mut seen_fields = HashSet::new();
 			let mut pending_values = Vec::new();
 			let mut found = HashSet::new();
 			let mut record_span_budget = remaining_spans;
 			let mut record_truncated = false;
 			let mut record_analysis_truncated = false;
 			for (field, source_values) in &record.fields {
-				if !seen_fields.insert(field.as_str()) {
-					return Err(FulltextError::invalid(format!("duplicate trace field {field}")));
-				}
 				if !self.field_lookup.contains_key(field) {
 					return Err(FulltextError::invalid(format!("unknown trace field {field}")));
 				}
@@ -1213,19 +1236,7 @@ impl Engine {
 						.into_iter()
 						.filter(|(_, surface)| fuzzy_eligible(surface))
 						.map(|(analyzed, surface)| {
-							let matchers = (request.options.fuzzy_distance != 1
-								|| !request.options.fuzzy_transpositions)
-								.then(|| {
-									(
-										FuzzyMatcher::new(&analyzed, self.id_field, request.options, false),
-										FuzzyMatcher::new(&surface, self.id_field, request.options, false),
-									)
-								});
-							FuzzyTraceTerm {
-								analyzed,
-								surface,
-								matchers,
-							}
+							FuzzyTraceTerm::new(analyzed, surface, self.id_field, request.options)
 						})
 						.collect(),
 				})
@@ -4287,6 +4298,25 @@ mod tests {
 			});
 			let expected = search_hits(&snapshot, ranked).unwrap();
 			assert!(expected.len() > 100);
+			let identities = |hits: &[SearchHit]| {
+				hits.iter()
+					.map(|hit| (hit.id.clone(), hit.score.to_bits(), hit.version.clone()))
+					.collect::<Vec<_>>()
+			};
+			request.limit = 100;
+			let ordinary = engine.search(&snapshot, &request).unwrap();
+			assert_eq!(ordinary.total, expected.len() as u64);
+			assert_eq!(identities(&ordinary.hits), identities(&expected[..100]));
+			let boundary_tie_limit = (1..=100)
+				.find(|&limit| expected[limit - 1].score.to_bits() == expected[limit].score.to_bits())
+				.unwrap();
+			request.limit = boundary_tie_limit;
+			let boundary_tie_page = engine.search(&snapshot, &request).unwrap();
+			assert_eq!(boundary_tie_page.total, expected.len() as u64);
+			assert_eq!(
+				identities(&boundary_tie_page.hits),
+				identities(&expected[..boundary_tie_limit])
+			);
 			request.traversal = true;
 			request.limit = 17;
 			let mut actual = Vec::new();
@@ -4302,6 +4332,7 @@ mod tests {
 				actual.extend(page.hits);
 			}
 			assert_eq!(actual, expected);
+			assert_eq!(identities(&actual[..100]), identities(&ordinary.hits));
 			assert!(engine.search(&snapshot, &request).unwrap().hits.is_empty());
 		}
 		writer.close().unwrap();
@@ -4528,6 +4559,109 @@ mod tests {
 		assert!(prefix.automaton.get().is_none());
 		assert!(prefix.matches("sjoestring").unwrap());
 		assert!(prefix.automaton.get().is_some());
+	}
+
+	#[test]
+	fn fuzzy_trace_matchers_skip_zero_distance_and_share_identical_terms() {
+		let field = Field::from_field_id(0);
+		for prefix in [false, true] {
+			let matcher = FuzzyMatcher::new(
+				"shoe",
+				field,
+				QueryOptions {
+					fuzzy_distance: 0,
+					fuzzy_transpositions: false,
+				},
+				prefix,
+			);
+			assert!(matcher.matches("shoe").unwrap());
+			assert_eq!(matcher.matches("shoetail").unwrap(), prefix);
+			assert!(!matcher.matches("shxe").unwrap());
+			assert!(matcher.automaton.get().is_none());
+		}
+		let options = QueryOptions {
+			fuzzy_distance: 2,
+			fuzzy_transpositions: true,
+		};
+		let term = FuzzyTraceTerm::new("shoe".to_owned(), "shoe".to_owned(), field, options);
+		let native = term.matchers.as_ref().unwrap();
+		assert!(native.surface.is_none());
+		assert!(std::ptr::eq(native.surface_matcher(), &native.analyzed));
+		assert!(native.analyzed.automaton.get().is_none());
+		assert!(term.matches(Some(&vec!["shxe"]), "unmatched").unwrap());
+		let prepared = native.analyzed.automaton.get().unwrap();
+		assert!(term.matches(None, "shye").unwrap());
+		assert!(std::ptr::eq(
+			prepared,
+			native.surface_matcher().automaton.get().unwrap()
+		));
+		let distinct = FuzzyTraceTerm::new("shoe".to_owned(), "shoes".to_owned(), field, options);
+		assert!(distinct.matchers.as_ref().unwrap().surface.is_some());
+		let default = FuzzyTraceTerm::new("shoe".to_owned(), "shoes".to_owned(), field, QueryOptions::default());
+		assert!(default.matchers.is_none());
+	}
+
+	#[test]
+	fn fuzzy_matcher_policies_agree_with_native_dictionary() {
+		let candidates = [
+			"shoe", "shoes", "shxe", "sxye", "sohe", "shoetail", "shxetail", "café", "cafe", "cxfé", "cxfxtail",
+			"zzzz", "",
+		];
+		let mut schema = Schema::builder();
+		let field = schema.add_text_field(
+			"term",
+			TextOptions::default().set_indexing_options(
+				TextFieldIndexing::default()
+					.set_tokenizer("raw")
+					.set_index_option(IndexRecordOption::Basic),
+			),
+		);
+		let index = Index::create_in_ram(schema.build());
+		let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+		for candidate in candidates {
+			let mut document = TantivyDocument::default();
+			document.add_text(field, candidate);
+			writer.add_document(document).unwrap();
+		}
+		writer.commit().unwrap();
+		let searcher = index.reader().unwrap().searcher();
+		for text in ["shoe", "café"] {
+			for prefix in [false, true] {
+				for distance in 0..=2 {
+					for transpositions in [false, true] {
+						let options = QueryOptions {
+							fuzzy_distance: distance,
+							fuzzy_transpositions: transpositions,
+						};
+						let matcher = FuzzyMatcher::new(text, field, options, prefix);
+						let term = Term::from_field_text(field, text);
+						let native = if prefix {
+							FuzzyTermQuery::new_prefix(term, distance, transpositions)
+						} else {
+							FuzzyTermQuery::new(term, distance, transpositions)
+						};
+						let mut expected = HashSet::new();
+						for segment in searcher.segment_readers() {
+							let inverted = segment.inverted_index(field).unwrap();
+							let mut stream = inverted
+								.terms()
+								.search(native.automaton().unwrap())
+								.into_stream()
+								.unwrap();
+							while stream.advance() {
+								expected.insert(String::from_utf8(stream.key().to_vec()).unwrap());
+							}
+						}
+						for candidate in candidates {
+							assert_eq!(matcher.matches(candidate).unwrap(), expected.contains(candidate), "{text:?} {candidate:?} prefix={prefix} distance={distance} transpositions={transpositions}");
+						}
+						if distance == 0 {
+							assert!(matcher.automaton.get().is_none());
+						}
+					}
+				}
+			}
+		}
 	}
 
 	#[test]

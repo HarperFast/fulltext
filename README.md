@@ -486,7 +486,7 @@ response and deadline limits remain in force. Invalid settings/term or clause ov
 Higher-policy handles retain ordinary admission for conservatively small ASCII requests. Larger or
 non-ASCII requests use the expensive lane; this can change latency and admission even when the
 analyzed query is small. Fixed whole-request construction guards also bound phrase positions and
-fuzzy automata. See [query capacity safeguards](docs/limits.md#query-capacity-policy) and qualify the
+weighted fuzzy construction work. See [query capacity safeguards](docs/limits.md#query-capacity-policy) and qualify the
 chosen policy on the consuming application's workload before rollout.
 
 ## Analyzer and field configuration
@@ -573,8 +573,9 @@ const traced = await index.traceMatches(
 Tracing evaluates only the supplied current values; it does not expand the live index dictionary.
 Fuzzy tracing retains its analyzed and current-source surface branches; indexed full-fuzzy membership
 uses analyzed terms. A source-surface highlight therefore need not imply indexed membership.
-Nondefault fuzzy policies use native automata; distance 1 with transpositions retains its existing
-full-fuzzy trace path.
+Nondefault fuzzy policies use native automata, except distance zero uses equality/prefix checks
+without a DFA. Identical analyzed/surface query terms share a matcher. Distance 1 with
+transpositions retains its existing full-fuzzy trace path.
 
 Fuzzy automaton construction is synchronous between deadline checks; an individual operation
 can overrun the cooperative budget.
