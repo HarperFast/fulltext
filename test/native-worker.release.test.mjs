@@ -17,8 +17,10 @@ if (process.platform === 'win32') {
 }
 
 for (const [scenario, name] of scenarios) {
-	test(name, async () => {
+	test(name, async (context) => {
 		const result = await runScenario(scenario);
+		if (process.platform === 'win32' || process.env.FULLTEXT_TEST_WRITER_DIAGNOSTICS === '1')
+			context.diagnostic(result.stderr);
 		assert.strictEqual(result.timedOut, false, `${scenario} scenario timed out\n${result.stderr}${result.stdout}`);
 		assert.strictEqual(result.code, 0, `${scenario} scenario exited ${result.code}\n${result.stderr}${result.stdout}`);
 	});
@@ -30,6 +32,7 @@ function runScenario(scenario) {
 		const timeoutMilliseconds = scenario === 'apply-stress' ? 240_000 : scenario === 'sequence' ? 270_000 : 60_000;
 		const child = spawn(process.execPath, [scenarioPath, scenario], {
 			stdio: ['ignore', 'pipe', 'pipe'],
+			env: { ...process.env, ...(process.platform === 'win32' ? { FULLTEXT_TEST_WRITER_DIAGNOSTICS: '1' } : {}) },
 		});
 		const timeout = setTimeout(() => {
 			timedOut = true;

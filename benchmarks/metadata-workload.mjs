@@ -1,6 +1,7 @@
 import assert from 'node:assert';
 import { prepareOracle, validate } from './metadata-oracle.mjs';
 import { closeIndex } from './metadata-cleanup.mjs';
+import { startWriterDiagnostics, writerStatusSnapshot } from './writer-diagnostics.mjs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -64,7 +65,9 @@ console.error(
 	}),
 );
 const progressStarted = performance.now();
-const progress = (stage) =>
+let writerDiagnostics;
+const progress = (stage) => {
+	writerDiagnostics?.stage(stage);
 	console.error(
 		JSON.stringify({
 			benchmark: 'metadata-workload',
@@ -73,6 +76,7 @@ const progress = (stage) =>
 			elapsedMilliseconds: performance.now() - progressStarted,
 		}),
 	);
+};
 progress('addon-import');
 const modulePath = argument('--module', fileURLToPath(new URL('../dist/native.js', import.meta.url)));
 const { openNativeFullTextIndex, runtimeInfo } = await import(pathToFileURL(path.resolve(modulePath)).href);
@@ -156,6 +160,10 @@ const measurements = [];
 const pressureResults = [];
 let completedReport;
 let workloadError;
+writerDiagnostics = startWriterDiagnostics('metadata-workload', () => ({
+	catalog: writerStatusSnapshot(index?.status()),
+	pressure: writerStatusSnapshot(pressure?.status()),
+}));
 try {
 	progress('catalog-open');
 	index = await openNativeFullTextIndex(options(path.join(directory, 'catalog')));
@@ -373,6 +381,7 @@ try {
 	workloadError = error;
 	throw error;
 } finally {
+	writerDiagnostics.detachStatus();
 	const closeErrors = [];
 	for (const [target, stage] of [
 		[pressure, 'long-keys-close'],
@@ -386,6 +395,7 @@ try {
 			closeErrors.push(error);
 		}
 	}
+	writerDiagnostics.stop();
 	if (closeErrors.length)
 		throw new AggregateError(closeErrors, `native cleanup failed; index retained at ${directory}`, {
 			cause: workloadError,

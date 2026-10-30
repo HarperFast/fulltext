@@ -31,6 +31,29 @@ const STATE_CLOSING: u8 = 1;
 const STATE_CLOSED: u8 = 2;
 const STATE_POISONED: u8 = 3;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "test-panic")]
+static WRITER_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+
+#[cfg(feature = "test-panic")]
+fn writer_diagnostic(handle: u32, operation: &'static str, stage: &'static str, elapsed: Duration) {
+	if WRITER_DIAGNOSTICS.get().copied() != Some(true) {
+		return;
+	}
+	let timestamp = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis();
+	let record = format!(
+		"fulltext-writer-diagnostic {{\"pid\":{},\"timestamp\":{},\"handle\":{},\"operation\":\"{}\",\"stage\":\"{}\",\"durationNanoseconds\":{}}}\n",
+		std::process::id(), timestamp, handle, operation, stage, elapsed.as_nanos()
+	);
+	write_writer_diagnostic(&mut std::io::stderr().lock(), record.as_bytes());
+}
+
+#[cfg(feature = "test-panic")]
+fn write_writer_diagnostic(output: &mut impl std::io::Write, record: &[u8]) {
+	let _ = output.write_all(record);
+}
 const RELOAD_ALIGNMENT_ATTEMPTS: u8 = 3;
 const RELOAD_FAILED_CODE: &str = "E_RELOAD_FAILED";
 
@@ -299,6 +322,9 @@ fn native_open_mode(
 	callback: CompletionCallback<'_>,
 	read_only: bool,
 ) -> boundary::Result<()> {
+	#[cfg(feature = "test-panic")]
+	WRITER_DIAGNOSTICS
+		.get_or_init(|| std::env::var_os("FULLTEXT_TEST_WRITER_DIAGNOSTICS").is_some_and(|value| value == "1"));
 	boundary::run_stateless(|| {
 		let environment = environment_state(&env)?;
 		let opening_done = Arc::new(CompletionSignal::new());
@@ -1732,6 +1758,16 @@ fn writer_loop_inner(
 			.writer_queue_nanoseconds
 			.fetch_add(duration_ns(queued.enqueued.elapsed()), Ordering::Relaxed);
 		let WriterCommand { operation, completion } = queued.value;
+		#[cfg(feature = "test-panic")]
+		let diagnostic_operation = match &operation {
+			WriterOperation::Apply(_) => "apply",
+			WriterOperation::Commit => "commit",
+			WriterOperation::Publish(_) => "publish",
+			WriterOperation::Reload => "reload",
+			WriterOperation::Close { .. } => "close",
+		};
+		#[cfg(feature = "test-panic")]
+		writer_diagnostic(runtime.handle, diagnostic_operation, "writer-start", Duration::ZERO);
 		let started = Instant::now();
 		let outcome = catch_unwind(AssertUnwindSafe(|| match operation {
 			WriterOperation::Apply(bytes) => {
@@ -1815,6 +1851,8 @@ fn writer_loop_inner(
 		runtime
 			.writer_execution_nanoseconds
 			.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+		#[cfg(feature = "test-panic")]
+		let diagnostic_elapsed = started.elapsed();
 		match outcome {
 			Ok(WriterOutcome::Continue(result)) => settle(completion, result),
 			Ok(WriterOutcome::Stop(outcome)) => {
@@ -1831,6 +1869,8 @@ fn writer_loop_inner(
 						)));
 					}
 				}
+				#[cfg(feature = "test-panic")]
+				writer_diagnostic(runtime.handle, diagnostic_operation, "writer-end", diagnostic_elapsed);
 				return;
 			}
 			Ok(WriterOutcome::Poison(result, poison)) => {
@@ -1862,9 +1902,13 @@ fn writer_loop_inner(
 						)));
 					}
 				}
+				#[cfg(feature = "test-panic")]
+				writer_diagnostic(runtime.handle, diagnostic_operation, "writer-end", diagnostic_elapsed);
 				return;
 			}
 		}
+		#[cfg(feature = "test-panic")]
+		writer_diagnostic(runtime.handle, diagnostic_operation, "writer-end", diagnostic_elapsed);
 	}
 	let cleanup_runtime = runtime.clone();
 	if catch_unwind(AssertUnwindSafe(move || {
@@ -1903,7 +1947,13 @@ pub(crate) fn finish_writer_close(writer: &mut Option<Writer>, read_only: bool) 
 }
 
 fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>) -> WriterCloseOutcome {
+	#[cfg(feature = "test-panic")]
+	writer_diagnostic(_runtime.handle, "close", "close-start", Duration::ZERO);
+	#[cfg(feature = "test-panic")]
+	let started = Instant::now();
 	let outcome = finish_writer_close(writer, _runtime.read_only);
+	#[cfg(feature = "test-panic")]
+	writer_diagnostic(_runtime.handle, "close", "close-end", started.elapsed());
 	#[cfg(feature = "test-panic")]
 	let outcome = {
 		let mut outcome = outcome;
@@ -1965,6 +2015,17 @@ fn finish_runtime(
 			&runtime.environment,
 		);
 	}
+	#[cfg(feature = "test-panic")]
+	writer_diagnostic(
+		runtime.handle,
+		"close",
+		if outcome.quiesced {
+			"runtime-released"
+		} else {
+			"runtime-unproven"
+		},
+		Duration::ZERO,
+	);
 	outcome
 }
 
@@ -2951,7 +3012,25 @@ impl EnvironmentState {
 impl CleanupWait {
 	fn wait(&self, timeout: Duration) -> bool {
 		match self {
-			Self::Runtime(runtime) => runtime.wait_closed(timeout),
+			Self::Runtime(runtime) => {
+				#[cfg(feature = "test-panic")]
+				let started = Instant::now();
+				#[cfg(feature = "test-panic")]
+				writer_diagnostic(runtime.handle, "cleanup", "cleanup-wait-start", Duration::ZERO);
+				let finished = runtime.wait_closed(timeout);
+				#[cfg(feature = "test-panic")]
+				writer_diagnostic(
+					runtime.handle,
+					"cleanup",
+					if finished {
+						"cleanup-wait-end"
+					} else {
+						"cleanup-wait-timeout"
+					},
+					started.elapsed(),
+				);
+				finished
+			}
 			Self::Opening(signal) => signal.wait(timeout),
 		}
 	}
@@ -3198,6 +3277,21 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(feature = "test-panic")]
+	#[test]
+	fn writer_diagnostics_ignore_failed_writes() {
+		struct Failed;
+		impl std::io::Write for Failed {
+			fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+				Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+			}
+			fn flush(&mut self) -> std::io::Result<()> {
+				Ok(())
+			}
+		}
+		super::write_writer_diagnostic(&mut Failed, b"diagnostic\n");
+	}
 
 	#[test]
 	fn quiescence_errors_preserve_classification_without_duplicate_prefix() {
