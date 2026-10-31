@@ -264,7 +264,7 @@ above that. Fuzzy traces compare at most 16 eligible alternatives. Branch-local 
 makes completion checks constant-time. Boundary and construction regressions live in `query-capacity.test.mjs` and the
 engine tests.
 
-Raised-policy admission compares maximum per-leaf term cost and summed compiled-clause cost against the default envelope. Boolean child counts and NOT’s two synthetic clauses are included, matching native query construction; term counts across independent leaves are not added. Protocol boundary tests and the two-handle optimized admission test enforce this distinction.
+Raised-policy admission compares maximum per-leaf term cost and summed compiled-clause cost against the default envelope. Each Boolean child costs one structural clause, NOT costs two, boost costs one, and optional scoring costs one per required or optional child, matching native query construction; term counts across independent leaves are not added. Protocol boundary tests and the two-handle optimized admission test enforce this distinction.
 
 Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
 non-ASCII input conservatively uses the expensive lane because normalization can expand text.
@@ -278,7 +278,10 @@ an ambiguous optional value.
 
 ## Query scoring
 
-Boost and Optional preserve child/required membership through native BoostQuery and Must/Should lowering.
-Every query walker charges Boost1 and Optional1+n before descending; optional-only anchors cannot make a complement-driven required branch cheap.
-Scoring admission is inherited from all children; boosted ANY routing looks through boosts to retain stable collection.
-Negative-zero boosts reject before execution. The direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts under ABI14/queryAPI8. Persisted identity is unchanged.
+Boost preserves its child's membership; Optional requires its required branch and adds scores from matching optional branches through native Must/Should composition. Every walker charges one structural clause per boost and one per required or optional child before descending. Optional-only anchors cannot make a complement-driven required branch cheap. Admission inherits expensive work from all children.
+
+A boost directly over an Any/All leaf multiplies the selected field weights before constructing term queries. This keeps bare term scorers visible to Tantivy's native pruning paths. The reference-score tests check exact float32 bits against BoostQuery: BoostWeight's scorer multiplies the outer boost into the leaf's existing boost, matching this lowering. Boosted multi-clause Any expressions retain stable collection for search/paging score parity.
+
+Other modes and composite subtrees remain wrapped in native BoostQuery. At the root, that wrapper uses Tantivy's generic pruning iterator rather than the specialized Boolean block-WAND paths; optional required-All composition also incurs scoring work beyond the required-only intersection. The paired optimized workload in benchmarks/query-scoring.mjs measures these accepted costs. Recheck topology, score bits and these comparisons when upgrading Tantivy; the measurements do not establish a catalog-scale latency guarantee.
+
+Negative-zero boosts reject before execution. Direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts with native ABI 14 and query API 8. Persisted identity is unchanged.

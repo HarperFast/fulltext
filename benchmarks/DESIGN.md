@@ -65,3 +65,25 @@ compare unchanged-default controls before attributing a regression to the new op
 ## Writer stall evidence
 
 The opt-in writer-diagnostics helper emits five-second process CPU/RSS and existing native status snapshots. It uses an unref timer, contains sampling/output errors, serializes counters as decimal strings and detaches native status before close while continuing process CPU/RSS sampling until close settles. Native test-addon events use a separate prefix so progress JSON parsers ignore them. Diagnostic overhead and separate wall-clock samples are observations; neither changes workload acceptance or establishes native CPU attribution.
+
+## Query relevance scoring
+
+`npm run benchmark:query-scoring` builds production artifacts and runs the local addon. Direct driver invocation assumes an already-built optimized addon. The workload indexes 10,000 documents across four commits, with 7,500 Any/OR matches and 5,000 All/AND matches. A subset of required matches also contains the optional term, and optional-only records must stay excluded. Before timing, paired full-result checks verify membership, exact totals, doubled boost scores and positive optional bonuses.
+
+Twenty warm sequential searches per row use limit 20, with exact totals disabled and enabled separately. The paired root-boost OR/AND rows measure composite wrapping; optional with required All measures native Must/Should composition against its required-only baseline. These costs remain accepted rather than introducing custom scorer or composite boost distribution semantics.
+
+A same-process optimized run on 2026-10-31, macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 produced these local p50 milliseconds:
+
+| Query                      | Exact totals off | Exact totals on |
+| -------------------------- | ---------------: | --------------: |
+| Any baseline               |            0.133 |           0.112 |
+| Boosted Any                |            0.108 |           0.111 |
+| Optional with required Any |            0.250 |           0.238 |
+| OR baseline                |            0.123 |           0.120 |
+| Root boost over OR         |            0.178 |           0.169 |
+| AND baseline               |            0.118 |           0.120 |
+| Root boost over AND        |            0.158 |           0.154 |
+| All baseline               |            0.124 |           0.108 |
+| Optional with required All |            0.217 |           0.204 |
+
+The composite root boost and required-All optional paths cost more in this corpus. Direct Any lowering does not imply zero overhead for other query shapes. This small warm fixture contains repeated terms and ties; timings include the JavaScript/native boundary and are not a throughput or catalog-scale qualification. Re-run paired rows on representative customer distributions before drawing broader performance conclusions.

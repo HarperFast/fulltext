@@ -444,8 +444,8 @@ separately. Apply one policy consistently across workers; reopen to change it wi
 Terms are counted after analysis per text leaf: ordinary ANY/ALL deduplicates analyzed terms;
 phrase/prefix position analysis retains positions as before. Compiled text-clause accounting
 includes selected fields, fuzzy branches, prefix expansion and Boolean overhead. Before allocating
-text-tree children, the facade and native scanner charge each AND/OR child once and each NOT twice
-against that handle's clause budget. This structural lower bound also counts empty and stopword-only
+text-tree children, the facade and native scanner charge one clause per AND/OR child, two per NOT,
+one per boost, and one per required or optional child of optional scoring against that handle's clause budget. This structural lower bound also counts empty and stopword-only
 branches; native analysis determines the final compiled cost. A 300-branch, single-term, single-field
 OR needs 600 clauses. The decoder independently enforces the supported 4,096-clause ceiling, and
 direct Rust searches validate structure before compilation. Requested field counts cannot exceed

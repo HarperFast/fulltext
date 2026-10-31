@@ -6,20 +6,31 @@ import { performance } from 'node:perf_hooks';
 import { openNativeFullTextIndex, runtimeInfo } from '../dist/native.js';
 import { closeIndex } from './metadata-cleanup.mjs';
 
-// Run against an optimized local addon: node scripts/run-local.mjs benchmarks/query-scoring.mjs.
 const root = await mkdtemp(path.join(tmpdir(), 'fulltext-query-scoring-'));
 const documents = 10_000;
 const rounds = 20;
 const required = { text: 'amber stone', mode: 'any', fields: ['title'] };
-const queries = {
-	baseline: required,
-	boost: { operator: 'boost', boost: 2, clause: required },
-	optional: {
-		operator: 'optional',
-		required,
-		optional: [{ operator: 'boost', boost: 3, clause: { text: 'quartz', fields: ['title'] } }],
-	},
-};
+const all = { ...required, mode: 'all' };
+const term = (text) => ({ text, fields: ['title'] });
+const boosted = (clause) => ({ operator: 'boost', boost: 2, clause });
+const rewarded = (required) => ({
+	operator: 'optional',
+	required,
+	optional: [{ operator: 'boost', boost: 3, clause: term('quartz') }],
+});
+const or = { operator: 'or', clauses: [term('amber'), term('stone')] };
+const and = { operator: 'and', clauses: [term('amber'), term('stone')] };
+const queries = [
+	{ name: 'any/baseline', query: required, baseline: 'any/baseline' },
+	{ name: 'any/boost', query: boosted(required), baseline: 'any/baseline', scale: 2 },
+	{ name: 'any/optional', query: rewarded(required), baseline: 'any/baseline', bonus: true },
+	{ name: 'or/baseline', query: or, baseline: 'or/baseline' },
+	{ name: 'or/root-boost', query: boosted(or), baseline: 'or/baseline', scale: 2 },
+	{ name: 'and/baseline', query: and, baseline: 'and/baseline' },
+	{ name: 'and/root-boost', query: boosted(and), baseline: 'and/baseline', scale: 2 },
+	{ name: 'all/baseline', query: all, baseline: 'all/baseline' },
+	{ name: 'all/optional', query: rewarded(all), baseline: 'all/baseline', bonus: true },
+];
 let index;
 try {
 	index = await openNativeFullTextIndex({
@@ -44,7 +55,16 @@ try {
 				const i = start + offset;
 				return {
 					id: String(i).padStart(5, '0'),
-					fields: { title: i % 4 === 0 ? 'quartz pebble' : i % 4 === 1 ? 'amber quartz' : 'amber stone' },
+					fields: {
+						title:
+							i % 4 === 0
+								? 'quartz pebble'
+								: i % 4 === 1
+									? 'amber quartz'
+									: i % 4 === 2
+										? 'amber stone quartz'
+										: 'amber stone',
+					},
 				};
 			}),
 		});
@@ -52,23 +72,30 @@ try {
 	}
 	await index.commit();
 	await index.reload();
-	const baseline = await index.search({ query: required, exactTotal: true, limit: documents });
-	const expectedIds = baseline.hits.map(({ id }) => id).sort();
-	assert.strictEqual(baseline.total, documents * 0.75);
-	const baselineScores = new Map(baseline.hits.map(({ id, score }) => [id, score]));
-	for (const [name, query] of Object.entries(queries)) {
+	const results = new Map();
+	for (const { name, query, baseline, scale, bonus } of queries) {
 		const result = await index.search({ query, exactTotal: true, limit: documents });
-		assert.strictEqual(result.total, baseline.total);
-		assert.deepStrictEqual(result.hits.map(({ id }) => id).sort(), expectedIds);
+		results.set(name, result);
+		const expected = results.get(baseline);
+		assert.strictEqual(
+			result.total,
+			name.startsWith('and/') || name.startsWith('all/') ? documents / 2 : documents * 0.75,
+		);
+		assert.deepStrictEqual(result.hits.map(({ id }) => id).sort(), expected.hits.map(({ id }) => id).sort());
+		const scores = new Map(expected.hits.map(({ id, score }) => [id, score]));
+		let improved = 0;
 		for (const hit of result.hits) {
-			if (name === 'boost') assert.strictEqual(hit.score, baselineScores.get(hit.id) * 2);
-			if (name === 'optional') assert(hit.score >= baselineScores.get(hit.id));
+			if (scale) assert.strictEqual(hit.score, scores.get(hit.id) * scale);
+			if (bonus) {
+				assert(hit.score >= scores.get(hit.id));
+				if (hit.score > scores.get(hit.id)) improved++;
+			}
 		}
-		if (name === 'optional') assert.strictEqual(Number(result.hits[0].id) % 4, 1);
+		if (bonus) assert(improved > 0);
 	}
 	const rows = [];
 	for (const exactTotal of [false, true]) {
-		for (const [name, query] of Object.entries(queries)) {
+		for (const { name, query, baseline } of queries) {
 			const request = { query, exactTotal, limit: 20 };
 			await index.search(request);
 			const times = [];
@@ -77,7 +104,7 @@ try {
 				const result = await index.search(request);
 				times.push(performance.now() - start);
 				assert.strictEqual(result.hits.length, 20);
-				if (exactTotal) assert.strictEqual(result.total, baseline.total);
+				if (exactTotal) assert.strictEqual(result.total, results.get(baseline).total);
 			}
 			times.sort((a, b) => a - b);
 			rows.push({
@@ -97,7 +124,9 @@ try {
 				architecture: process.arch,
 				runtime: await runtimeInfo(),
 				documents,
-				requiredMatches: baseline.total,
+				requiredMatches: Object.fromEntries(
+					queries.filter(({ name, baseline }) => name === baseline).map(({ name }) => [name, results.get(name).total]),
+				),
 				rows,
 			},
 			null,
