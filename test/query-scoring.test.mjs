@@ -107,6 +107,45 @@ test('optional scoring preserves required eligibility and totals across segments
 	assert(ranked.hits.find(({ id }) => id === 'bonus').score > ranked.hits.find(({ id }) => id === 'required').score);
 });
 
+test('adds both optional contributions to an independently scored required match', async (context) => {
+	const { index } = await fixture(context, [
+		{ id: 'both', fields: { title: 'anchor', body: 'ruby sapphire' } },
+		{ id: 'first', fields: { title: 'anchor', body: 'ruby' } },
+		{ id: 'second', fields: { title: 'anchor', body: 'sapphire' } },
+		{ id: 'neither', fields: { title: 'anchor', body: 'plain' } },
+		{ id: 'optional-only', fields: { title: 'outside', body: 'ruby sapphire' } },
+	]);
+	const required = leaf('anchor');
+	const first = leaf('ruby', ['body']);
+	const second = leaf('sapphire', ['body']);
+	const scores = async (query) =>
+		new Map((await index.search({ query, exactTotal: true })).hits.map(({ id, score }) => [id, score]));
+	const requiredScores = await scores(required);
+	const firstScores = await scores(first);
+	const secondScores = await scores(second);
+	const actual = await index.search({
+		query: optional(boost(required, 0.5), boost(first, 2), boost(second, 3.5)),
+		exactTotal: true,
+	});
+	assert.deepStrictEqual(ids(actual), ['both', 'first', 'neither', 'second']);
+	assert.strictEqual(actual.total, 4);
+	for (const hit of actual.hits) {
+		const contributions = [
+			Math.fround(requiredScores.get(hit.id) * 0.5),
+			Math.fround((firstScores.get(hit.id) ?? 0) * 2),
+			Math.fround((secondScores.get(hit.id) ?? 0) * 3.5),
+		];
+		const expected = contributions.reduce((sum, score) => sum + score, 0);
+		const tolerance = Math.max(1e-6, Math.abs(expected) * 1e-6);
+		assert(Math.abs(hit.score - expected) <= tolerance, `additive score for ${hit.id}`);
+		if (hit.id === 'both') {
+			assert(hit.score > Math.max(...contributions) + tolerance, 'sum must exceed max-only scoring');
+			for (const contribution of contributions)
+				assert(contribution > tolerance, 'dropping any contribution must exceed the tolerance');
+		}
+	}
+});
+
 test('boosts scale scores, preserve zero-score membership and compose without a cumulative cap', async (context) => {
 	const { index } = await fixture(context, records);
 	const query = leaf('amber');
