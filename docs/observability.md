@@ -35,7 +35,7 @@ than calculate a negative rate.
 
 `native.queues` reports writer, ordinary-search and expensive-search occupancy, admitted bytes,
 oldest age, capacity and whether capacity is shared. Queue `bytes` is current occupancy; operation `requestBytes` is cumulative admitted payload. A process-wide permit pool is not a separate
-handle-owned capacity. An empty/unavailable queue has no oldest age. There is no active native
+handle-owned capacity. Legacy `status().metrics.searchQueueNanoseconds` keeps its existing dequeue-only span; telemetry queue timing also includes subsequent permit wait. Do not add the two observations together. An empty/unavailable queue has no oldest age. There is no active native
 cancellation API: deadline timeouts are errors, not cancellation counts.
 
 `native.phases` reports commit, reader-reload and teardown success/failure counts and timing
@@ -48,7 +48,7 @@ an index, searcher, mapping or execution permit, so keeping it cannot keep an in
 
 Operation counters and timing totals are always collected. Histograms start disabled. Enable them
 with `configureTelemetry({ histograms: true })`; omitted settings retain their prior values.
-Disabling freezes accumulated histogram data; re-enabling continues it. There is no reset API.
+Configure through the owning writer/reader facade; directly configuring internal native handles or constructing duplicate facade owners is unsupported. Disabling freezes accumulated histogram data; re-enabling continues it. There is no reset API.
 Histogram `count` and `sumNanoseconds` describe only enabled samples, independently of always-on
 timing totals. Buckets are **noncumulative**; each `upperBoundsNanoseconds` entry is an inclusive
 upper bound, with `null` for infinity. Convert to cumulative buckets when required by an exporter.

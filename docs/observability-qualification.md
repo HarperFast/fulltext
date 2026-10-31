@@ -95,3 +95,16 @@ That revised polling profile was **not measured by this initial run**. A longer 
 with 40,000 queries per process is planned after the final runtime gates; no results from that
 planned run are claimed here. See [the protocol](observability.md#qualifying-overhead) for module
 selection, raw reporting and scope.
+
+## Refined native recorder microbenchmark
+
+At runtime commit [`8ebe625`](https://github.com/HarperFast/fulltext/commit/8ebe6257e97187980cc4741a0f4dcf4763e146ce), the optimized ignored Rust microbenchmark completed 100,000 operations per thread, including ticket ownership, admission, dispatch, queue/execution clocks and settlement. These are single local trials, not confidence intervals or end-to-end overhead percentages. Four threads share the same metrics, deliberately exercising counter contention.
+
+| Threads | Histograms | Operations | Elapsed milliseconds | Wall nanoseconds per operation |
+| ------- | ---------- | ---------- | -------------------- | ------------------------------ |
+| 1       | off        | 100,000    | 9.325250             | 93.25                          |
+| 1       | on         | 100,000    | 9.634834             | 96.35                          |
+| 4       | off        | 400,000    | 74.081334            | 185.20                         |
+| 4       | on         | 400,000    | 102.700208           | 256.75                         |
+
+The refined recorder removes the redundant completed-counter update and constructor clock. It preserves independent admission attempts; completed totals derive from success plus failure. This microbenchmark does not establish the whole-wrapper 1%/3% targets.
