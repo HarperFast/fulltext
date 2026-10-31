@@ -1,5 +1,14 @@
 # Qualification measurement
 
+## Observability comparisons
+
+`observability.mjs` uses fresh child processes and separate baseline/candidate module paths, with
+alternating order inside each pair. It cannot silently swap an addon under an already loaded
+facade. Keep workload/correctness identical across profiles; baseline deliberately makes no
+telemetry API calls. Optional snapshot-byte cost and polling are separate profiles. Preserve raw
+pairs and mark noisy measurements inconclusive instead of treating a rounded median as proof of
+the 1%/3% throughput targets. Finite local CPU/RSS observations are not sustained-memory evidence.
+
 ## Mixed metadata soak
 
 `metadata-soak.mjs` gives each in-flight query a lease on a reader that is never reloaded. Its

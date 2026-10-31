@@ -337,7 +337,7 @@ it: its cached wire representation is crate-private.
 Exhaustive matches must handle `FilterExpression::Not(Box<FilterExpression>)` and
 `FilterComparator::{Exists, Missing}`. Presence clauses carry `values: Vec::new()`.
 `SearchResult` and the filter enums are source changes to the pre-1.0 Rust API; the JavaScript
-facade uses packed protocol 8, native ABI 13, and query API 7 with its matching addon.
+facade uses packed protocol 8, native ABI 14, and query API 7 with its matching addon.
 
 Direct Rust `SearchClause` literals also supply `options: QueryOptions::default()` or validated
 fuzzy controls. Shared semantic checks cover candidate count/bytes before deduplication,
