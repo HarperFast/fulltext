@@ -131,3 +131,28 @@ An optimized 2026-10-31 run after moving the stable-score fact into query constr
 These are total-request comparisons. The wrapper control adds an AST node, stable collection resolves ID ordinals, exact totals can add a separate native count, and tied TopDocs can rerun collection. Those differences prevent attributing the timing delta solely to pruning or ordinal lookup. The small single-term differences do not establish an optimization benefit; the two-term and wider-All rows expose costs on this corpus only. Historical tables above describe earlier fixtures/builds and are not a matched before/after speedup comparison.
 
 Correctness evidence is separate: the old installed addon fails the permanent 300-document, two-commit four-term All/AND/empty-body regressions with a distinct cutoff; the three-term control passes on that addon. The native canary independently compares raw TopDocs with scorer iteration at four terms. The new route passes both. Three-term routing is a conservative mitigation, not a demonstrated three-term failure or a claim of universal safety for smaller native queries. Ordinary stable collection checks deadlines after collection; these measurements do not establish strict latency bounds, customer-distribution throughput, or catalog-scale memory limits.
+
+### Additional compiler routing shapes
+
+Use `node scripts/run-local.mjs benchmarks/query-scoring.mjs --routing-shapes` and add `--varied-scores` for the corresponding varied run. This opt-in mode leaves the default 20 shapes and corpus unchanged. It reuses the 10,000-document, four 2,500-document commit boundaries, 20 warm samples and limit 20. Only this mode adds short `xy`/`zz` tokens correlated with amber/stone membership, copies title into a second body field, enables positions/surface terms, and uses 125-document mutation batches. Both runs observed four committed segments.
+
+Each family has an explicit expected total: OR, short-Fuzzy and one-token two-field Phrase match 7,500 documents; exact prefix and three-term two-field All match 5,000. The exact prefix has two completed terms and a singleton final `ruby` expansion. Complete correctness reads use 100-hit traversal pages because ordinary prefix search rejects limits above 100; timed ordinary requests remain at limit 20. Complete membership, totals and exact doubled baseline scores must agree with `boost(2, boost(1, query))` before timing. The native wrapper retains generic scoring. The varied mode requires distinct ranks 20/21 for all 20 rows; the tied mode deliberately retains boundary ties.
+
+On the same unchanged optimized artifact `ce875b5a1ee0bea5486c5f3195c29925e62301dded248023113e7b6f2e219bd8`, Node 24.16.0/macOS arm64, all 20 rows passed in each mode. P50 milliseconds:
+
+| Query                                       | Tied, exact off | Tied, exact on | Varied, exact off | Varied, exact on |
+| ------------------------------------------- | --------------: | -------------: | ----------------: | ---------------: |
+| OR baseline                                 |           0.102 |          0.099 |             0.137 |            0.130 |
+| OR native wrapped                           |           0.167 |          0.156 |             0.107 |            0.129 |
+| Exact singleton prefix baseline             |           0.111 |          0.106 |             0.142 |            0.142 |
+| Exact singleton prefix native wrapped       |           0.160 |          0.155 |             0.121 |            0.155 |
+| Two short Fuzzy terms baseline              |           0.099 |          0.099 |             0.129 |            0.127 |
+| Two short Fuzzy terms native wrapped        |           0.232 |          0.155 |             0.105 |            0.130 |
+| One-token Phrase, two fields baseline       |           0.103 |          0.101 |             0.131 |            0.131 |
+| One-token Phrase, two fields native wrapped |           0.240 |          0.161 |             0.108 |            0.139 |
+| Three-term All, two fields baseline         |           0.204 |          0.200 |             0.240 |            0.237 |
+| Three-term All, two fields native wrapped   |           0.372 |          0.348 |             0.221 |            0.327 |
+
+The default driver already measured its original OR pair on this artifact: tied baseline/root boost p50 was 0.110/0.160 ms with exact totals off and 0.105/0.165 ms on; varied was 0.138/0.104 ms off and 0.140/0.134 ms on. The routing-mode OR rows use the augmented corpus, so they are not matched before/after comparisons with those default rows.
+
+These samples measure total requests, including JavaScript/native calls, query construction, stable ID-ordinal resolution and possible separate exact counts. Wrapped controls add AST nodes and double scores; tied cutoffs can trigger a stable rerun. None of these pairs isolates pruning or compiler overhead, and timing differences change with totals and corpus. The added families make the small-workload costs visible; they establish no general speedup, strict deadline bound, catalog-scale throughput or memory qualification.

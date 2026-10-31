@@ -414,6 +414,8 @@ test('compiled term sums preserve small-window search and paging scores without 
 	const enabled = { field: 'enabled', comparator: 'equals', value: true };
 	for (const [name, weight, query, restrictions = {}] of [
 		['boosted All', 0.7, boost(all, 0.3)],
+		['two-term All fractional boost', 0.7, boost({ ...all, text: 'stone quartz' }, 0.3)],
+		['two-term All double boost', 0.7, boost({ ...all, text: 'stone quartz' }, 2)],
 		...[
 			['All', all],
 			['AND', and],
