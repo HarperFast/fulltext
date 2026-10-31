@@ -9,6 +9,8 @@ import { closeIndex } from './metadata-cleanup.mjs';
 const root = await mkdtemp(path.join(tmpdir(), 'fulltext-query-scoring-'));
 const documents = 10_000;
 const rounds = 20;
+const variedScores = process.argv.includes('--varied-scores');
+const corpus = variedScores ? 'varied-scores' : 'tied-scores';
 const required = { text: 'amber stone', mode: 'any', fields: ['title'] };
 const all = { ...required, mode: 'all' };
 const term = (text) => ({ text, fields: ['title'] });
@@ -31,6 +33,31 @@ const queries = [
 	{ name: 'all/baseline', query: all, baseline: 'all/baseline' },
 	{ name: 'all/optional', query: rewarded(all), baseline: 'all/baseline', bonus: true },
 ];
+function documentTitle(i) {
+	const words =
+		i % 4 === 0
+			? ['quartz', 'pebble']
+			: i % 4 === 1
+				? ['amber', 'quartz']
+				: i % 4 === 2
+					? ['amber', 'stone', 'quartz']
+					: ['amber', 'stone'];
+	if (!variedScores) return words.join(' ');
+	return (
+		words
+			.map((word, field) =>
+				Array(1 + ((i * (17 + field * 14)) % (23 + field * 6)))
+					.fill(word)
+					.join(' '),
+			)
+			.join(' ') +
+		' ' +
+		Array(1 + ((i * 37) % 173))
+			.fill('filler')
+			.join(' ')
+	);
+}
+
 let index;
 try {
 	index = await openNativeFullTextIndex({
@@ -56,14 +83,7 @@ try {
 				return {
 					id: String(i).padStart(5, '0'),
 					fields: {
-						title:
-							i % 4 === 0
-								? 'quartz pebble'
-								: i % 4 === 1
-									? 'amber quartz'
-									: i % 4 === 2
-										? 'amber stone quartz'
-										: 'amber stone',
+						title: documentTitle(i),
 					},
 				};
 			}),
@@ -96,6 +116,10 @@ try {
 	const rows = [];
 	for (const exactTotal of [false, true]) {
 		for (const { name, query, baseline } of queries) {
+			const boundary = results.get(baseline).hits;
+			const distinctBoundary = boundary[19].score !== boundary[20].score;
+			if (variedScores && (name.startsWith('or/') || name.startsWith('and/')))
+				assert(distinctBoundary, `${name}: varied corpus must avoid a stable-collector boundary-tie rerun`);
 			const request = { query, exactTotal, limit: 20 };
 			await index.search(request);
 			const times = [];
@@ -110,6 +134,7 @@ try {
 			rows.push({
 				name,
 				exactTotal,
+				distinctBoundary,
 				rounds,
 				p50Milliseconds: times[Math.floor(rounds / 2)],
 				p95Milliseconds: times[Math.floor(rounds * 0.95)],
@@ -124,6 +149,7 @@ try {
 				architecture: process.arch,
 				runtime: await runtimeInfo(),
 				documents,
+				corpus,
 				requiredMatches: Object.fromEntries(
 					queries.filter(({ name, baseline }) => name === baseline).map(({ name }) => [name, results.get(name).total]),
 				),

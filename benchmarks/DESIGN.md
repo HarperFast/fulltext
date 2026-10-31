@@ -86,4 +86,19 @@ A same-process optimized run on 2026-10-31, macOS arm64, Node 24.16.0, Tantivy 0
 | All baseline               |            0.124 |           0.108 |
 | Optional with required All |            0.217 |           0.204 |
 
-The composite root boost and required-All optional paths cost more in this corpus. Lowering a root boost directly over an Any leaf does not imply zero overhead for other query shapes. Recursive boosts retain native wrappers to preserve outer-first float32 multiplication. This small warm fixture contains repeated terms and ties; timings include the JavaScript/native boundary and are not a throughput or catalog-scale qualification. Qualification of pruning overhead specifically requires a varied-score corpus where the unboosted baseline retains its specialized pruning path without tie-driven stable reruns. Re-run paired rows on representative customer distributions before drawing broader performance conclusions.
+The composite root boost and required-All optional paths cost more in this corpus. Lowering a root boost directly over an Any leaf does not imply zero overhead for other query shapes. Recursive boosts retain native wrappers to preserve outer-first float32 multiplication. This small warm fixture contains repeated terms and ties; timings include the JavaScript/native boundary and are not a throughput or catalog-scale qualification. The varied-score mode below removes the boundary-tie rerun confound for its OR/AND pairs. Re-run paired rows on representative customer distributions before drawing broader performance conclusions.
+
+### Varied-score collector boundary
+
+Run `npm run benchmark:query-scoring -- --varied-scores` to keep the same membership distribution while varying term frequency and document length. The driver checks that ranks 20 and 21 have different scores for each OR/AND pair before timing. With these unfiltered Boolean queries, that check rules out the stable-collector boundary-tie rerun in `Engine::collect_search`. Output records the corpus and `distinctBoundary` for each row. This does not measure how many blocks Tantivy prunes.
+
+After the nested-boost multiplication-order fix, an optimized run on the same machine/runtime produced these p50 milliseconds (10,000 documents, 20 warm sequential samples, limit 20):
+
+| Query               | Exact totals off | Exact totals on |
+| ------------------- | ---------------: | --------------: |
+| OR baseline         |            0.132 |           0.158 |
+| Root boost over OR  |            0.108 |           0.133 |
+| AND baseline        |            0.072 |           0.094 |
+| Root boost over AND |            0.101 |           0.126 |
+
+All paired membership, total and boost-score checks passed, as did the four distinct-boundary assertions in both total modes. The OR cost difference changes sign relative to the tied corpus; neither sample establishes a general speedup or slowdown. Generic composite boosting remains an accepted native-library tradeoff. These small warm samples do not qualify throughput, memory at catalog scale, or other document/score distributions.
