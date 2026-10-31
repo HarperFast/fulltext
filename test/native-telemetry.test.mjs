@@ -314,21 +314,55 @@ test('committing alone does not advance the reader observation; reload installs 
 	assert.strictEqual(snapshot(index).native.phases.readerReload.count, 1n);
 });
 
-test('snapshot bytes are opt-in and measured after an explicit unchanged reload', async (context) => {
-	const { index } = await fixture(context);
+test('snapshot-byte freshness survives unchanged reloads and resets on a changed snapshot', async (context) => {
+	const { index, addon, handle } = await rawFixture(context);
 	await index.applyMutationBatch({ upserts: [{ id: 'a', fields: { text: 'hello' } }] });
 	await index.publish('one');
 	assert.strictEqual(snapshot(index).native.reader.snapshotBytes, null);
+	assert.strictEqual(snapshot(index).native.reader.snapshotBytesAgeNanoseconds, null);
 	index.configureTelemetry({ snapshotBytes: true });
 	assert.strictEqual(snapshot(index).native.reader.snapshotBytes, null);
+	assert.strictEqual(snapshot(index).native.reader.snapshotBytesAgeNanoseconds, null);
 	await index.reload();
-	await waitFor(() => snapshot(index).native.reader.snapshotBytes !== null);
+	await waitFor(() => {
+		const reader = snapshot(index).native.reader;
+		return !reader.snapshotBytesPending && reader.snapshotBytes !== null;
+	});
 	const measured = snapshot(index).native.reader;
 	assert(measured.snapshotBytes > 0n);
 	assert.strictEqual(measured.snapshotBytesError, null);
+	assert.strictEqual(typeof measured.snapshotBytesAgeNanoseconds, 'bigint');
+	assert(measured.snapshotBytesAgeNanoseconds >= 0n);
+
+	addon.__testFailNextTelemetryObservation(handle);
 	await index.reload();
 	await waitFor(() => !snapshot(index).native.reader.snapshotBytesPending);
-	assert.strictEqual(snapshot(index).native.reader.snapshotBytes, measured.snapshotBytes);
+	const unchanged = snapshot(index).native.reader;
+	assert.strictEqual(unchanged.snapshotBytes, measured.snapshotBytes);
+	assert.strictEqual(unchanged.snapshotBytesError, null);
+	assert(unchanged.snapshotBytesAgeNanoseconds >= measured.snapshotBytesAgeNanoseconds);
+	assert(unchanged.snapshotBytesAgeNanoseconds > unchanged.ageNanoseconds);
+
+	await index.applyMutationBatch({ upserts: [{ id: 'b', fields: { text: 'hello again' } }] });
+	await index.publish('two');
+	await waitFor(() => {
+		const reader = snapshot(index).native.reader;
+		return !reader.snapshotBytesPending && reader.snapshotBytesError === 'E_STORAGE';
+	});
+	const changed = snapshot(index).native.reader;
+	assert.strictEqual(changed.documents, 2n);
+	assert.strictEqual(typeof changed.ageNanoseconds, 'bigint');
+	assert.strictEqual(changed.snapshotBytes, null);
+	assert.strictEqual(changed.snapshotBytesAgeNanoseconds, null);
+
+	await index.reload();
+	await waitFor(() => {
+		const reader = snapshot(index).native.reader;
+		return !reader.snapshotBytesPending && reader.snapshotBytes !== null;
+	});
+	const recovered = snapshot(index).native.reader;
+	assert.strictEqual(recovered.snapshotBytesError, null);
+	assert.strictEqual(typeof recovered.snapshotBytesAgeNanoseconds, 'bigint');
 });
 
 test('snapshot-byte observer failure cannot change publication or search results', async (context) => {
