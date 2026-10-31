@@ -359,6 +359,8 @@ test('snapshot-byte freshness survives unchanged reloads and resets on a changed
 	const { index, addon, handle } = await rawFixture(context);
 	await index.applyMutationBatch({ upserts: [{ id: 'a', fields: { text: 'hello' } }] });
 	await index.publish('one');
+	// Publish resolves before its optional observation tail; an empty native frame drains the writer without reloading.
+	assert.strictEqual(await index.apply(encodeMutationBatch({ upserts: [] })), 0);
 	assert.strictEqual(snapshot(index).native.reader.snapshotBytes, null);
 	assert.strictEqual(snapshot(index).native.reader.snapshotBytesAgeNanoseconds, null);
 	index.configureTelemetry({ snapshotBytes: true });
