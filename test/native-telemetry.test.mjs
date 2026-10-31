@@ -224,6 +224,39 @@ test('closed telemetry tokens preserve final outcomes without blocking immediate
 	if (retired.state === 'reset') rmSync(retired.retiredPath, { recursive: true, force: true });
 });
 
+test('accessor-triggered close rejects search and trace before native handoff', async (context) => {
+	for (const operation of ['search', 'trace']) {
+		const { index } = await fixture(context);
+		let closing;
+		const beginClose = () => (closing ??= index.close());
+		const request =
+			operation === 'search'
+				? {
+						get text() {
+							beginClose();
+							return 'hello';
+						},
+					}
+				: {
+						text: 'hello',
+						get fields() {
+							beginClose();
+							return ['text'];
+						},
+					};
+		const query = operation === 'search' ? index.search(request) : index.traceMatches(request, []);
+		const [result, close] = await Promise.allSettled([query, closing ?? Promise.resolve()]);
+		assert(closing);
+		assert.strictEqual(result.status, 'rejected');
+		assert.strictEqual(result.reason.code, 'E_CLOSED');
+		assert.strictEqual(close.status, 'fulfilled');
+		assert.strictEqual(close.value.cleanupError, undefined);
+		const telemetry = snapshot(index);
+		assert.strictEqual(telemetry.preparationRejections[operation].errors.E_CLOSED, 1n);
+		assert.strictEqual(telemetry.native.operations[operation].attempted, 0n);
+	}
+});
+
 test('telemetry token rejects ordinary JavaScript objects', () => {
 	assert.throws(() => loadAddon().__nativeTelemetry({}));
 	assert.throws(() => loadAddon().__nativeConfigureTelemetry({}, true, false));

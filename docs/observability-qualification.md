@@ -122,6 +122,53 @@ The artifact remains private and unchanged. Across the classified and single-hit
 13,440,000 timed queries were correct; **the complete 1%/3%/5% overhead qualification remains
 unestablished**. These measurements do not establish production capacity or sustained memory.
 
+## Isolated optional observation costs
+
+This final optional-cost control measured [`b3f9be1`](https://github.com/HarperFast/fulltext/commit/b3f9be1178fb4c1e4120551f65d88203605fc2c2)
+against baseline `bb4fac1`: four callers, two indexes, 2,000 documents per index, seven alternating
+pairs per cell and 40,000 queries per child. All **four cells, 56 fresh children and 2,240,000 timed
+queries completed correctly**. Candidate native class counters and disabled-histogram flags were
+verified in every report. All 28 final reader snapshots in the byte profile had non-null bytes,
+no pending observation and no observation error.
+
+Polling scraped every **10 ms as a stress control, not a recommended export interval**, with
+histograms disabled to isolate off-plus-polling cost. Byte observations also ran with histograms
+disabled. Both profiles are `cost-observation-only` with null targets; the histogram off/on gates
+are neither applied nor relaxed. All values are median [full seven-pair range], in percentages
+except sampled RSS differences in MiB.
+
+| Search         | Profile | Throughput loss       | p99 increase           | Mixed process CPU change | Mutation/publication p50 change |
+| -------------- | ------- | --------------------- | ---------------------- | ------------------------ | ------------------------------- |
+| ordinary-cheap | polling | 9.03 [4.76, 19.87]    | 36.24 [19.65, 109.57]  | 11.38 [4.24, 14.00]      | -5.36 [-35.57, 70.81]           |
+| ordinary-cheap | bytes   | 2.25 [-21.99, 40.03]  | 9.53 [-38.34, 309.50]  | -0.06 [-5.83, 9.61]      | -23.48 [-51.06, 76.31]          |
+| expensive      | polling | 2.30 [-17.21, 25.16]  | 49.31 [-12.54, 139.47] | 3.71 [-2.82, 18.37]      | -21.89 [-38.07, 107.67]         |
+| expensive      | bytes   | -4.53 [-20.94, 20.25] | 1.28 [-23.73, 105.40]  | -4.88 [-9.33, 4.48]      | 32.82 [-29.67, 59.10]           |
+
+| Search         | Profile | Sampled peak process RSS difference (MiB) | Mixed elapsed change (%) |
+| -------------- | ------- | ----------------------------------------- | ------------------------ |
+| ordinary-cheap | polling | 3.36 [-3.17, 7.00]                        | -6.60 [-18.86, 58.04]    |
+| ordinary-cheap | bytes   | -2.63 [-11.13, 5.75]                      | -23.11 [-40.28, 55.69]   |
+| expensive      | polling | 1.78 [-3.03, 7.22]                        | -5.38 [-28.02, 63.36]    |
+| expensive      | bytes   | -1.30 [-5.17, 4.95]                       | 11.53 [-17.90, 41.68]    |
+
+The polling single-hit case observed 9.03% median throughput loss, 36.24% p99 increase and 11.38%
+CPU increase; this is measurable cost, not zero-overhead telemetry. The expensive polling case
+observed 49.31% median p99 increase with a range crossing zero. Publication and byte-cost results
+are noisy. CPU and elapsed include queries, oracle checks and 20 mutation/publication cycles;
+RSS has the same sampled process-wide limitations described above.
+
+Elapsed measurement ends before close and does not explicitly await the final byte-observer
+tail. The preceding 19 publication cycles can carry the prior observation's queue wait into the
+next mutation/publication cycle. Consequently, neither publication callback timing nor mixed
+elapsed is a full-drain byte-cost bound. Final successful snapshot values verify availability,
+not that the full observation tail was included in those timings.
+
+This closes the isolated polling-cost evidence gap only for the measured four-caller/two-index
+topology and query shapes. It does not establish a broad polling/byte-cost bound, production
+capacity or sustained memory. Raw report SHA-256:
+`f44a58c5c6efc616a3757e68268487aabaf1dd3edf7b1e7630863d4102f3c975`.
+The full raw reports remain private and unchanged.
+
 <details>
 <summary>Historical exact-total-only measurements and recorder microbenchmark</summary>
 

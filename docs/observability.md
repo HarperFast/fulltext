@@ -138,3 +138,7 @@ tuning is part of the protocol.
 See [recorded qualification results](observability-qualification.md) for classified fixture-specific
 comparisons and historical evidence. The current polling profile leaves histograms disabled to isolate
 scraping cost; the initial recorded matrix used histograms enabled while polling.
+The final-source optional control measures that isolated profile only at four callers/two indexes
+for single-hit ordinary and expensive-prefix searches. Its 10 ms stress interval has measurable
+cost and is not an export-interval recommendation. Byte-cost timings do not await the final
+post-settlement observer tail; successful final byte values are not a full-drain timing bound.
