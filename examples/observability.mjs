@@ -6,9 +6,10 @@ import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
 
 const root = await mkdtemp(path.join(tmpdir(), 'fulltext-observability-example-'));
 let index;
-let completed = false;
+let primaryError;
+let failed = false;
 let closeAttempted = false;
-let closeError;
+const cleanupErrors = [];
 
 function exportSnapshot(snapshot) {
 	return JSON.stringify(snapshot, (_key, value) => (typeof value === 'bigint' ? value.toString() : value));
@@ -41,27 +42,35 @@ try {
 	assert.strictEqual(snapshot.native.reader.documents, 1n);
 	console.log(exportSnapshot(snapshot));
 	closeAttempted = true;
-	try {
-		const closed = await index.close();
-		closeError = closed.cleanupError;
-	} catch (error) {
-		closeError = error;
-	}
-	if (closeError) throw closeError;
+	const closed = await index.close();
+	if (closed.cleanupError) throw closed.cleanupError;
 	const finalSnapshot = index.telemetry();
 	assert(finalSnapshot.available);
 	assert.strictEqual(finalSnapshot.native.state, 'closed');
 	console.log(exportSnapshot(finalSnapshot));
-	completed = true;
+} catch (error) {
+	failed = true;
+	primaryError = error;
 } finally {
 	if (!closeAttempted) {
 		try {
-			const result = await index?.close();
-			closeError = result?.cleanupError;
+			const result = await index?.close({ mode: 'rollback' });
+			if (result?.cleanupError) cleanupErrors.push(result.cleanupError);
 		} catch (error) {
-			closeError = error;
+			cleanupErrors.push(error);
 		}
 	}
-	if (!closeError) await rm(root, { recursive: true, force: true });
-	else if (completed) throw closeError;
+	if (!failed && cleanupErrors.length === 0) {
+		try {
+			await rm(root, { recursive: true, force: true });
+		} catch (error) {
+			cleanupErrors.push(error);
+		}
+	}
 }
+if (failed || cleanupErrors.length > 0) console.error(`Observability example retained for inspection: ${root}`);
+if (failed && cleanupErrors.length > 0)
+	throw new AggregateError([primaryError, ...cleanupErrors], 'Example and cleanup failed', { cause: primaryError });
+if (failed) throw primaryError;
+if (cleanupErrors.length === 1) throw cleanupErrors[0];
+if (cleanupErrors.length > 1) throw new AggregateError(cleanupErrors, 'Example cleanup failed');

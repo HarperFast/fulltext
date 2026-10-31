@@ -243,3 +243,63 @@ for (const failure of ['primary-and-close', 'close', 'partial-open'])
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+for (const failure of ['primary', 'primary-and-close', 'close', 'partial-open', 'dirty-publish', 'none'])
+	test(`paired driver preserves ${failure} outcomes and verifies cleanup before reporting success`, () => {
+		const root = mkdtempSync(path.join(tmpdir(), 'observability-paired-cleanup-'));
+		const marker = path.join(root, 'marker.json');
+		let fixtureRoot;
+		try {
+			const result = spawnSync(
+				process.execPath,
+				[
+					fileURLToPath(new URL('../benchmarks/observability.mjs', import.meta.url)),
+					'--child=1',
+					'--operation=ordinary',
+					'--profile=baseline',
+					`--module=${fileURLToPath(new URL('./fixtures/observability-benchmark-clock.mjs', import.meta.url))}`,
+					'--documents=8',
+					'--queries=3',
+					'--callers=1',
+					'--indexes=4',
+				],
+				{
+					encoding: 'utf8',
+					timeout: 20_000,
+					env: { ...process.env, FULLTEXT_PAIRED_TEST_FAILURE: failure, FULLTEXT_PAIRED_TEST_MARKER: marker },
+				},
+			);
+			assert.ifError(result.error);
+			const state = JSON.parse(readFileSync(marker, 'utf8'));
+			fixtureRoot = state.root;
+			assert.strictEqual(state.closeAttempts, failure === 'partial-open' ? 1 : 4);
+			assert.deepStrictEqual(state.closeModes, Array(state.closeAttempts).fill('rollback'));
+			if (failure === 'none') {
+				assert.strictEqual(result.status, 0, result.stderr);
+				assert.strictEqual(JSON.parse(result.stdout).queryCount, 3);
+				assert.strictEqual(existsSync(fixtureRoot), false);
+			} else {
+				assert.notStrictEqual(result.status, 0);
+				assert.strictEqual(result.stdout, '', 'Failed cleanup must not emit a successful report');
+				assert(existsSync(fixtureRoot));
+				assert(result.stderr.includes(fixtureRoot));
+				const message =
+					failure === 'partial-open'
+						? 'E_PAIRED_OPEN'
+						: failure === 'dirty-publish'
+							? 'E_PAIRED_PUBLISH'
+							: failure === 'close'
+								? 'E_PAIRED_CLOSE'
+								: 'E_PAIRED_PRIMARY';
+				assert(result.stderr.includes(message));
+				if (failure === 'primary-and-close') {
+					assert.match(result.stderr, /AggregateError: Paired measurement and cleanup failed/);
+					for (let i = 1; i <= 4; i++) assert(result.stderr.includes(`E_PAIRED_CLOSE_${i}`));
+					assert.match(result.stderr, /\[cause\]/);
+				} else assert.doesNotMatch(result.stderr, /AggregateError|E_DIRTY_CLOSE/);
+			}
+		} finally {
+			if (fixtureRoot) rmSync(fixtureRoot, { recursive: true, force: true });
+			rmSync(root, { recursive: true, force: true });
+		}
+	});

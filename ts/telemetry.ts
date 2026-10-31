@@ -66,6 +66,7 @@ export interface NativeTelemetry {
 		durationNanoseconds: bigint;
 		error: string | null;
 		snapshotBytes: bigint | null;
+		/** Measurement needed for this snapshot; enabling alone schedules no work. */
 		snapshotBytesPending: boolean;
 		snapshotBytesError: string | null;
 		snapshotBytesDurationNanoseconds: bigint;

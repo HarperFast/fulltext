@@ -87,7 +87,11 @@ const snapshot = index.telemetry();
 // Native byte observation can still be pending after reload resolves.
 ```
 
-Enabling alone queues no work. A subsequent snapshot replacement triggers observation. Tantivy
+Enabling alone queues no work. `snapshotBytesPending: true` means an enabled measurement is
+needed for the current snapshot; it is not a count or promise of queued/running work. It can become
+true immediately after enabling, before any work is scheduled. A subsequent successful publication
+or reload provides an observation opportunity, even when the snapshot is unchanged. Pending clears
+after an attempt, including failure, so also inspect `snapshotBytesError` and the cached value. Tantivy
 `Searcher::space_usage()` supplies the size of the large files referenced by that reader snapshot.
 This excludes small metadata, older pinned snapshots, uncommitted files and in-progress merge
 files; it is **not total directory size or resident memory**. Work runs after command settlement,

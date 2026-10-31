@@ -15,6 +15,7 @@ import {
 import { loadAddon } from '../dist/load-addon.js';
 import { encodeOpen } from '../dist/codec.js';
 import { invoke } from '../dist/invoke.js';
+import { FacadeTelemetry } from '../dist/telemetry.js';
 import { setImmediate } from 'node:timers/promises';
 
 function options(directory, overrides = {}) {
@@ -122,6 +123,49 @@ test('telemetry configuration is strict, histogram samples freeze when disabled 
 		resumed.buckets.reduce((sum, count) => sum + count, 0n),
 		resumed.count,
 	);
+});
+
+test('facade distributions include exact bounds, zero and overflow and return independent bigint snapshots', async (context) => {
+	const { handle } = await rawFixture(context);
+	const telemetry = new FacadeTelemetry(handle);
+	telemetry.configure({ histograms: true });
+	const mutationValues = [0, 1, 2, 10, 11, 100, 101, 1_000, 1_001, 10_000, 10_001];
+	for (const value of mutationValues) telemetry.batchRequested(value);
+	const byteValues = [1_024, 1_025, 16_384, 16_385, 65_536, 65_537, 1_048_576, 1_048_577, 8_388_608, 8_388_609];
+	for (const value of byteValues) telemetry.batchFrame(value, 0);
+	const result = telemetry.snapshot();
+	assert(result.available);
+	const mutations = result.logicalBatches.requestedMutationsDistribution;
+	assert.deepStrictEqual(mutations.upperBounds, [0n, 1n, 10n, 100n, 1_000n, 10_000n, null]);
+	assert.deepStrictEqual(mutations.buckets, [1n, 1n, 2n, 2n, 2n, 2n, 1n]);
+	const bytes = result.logicalBatches.frameBytesDistribution;
+	assert.deepStrictEqual(bytes.upperBounds, [1_024n, 16_384n, 65_536n, 1_048_576n, 8_388_608n, null]);
+	assert.deepStrictEqual(bytes.buckets, [1n, 2n, 2n, 2n, 2n, 1n]);
+	for (const [distribution, values] of [
+		[mutations, mutationValues],
+		[bytes, byteValues],
+	]) {
+		assert.strictEqual(distribution.count, BigInt(values.length));
+		assert.strictEqual(
+			distribution.sum,
+			values.reduce((sum, value) => sum + BigInt(value), 0n),
+		);
+		assert.strictEqual(distribution.buckets.length, distribution.upperBounds.length);
+	}
+	assert.strictEqual(typeof result.native.reader.documents, 'bigint');
+	assert.strictEqual(result.native.reader.error, null);
+	assert.strictEqual(typeof result.native.state, 'string');
+	assert.strictEqual(typeof result.native.histogramsEnabled, 'boolean');
+	const nativeHistogram = result.native.operations.search.execution.histogram;
+	assert.strictEqual(nativeHistogram.upperBoundsNanoseconds.at(-1), null);
+	assert(nativeHistogram.buckets.every((value) => typeof value === 'bigint'));
+	assert(nativeHistogram.upperBoundsNanoseconds.slice(0, -1).every((value) => typeof value === 'bigint'));
+	telemetry.configure({ histograms: false });
+	telemetry.batchRequested(0);
+	telemetry.batchFrame(0, 0);
+	assert.deepStrictEqual(telemetry.snapshot().logicalBatches.requestedMutationsDistribution, mutations);
+	mutations.buckets[0] = 999n;
+	assert.strictEqual(telemetry.snapshot().logicalBatches.requestedMutationsDistribution.buckets[0], 1n);
 });
 
 test('facade preparation failures do not invent native search attempts or expose query text', async (context) => {
@@ -364,8 +408,12 @@ test('snapshot-byte freshness survives unchanged reloads and resets on a changed
 	assert.strictEqual(snapshot(index).native.reader.snapshotBytes, null);
 	assert.strictEqual(snapshot(index).native.reader.snapshotBytesAgeNanoseconds, null);
 	index.configureTelemetry({ snapshotBytes: true });
+	assert.strictEqual(snapshot(index).native.reader.snapshotBytesPending, true);
 	assert.strictEqual(snapshot(index).native.reader.snapshotBytes, null);
 	assert.strictEqual(snapshot(index).native.reader.snapshotBytesAgeNanoseconds, null);
+	await setImmediate();
+	assert.strictEqual(snapshot(index).native.reader.snapshotBytesPending, true);
+	assert.strictEqual(snapshot(index).native.reader.snapshotBytes, null);
 	await index.reload();
 	await waitFor(() => {
 		const reader = snapshot(index).native.reader;

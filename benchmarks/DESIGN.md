@@ -33,8 +33,8 @@ candidate modules, serial fresh children, 100 searches/handle, default 25 warmup
 measured calls/handle with event-loop turns between them. The five selected topologies cap total
 search workers at 64 and handles at 16. Explicit aggregate queue budget covers writer, ordinary
 and expensive queues. Results pool per-call quantiles per child and retain every per-handle
-sample; they do not bound active workload stalls. Emit the child report only after verified close
-and directory cleanup; preserve a primary measurement failure with any secondary cleanup errors,
+sample; they do not bound active workload stalls. Both observability drivers emit a child report
+only after verified rollback close and directory cleanup; preserve a primary measurement failure with any secondary cleanup errors,
 and retain the directory on every failed measurement, including a failed open without an owned
 handle that could prove quiescence. Test fixtures verify configuration, warmup and
 sample counts without treating a fake clock as native performance evidence.

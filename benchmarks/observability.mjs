@@ -53,7 +53,10 @@ if (options.child) {
 		count: 0,
 		durationsMilliseconds: [],
 	}));
-	let clean = false;
+	let report;
+	let primaryError;
+	let failed = false;
+	const cleanupErrors = [];
 	const setupStart = performance.now();
 	const setupCpuStart = process.cpuUsage();
 	try {
@@ -227,74 +230,87 @@ if (options.child) {
 		const cpu = process.cpuUsage(cpuStart);
 		if (pollingError) throw pollingError;
 		for (const index of indexes) await check(index);
-		console.log(
-			serialize({
-				measurementVersion,
-				profile,
-				operation: options.operation,
-				collectorScenario: cheapOrdinary ? 'single-hit' : 'tie-heavy',
-				queryClass,
-				queryClassVerification: beforeWarmup ? 'native-operation-counters' : 'matching-request-classification',
-				request,
-				callers,
-				indexCount,
-				documentCount,
-				queryCount,
-				latencyScope: 'search-api-completion-before-validation',
-				queryPhaseScope: 'sum-of-drained-query-windows-excluding-validation',
-				validationWindow,
-				queryWindows,
-				queryCpuMicroseconds: queryCpu.user + queryCpu.system,
-				queryEventLoopUtilization: {
-					...queryEventLoop,
-					utilization: queryEventLoop.active / (queryEventLoop.active + queryEventLoop.idle) || 0,
-				},
-				mixedPhaseScope: 'queries-validation-and-20-mutation-publication-cycles',
-				polling: {
-					enabled: profile === 'polling',
-					intervalPerHandleMilliseconds: pollIntervalMilliseconds,
-					timerTurnDelayMilliseconds: pollTimerDelayMilliseconds,
-					minimumPollsPerHandle,
-					samplesSufficient: profile === 'polling' ? polls.every(({ count }) => count >= minimumPollsPerHandle) : null,
-					schedule: 'one-handle-per-timer-turn-staggered',
-					histograms: profile === 'on',
-					snapshotBytes: profile === 'bytes',
-					handles: polls,
-				},
-				elapsedMilliseconds,
-				queryMilliseconds,
-				throughput: (queryCount * 1_000) / queryMilliseconds,
-				p50Milliseconds: median(latencies),
-				p99Milliseconds: percentile(latencies, 0.99),
-				publicationP50Milliseconds: median(publicationLatencies),
-				publicationP99Milliseconds: percentile(publicationLatencies, 0.99),
-				mutationPublicationP50Milliseconds: median(mutationPublicationLatencies),
-				mutationPublicationP99Milliseconds: percentile(mutationPublicationLatencies, 0.99),
-				indexingMilliseconds,
-				indexingCpuMicroseconds: indexingCpu.user + indexingCpu.system,
-				cpuMicroseconds: cpu.user + cpu.system,
-				rssStartBytes: rssStart,
-				rssEndBytes: process.memoryUsage().rss,
-				peakRssBytes: Math.max(peakRss, process.memoryUsage().rss),
-				runtime: await runtimeInfo(),
-				telemetry: profile === 'baseline' ? undefined : indexes.map((index) => index.telemetry()),
-			}),
-		);
-		clean = true;
+		report = {
+			measurementVersion,
+			profile,
+			operation: options.operation,
+			collectorScenario: cheapOrdinary ? 'single-hit' : 'tie-heavy',
+			queryClass,
+			queryClassVerification: beforeWarmup ? 'native-operation-counters' : 'matching-request-classification',
+			request,
+			callers,
+			indexCount,
+			documentCount,
+			queryCount,
+			latencyScope: 'search-api-completion-before-validation',
+			queryPhaseScope: 'sum-of-drained-query-windows-excluding-validation',
+			validationWindow,
+			queryWindows,
+			queryCpuMicroseconds: queryCpu.user + queryCpu.system,
+			queryEventLoopUtilization: {
+				...queryEventLoop,
+				utilization: queryEventLoop.active / (queryEventLoop.active + queryEventLoop.idle) || 0,
+			},
+			mixedPhaseScope: 'queries-validation-and-20-mutation-publication-cycles',
+			polling: {
+				enabled: profile === 'polling',
+				intervalPerHandleMilliseconds: pollIntervalMilliseconds,
+				timerTurnDelayMilliseconds: pollTimerDelayMilliseconds,
+				minimumPollsPerHandle,
+				samplesSufficient: profile === 'polling' ? polls.every(({ count }) => count >= minimumPollsPerHandle) : null,
+				schedule: 'one-handle-per-timer-turn-staggered',
+				histograms: profile === 'on',
+				snapshotBytes: profile === 'bytes',
+				handles: polls,
+			},
+			elapsedMilliseconds,
+			queryMilliseconds,
+			throughput: (queryCount * 1_000) / queryMilliseconds,
+			p50Milliseconds: median(latencies),
+			p99Milliseconds: percentile(latencies, 0.99),
+			publicationP50Milliseconds: median(publicationLatencies),
+			publicationP99Milliseconds: percentile(publicationLatencies, 0.99),
+			mutationPublicationP50Milliseconds: median(mutationPublicationLatencies),
+			mutationPublicationP99Milliseconds: percentile(mutationPublicationLatencies, 0.99),
+			indexingMilliseconds,
+			indexingCpuMicroseconds: indexingCpu.user + indexingCpu.system,
+			cpuMicroseconds: cpu.user + cpu.system,
+			rssStartBytes: rssStart,
+			rssEndBytes: process.memoryUsage().rss,
+			peakRssBytes: Math.max(peakRss, process.memoryUsage().rss),
+			runtime: await runtimeInfo(),
+			telemetry: profile === 'baseline' ? undefined : indexes.map((index) => index.telemetry()),
+		};
+	} catch (error) {
+		failed = true;
+		primaryError = error;
 	} finally {
 		clearTimeout(poll);
-		let closeError;
 		for (const index of indexes) {
 			try {
-				const result = await index.close();
-				if (result.cleanupError) closeError ??= result.cleanupError;
+				const result = await index.close({ mode: 'rollback' });
+				if (result.cleanupError) cleanupErrors.push(result.cleanupError);
 			} catch (error) {
-				closeError ??= error;
+				cleanupErrors.push(error);
 			}
 		}
-		if (!closeError) await rm(root, { recursive: true, force: true });
-		else if (clean) throw closeError;
+		if (!failed && cleanupErrors.length === 0) {
+			try {
+				await rm(root, { recursive: true, force: true });
+			} catch (error) {
+				cleanupErrors.push(error);
+			}
+		}
 	}
+	if (failed || cleanupErrors.length > 0) console.error(`Paired fixture retained for inspection: ${root}`);
+	if (failed && cleanupErrors.length > 0)
+		throw new AggregateError([primaryError, ...cleanupErrors], 'Paired measurement and cleanup failed', {
+			cause: primaryError,
+		});
+	if (failed) throw primaryError;
+	if (cleanupErrors.length === 1) throw cleanupErrors[0];
+	if (cleanupErrors.length > 1) throw new AggregateError(cleanupErrors, 'Paired cleanup failed');
+	console.log(serialize(report));
 } else {
 	assert(
 		options.baseline && options.candidate && options.output,

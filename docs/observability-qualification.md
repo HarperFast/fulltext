@@ -141,6 +141,38 @@ can affect them. Do not use the idle table as a bound for loaded handles.
 
 Normal-schedule raw-report SHA-256: `1fc6c51b9b1dec7db1405f54a1c20c6f223fad0573c7daa5a08eb2839d4a8e16`.
 
+The parent paired matrix fixes index counts at one/two. Reproduce these active four/sixteen-handle
+controls through its child mode instead. Prepare immutable `previous` (`6a166c4`) and `optimized`
+(`077dffc`) package directories containing their own `dist/native.js` and production addon, and
+run the following sequentially under Node 24.16.0. Replace `/absolute/packages` and
+`/absolute/reports` with existing directories; each output file is a complete child report.
+
+```sh
+set -e
+for fulltext_handles in 4 16
+do
+  for fulltext_version in previous optimized
+  do
+    FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/observability.mjs \
+      --child=1 --operation=ordinary-cheap --profile=polling \
+      --module="/absolute/packages/$fulltext_version/dist/native.js" \
+      --documents=2000 --queries=1000000 --callers=4 --indexes=$fulltext_handles \
+      --validation-window=1024 --poll-interval-ms=1000 \
+      > "/absolute/reports/$fulltext_version-$fulltext_handles.json"
+  done
+done
+```
+
+This matches the recorded child flags; the current harness retains its subsequent cleanup fixes.
+Each index uses four search threads, one indexing thread, a 15,000,000-byte writer-memory limit and
+8 MiB per native queue. The recorded controls did not configure an aggregate process budget;
+without `configureNativeFullTextRuntime`, there is no implicit aggregate reservation limit. This
+is a finite local fixture, not an application budget recommendation. Do not add a process-wide
+expensive-search limit to this reproduction and call it the same control. Check each report's
+actual per-handle `polling` counts/durations, runtime identity and successful correctness total.
+Results on another machine or runtime do not reproduce the recorded timing values or strengthen
+the original overhead classification.
+
 ## Historical measurement scope
 
 All historical search p50/p99 values in the following sections include each query’s correctness validation after the API
