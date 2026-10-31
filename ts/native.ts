@@ -1436,14 +1436,14 @@ function normalizeExpression(
 	)
 		throw new FulltextError('E_INVALID_ARGUMENT', 'optional scoring controls belong on an optional expression');
 	if (
-		('clause' in expression &&
-			expression.clause !== undefined &&
-			expression.operator !== 'boost' &&
-			expression.operator !== 'not') ||
-		('clauses' in expression &&
-			expression.clauses !== undefined &&
-			expression.operator !== 'and' &&
-			expression.operator !== 'or')
+		(expression.operator !== 'boost' &&
+			expression.operator !== 'not' &&
+			'clause' in expression &&
+			expression.clause !== undefined) ||
+		(expression.operator !== 'and' &&
+			expression.operator !== 'or' &&
+			'clauses' in expression &&
+			expression.clauses !== undefined)
 	)
 		throw new FulltextError('E_INVALID_ARGUMENT', 'conflicting search expression children');
 	if ('text' in expression) {
