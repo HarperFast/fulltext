@@ -68,13 +68,13 @@ The opt-in writer-diagnostics helper emits five-second process CPU/RSS and exist
 
 ## Query relevance scoring
 
-`npm run benchmark:query-scoring` builds production artifacts and runs the local addon. Direct driver invocation assumes an already-built optimized addon. The workload indexes 10,000 documents across four commits, with 7,500 Any/OR matches and 5,000 All/AND matches. A subset of required matches also contains the optional term, and optional-only records must stay excluded. Before timing, paired full-result checks verify membership, exact totals, doubled boost scores and positive optional bonuses.
+`npm run benchmark:query-scoring` builds production artifacts and runs the local addon. Direct driver invocation assumes an already-built optimized addon. The original sample indexed 10,000 documents across four commits, with 7,500 Any/OR matches and 5,000 All/AND matches. A subset of required matches also contains the optional term, and optional-only records must stay excluded. Before timing, paired full-result checks verify membership, exact totals, doubled boost scores and positive optional bonuses.
 
-Twenty warm sequential searches per row use limit 20, with exact totals disabled and enabled separately. The paired root-boost OR/AND rows compare complete request latency with composite wrapping; optional with required All compares native Must/Should composition against its required-only baseline. Repeated score ties can force the unboosted top-docs collector to rerun through stable collection, so these rows dilute specialized-pruning differences and do not isolate the cost of losing block-WAND. These costs remain accepted rather than introducing custom scorer or composite boost distribution semantics.
+The original sample used twenty warm sequential searches per row, limit 20, with exact totals disabled and enabled separately. The paired root-boost OR/AND rows compare complete request latency with composite wrapping; optional with required All compares native Must/Should composition against its required-only baseline. Repeated score ties can force the unboosted top-docs collector to rerun through stable collection, so these rows dilute specialized-pruning differences and do not isolate the cost of losing block-WAND. These costs remain accepted rather than introducing custom scorer or composite boost distribution semantics.
 
-The two-term Any baseline and boosted Any rows both use stable collection, so they do not measure the root leaf lowering's specialized pruning. There is no boosted-All row; native topology and reference-score tests qualify that lowering, rather than these timings.
+The original sample's two-term Any baseline and boosted Any rows both used stable collection, so they did not measure the root leaf lowering's specialized pruning. That sample lacked a boosted-All row; the current driver and measurements below add two-, three- and four-term All comparisons.
 
-A same-process optimized run on 2026-10-31, macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 produced these local p50 milliseconds:
+A same-process optimized run of the original sample on 2026-10-31, macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 produced these local p50 milliseconds:
 
 | Query                      | Exact totals off | Exact totals on |
 | -------------------------- | ---------------: | --------------: |
@@ -92,7 +92,7 @@ The composite root boost and required-All optional paths cost more in this corpu
 
 ### Varied-score collector boundary
 
-Run `npm run benchmark:query-scoring -- --varied-scores` to keep the same membership distribution while varying term frequency and document length. The driver checks that ranks 20 and 21 have different scores for each OR/AND pair before timing. With these unfiltered Boolean queries, that check rules out the stable-collector boundary-tie rerun in `Engine::collect_search`. Output records the corpus and `distinctBoundary` for each row. This does not measure how many blocks Tantivy prunes.
+The earlier varied-score sample kept the same membership distribution while varying term frequency and document length. It checked that ranks 20 and 21 differed for each OR/AND pair before timing; the current driver extends that check to every non-optional row. With these unfiltered Boolean queries, that check rules out the stable-collector boundary-tie rerun in `Engine::collect_search`. Output records the corpus and `distinctBoundary` for each row. This does not measure how many blocks Tantivy prunes.
 
 After the nested-boost multiplication-order fix, an optimized run on the same machine/runtime produced these p50 milliseconds (10,000 documents, 20 warm sequential samples, limit 20):
 
@@ -104,3 +104,30 @@ After the nested-boost multiplication-order fix, an optimized run on the same ma
 | Root boost over AND |            0.101 |           0.126 |
 
 All paired membership, total and boost-score checks passed, as did the four distinct-boundary assertions in both total modes. The OR cost difference changes sign relative to the tied corpus; neither sample establishes a general speedup or slowdown. Generic composite boosting remains an accepted native-library tradeoff. These small warm samples do not qualify throughput, memory at catalog scale, or other document/score distributions.
+
+### Stable routing for wider term sums
+
+The current driver adds a single-term baseline and root-lowered/native-wrapped comparisons, plus two-, three- and four-term All families. `boost(2, boost(1, clause))` is the native-wrapped control: its inner identity boost disappears, while the outer native wrapper remains. Complete membership, scaled scores and native-wrapped score bits must agree before any timing. All 40 rows completed in each of the tied and varied modes (20 query shapes across exact totals off/on). Both runs observed four committed segments; each All term has 5,000 postings spread across the committed batches, beyond one 128-document block. Committed `meta.json` observations are benchmark diagnostics, not a public storage API.
+
+In the varied corpus, ranks 20 and 21 must differ for every non-optional row. The three/four-term All baseline and lowered rows now use stable collection; the native-wrapped controls use generic native TopDocs iteration. Two-term All starts with native pruning, while tied cutoffs can trigger the existing stable rerun. The tied mode deliberately retains that confound.
+
+An optimized 2026-10-31 run on macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 measured these p50 milliseconds (20 warm sequential samples, limit 20):
+
+| Query                         | Tied, exact off | Tied, exact on | Varied, exact off | Varied, exact on |
+| ----------------------------- | --------------: | -------------: | ----------------: | ---------------: |
+| Single term baseline          |           0.109 |          0.109 |             0.102 |            0.094 |
+| Single term root lowered      |           0.106 |          0.101 |             0.092 |            0.093 |
+| Single term native wrapped    |           0.114 |          0.106 |             0.093 |            0.099 |
+| Two-term All baseline         |           0.133 |          0.128 |             0.079 |            0.101 |
+| Two-term All root lowered     |           0.133 |          0.126 |             0.080 |            0.099 |
+| Two-term All native wrapped   |           0.138 |          0.132 |             0.101 |            0.122 |
+| Three-term All baseline       |           0.111 |          0.105 |             0.155 |            0.149 |
+| Three-term All root lowered   |           0.111 |          0.102 |             0.155 |            0.151 |
+| Three-term All native wrapped |           0.166 |          0.155 |             0.130 |            0.169 |
+| Four-term All baseline        |           0.132 |          0.128 |             0.172 |            0.158 |
+| Four-term All root lowered    |           0.130 |          0.125 |             0.172 |            0.167 |
+| Four-term All native wrapped  |           0.202 |          0.201 |             0.149 |            0.197 |
+
+These are total-request comparisons. The wrapper control adds an AST node, stable collection resolves ID ordinals, exact totals can add a separate native count, and tied TopDocs can rerun collection. Those differences prevent attributing the timing delta solely to pruning or ordinal lookup. The small single-term differences do not establish an optimization benefit; the two-term and wider-All rows expose costs on this corpus only. Historical tables above describe earlier fixtures/builds and are not a matched before/after speedup comparison.
+
+Correctness evidence is separate: the old installed addon fails the permanent 300-document, two-commit four-term All/AND/empty-body regressions with a distinct cutoff; the three-term control passes on that addon. The native canary independently compares raw TopDocs with scorer iteration at four terms. The new route passes both. Three-term routing is a conservative mitigation, not a demonstrated three-term failure or a claim of universal safety for smaller native queries. Ordinary stable collection checks deadlines after collection; these measurements do not establish strict latency bounds, customer-distribution throughput, or catalog-scale memory limits.

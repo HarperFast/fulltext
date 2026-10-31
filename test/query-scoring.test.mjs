@@ -395,3 +395,63 @@ test('optional scoring snapshots Proxy array length before charging and reading 
 		assert.strictEqual(lengthReads, 1);
 	}
 });
+
+test('single-field All and AND preserve small-window search and paging scores without boundary ties', async (context) => {
+	const terms = ['amber', 'stone', 'quartz', 'ruby'];
+	const documents = Array.from({ length: 300 }, (_, id) => ({
+		id: `all-${id}`,
+		fields: {
+			title: [
+				...terms.flatMap((term, position) => Array(1 + ((id * (7 + position * 4)) % (11 + position * 6))).fill(term)),
+				...Array(1 + ((id * 37) % 173)).fill('filler'),
+			].join(' '),
+		},
+	}));
+	const all = { text: terms.join(' '), mode: 'all', fields: ['title'] };
+	for (const [name, weight, query] of [
+		['boosted All', 0.7, boost(all, 0.3)],
+		['bare All with folded weight', Math.fround(Math.fround(0.7) * Math.fround(0.3)), all],
+		[
+			'three-term All across segments',
+			Math.fround(Math.fround(0.7) * Math.fround(0.3)),
+			{ ...all, text: terms.slice(0, 3).join(' ') },
+		],
+		[
+			'multi-field All with empty body',
+			Math.fround(Math.fround(0.7) * Math.fround(0.3)),
+			{ ...all, fields: ['title', 'body'] },
+		],
+		[
+			'explicit AND with folded weight',
+			Math.fround(Math.fround(0.7) * Math.fround(0.3)),
+			{ operator: 'and', clauses: terms.map((text) => leaf(text)) },
+		],
+	]) {
+		await context.test(name, async (context) => {
+			const { index } = await fixture(
+				context,
+				[...documents.slice(0, 150), { id: 'distractor', fields: { title: 'amber stone' } }],
+				{
+					fields: [
+						{ name: 'title', weight },
+						{ name: 'body', weight: 1 },
+					],
+				},
+			);
+			await index.applyMutationBatch({ upserts: documents.slice(150) });
+			await index.commit();
+			await index.reload();
+			const page = await index.searchPage({ query, limit: 6 });
+			assert.strictEqual(page.total, documents.length);
+			assert.strictEqual(page.hits.length, 6);
+			assert.notStrictEqual(page.hits[4].score, page.hits[5].score, 'the search cutoff must not trigger a tie rerun');
+			const searched = await index.search({ query, limit: 5, exactTotal: false });
+			assert.deepStrictEqual(searched.hits, page.hits.slice(0, 5));
+			assert(!searched.hits.some(({ id }) => id === 'distractor'));
+			const first = await index.searchPage({ query, limit: 5 });
+			assert.deepStrictEqual(first.hits, searched.hits);
+			const next = await index.searchPage({ query, limit: 1, continuation: first.continuation });
+			assert.deepStrictEqual(next.hits, page.hits.slice(5));
+		});
+	}
+});

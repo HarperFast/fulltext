@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -13,6 +13,8 @@ const variedScores = process.argv.includes('--varied-scores');
 const corpus = variedScores ? 'varied-scores' : 'tied-scores';
 const required = { text: 'amber stone', mode: 'any', fields: ['title'] };
 const all = { ...required, mode: 'all' };
+const all3 = { ...all, text: 'amber stone ruby' };
+const all4 = { ...all, text: 'amber stone ruby sapphire' };
 const term = (text) => ({ text, fields: ['title'] });
 const boosted = (clause) => ({ operator: 'boost', boost: 2, clause });
 const rewarded = (required) => ({
@@ -22,7 +24,17 @@ const rewarded = (required) => ({
 });
 const or = { operator: 'or', clauses: [term('amber'), term('stone')] };
 const and = { operator: 'and', clauses: [term('amber'), term('stone')] };
+const wrapped = (clause) => boosted({ operator: 'boost', boost: 1, clause });
 const queries = [
+	{ name: 'single/baseline', query: term('amber'), baseline: 'single/baseline' },
+	{ name: 'single/lowered-root', query: boosted(term('amber')), baseline: 'single/baseline', scale: 2 },
+	{
+		name: 'single/native-wrapped',
+		query: wrapped(term('amber')),
+		baseline: 'single/baseline',
+		scale: 2,
+		equivalent: 'single/lowered-root',
+	},
 	{ name: 'any/baseline', query: required, baseline: 'any/baseline' },
 	{ name: 'any/boost', query: boosted(required), baseline: 'any/baseline', scale: 2 },
 	{ name: 'any/optional', query: rewarded(required), baseline: 'any/baseline', bonus: true },
@@ -31,7 +43,33 @@ const queries = [
 	{ name: 'and/baseline', query: and, baseline: 'and/baseline' },
 	{ name: 'and/root-boost', query: boosted(and), baseline: 'and/baseline', scale: 2 },
 	{ name: 'all/baseline', query: all, baseline: 'all/baseline' },
+	{ name: 'all/lowered-root', query: boosted(all), baseline: 'all/baseline', scale: 2 },
+	{
+		name: 'all/native-wrapped',
+		query: wrapped(all),
+		baseline: 'all/baseline',
+		scale: 2,
+		equivalent: 'all/lowered-root',
+	},
 	{ name: 'all/optional', query: rewarded(all), baseline: 'all/baseline', bonus: true },
+	{ name: 'all3/baseline', query: all3, baseline: 'all3/baseline' },
+	{ name: 'all3/lowered-root', query: boosted(all3), baseline: 'all3/baseline', scale: 2 },
+	{
+		name: 'all3/native-wrapped',
+		query: wrapped(all3),
+		baseline: 'all3/baseline',
+		scale: 2,
+		equivalent: 'all3/lowered-root',
+	},
+	{ name: 'all4/baseline', query: all4, baseline: 'all4/baseline' },
+	{ name: 'all4/lowered-root', query: boosted(all4), baseline: 'all4/baseline', scale: 2 },
+	{
+		name: 'all4/native-wrapped',
+		query: wrapped(all4),
+		baseline: 'all4/baseline',
+		scale: 2,
+		equivalent: 'all4/lowered-root',
+	},
 ];
 function documentTitle(i) {
 	const words =
@@ -40,8 +78,8 @@ function documentTitle(i) {
 			: i % 4 === 1
 				? ['amber', 'quartz']
 				: i % 4 === 2
-					? ['amber', 'stone', 'quartz']
-					: ['amber', 'stone'];
+					? ['amber', 'stone', 'quartz', 'ruby', 'sapphire']
+					: ['amber', 'stone', 'ruby', 'sapphire'];
 	if (!variedScores) return words.join(' ');
 	return (
 		words
@@ -92,14 +130,18 @@ try {
 	}
 	await index.commit();
 	await index.reload();
+	const committedSegments = JSON.parse(await readFile(path.join(root, 'index', 'meta.json'), 'utf8')).segments.length;
+	assert(committedSegments >= 2, 'qualification must span multiple committed segments');
 	const results = new Map();
-	for (const { name, query, baseline, scale, bonus } of queries) {
+	for (const { name, query, baseline, scale, bonus, equivalent } of queries) {
 		const result = await index.search({ query, exactTotal: true, limit: documents });
 		results.set(name, result);
 		const expected = results.get(baseline);
 		assert.strictEqual(
 			result.total,
-			name.startsWith('and/') || name.startsWith('all/') ? documents / 2 : documents * 0.75,
+			name.startsWith('and/') || name.startsWith('all/') || name.startsWith('all4/') || name.startsWith('all3/')
+				? documents / 2
+				: documents * 0.75,
 		);
 		assert.deepStrictEqual(result.hits.map(({ id }) => id).sort(), expected.hits.map(({ id }) => id).sort());
 		const scores = new Map(expected.hits.map(({ id, score }) => [id, score]));
@@ -112,13 +154,19 @@ try {
 			}
 		}
 		if (bonus) assert(improved > 0);
+		if (equivalent)
+			assert.deepStrictEqual(
+				result.hits,
+				results.get(equivalent).hits,
+				`${name}: native and root-lowered scores must agree`,
+			);
 	}
 	const rows = [];
 	for (const exactTotal of [false, true]) {
 		for (const { name, query, baseline } of queries) {
-			const boundary = results.get(baseline).hits;
+			const boundary = results.get(name).hits;
 			const distinctBoundary = boundary[19].score !== boundary[20].score;
-			if (variedScores && (name.startsWith('or/') || name.startsWith('and/')))
+			if (variedScores && !name.endsWith('/optional'))
 				assert(distinctBoundary, `${name}: varied corpus must avoid a stable-collector boundary-tie rerun`);
 			const request = { query, exactTotal, limit: 20 };
 			await index.search(request);
@@ -150,6 +198,7 @@ try {
 				runtime: await runtimeInfo(),
 				documents,
 				corpus,
+				committedSegments,
 				requiredMatches: Object.fromEntries(
 					queries.filter(({ name, baseline }) => name === baseline).map(({ name }) => [name, results.get(name).total]),
 				),

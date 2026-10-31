@@ -507,8 +507,8 @@ optional branch; callers must authorize access to all of those fields. Defined `
 `mode` and `fields` properties on groups, including existing Boolean groups. Older facades could
 ignore these properties. Nested text leaves now reject legacy `operator` mode aliases other than
 `any` and `all`; use `mode: 'prefix'` instead of `operator: 'prefix'` inside `query`.
-The top-level request's legacy `operator: 'prefix'` alias remains supported. Properties set to `undefined`
-are treated as absent. These additions require a matching ABI 14 / query API 8 facade and addon.
+The top-level request's legacy `operator: 'prefix'` alias remains supported. The scoring and structural
+properties listed above treat `undefined` as absent; this does not apply to a present `text` property. These additions require a matching ABI 14 / query API 8 facade and addon.
 
 ### Configurable query capacity
 

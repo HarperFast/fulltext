@@ -922,10 +922,10 @@ impl Engine {
 			});
 		}
 		let window_end = request.offset + request.limit;
-		let stable_any = request.candidate_ids.is_none()
+		let stable_scores = request.candidate_ids.is_none()
 			&& request.filter.is_none()
-			&& needs_stable_any(&request.expression, query.clauses);
-		let (hits, bounded_total, bounded_total_relation, collected_total) = if stable_any {
+			&& needs_stable_scores(&request.expression, query.clauses, self.fields.len());
+		let (hits, bounded_total, bounded_total_relation, collected_total) = if stable_scores {
 			let (retained, match_count, mut scored_docs) = searcher
 				.search(
 					query.query.as_ref(),
@@ -2364,10 +2364,38 @@ fn resolve_string_ordinals(
 	Ok(values)
 }
 
-fn needs_stable_any(expression: &SearchExpression, clauses: usize) -> bool {
+fn needs_stable_scores(mut expression: &SearchExpression, mut clauses: usize, field_count: usize) -> bool {
+	if let SearchExpression::Boost { clause, .. } = expression {
+		if matches!(
+			clause.as_ref(),
+			SearchExpression::Clause(SearchClause {
+				mode: SearchMode::Any | SearchMode::All,
+				..
+			})
+		) {
+			expression = clause;
+			clauses = clauses.saturating_sub(1);
+		}
+	}
+	while let SearchExpression::Boost { boost, clause } = expression {
+		if *boost != 1.0 {
+			return false;
+		}
+		expression = clause;
+		clauses = clauses.saturating_sub(1);
+	}
 	match expression {
-		SearchExpression::Clause(clause) => clause.mode == SearchMode::Any && clauses > 1,
-		SearchExpression::Boost { clause, .. } => needs_stable_any(clause, clauses.saturating_sub(1)),
+		SearchExpression::Clause(clause) if clause.mode == SearchMode::Any => clauses > 1,
+		SearchExpression::Clause(clause) if clause.mode == SearchMode::All => {
+			let selected_fields = if clause.fields.is_empty() {
+				field_count
+			} else {
+				clause.fields.len()
+			};
+			clauses.checked_div(selected_fields).is_some_and(|terms| terms > 2)
+		}
+		SearchExpression::And(children) => children.len() > 2,
+		SearchExpression::Or(children) => children.len() > 1,
 		_ => false,
 	}
 }
@@ -5760,7 +5788,7 @@ mod tests {
 				};
 				let built = engine.expression_query(&searcher, &expression).unwrap();
 				assert_eq!(built.clauses, 2);
-				assert!(!needs_stable_any(&expression, built.clauses));
+				assert!(!needs_stable_scores(&expression, built.clauses, engine.fields.len()));
 				let topology = format!("{:?}", built.query);
 				assert!(topology.starts_with("BooleanQuery"), "{topology}");
 				if mode == SearchMode::Any {
@@ -5775,10 +5803,235 @@ mod tests {
 					};
 					let built = engine.expression_query(&searcher, &wide).unwrap();
 					assert_eq!(built.clauses, 4);
-					assert!(needs_stable_any(&wide, built.clauses));
+					assert!(needs_stable_scores(&wide, built.clauses, config.identity.fields.len()));
 				}
 			}
 		}
+	}
+
+	#[test]
+	fn four_term_intersection_pruning_differs_from_scorer_but_search_preserves_bits() {
+		let mut configuration = config();
+		configuration.identity.fields = vec![FieldConfig {
+			name: "title".to_owned(),
+			weight: 0.7f32 * 0.3f32,
+		}];
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let mut writer = engine.writer(&configuration).unwrap();
+		let terms = ["amber", "stone", "quartz", "ruby"];
+		let mut upserts = (0..127)
+			.map(|id| {
+				let mut words = Vec::new();
+				for (position, term) in terms.iter().enumerate() {
+					words.extend(std::iter::repeat_n(
+						*term,
+						1 + ((id * (7 + position * 4)) % (11 + position * 6)),
+					));
+				}
+				words.extend(std::iter::repeat_n("filler", 1 + ((id * 37) % 173)));
+				crate::protocol::Upsert {
+					id: format!("all-{id}"),
+					version: None,
+					fields: vec![("title".to_owned(), vec![words.join(" ")])],
+					filters: Vec::new(),
+				}
+			})
+			.collect::<Vec<_>>();
+		upserts.push(crate::protocol::Upsert {
+			id: "distractor".to_owned(),
+			version: None,
+			fields: vec![("title".to_owned(), vec!["amber stone quartz".to_owned()])],
+			filters: Vec::new(),
+		});
+		writer
+			.apply(MutationBatch {
+				upserts,
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let expression = expression(&terms.join(" "), SearchMode::All, vec!["title".to_owned()]);
+		let built = engine.expression_query(&searcher, &expression).unwrap();
+		let weight = built
+			.query
+			.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
+			.unwrap();
+		let mut iterated = Vec::new();
+		for (segment, reader) in searcher.segment_readers().iter().enumerate() {
+			let mut scorer = weight.scorer(reader, 1.0).unwrap();
+			while scorer.doc() != tantivy::TERMINATED {
+				iterated.push((scorer.score(), DocAddress::new(segment as u32, scorer.doc())));
+				scorer.advance();
+			}
+		}
+		let ids = search_hit_ids(&searcher, &iterated).unwrap();
+		let mut expected = iterated
+			.into_iter()
+			.zip(ids)
+			.map(|((score, _), id)| (id, score))
+			.collect::<Vec<_>>();
+		expected
+			.sort_by(|(left_id, left), (right_id, right)| right.total_cmp(left).then_with(|| left_id.cmp(right_id)));
+		assert_ne!(expected[4].1, expected[5].1, "fixture cutoff must avoid tie fallback");
+		let raw = searcher
+			.search(built.query.as_ref(), &TopDocs::with_limit(6).order_by_score())
+			.unwrap();
+		let raw_ids = search_hit_ids(&searcher, &raw).unwrap();
+		let raw_bits = raw
+			.iter()
+			.zip(raw_ids)
+			.take(5)
+			.map(|((score, _), id)| (id, score.to_bits()))
+			.collect::<Vec<_>>();
+		let expected_bits = expected
+			.into_iter()
+			.take(5)
+			.map(|(id, score)| (id, score.to_bits()))
+			.collect::<Vec<_>>();
+		assert_ne!(
+			raw_bits, expected_bits,
+			"pinned Tantivy intersection canary no longer diverges; reassess stable routing"
+		);
+		assert_eq!(
+			raw_bits.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+			expected_bits.iter().map(|(id, _)| id).collect::<Vec<_>>()
+		);
+		let mut request = admission_request(SearchMode::All);
+		request.expression = expression;
+		request.limit = 5;
+		let result = engine.search(&searcher, &request).unwrap();
+		let actual = result
+			.hits
+			.into_iter()
+			.map(|hit| (hit.id, hit.score.to_bits()))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			actual, expected_bits,
+			"ordinary search must preserve native scorer bits"
+		);
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn empty_direct_rust_schema_has_no_score_sum_to_stabilize() {
+		let mut configuration = config();
+		configuration.identity.fields.clear();
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let result = engine.search(&searcher, &admission_request(SearchMode::All)).unwrap();
+		assert!(result.hits.is_empty());
+		assert_eq!(result.total, 0);
+	}
+
+	#[test]
+	fn stable_score_routes_preserve_safe_small_queries_and_cover_term_sums() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let mut writer = engine.writer(&config()).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "populated-fields".to_owned(),
+					version: None,
+					fields: vec![
+						("title".to_owned(), vec!["amber stone quartz".to_owned()]),
+						("description".to_owned(), vec!["amber stone quartz".to_owned()]),
+					],
+					filters: Vec::new(),
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let leaf = |text, mode| expression(text, mode, vec!["title".to_owned()]);
+		let all_two = leaf("amber stone", SearchMode::All);
+		let all_three = leaf("amber stone quartz", SearchMode::All);
+		let two_leaves = vec![leaf("amber", SearchMode::Any), leaf("stone", SearchMode::Any)];
+		let three_leaves = vec![
+			leaf("amber", SearchMode::Any),
+			leaf("stone", SearchMode::Any),
+			leaf("quartz", SearchMode::Any),
+		];
+		let boost = |clause| SearchExpression::Boost {
+			boost: 0.3,
+			clause: Box::new(clause),
+		};
+		for (name, expression, expected_clauses, expected_stable) in [
+			("single Any", leaf("amber", SearchMode::Any), 1, false),
+			("two-term Any", leaf("amber stone", SearchMode::Any), 2, true),
+			("two-term All", all_two.clone(), 2, false),
+			("three-term All", all_three.clone(), 3, true),
+			("two-leaf AND", SearchExpression::And(two_leaves.clone()), 4, false),
+			("three-leaf AND", SearchExpression::And(three_leaves.clone()), 6, true),
+			(
+				"single-leaf OR",
+				SearchExpression::Or(vec![leaf("amber", SearchMode::Any)]),
+				2,
+				false,
+			),
+			("two-leaf OR", SearchExpression::Or(two_leaves), 4, true),
+			("boosted two-term All", boost(all_two), 3, false),
+			("boosted three-term All", boost(all_three.clone()), 4, true),
+			("nested boosted All", boost(boost(all_three)), 5, false),
+			(
+				"boosted AND",
+				boost(SearchExpression::And(three_leaves.clone())),
+				7,
+				false,
+			),
+			(
+				"identity boosted AND",
+				SearchExpression::Boost {
+					boost: 1.0,
+					clause: Box::new(SearchExpression::And(three_leaves)),
+				},
+				7,
+				true,
+			),
+			(
+				"two-term multi-field All",
+				expression("amber stone", SearchMode::All, vec![]),
+				4,
+				false,
+			),
+			(
+				"three-term multi-field All",
+				expression("amber stone quartz", SearchMode::All, vec![]),
+				6,
+				true,
+			),
+			(
+				"single-term multi-field All",
+				expression("amber", SearchMode::All, vec![]),
+				2,
+				false,
+			),
+			(
+				"optional root",
+				SearchExpression::Optional {
+					required: Box::new(leaf("amber", SearchMode::Any)),
+					optional: vec![leaf("stone", SearchMode::Any)],
+				},
+				4,
+				false,
+			),
+			(
+				"not root",
+				SearchExpression::Not(Box::new(leaf("amber stone quartz", SearchMode::All))),
+				5,
+				false,
+			),
+		] {
+			let built = engine.expression_query(&searcher, &expression).unwrap();
+			assert_eq!(built.clauses, expected_clauses, "{name}");
+			assert_eq!(
+				needs_stable_scores(&expression, built.clauses, engine.fields.len()),
+				expected_stable,
+				"{name}"
+			);
+		}
+		writer.close().unwrap();
 	}
 
 	#[test]
