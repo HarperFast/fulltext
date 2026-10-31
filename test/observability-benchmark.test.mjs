@@ -1,6 +1,6 @@
 import assert from 'node:assert';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -186,4 +186,49 @@ for (const argument of ['--sample-rounds=10001', '--warmup-rounds=1001'])
 		assert.ifError(result.error);
 		assert.notStrictEqual(result.status, 0);
 		assert.match(result.stderr, /must be a positive integer/);
+	});
+
+for (const failure of ['primary-and-close', 'close'])
+	test(`idle scrape driver preserves ${failure} failure and publishes no success report`, () => {
+		const root = mkdtempSync(path.join(tmpdir(), 'observability-cleanup-test-'));
+		const marker = path.join(root, 'marker.json');
+		let fixtureRoot;
+		try {
+			const result = spawnSync(
+				process.execPath,
+				[
+					fileURLToPath(new URL('../benchmarks/observability-scrape-cost.mjs', import.meta.url)),
+					'--child=1',
+					`--module=${fileURLToPath(new URL('./fixtures/observability-scrape-clock.mjs', import.meta.url))}`,
+					'--topology=4x4',
+					'--histograms=false',
+					'--warmup-rounds=1',
+					'--sample-rounds=1',
+				],
+				{
+					encoding: 'utf8',
+					timeout: 20_000,
+					env: { ...process.env, FULLTEXT_SCRAPE_TEST_FAILURE: failure, FULLTEXT_SCRAPE_TEST_MARKER: marker },
+				},
+			);
+			assert.ifError(result.error);
+			assert.notStrictEqual(result.status, 0);
+			assert.strictEqual(result.stdout, '', 'A cleanup failure must not publish a successful child report');
+			const state = JSON.parse(readFileSync(marker, 'utf8'));
+			fixtureRoot = state.root;
+			assert.strictEqual(state.closeAttempts, 4, 'All handles must get a close attempt after failure');
+			assert(existsSync(fixtureRoot), 'An index root must be retained when any close is unproven');
+			assert.match(result.stderr, /E_SCRAPE_CLOSE/);
+			if (failure === 'primary-and-close') {
+				assert.match(result.stderr, /AggregateError: Scrape measurement and cleanup failed/);
+				assert.match(result.stderr, /E_SCRAPE_PRIMARY/);
+				assert.match(result.stderr, /\[cause\]/);
+			} else {
+				assert.doesNotMatch(result.stderr, /AggregateError/);
+				assert.doesNotMatch(result.stderr, /E_SCRAPE_PRIMARY/);
+			}
+		} finally {
+			if (fixtureRoot) rmSync(fixtureRoot, { recursive: true, force: true });
+			rmSync(root, { recursive: true, force: true });
+		}
 	});

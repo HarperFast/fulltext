@@ -44,6 +44,10 @@ if (options.child) {
 	const root = await mkdtemp(path.join(tmpdir(), 'fulltext-scrape-'));
 	const indexes = [];
 	const yieldTurn = () => new Promise((resolve) => setImmediate(resolve));
+	let report;
+	let primaryError;
+	let failed = false;
+	const cleanupErrors = [];
 	try {
 		for (let i = 0; i < handles; i++) {
 			const index = await openNativeFullTextIndex({
@@ -97,38 +101,50 @@ if (options.child) {
 				await yieldTurn();
 			}
 		const all = durations.flat();
-		console.log(
-			JSON.stringify({
-				measurementVersion: 1,
-				module,
-				workers,
-				handles,
-				histograms,
-				snapshotBytes: false,
-				scope: 'idle-populated-handle-synchronous-telemetry-call',
-				schedule: 'serial-one-handle-per-event-loop-turn-no-interval-target',
-				searchWarmupPerHandle: 100,
-				warmupRounds,
-				samplesPerHandle: sampleRounds,
-				durationsMilliseconds: durations,
-				p50Milliseconds: percentile(all, 0.5),
-				p99Milliseconds: percentile(all, 0.99),
-				maxMilliseconds: all.reduce((maximum, duration) => Math.max(maximum, duration), 0),
-				runtime: await runtimeInfo(),
-			}),
-		);
+		report = {
+			measurementVersion: 1,
+			module,
+			workers,
+			handles,
+			histograms,
+			snapshotBytes: false,
+			scope: 'idle-populated-handle-synchronous-telemetry-call',
+			schedule: 'serial-one-handle-per-event-loop-turn-no-interval-target',
+			searchWarmupPerHandle: 100,
+			warmupRounds,
+			samplesPerHandle: sampleRounds,
+			durationsMilliseconds: durations,
+			p50Milliseconds: percentile(all, 0.5),
+			p99Milliseconds: percentile(all, 0.99),
+			maxMilliseconds: all.reduce((maximum, duration) => Math.max(maximum, duration), 0),
+			runtime: await runtimeInfo(),
+		};
+	} catch (error) {
+		failed = true;
+		primaryError = error;
 	} finally {
-		let error;
 		for (const index of indexes)
 			try {
 				const result = await index.close({ mode: 'rollback' });
-				if (result.cleanupError) error ??= result.cleanupError;
-			} catch (cause) {
-				error ??= cause;
+				if (result.cleanupError) cleanupErrors.push(result.cleanupError);
+			} catch (error) {
+				cleanupErrors.push(error);
 			}
-		if (error) throw error;
-		await rm(root, { recursive: true, force: true });
+		if (cleanupErrors.length === 0)
+			try {
+				await rm(root, { recursive: true, force: true });
+			} catch (error) {
+				cleanupErrors.push(error);
+			}
 	}
+	if (failed && cleanupErrors.length > 0)
+		throw new AggregateError([primaryError, ...cleanupErrors], 'Scrape measurement and cleanup failed', {
+			cause: primaryError,
+		});
+	if (failed) throw primaryError;
+	if (cleanupErrors.length === 1) throw cleanupErrors[0];
+	if (cleanupErrors.length > 1) throw new AggregateError(cleanupErrors, 'Scrape cleanup failed');
+	console.log(JSON.stringify(report));
 } else {
 	assert(
 		options.baseline && options.candidate && options.output,
