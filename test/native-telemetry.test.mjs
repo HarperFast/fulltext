@@ -512,10 +512,11 @@ test('concurrent search callers remain correct while telemetry is repeatedly scr
 	const callers = Array.from({ length: callerCount }, async () => {
 		try {
 			for (let query = 0; query < queriesPerCaller; query++) {
-				const result = await index.search({ text: 'shared', exactTotal: true, limit: 3 });
+				const result = await index.search({ text: 'shared', mode: 'any', limit: records.length });
 				assert.strictEqual(result.total, records.length);
 				assert.strictEqual(result.totalRelation, 'exact');
-				assert.strictEqual(result.hits.length, 3);
+				assert.strictEqual(result.hits.length, records.length);
+				assert.strictEqual(new Set(result.hits.map((hit) => hit.id)).size, records.length);
 				assert(result.hits.every((hit) => ids.has(hit.id)));
 				await setImmediate();
 			}
@@ -547,6 +548,7 @@ test('concurrent search callers remain correct while telemetry is repeatedly scr
 	assert(scrapesWhilePending >= 3);
 	const final = snapshot(index).native;
 	const searches = final.operations.search;
+	assert.strictEqual(final.operations.expensiveSearch.attempted, 0n);
 	const totalQueries = BigInt(callerCount * queriesPerCaller);
 	assert.strictEqual(searches.attempted, totalQueries);
 	assert.strictEqual(searches.accepted, totalQueries);

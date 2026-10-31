@@ -505,24 +505,28 @@ pub fn test_fail_next_telemetry_observation(env: Env, handle: u32) -> boundary::
 }
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeCreateTelemetry")]
 pub fn native_create_telemetry(env: Env, handle: u32) -> boundary::Result<External<TelemetryToken>> {
-	let runtime = runtime(&env, handle)?;
-	#[cfg(feature = "test-panic")]
-	if FAIL_TELEMETRY_TOKEN.swap(false, Ordering::Relaxed) {
-		return Err(napi_error("E_NATIVE_FAILURE", "injected telemetry acquisition failure"));
-	}
-	Ok(External::new(TelemetryToken {
-		metrics: runtime.metrics.clone(),
-		runtime: Arc::downgrade(&runtime),
-		environment: env.raw() as usize,
-		max_commands: runtime.config.limits.max_queued_commands,
-		max_bytes: runtime.config.limits.max_queued_bytes,
-		isolated: runtime.expensive_search_queue.is_some(),
-	}))
+	boundary::run_stateless(|| {
+		let runtime = runtime(&env, handle)?;
+		#[cfg(feature = "test-panic")]
+		if FAIL_TELEMETRY_TOKEN.swap(false, Ordering::Relaxed) {
+			return Err(napi_error("E_NATIVE_FAILURE", "injected telemetry acquisition failure"));
+		}
+		Ok(External::new(TelemetryToken {
+			metrics: runtime.metrics.clone(),
+			runtime: Arc::downgrade(&runtime),
+			environment: env.raw() as usize,
+			max_commands: runtime.config.limits.max_queued_commands,
+			max_bytes: runtime.config.limits.max_queued_bytes,
+			isolated: runtime.expensive_search_queue.is_some(),
+		}))
+	})?
 }
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeTelemetry")]
 pub fn native_telemetry(env: Env, token: &External<TelemetryToken>) -> boundary::Result<String> {
-	token.validate(&env)?;
-	Ok(token.metrics.json(&token.queues()))
+	boundary::run_stateless(|| {
+		token.validate(&env)?;
+		Ok(token.metrics.json(&token.queues()))
+	})?
 }
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeConfigureTelemetry")]
 pub fn native_configure_telemetry(
@@ -531,14 +535,16 @@ pub fn native_configure_telemetry(
 	histograms: bool,
 	snapshot_bytes: bool,
 ) -> boundary::Result<()> {
-	token.validate(&env)?;
-	let runtime = token
-		.runtime
-		.upgrade()
-		.ok_or_else(|| napi_error("E_CLOSED", "index is closed"))?;
-	runtime.require_open().map_err(fulltext_napi_error)?;
-	token.metrics.configure(histograms, snapshot_bytes);
-	Ok(())
+	boundary::run_stateless(|| {
+		token.validate(&env)?;
+		let runtime = token
+			.runtime
+			.upgrade()
+			.ok_or_else(|| napi_error("E_CLOSED", "index is closed"))?;
+		runtime.require_open().map_err(fulltext_napi_error)?;
+		token.metrics.configure(histograms, snapshot_bytes);
+		Ok(())
+	})?
 }
 fn observe_phase<T>(metrics: &Metrics, phase: usize, run: impl FnOnce() -> Result<T>) -> Result<T> {
 	let started = Instant::now();

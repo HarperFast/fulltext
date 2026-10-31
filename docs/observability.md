@@ -102,6 +102,12 @@ ordinary/prefix searches, one/four callers, one/two indexes, histograms off/on, 
 optional snapshot bytes. It records correctness checks, throughput, latency, indexing/publication
 cost, process CPU/RSS, runtime versions and caller-supplied source revisions.
 
+Ordinary requests use `any` with `exactTotal: false`, checking the known bounded total and stable
+top IDs. Prefix requests retain exact totals and use the expensive-search queue. Candidate warmup
+verifies both the selected native operation counter and the absence of attempts in the other
+class before timing starts. Baseline routing follows the same request classifier. Historical
+results used exact totals for both labels and therefore did not measure the ordinary queue.
+
 ```sh
 node benchmarks/observability.mjs \
   --baseline=/absolute/baseline/dist/native.js \

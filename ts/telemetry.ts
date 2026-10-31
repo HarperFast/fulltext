@@ -24,6 +24,7 @@ export interface TelemetryOperation {
 	attempted: bigint;
 	accepted: bigint;
 	rejected: bigint;
+	/** Current dispatched work, including permit waits; not a cumulative counter. */
 	dispatched: bigint;
 	completed: bigint;
 	succeeded: bigint;
@@ -36,7 +37,9 @@ export interface TelemetryOperation {
 }
 export interface TelemetryQueue {
 	available: boolean;
+	/** Current queue occupancy. */
 	commands: bigint;
+	/** Current admitted bytes held in this queue. */
 	bytes: bigint;
 	oldestAgeNanoseconds: bigint | null;
 	maxCommands: bigint;

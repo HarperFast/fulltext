@@ -77,20 +77,50 @@ if (options.child) {
 			text: 'catalog',
 			mode: options.operation === 'expensive' ? 'prefix' : 'any',
 			limit: 10,
-			exactTotal: true,
+			exactTotal: options.operation === 'expensive',
 		};
+		const queryClass = options.operation === 'expensive' ? 'expensiveSearch' : 'search';
+		const otherQueryClass = queryClass === 'search' ? 'expensiveSearch' : 'search';
+		const expectedIds = Array.from({ length: documentCount }, (_, id) => String(id))
+			.sort()
+			.slice(0, 10);
+		const operationCounts = () =>
+			indexes.map((index) => {
+				const snapshot = index.telemetry();
+				assert(snapshot.available, 'Candidate telemetry is required to verify native query classification');
+				return snapshot.native.operations;
+			});
+		const beforeWarmup = profile === 'baseline' ? undefined : operationCounts();
 		const check = async (index) => {
 			const result = await index.search(request);
-			assert.strictEqual(result.total, documentCount);
-			assert.strictEqual(result.totalRelation, 'exact');
-			assert.strictEqual(result.hits.length, 10);
-			assert.strictEqual(new Set(result.hits.map((hit) => hit.id)).size, 10);
+			assert.strictEqual(result.total, request.exactTotal ? documentCount : Math.min(documentCount, 10));
+			assert.strictEqual(result.totalRelation, request.exactTotal || documentCount <= 10 ? 'exact' : 'lower-bound');
+			assert.strictEqual(result.hits.length, expectedIds.length);
+			assert.strictEqual(new Set(result.hits.map((hit) => hit.id)).size, expectedIds.length);
+			assert.deepStrictEqual(
+				result.hits.map((hit) => hit.id),
+				expectedIds,
+			);
 			for (const hit of result.hits) {
 				assert(Number.isSafeInteger(Number(hit.id)) && Number(hit.id) >= 0 && Number(hit.id) < documentCount);
 				assert(Number.isFinite(hit.score));
 			}
 		};
 		for (let i = 0; i < 100; i++) await check(indexes[i % indexes.length]);
+		if (beforeWarmup) {
+			const afterWarmup = operationCounts();
+			const selected = afterWarmup.reduce(
+				(total, operations, i) => total + operations[queryClass].succeeded - beforeWarmup[i][queryClass].succeeded,
+				0n,
+			);
+			const other = afterWarmup.reduce(
+				(total, operations, i) =>
+					total + operations[otherQueryClass].attempted - beforeWarmup[i][otherQueryClass].attempted,
+				0n,
+			);
+			assert.strictEqual(selected, 100n, 'Warmup must use the selected native search class');
+			assert.strictEqual(other, 0n, 'Warmup must not use the other native search class');
+		}
 		if (profile === 'polling')
 			poll = setInterval(() => {
 				try {
@@ -140,6 +170,9 @@ if (options.child) {
 			serialize({
 				profile,
 				operation: options.operation,
+				queryClass,
+				queryClassVerification: beforeWarmup ? 'native-operation-counters' : 'matching-request-classification',
+				request,
 				callers,
 				indexCount,
 				documentCount,

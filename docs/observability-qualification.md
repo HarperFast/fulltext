@@ -1,5 +1,13 @@
 # Observability qualification
 
+> **Historical classification correction:** every matrix and phase-control run recorded below used
+> `exactTotal: true`. The native classifier routes exact-total requests to the expensive-search
+> queue, including the raw reports' `ordinary`/`any` labels. Both historical query shapes therefore
+> measured expensive-queue work. They provide **no ordinary-queue or ordinary-contention evidence**.
+> Raw reports and measurements remain unchanged. The corrected driver uses `any` with bounded
+> totals for ordinary work and verifies candidate routing through native operation counters;
+> that corrected workload has not yet been measured here.
+
 ## Initial paired matrix
 
 This historical run compared [candidate `32a9401`](https://github.com/HarperFast/fulltext/commit/32a94018d7f02f7c10c3e3ed228d0fa74b51b7a2)
@@ -149,7 +157,8 @@ are not a separate passed gate.
 ## Same-process phase control
 
 Four private diagnostic processes used the same measured candidate/baseline packages, corpus,
-ordinary exact-total request and correctness oracle, with four callers and one index. Each made
+`any` exact-total request and correctness oracle, with four callers and one index. Despite its
+historical ordinary label, that request used the expensive-search queue. Each made
 one initial publication, then eight alternating off/on phases, each with 2,000 untimed warmup
 queries and 100,000 timed queries. Normal and reversed order were run for each package.
 **All 32 timed phases, 3,200,000 timed queries and 64,000 warmup queries completed correctly.**
@@ -201,9 +210,10 @@ All four raw diagnostic reports are preserved privately with these SHA-256 ident
 | Baseline, reverse order  | `49f1d53c50134f47759e67f1912b2e69486c40acee42795f14ba800a2ed0ee28` |
 
 The adjudication is limited: preserve the repeatably positive matrix cell as an unresolved
-performance qualification concern, while treating its cause and any configuration-specific
-regression as unproven. Subsequent timing/accounting refinements need their own measured evidence;
-these runs cannot qualify changes made after `8ebe625`.
+performance qualification concern for its **expensive-queue exact-total query shape**, while
+treating its cause and any configuration-specific regression as unproven. It cannot establish an
+ordinary-path regression. Subsequent timing/accounting refinements and the corrected ordinary
+workload need their own measured evidence; these runs cannot qualify changes after `8ebe625`.
 
 ## Refined native recorder microbenchmark
 
