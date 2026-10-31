@@ -1474,6 +1474,34 @@ impl Engine {
 
 	fn expression_query(&self, searcher: &Searcher, expression: &SearchExpression) -> Result<BuiltQuery> {
 		crate::protocol::validate_search_structure(expression, self.max_query_clauses, self.fields.len())?;
+		if let SearchExpression::Boost { boost, clause } = expression {
+			if let SearchExpression::Clause(leaf) = clause.as_ref() {
+				if matches!(leaf.mode, SearchMode::Any | SearchMode::All) {
+					// Only the root has no inherited boost whose multiplication order must be preserved.
+					let fields: Vec<_> = self
+						.selected_fields(&leaf.fields)?
+						.into_iter()
+						.cloned()
+						.map(|mut field| {
+							field.weight *= *boost;
+							field
+						})
+						.collect();
+					let fields: Vec<_> = fields.iter().collect();
+					let occur = if leaf.mode == SearchMode::Any {
+						Occur::Should
+					} else {
+						Occur::Must
+					};
+					let (query, clauses) = self.term_query(&leaf.text, &fields, occur)?;
+					self.check_total_clause_count(clauses, 1)?;
+					return Ok(BuiltQuery {
+						query,
+						clauses: clauses + 1,
+					});
+				}
+			}
+		}
 		self.expression_query_inner(searcher, expression, &mut QueryConstructionBudget::default())
 	}
 
@@ -1488,38 +1516,11 @@ impl Engine {
 			SearchExpression::And(children) => self.boolean_query(searcher, children, Occur::Must, budget),
 			SearchExpression::Or(children) => self.boolean_query(searcher, children, Occur::Should, budget),
 			SearchExpression::Boost { boost, clause } => {
-				let child = match clause.as_ref() {
-					SearchExpression::Clause(leaf) if matches!(leaf.mode, SearchMode::Any | SearchMode::All) => {
-						// Keep term scorers visible to Tantivy's pruning collector.
-						let fields: Vec<_> = self
-							.selected_fields(&leaf.fields)?
-							.into_iter()
-							.cloned()
-							.map(|mut field| {
-								field.weight *= *boost;
-								field
-							})
-							.collect();
-						let fields: Vec<_> = fields.iter().collect();
-						let occur = if leaf.mode == SearchMode::Any {
-							Occur::Should
-						} else {
-							Occur::Must
-						};
-						let (query, clauses) = self.term_query(&leaf.text, &fields, occur)?;
-						BuiltQuery { query, clauses }
-					}
-					_ => {
-						let mut child = self.expression_query_inner(searcher, clause, budget)?;
-						child.query = boosted(child.query, *boost);
-						child
-					}
-				};
+				let mut child = self.expression_query_inner(searcher, clause, budget)?;
 				self.check_total_clause_count(child.clauses, 1)?;
-				Ok(BuiltQuery {
-					query: child.query,
-					clauses: child.clauses + 1,
-				})
+				child.query = boosted(child.query, *boost);
+				child.clauses += 1;
+				Ok(child)
 			}
 			SearchExpression::Optional { required, optional } => {
 				let mut clauses = optional.len() + 1;
@@ -5657,6 +5658,88 @@ mod tests {
 			]
 		);
 		writer.close().unwrap();
+	}
+
+	fn assert_nested_boost_reference_scores(field_weight: f32, outer: f32, inner: f32) {
+		let mut config = config();
+		config.identity.fields[0].weight = field_weight;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "matched".to_owned(),
+					version: None,
+					fields: vec![("title".to_owned(), vec!["amber stone".to_owned()])],
+					filters: Vec::new(),
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		for mode in [SearchMode::Any, SearchMode::All] {
+			let leaf = expression("amber", mode, vec!["title".to_owned()]);
+			let query = SearchExpression::Boost {
+				boost: outer,
+				clause: Box::new(SearchExpression::Boost {
+					boost: inner,
+					clause: Box::new(leaf.clone()),
+				}),
+			};
+			let base = engine.expression_query(&searcher, &leaf).unwrap();
+			let reference = BoostQuery::new(Box::new(BoostQuery::new(base.query, inner)), outer);
+			let actual = engine.expression_query(&searcher, &query).unwrap();
+			let scores = |query: &dyn Query| {
+				let weight = query
+					.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
+					.unwrap();
+				searcher
+					.segment_readers()
+					.iter()
+					.flat_map(|reader| {
+						let mut scorer = weight.scorer(reader, 1.0).unwrap();
+						let mut scores = Vec::new();
+						while scorer.doc() != tantivy::TERMINATED {
+							scores.push((scorer.doc(), scorer.score().to_bits()));
+							scorer.advance();
+						}
+						scores
+					})
+					.collect::<Vec<_>>()
+			};
+			let expected = scores(&reference);
+			assert!(!expected.is_empty());
+			assert_eq!(
+				scores(actual.query.as_ref()),
+				expected,
+				"native boost order changed for {field_weight} * {inner} * {outer}"
+			);
+			let mut request = admission_request(mode);
+			request.expression = query;
+			request.exact_total = true;
+			let result = engine.search(&searcher, &request).unwrap();
+			assert_eq!(result.total, 1);
+			assert_eq!(result.hits[0].id, "matched");
+			if outer == 0.0 {
+				assert_eq!(result.hits[0].score, 0.0);
+			}
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn nested_boost_zero_preserves_native_order_without_intermediate_overflow() {
+		assert_nested_boost_reference_scores(3e38, 0.0, 2.0);
+	}
+
+	#[test]
+	fn nested_boost_fractional_weights_preserve_native_score_bits() {
+		for weight in [0.1, 0.3, 0.7, 1.3] {
+			for (outer, inner) in [(0.7, 0.3), (0.1, 0.7), (1.3, 2.7)] {
+				assert_nested_boost_reference_scores(weight, outer, inner);
+			}
+		}
 	}
 
 	#[test]
