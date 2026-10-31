@@ -49,6 +49,12 @@ source oracle is prepared for that reader's published checkpoint. A publication 
 lease; retirement closes the old reader only after its queries finish. This prevents comparing a
 legitimate old-snapshot result with newer source rows.
 
+The optional `--min-publications` positive safe integer gives short correctness fixtures a
+completion condition: the mixed phase continues until both its duration and publication minimum
+are met, unless an operation fails first. Absence means zero and adds no iterations to the default
+30-minute mixed/10-minute drain workload. Fixture children retain their existing outer deadlines;
+the option does not relax resource gates or qualify a short run as a sustained soak.
+
 Latency histograms have fixed bins. Recent memory samples retain only the final five-minute
 window; the sampling interval is at least 100 ms. Full samples stream to disk. Do not retain every
 query or latency in memory: that makes the harness itself a growing part of the RSS measurement.

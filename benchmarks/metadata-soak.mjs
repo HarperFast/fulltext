@@ -24,6 +24,8 @@ assert(artifacts && path.isAbsolute(artifacts), '--artifacts requires a new abso
 const documents = positive('--documents', 50_000, true);
 assert(documents >= 200, '--documents must be at least 200');
 const mixedMilliseconds = positive('--mixed-seconds', 1800) * 1000;
+const minimumPublications =
+	argument('--min-publications') === undefined ? 0 : positive('--min-publications', undefined, true);
 const drainMilliseconds = positive('--drain-seconds', 600) * 1000;
 const readers = positive('--readers', 8, true);
 const writeInterval = positive('--write-interval-ms', 2000);
@@ -79,6 +81,7 @@ const manifest = {
 		documents,
 		readers,
 		mixedMilliseconds,
+		minimumPublications,
 		drainMilliseconds,
 		writeInterval,
 		sampleInterval,
@@ -419,7 +422,7 @@ try {
 	sampleTask = sampleLoop().catch((error) => fail(error, 'sample'));
 	workers = Array.from({ length: readers }, (_, n) => readLoop(n));
 	let deleted = [];
-	while (!firstError && performance.now() - phaseStarted < mixedMilliseconds) {
+	while (!firstError && (performance.now() - phaseStarted < mixedMilliseconds || publications < minimumPublications)) {
 		const nextWrite = performance.now() + writeInterval;
 		epoch++;
 		const changed = new Map();

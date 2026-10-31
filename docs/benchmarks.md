@@ -372,6 +372,17 @@ six-minute expanded workload observation. The guide retains an unexplained earli
 flag alongside all subsequent passing diagnostic and acceptance runs. These are local synthetic
 observations, not production performance objectives.
 
+## Mixed metadata soak fixtures
+
+`benchmarks/metadata-soak.mjs` defaults to a 30-minute mixed phase followed by a 10-minute drain,
+with unchanged correctness, latency and memory gates. Short correctness fixtures may explicitly
+set `--min-publications 2` to require two completed publications as well as the requested mixed
+duration. The supplied value must be a positive safe integer; omitting it imposes no publication
+minimum. The driver stops on an operation failure even when the minimum is unmet. This option
+can extend the mixed phase, so fixture children keep an independent outer deadline (40 seconds
+in the short CI cases, within their 45-second test deadline). These short runs verify behavior,
+not sustained performance or production capacity.
+
 ## Configurable query-capacity qualification
 
 Build optimized artifacts, then run:

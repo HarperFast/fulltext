@@ -12,7 +12,7 @@ const execute = promisify(execFile);
 const driver = fileURLToPath(new URL('../benchmarks/metadata-soak.mjs', import.meta.url));
 const cases = ['ordinary-exact', 'price-sort', 'nested-histogram', 'runtime-five-sort'];
 const readJson = async (file) => JSON.parse(await readFile(file, 'utf8'));
-async function fixture(context) {
+async function fixture(context, { minimumPublications = true } = {}) {
 	const artifactRoot = process.env.FULLTEXT_TEST_ARTIFACT_ROOT
 		? path.resolve(process.env.FULLTEXT_TEST_ARTIFACT_ROOT)
 		: undefined;
@@ -28,6 +28,8 @@ async function fixture(context) {
 		'400',
 		'--mixed-seconds',
 		'1',
+		'--min-publications',
+		'2',
 		'--drain-seconds',
 		'1',
 		'--write-interval-ms',
@@ -45,6 +47,7 @@ async function fixture(context) {
 		'--max-tail-rss-range-mib',
 		'4096',
 	];
+	if (!minimumPublications) args.splice(args.indexOf('--min-publications'), 2);
 	return { artifacts, args };
 }
 async function verifyRetainedSamples(artifacts) {
@@ -259,3 +262,53 @@ test(
 		await assert.rejects(access(path.join(artifacts, 'report.json')), { code: 'ENOENT' });
 	},
 );
+
+for (const scenario of ['success', 'throughput-failure', 'duration-default'])
+	test(`short soak publication minimum under delayed work: ${scenario}`, { timeout: 45_000 }, async (context) => {
+		const { artifacts, args } = await fixture(context, { minimumPublications: scenario !== 'duration-default' });
+		const expectedFailure = scenario !== 'success';
+		const command = [
+			...args,
+			'--module',
+			fileURLToPath(new URL('./fixtures/metadata-delayed-publication.mjs', import.meta.url)),
+		];
+		if (expectedFailure) command.push('--min-throughput', '1000000000000');
+		let report;
+		try {
+			const { stdout } = await execute(process.execPath, command, {
+				timeout: 40_000,
+				maxBuffer: 4 << 20,
+				env: { ...process.env, FULLTEXT_PREFER_LOCAL_BUILD: '1' },
+			});
+			assert.strictEqual(expectedFailure, false, 'Intentional throughput failure must reject');
+			report = JSON.parse(stdout);
+		} catch (error) {
+			if (!expectedFailure) throw error;
+			assert.strictEqual(error.stdout, '');
+			assert.match(error.stderr, /throughput gate failed/);
+			report = await readJson(path.join(artifacts, 'failure.json'));
+			assert.deepStrictEqual(report.closeErrors, []);
+			await access(path.join(artifacts, 'index', 'meta.json'));
+			await assert.rejects(access(path.join(artifacts, 'report.json')), { code: 'ENOENT' });
+		}
+		if (scenario === 'duration-default') assert(report.publications < 2);
+		else assert.strictEqual(report.publications, 2);
+		assert.strictEqual(report.accepted, !expectedFailure);
+		if (scenario === 'duration-default') assert(report.mutations <= 110);
+		else assert(report.mutations >= 220);
+		const manifest = await readJson(path.join(artifacts, 'manifest.json'));
+		assert.strictEqual(manifest.workload.minimumPublications, scenario === 'duration-default' ? 0 : 2);
+		assert.strictEqual(manifest.workload.mixedMilliseconds, 1000);
+		assert.strictEqual(manifest.gates.minSuccessesPerSecond, expectedFailure ? 1000000000000 : 10);
+		verifyQueries(report);
+		await verifyRetainedSamples(artifacts);
+		if (!expectedFailure) await assert.rejects(access(path.join(artifacts, 'index')), { code: 'ENOENT' });
+	});
+
+for (const value of ['0', '-1', '1.5', 'NaN', '9007199254740992'])
+	test(`soak rejects invalid publication minimum ${value}`, { timeout: 45_000 }, async (context) => {
+		const { artifacts, args } = await fixture(context);
+		args[args.indexOf('--min-publications') + 1] = value;
+		await assert.rejects(execute(process.execPath, args, { timeout: 40_000 }), /--min-publications must be positive/);
+		await assert.rejects(access(path.join(artifacts, 'manifest.json')), { code: 'ENOENT' });
+	});
