@@ -40,7 +40,7 @@ export async function openNativeFullTextIndex(options) {
 			return { total: 1 };
 		},
 		telemetry() {
-			if (failure === 'primary-and-close') throw new Error('E_SCRAPE_PRIMARY');
+			if (failure === 'primary' || failure === 'primary-and-close') throw new Error('E_SCRAPE_PRIMARY');
 			assert.strictEqual(counts.queries, 100);
 			counts.scrapes++;
 			milliseconds += 2;

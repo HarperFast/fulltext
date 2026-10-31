@@ -188,7 +188,7 @@ for (const argument of ['--sample-rounds=10001', '--warmup-rounds=1001'])
 		assert.match(result.stderr, /must be a positive integer/);
 	});
 
-for (const failure of ['primary-and-close', 'close', 'partial-open'])
+for (const failure of ['primary', 'primary-and-close', 'close', 'partial-open'])
 	test(`idle scrape driver preserves ${failure} failure and publishes no success report`, () => {
 		const root = mkdtempSync(path.join(tmpdir(), 'observability-cleanup-test-'));
 		const marker = path.join(root, 'marker.json');
@@ -229,6 +229,9 @@ for (const failure of ['primary-and-close', 'close', 'partial-open'])
 			if (failure === 'partial-open') {
 				assert.match(result.stderr, /E_SCRAPE_OPEN/);
 				assert(result.stderr.includes(fixtureRoot), 'A retained fixture path must be reported');
+			} else if (failure === 'primary') {
+				assert.match(result.stderr, /E_SCRAPE_PRIMARY/);
+				assert.doesNotMatch(result.stderr, /E_SCRAPE_CLOSE/);
 			} else assert.match(result.stderr, /E_SCRAPE_CLOSE/);
 			if (failure === 'primary-and-close') {
 				assert.match(result.stderr, /AggregateError: Scrape measurement and cleanup failed/);
@@ -236,7 +239,7 @@ for (const failure of ['primary-and-close', 'close', 'partial-open'])
 				assert.match(result.stderr, /\[cause\]/);
 			} else {
 				assert.doesNotMatch(result.stderr, /AggregateError/);
-				assert.doesNotMatch(result.stderr, /E_SCRAPE_PRIMARY/);
+				if (failure !== 'primary') assert.doesNotMatch(result.stderr, /E_SCRAPE_PRIMARY/);
 			}
 		} finally {
 			if (fixtureRoot) rmSync(fixtureRoot, { recursive: true, force: true });
@@ -273,7 +276,10 @@ for (const failure of ['primary', 'primary-and-close', 'close', 'partial-open', 
 			const state = JSON.parse(readFileSync(marker, 'utf8'));
 			fixtureRoot = state.root;
 			assert.strictEqual(state.closeAttempts, failure === 'partial-open' ? 1 : 4);
-			assert.deepStrictEqual(state.closeModes, Array(state.closeAttempts).fill('rollback'));
+			assert.deepStrictEqual(
+				state.closeModes,
+				Array(state.closeAttempts).fill(failure === 'none' || failure === 'close' ? null : 'rollback'),
+			);
 			if (failure === 'none') {
 				assert.strictEqual(result.status, 0, result.stderr);
 				assert.strictEqual(JSON.parse(result.stdout).queryCount, 3);

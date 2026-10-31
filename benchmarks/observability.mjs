@@ -288,7 +288,7 @@ if (options.child) {
 		clearTimeout(poll);
 		for (const index of indexes) {
 			try {
-				const result = await index.close({ mode: 'rollback' });
+				const result = await index.close(failed ? { mode: 'rollback' } : undefined);
 				if (result.cleanupError) cleanupErrors.push(result.cleanupError);
 			} catch (error) {
 				cleanupErrors.push(error);
