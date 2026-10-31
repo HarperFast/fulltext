@@ -1,8 +1,132 @@
 # Observability qualification
 
+## Worker-bank optimization and validation-excluded windows
+
+Runtime [`077dffc`](https://github.com/HarperFast/fulltext/commit/077dffc10d82e58a4e4186e65e1d0e037490905d)
+was compared both with the previous telemetry runtime
+[`6a166c4`](https://github.com/HarperFast/fulltext/commit/6a166c4a5925819b6c6539e1b39760c6ed39107a)
+and the original pre-telemetry `bb4fac1`. Each comparison used eight single-hit ordinary cells,
+seven alternating fresh-process pairs, 2,000 documents/index and 40,000 timed queries/child on
+Node 24.16.0/Darwin arm64. All **224 children and 8,960,000 timed correctness checks passed**.
+The previous/candidate facades are byte-identical; their native recorder differs. Histogram modes
+match in the optimization comparison; the original-version control has no telemetry API calls.
+
+These are `measurementVersion: 2` observations: API percentiles stop before validation, and
+throughput sums fully drained 1,024-result query windows with validation outside each timer.
+Every result is still checked. Query CPU/event-loop observations use those same windows; mixed
+CPU/elapsed retain validation and 20 mutation/publication cycles. This scope differs from the
+historical reports below; do not reinterpret those raw values. Median query-window event-loop
+utilization was 95.8–100%, so this fixture is substantially constrained by JavaScript/event-loop
+work and cannot isolate per-worker native CPU savings.
+
+The worker banks improved four-caller/histograms-off throughput in every observed pair at both
+index counts: median gains 1.55% and 1.31%, with query-process CPU medians down 1.31% and 1.84%.
+Other cells overlap no change, and histogram-on outliers remain. Retain the bank memory/scrape
+tradeoff; these observations do not promise that every workload benefits.
+
+All changes below are percentages, median [minimum, maximum] over seven pairs. Negative
+throughput loss means a gain; negative p99 increase means lower API latency. Ranges are not
+confidence intervals.
+
+### Optimization relative to previous telemetry
+
+| Callers | Indexes | Histograms | Throughput loss      | API p99 increase      |
+| ------- | ------- | ---------- | -------------------- | --------------------- |
+| 1       | 1       | off        | -0.53 [-5.27, 1.88]  | -3.74 [-46.64, 5.86]  |
+| 1       | 1       | on         | 0.20 [-1.68, 0.72]   | -1.01 [-21.61, 12.12] |
+| 1       | 2       | off        | -0.58 [-4.63, 0.16]  | 0.00 [-3.37, 5.72]    |
+| 1       | 2       | on         | -0.18 [-1.46, 1.43]  | -1.09 [-2.28, 3.40]   |
+| 4       | 1       | off        | -1.55 [-7.93, -0.53] | -3.73 [-9.89, 6.95]   |
+| 4       | 1       | on         | -2.13 [-2.87, 7.96]  | 1.21 [-4.97, 13.32]   |
+| 4       | 2       | off        | -1.31 [-3.40, -0.54] | -3.48 [-13.08, 1.32]  |
+| 4       | 2       | on         | -1.29 [-3.43, 7.03]  | -0.27 [-4.68, 11.88]  |
+
+### Total addition relative to the original version
+
+Every cell's median met the original numerical targets, but **the tight overall overhead bound
+remains unestablished**. Only four-callers/two-indexes/histograms-on stayed within all applicable
+thresholds in every pair; the other seven cells were inconclusive. No cell was outside a target
+in every pair. Keep the 1% off / 3% on throughput and 5% on p99 targets unchanged; no general
+performance pass, production capacity or sustained-memory qualification is claimed.
+
+| Callers | Indexes | Histograms | Throughput loss      | API p99 increase     |
+| ------- | ------- | ---------- | -------------------- | -------------------- |
+| 1       | 1       | off        | -0.24 [-28.87, 3.29] | -0.33 [-5.86, 2.47]  |
+| 1       | 1       | on         | 0.35 [-29.78, 1.52]  | -0.22 [-23.92, 5.62] |
+| 1       | 2       | off        | 0.50 [-2.95, 9.22]   | 3.14 [-11.09, 18.17] |
+| 1       | 2       | on         | -0.28 [-1.89, 1.61]  | 1.64 [-9.19, 23.95]  |
+| 4       | 1       | off        | 0.50 [-0.60, 2.91]   | -0.73 [-8.50, 3.74]  |
+| 4       | 1       | on         | 0.66 [-2.74, 3.94]   | -1.14 [-8.77, 1.93]  |
+| 4       | 2       | off        | -0.86 [-5.31, 7.86]  | 1.71 [-4.17, 10.78]  |
+| 4       | 2       | on         | -0.14 [-3.54, 0.81]  | -0.67 [-9.70, 5.00]  |
+
+Private raw-report SHA-256 values:
+
+- optimization: `9a0ecaa41e873f38e120ca78175868beb5f187ae12e84d76048e1326d9a9cf6f`.
+- total: `ce48fec2dfcc41e51859c9ea50133c815ffe251c17a27838838d291e6015a016`.
+
+### Native recorder control
+
+Serial release-mode microbenchmarks retain all atomic increments. In the synthetic four-producer
+recorder, shared/banked wall time was 66.84/55.43 ms with histograms off and 82.48/51.33 ms on
+for 400,000 aggregate operations. The production-shaped one-producer/four-worker control with
+10 μs busywork per operation was mixed: 107.84/112.67 ms off and 112.36/109.49 ms on for 40,000
+operations. These single trials include thread/queue/scheduling costs; neither is native CPU
+attribution or a production throughput bound. Earlier simultaneous microbenchmark output is
+preserved but excluded from this serial comparison.
+
+### Synchronous collection cost
+
+Twenty fresh-child cells covered previous/optimized recorder, histograms off/on and selected
+worker/handle topologies 1/1, 4/1, 64/1, 4/4 and 4/16. Each handle had 100 successful searches,
+25 warmup scrapes and 120 measured scrapes, yielding **11,040 measured calls**. Each synchronous
+call includes native queue/counter snapshot/serialization and JavaScript parse/BigInt conversion.
+One handle is sampled per event-loop turn. These are populated idle handles, not a queue-contention
+or universal pause bound. Snapshot-byte collection stayed disabled. Explicit process budgets
+covered all three queues, at most 64 search threads and 16 writer handles; the first harness open
+correctly rejected an undersized aggregate queue budget, before any measurements.
+
+| Workers/handle | Handles | Histograms | Previous p99 (ms) | Optimized p50 / p99 / max (ms) |
+| -------------- | ------- | ---------- | ----------------- | ------------------------------ |
+| 1              | 1       | off        | 0.332             | 0.301 / 0.361 / 0.397          |
+| 1              | 1       | on         | 0.340             | 0.303 / 0.342 / 0.366          |
+| 4              | 1       | off        | 0.364             | 0.299 / 0.335 / 0.348          |
+| 4              | 1       | on         | 0.352             | 0.301 / 0.341 / 0.343          |
+| 64             | 1       | off        | 0.344             | 0.302 / 0.343 / 0.344          |
+| 64             | 1       | on         | 0.352             | 0.302 / 0.337 / 0.356          |
+| 4              | 4       | off        | 0.347             | 0.282 / 0.354 / 0.369          |
+| 4              | 4       | on         | 0.357             | 0.283 / 0.352 / 0.392          |
+| 4              | 16      | off        | 0.308             | 0.284 / 0.310 / 0.330          |
+| 4              | 16      | on         | 0.305             | 0.285 / 0.346 / 0.466          |
+
+Per-call maxima below 0.47 ms on this machine do not justify scraping every index in one tight
+loop. Stagger handles and qualify the intended worker/handle count and exporter schedule.
+
+Scrape raw-report SHA-256: `d2fb41b62186585528ce2184d8da02808e9255587a7d9745f8266b1a0f848eec`.
+
+### Normal-interval active collection
+
+An additional four fresh-process controls used four callers, four or sixteen handles, histograms
+and byte collection disabled, the same 1,024-result validation windows and **1,000,000 correct timed
+queries per child**. Previous/optimized recorder both used the one-second-per-handle schedule.
+All handles received 11–12 scrapes over 11.6–11.9 seconds of mixed-phase elapsed time; this is a
+finite schedule check, not sustained-memory qualification or a no-poll throughput comparison.
+It adds 4,000,000 correctness-checked timed queries to the 8,960,000 paired observations above.
+Active collection pauses exceed idle observations; GC, concurrent work and snapshot acquisition
+can affect them. Do not use the idle table as a bound for loaded handles.
+
+| Recorder        | Handles | Samples/handle | Active scrape p99 / max (ms) |
+| --------------- | ------- | -------------- | ---------------------------- |
+| preoptimization | 4       | 11–12          | 1.070 / 1.070                |
+| optimized       | 4       | 11–12          | 1.258 / 1.258                |
+| preoptimization | 16      | 11–12          | 1.039 / 1.064                |
+| optimized       | 16      | 11–12          | 1.132 / 1.475                |
+
+Normal-schedule raw-report SHA-256: `1fc6c51b9b1dec7db1405f54a1c20c6f223fad0573c7daa5a08eb2839d4a8e16`.
+
 ## Historical measurement scope
 
-All recorded search p50/p99 values below include each query’s correctness validation after the API
+All historical search p50/p99 values in the following sections include each query’s correctness validation after the API
 completed. They are query-plus-validation measurements, not isolated API completion latency. The
 raw reports and numerical results are preserved; they cannot establish a search-API p99 bound.
 The corrected driver captures API completion before validation and labels that scope explicitly.
