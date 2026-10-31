@@ -103,7 +103,7 @@ reason. Operations continue; telemetry configuration then reports capability fai
 [The paired driver](../benchmarks/observability.mjs) loads separately prepared baseline and
 candidate packages by absolute module path. It never swaps their native binaries. Each sample
 runs in a fresh process; pair order alternates to reduce time-order bias. The default matrix covers
-three search scenarios, one/four callers, one/two indexes, histograms off/on, 10 ms polling and
+three search scenarios, one/four callers, one/two indexes, histograms off/on, staggered 1,000 ms-per-handle polling and
 optional snapshot bytes. It records correctness checks, throughput, latency, indexing/publication
 cost, process CPU/RSS, runtime versions and caller-supplied source revisions.
 
@@ -127,9 +127,12 @@ npm run benchmark:observability -- \
 Search p50/p99 sample the elapsed time until `search()` resolves, before validating its result;
 reports label this `latencyScope: 'search-api-completion-before-validation'`. Other concurrent
 callers and export work can still affect promise completion on the shared event loop.
-`queryMilliseconds` and throughput include search and validation (`queryPhaseScope:
-'search-and-validation'`). Mixed CPU and elapsed time additionally include 20 mutation/publication
-cycles. Historical reports measured query-plus-validation percentiles and
+With `measurementVersion: 2`, `queryMilliseconds` and throughput sum fully drained query windows
+(`queryPhaseScope: 'sum-of-drained-query-windows-excluding-validation'`). Every result is validated
+after its window, with a default bound of 1,024 results (`--validation-window`, maximum 65,536).
+Query CPU and event-loop utilization use the same windows; high event-loop utilization can hide
+native recorder improvements behind JavaScript work. Mixed CPU/elapsed retain validation and
+20 mutation/publication cycles. Historical reports measured query-plus-validation percentiles and
 are labeled separately; do not compare those percentiles as if they had the new API-only scope.
 
 Predeclared targets are at most 1% median throughput loss with histograms off, and 3% throughput
@@ -144,12 +147,22 @@ sustained memory behavior or per-index native memory attribution. No forced GC o
 tuning is part of the protocol.
 
 See [recorded qualification results](observability-qualification.md) for classified fixture-specific
-comparisons and historical evidence. The current polling profile leaves histograms disabled to isolate
+comparisons and historical evidence. The polling profile defaults to `--poll-interval-ms=1000` per handle, staggers one handle per timer
+turn and reports actual per-handle counts and synchronous durations. Check those counts before
+interpreting short runs. It leaves histograms disabled to isolate
 scraping cost; the initial recorded matrix used histograms enabled while polling.
 The final-source optional control measures that isolated profile only at four callers/two indexes
 for single-hit ordinary and expensive-prefix searches. Its 10 ms stress interval has measurable
 cost and is not an export-interval recommendation. Byte-cost timings do not await the final
 post-settlement observer tail; successful final byte values are not a full-drain timing bound.
+
+Search completion counters use three atomic worker banks per configured search worker, plus a
+shared fallback for unbound work. Recording still uses atomic increments; this reduces sharing
+without assuming that only one thread can ever settle a ticket. On the measured arm64 build,
+bank payload is 1,152 bytes per worker (4.5 KiB at four workers, 72 KiB at 64), plus a fixed
+1 KiB alignment increase and container overhead. These scalar banks remain with a retained
+telemetry token after close. Scrapes sum all configured banks, so scrape work grows with worker
+count even when workers are idle. No engine, searcher or native mapping is retained by those banks.
 
 Each `telemetry()` call synchronously snapshots native queues/counters and serializes them, then
 parses the result on the calling JavaScript thread. Do not scrape every index in one tight loop:

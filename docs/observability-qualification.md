@@ -6,8 +6,10 @@ All recorded search p50/p99 values below include each query’s correctness vali
 completed. They are query-plus-validation measurements, not isolated API completion latency. The
 raw reports and numerical results are preserved; they cannot establish a search-API p99 bound.
 The corrected driver captures API completion before validation and labels that scope explicitly.
-Its query-phase elapsed time and throughput still include validation work; mixed CPU/elapsed
-also include 20 mutation/publication cycles. New API-latency measurements must be kept separate from these historical reports; the unresolved
+The earlier correction at `6a166c4` still included validation in query-phase throughput. The
+current `measurementVersion: 2` excludes validation by timing bounded, fully drained windows,
+and records their CPU/event-loop utilization separately. Mixed CPU/elapsed continue to include
+validation and 20 mutation/publication cycles. New measurements must be kept separate from these historical reports; the unresolved
 overhead decision and original targets are unchanged.
 
 ## Classified catalog and prefix comparison

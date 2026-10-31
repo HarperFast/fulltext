@@ -1267,7 +1267,7 @@ impl Runtime {
 		let read_only = parts.read_only;
 		let expensive_search_budget = parts.reservation.budget();
 		let engine = Arc::new(parts.engine);
-		let metrics = Metrics::new();
+		let metrics = Metrics::with_search_workers(search_thread_count);
 		let reader = Arc::new(SnapshotReader::new(parts.reader, metrics.clone()));
 		let writer_queue = Arc::new(BoundedQueue::new(
 			parts.config.limits.max_queued_commands,
@@ -1348,9 +1348,9 @@ impl Runtime {
 				.name(format!("fulltext-search-{handle}-{worker}"))
 				.spawn(move || {
 					if worker == 0 || search_runtime.expensive_search_queue.is_none() {
-						ordinary_search_loop(search_runtime, search_engine, search_reader);
+						ordinary_search_loop(search_runtime, search_engine, search_reader, worker);
 					} else {
-						flexible_search_loop(search_runtime, search_engine, search_reader);
+						flexible_search_loop(search_runtime, search_engine, search_reader, worker);
 					}
 				}) {
 				Ok(join) => join,
@@ -1972,6 +1972,11 @@ impl Completion {
 			ticket.arm();
 		}
 	}
+	fn bind_worker(&mut self, worker: usize) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.bind_worker(worker);
+		}
+	}
 	fn dispatch(&mut self) {
 		if let Some(ticket) = &mut self.ticket {
 			ticket.dispatch();
@@ -2454,12 +2459,15 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 		.ok_or_else(|| FulltextError::new("E_POISONED", "writer is unavailable"))
 }
 
-fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
+fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>, worker: usize) {
 	while let Some(queued) = runtime.ordinary_search_queue.pop() {
 		#[cfg(feature = "test-panic")]
 		let mut queued = queued;
 		#[cfg(feature = "test-panic")]
-		queued.value.completion.dispatch();
+		{
+			queued.value.completion.bind_worker(worker);
+			queued.value.completion.dispatch();
+		}
 		#[cfg(feature = "test-panic")]
 		{
 			let milliseconds = runtime.ordinary_search_delay_milliseconds.swap(0, Ordering::AcqRel);
@@ -2467,13 +2475,13 @@ fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 				thread::sleep(Duration::from_millis(milliseconds));
 			}
 		}
-		if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+		if !execute_search_command(&runtime, &engine, &reader, queued, None, worker) {
 			return;
 		}
 	}
 }
 
-fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
+fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>, worker: usize) {
 	let expensive = runtime.expensive_search_queue.as_ref().unwrap();
 	let wake = runtime.search_wake.as_ref().unwrap();
 	loop {
@@ -2484,7 +2492,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		if has_expensive && (permit.is_some() || runtime.expensive_search_budget.is_none()) {
 			if let Some(queued) = expensive.try_pop() {
 				drop(wake_demand);
-				if !execute_search_command(&runtime, &engine, &reader, queued, permit) {
+				if !execute_search_command(&runtime, &engine, &reader, queued, permit, worker) {
 					return;
 				}
 				continue;
@@ -2501,7 +2509,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		};
 		let had_expired = !inspection.expired.is_empty();
 		for queued in inspection.expired {
-			if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+			if !execute_search_command(&runtime, &engine, &reader, queued, None, worker) {
 				return;
 			}
 		}
@@ -2516,7 +2524,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		if ordinary_steal_allowed {
 			if let Some(queued) = runtime.ordinary_search_queue.try_pop() {
 				drop(wake_demand);
-				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+				if !execute_search_command(&runtime, &engine, &reader, queued, None, worker) {
 					return;
 				}
 				continue;
@@ -2525,7 +2533,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		if runtime.state.load(Ordering::Acquire) != STATE_OPEN {
 			if let Some(queued) = expensive.try_pop() {
 				drop(wake_demand);
-				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+				if !execute_search_command(&runtime, &engine, &reader, queued, None, worker) {
 					return;
 				}
 				continue;
@@ -2534,7 +2542,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		if expensive_closed {
 			drop(wake_demand);
 			while let Some(queued) = runtime.ordinary_search_queue.pop() {
-				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+				if !execute_search_command(&runtime, &engine, &reader, queued, None, worker) {
 					return;
 				}
 			}
@@ -2578,6 +2586,7 @@ fn execute_search_command(
 	reader: &SnapshotReader,
 	queued: Queued<SearchCommand>,
 	preacquired_permit: Option<ExpensiveSearchPermit>,
+	worker: usize,
 ) -> bool {
 	let queued_for = queued.enqueued.elapsed();
 	runtime
@@ -2587,6 +2596,7 @@ fn execute_search_command(
 		operation,
 		mut completion,
 	} = queued.value;
+	completion.bind_worker(worker);
 	completion.dispatch();
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
 		SearchOperation::Search { bytes, expensive } => {

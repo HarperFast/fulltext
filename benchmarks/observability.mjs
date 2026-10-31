@@ -23,6 +23,10 @@ const median = (values) => percentile(values, 0.5);
 const serialize = (value) => JSON.stringify(value, (_, item) => (typeof item === 'bigint' ? item.toString() : item), 2);
 
 const supportedOperations = ['ordinary', 'ordinary-cheap', 'expensive'];
+const measurementVersion = 2;
+const validationWindow = integer('validation-window', 1_024);
+assert(validationWindow <= 65_536, 'validation-window must not exceed 65536 results');
+const pollIntervalMilliseconds = integer('poll-interval-ms', 1_000);
 
 if (options.child) {
 	assert(supportedOperations.includes(options.operation), 'Unknown operation');
@@ -36,11 +40,13 @@ if (options.child) {
 	const callers = integer('callers', 1);
 	const indexCount = integer('indexes', 1);
 	const profile = options.profile;
+	const pollTimerDelayMilliseconds = Math.max(1, Math.floor(pollIntervalMilliseconds / indexCount));
 	const latencies = [];
 	const publicationLatencies = [];
 	const mutationPublicationLatencies = [];
 	let pollingError;
 	let poll;
+	const polls = Array.from({ length: indexCount }, () => ({ count: 0, durationsMilliseconds: [] }));
 	let clean = false;
 	const setupStart = performance.now();
 	const setupCpuStart = process.cpuUsage();
@@ -98,10 +104,7 @@ if (options.child) {
 				return snapshot.native.operations;
 			});
 		const beforeWarmup = profile === 'baseline' ? undefined : operationCounts();
-		const check = async (index) => {
-			const before = performance.now();
-			const result = await index.search(request);
-			const elapsed = performance.now() - before;
+		const validate = (result) => {
 			assert.strictEqual(
 				result.total,
 				cheapOrdinary ? 1 : request.exactTotal ? documentCount : Math.min(documentCount, 10),
@@ -120,8 +123,8 @@ if (options.child) {
 				assert(Number.isSafeInteger(Number(hit.id)) && Number(hit.id) >= 0 && Number(hit.id) < documentCount);
 				assert(Number.isFinite(hit.score));
 			}
-			return elapsed;
 		};
+		const check = async (index) => validate(await index.search(request));
 		for (let i = 0; i < 100; i++) await check(indexes[i % indexes.length]);
 		if (beforeWarmup) {
 			const afterWarmup = operationCounts();
@@ -137,14 +140,23 @@ if (options.child) {
 			assert.strictEqual(selected, 100n, 'Warmup must use the selected native search class');
 			assert.strictEqual(other, 0n, 'Warmup must not use the other native search class');
 		}
-		if (profile === 'polling')
-			poll = setInterval(() => {
+		if (profile === 'polling') {
+			let nextHandle = 0;
+			const collect = () => {
+				const handle = nextHandle++ % indexes.length;
+				const before = performance.now();
 				try {
-					for (const index of indexes) index.telemetry();
+					indexes[handle].telemetry();
 				} catch (error) {
 					pollingError ??= error;
+				} finally {
+					polls[handle].count++;
+					polls[handle].durationsMilliseconds.push(performance.now() - before);
 				}
-			}, 10);
+				poll = setTimeout(collect, pollTimerDelayMilliseconds);
+			};
+			poll = setTimeout(collect, pollTimerDelayMilliseconds);
+		}
 		const cpuStart = process.cpuUsage();
 		const rssStart = process.memoryUsage().rss;
 		let peakRss = rssStart;
@@ -152,18 +164,44 @@ if (options.child) {
 			peakRss = Math.max(peakRss, process.memoryUsage().rss);
 		}, 25);
 		const start = performance.now();
-		let queryMilliseconds;
+		let queryMilliseconds = 0;
+		const queryCpu = { user: 0, system: 0 };
+		const queryEventLoop = { idle: 0, active: 0 };
+		let queryWindows = 0;
 		try {
-			let next = 0;
-			await Promise.all(
-				Array.from({ length: callers }, async () => {
-					while (next < queryCount) {
-						const id = next++;
-						latencies.push(await check(indexes[id % indexes.length]));
-					}
-				}),
-			);
-			queryMilliseconds = performance.now() - start;
+			for (let first = 0; first < queryCount; first += validationWindow) {
+				const end = Math.min(first + validationWindow, queryCount);
+				const results = new Array(end - first);
+				let next = first;
+				const windowCpu = process.cpuUsage();
+				const windowEventLoop = performance.eventLoopUtilization();
+				const windowStart = performance.now();
+				const completed = await Promise.allSettled(
+					Array.from({ length: Math.min(callers, results.length) }, async () => {
+						while (next < end) {
+							const id = next++;
+							const before = performance.now();
+							const result = await indexes[id % indexes.length].search(request);
+							const elapsed = performance.now() - before;
+							results[id - first] = { result, elapsed };
+						}
+					}),
+				);
+				const failure = completed.find((result) => result.status === 'rejected');
+				if (failure) throw failure.reason;
+				queryMilliseconds += performance.now() - windowStart;
+				const cpu = process.cpuUsage(windowCpu);
+				const eventLoop = performance.eventLoopUtilization(windowEventLoop);
+				queryCpu.user += cpu.user;
+				queryCpu.system += cpu.system;
+				queryEventLoop.idle += eventLoop.idle;
+				queryEventLoop.active += eventLoop.active;
+				queryWindows++;
+				for (const { result, elapsed } of results) {
+					validate(result);
+					latencies.push(elapsed);
+				}
+			}
 			for (let i = 0; i < 20; i++) {
 				const index = indexes[i % indexes.length];
 				const cycleStart = performance.now();
@@ -176,12 +214,14 @@ if (options.child) {
 		} finally {
 			clearInterval(rssTimer);
 		}
+		clearTimeout(poll);
 		const elapsedMilliseconds = performance.now() - start;
 		const cpu = process.cpuUsage(cpuStart);
 		if (pollingError) throw pollingError;
 		for (const index of indexes) await check(index);
 		console.log(
 			serialize({
+				measurementVersion,
 				profile,
 				operation: options.operation,
 				collectorScenario: cheapOrdinary ? 'single-hit' : 'tie-heavy',
@@ -193,7 +233,24 @@ if (options.child) {
 				documentCount,
 				queryCount,
 				latencyScope: 'search-api-completion-before-validation',
-				queryPhaseScope: 'search-and-validation',
+				queryPhaseScope: 'sum-of-drained-query-windows-excluding-validation',
+				validationWindow,
+				queryWindows,
+				queryCpuMicroseconds: queryCpu.user + queryCpu.system,
+				queryEventLoopUtilization: {
+					...queryEventLoop,
+					utilization: queryEventLoop.active / (queryEventLoop.active + queryEventLoop.idle) || 0,
+				},
+				mixedPhaseScope: 'queries-validation-and-20-mutation-publication-cycles',
+				polling: {
+					enabled: profile === 'polling',
+					intervalPerHandleMilliseconds: pollIntervalMilliseconds,
+					timerTurnDelayMilliseconds: pollTimerDelayMilliseconds,
+					schedule: 'one-handle-per-timer-turn-staggered',
+					histograms: profile === 'on',
+					snapshotBytes: profile === 'bytes',
+					handles: polls,
+				},
 				elapsedMilliseconds,
 				queryMilliseconds,
 				throughput: (queryCount * 1_000) / queryMilliseconds,
@@ -215,7 +272,7 @@ if (options.child) {
 		);
 		clean = true;
 	} finally {
-		clearInterval(poll);
+		clearTimeout(poll);
 		let closeError;
 		for (const index of indexes) {
 			try {
@@ -288,6 +345,8 @@ if (options.child) {
 				for (const profile of profiles) {
 					const configuration = {
 						child: 1,
+						'validation-window': validationWindow,
+						'poll-interval-ms': pollIntervalMilliseconds,
 						callers,
 						indexes,
 						operation,
@@ -310,6 +369,7 @@ if (options.child) {
 								path.resolve(options.output),
 								serialize({
 									status: 'failed',
+									measurementVersion,
 									node: process.version,
 									samples,
 									incomplete: { profile, configuration, pair, results },
@@ -360,6 +420,9 @@ if (options.child) {
 						path.resolve(options.output),
 						serialize({
 							scope: 'finite local synthetic qualification; no production or sustained-memory claim',
+							measurementVersion,
+							validationWindow,
+							pollIntervalMilliseconds,
 							baselineModule: path.resolve(options.baseline),
 							candidateModule: path.resolve(options.candidate),
 							baselineRevision: options['baseline-revision'] ?? 'unspecified',

@@ -17,8 +17,12 @@ case invokes the stable fallback after TopDocs, so it cannot bound the cheapest 
 The unique product7 case requires ID7/total1/exact, and ID0-only publications cannot change it.
 
 Per-query timers stop when the search API resolves, before correctness validation. The report
-labels API latency separately from validation-inclusive query-phase throughput/time. Mixed CPU
-and elapsed time also include 20 mutation/publication cycles.
+labels API latency separately from query-window throughput/time (`measurementVersion: 2`). Each
+bounded window (default 1,024 results) drains every caller before validating every result outside
+its timer. CPU and event-loop utilization are sampled over those same windows; mixed CPU/elapsed
+still include validation and 20 mutation/publication cycles. Polling defaults to 1,000 ms per handle,
+one handle per timer turn, and reports actual counts and synchronous scrape durations. A short
+run with few scrapes cannot qualify that schedule; retain 10 ms only as an explicit stress setting.
 Historical reports used validation-inclusive percentiles; preserve and label them rather than
 reinterpreting their p99 values as API completion latency.
 

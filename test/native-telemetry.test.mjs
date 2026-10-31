@@ -558,6 +558,30 @@ test('an actual search actor panic records one failure and preserves final count
 	conservedAtQuiescence(final.operations.close);
 });
 
+test('worker panic settles its bound ticket and queued fallback tickets exactly once', async (context) => {
+	const { index, addon, handle } = await rawFixture(context, { searchThreads: 1, maxQueuedCommands: 16 });
+	await index.applyMutationBatch({ upserts: [{ id: 'one', fields: { text: 'catalog' } }] });
+	await index.publish('one');
+	index.configureTelemetry({ histograms: true });
+	addon.__testDelayNextOrdinarySearch(handle, 200);
+	addon.__testPanicNextSearch(handle);
+	const queries = Array.from({ length: 8 }, () => index.search({ text: 'catalog', exactTotal: false }));
+	const results = await Promise.allSettled(queries);
+	assert(results.every((result) => result.status === 'rejected' && result.reason.code === 'E_NATIVE_PANIC'));
+	const operation = snapshot(index).native.operations.search;
+	assert.strictEqual(operation.attempted, 8n);
+	assert.strictEqual(operation.accepted, 8n);
+	assert.strictEqual(operation.completed, 8n);
+	assert.strictEqual(operation.failed, 8n);
+	assert.strictEqual(operation.errors.E_NATIVE_PANIC, 8n);
+	assert.strictEqual(operation.succeeded, 0n);
+	assert.strictEqual(operation.rejected, 0n);
+	conservedAtQuiescence(operation);
+	const closed = await index.close({ mode: 'rollback' });
+	assert.strictEqual(closed.cleanupError, undefined);
+	assert.deepStrictEqual(snapshot(index).native.operations.search, operation);
+});
+
 test('poison before native admission rejects one attempt without inventing a completed command', async (context) => {
 	const { index, addon, handle } = await rawFixture(context);
 	addon.__testPoisonBeforeNextAdmission(handle);

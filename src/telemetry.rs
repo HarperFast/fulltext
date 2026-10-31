@@ -70,25 +70,9 @@ impl Latency {
 		}
 	}
 	fn json(&self) -> String {
-		let buckets = self
-			.buckets
-			.iter()
-			.map(|v| format!("\"{}\"", load(v)))
-			.collect::<Vec<_>>()
-			.join(",");
-		let bounds = BOUNDS
-			.iter()
-			.enumerate()
-			.map(|(i, v)| {
-				if i + 1 == BOUNDS.len() {
-					"null".to_owned()
-				} else {
-					format!("\"{v}\"")
-				}
-			})
-			.collect::<Vec<_>>()
-			.join(",");
-		format!("{{\"count\":\"{}\",\"sumNanoseconds\":\"{}\",\"histogram\":{{\"count\":\"{}\",\"sumNanoseconds\":\"{}\",\"buckets\":[{buckets}],\"upperBoundsNanoseconds\":[{bounds}]}}}}", load(&self.count),load(&self.sum),load(&self.histogram_count),load(&self.histogram_sum))
+		let mut values = LatencyValues::default();
+		values.include(self);
+		values.json()
 	}
 }
 
@@ -101,26 +85,83 @@ struct Admission {
 	request_bytes: AtomicU64,
 }
 #[repr(align(128))]
-struct Actor {
+#[derive(Default)]
+struct ActorCounters {
 	dispatched: AtomicU64,
 	succeeded: AtomicU64,
 	failed: AtomicU64,
-	mutations: AtomicU64,
-	errors: [AtomicU64; ERROR_CODES.len() + 1],
 	queue: Latency,
 	execution: Latency,
+}
+struct Actor {
+	counters: ActorCounters,
+	mutations: AtomicU64,
+	errors: [AtomicU64; ERROR_CODES.len() + 1],
 }
 impl Default for Actor {
 	fn default() -> Self {
 		Self {
-			dispatched: AtomicU64::new(0),
-			succeeded: AtomicU64::new(0),
-			failed: AtomicU64::new(0),
+			counters: ActorCounters::default(),
 			mutations: AtomicU64::new(0),
 			errors: std::array::from_fn(|_| AtomicU64::new(0)),
-			queue: Latency::default(),
-			execution: Latency::default(),
 		}
+	}
+}
+#[derive(Default)]
+struct LatencyValues {
+	count: u64,
+	sum: u64,
+	histogram_count: u64,
+	histogram_sum: u64,
+	buckets: [u64; 12],
+}
+impl LatencyValues {
+	fn include(&mut self, source: &Latency) {
+		self.count = self.count.wrapping_add(load(&source.count));
+		self.sum = self.sum.wrapping_add(load(&source.sum));
+		self.histogram_count = self.histogram_count.wrapping_add(load(&source.histogram_count));
+		self.histogram_sum = self.histogram_sum.wrapping_add(load(&source.histogram_sum));
+		for (value, source) in self.buckets.iter_mut().zip(&source.buckets) {
+			*value = value.wrapping_add(load(source));
+		}
+	}
+	fn json(&self) -> String {
+		let buckets = self
+			.buckets
+			.iter()
+			.map(|value| format!("\"{value}\""))
+			.collect::<Vec<_>>()
+			.join(",");
+		let bounds = BOUNDS
+			.iter()
+			.enumerate()
+			.map(|(index, value)| {
+				if index + 1 == BOUNDS.len() {
+					"null".to_owned()
+				} else {
+					format!("\"{value}\"")
+				}
+			})
+			.collect::<Vec<_>>()
+			.join(",");
+		format!("{{\"count\":\"{}\",\"sumNanoseconds\":\"{}\",\"histogram\":{{\"count\":\"{}\",\"sumNanoseconds\":\"{}\",\"buckets\":[{buckets}],\"upperBoundsNanoseconds\":[{bounds}]}}}}", self.count,self.sum,self.histogram_count,self.histogram_sum)
+	}
+}
+#[derive(Default)]
+struct ActorValues {
+	dispatched: u64,
+	succeeded: u64,
+	failed: u64,
+	queue: LatencyValues,
+	execution: LatencyValues,
+}
+impl ActorValues {
+	fn include(&mut self, source: &ActorCounters) {
+		self.dispatched = self.dispatched.wrapping_add(load(&source.dispatched));
+		self.succeeded = self.succeeded.wrapping_add(load(&source.succeeded));
+		self.failed = self.failed.wrapping_add(load(&source.failed));
+		self.queue.include(&source.queue);
+		self.execution.include(&source.execution);
 	}
 }
 #[derive(Default)]
@@ -171,6 +212,7 @@ pub(crate) struct Metrics {
 	#[cfg(feature = "test-panic")]
 	fail_observation: AtomicBool,
 	operations: [Operation; 8],
+	search_workers: Box<[[ActorCounters; 3]]>,
 	pub(crate) histograms: AtomicBool,
 	pub(crate) snapshot_bytes: AtomicBool,
 	pub(crate) state: Arc<AtomicU8>,
@@ -182,13 +224,20 @@ pub(crate) struct Metrics {
 }
 
 impl Metrics {
+	#[cfg(test)]
 	pub(crate) fn new() -> Arc<Self> {
+		Self::with_search_workers(0)
+	}
+	pub(crate) fn with_search_workers(workers: usize) -> Arc<Self> {
 		#[cfg(feature = "test-panic")]
 		LIVE_METRICS.fetch_add(1, Relaxed);
 		Arc::new(Self {
 			#[cfg(feature = "test-panic")]
 			fail_observation: AtomicBool::new(false),
 			operations: std::array::from_fn(|_| Operation::default()),
+			search_workers: (0..workers)
+				.map(|_| std::array::from_fn(|_| ActorCounters::default()))
+				.collect(),
 			histograms: AtomicBool::new(false),
 			snapshot_bytes: AtomicBool::new(false),
 			state: Arc::new(AtomicU8::new(0)),
@@ -211,10 +260,21 @@ impl Metrics {
 			.unwrap_or(ERROR_CODES.len());
 		add(&op.actor.errors[i], 1);
 	}
+	fn actor_values(&self, operation: usize) -> ActorValues {
+		let mut values = ActorValues::default();
+		values.include(&self.operations[operation].actor.counters);
+		if let Some(class) = operation.checked_sub(5).filter(|class| *class < 3) {
+			for worker in &self.search_workers {
+				values.include(&worker[class]);
+			}
+		}
+		values
+	}
 	pub(crate) fn ticket(self: &Arc<Self>, operation: usize, bytes: usize) -> Ticket {
 		Ticket {
 			metrics: self.clone(),
 			operation,
+			worker: None,
 			bytes: bytes as u64,
 			accepted: false,
 			dispatched: false,
@@ -378,13 +438,14 @@ impl Metrics {
 	#[cfg(test)]
 	pub(crate) fn test_counts(&self, operation: usize) -> [u64; 7] {
 		let o = &self.operations[operation];
-		let succeeded = load(&o.actor.succeeded);
-		let failed = load(&o.actor.failed);
+		let actor = self.actor_values(operation);
+		let succeeded = actor.succeeded;
+		let failed = actor.failed;
 		[
 			load(&o.admission.attempted),
 			load(&o.admission.accepted),
 			load(&o.admission.rejected),
-			load(&o.actor.dispatched),
+			actor.dispatched,
 			succeeded.wrapping_add(failed),
 			succeeded,
 			failed,
@@ -409,16 +470,16 @@ impl Metrics {
 				output.push(',');
 			}
 			let a = &op.admission;
-			let b = &op.actor;
-			let succeeded = load(&b.succeeded);
-			let failed = load(&b.failed);
+			let b = self.actor_values(i);
+			let succeeded = b.succeeded;
+			let failed = b.failed;
 			let completed = succeeded.wrapping_add(failed);
-			let _=write!(output,"\"{}\":{{\"attempted\":\"{}\",\"accepted\":\"{}\",\"rejected\":\"{}\",\"dispatched\":\"{}\",\"completed\":\"{}\",\"succeeded\":\"{}\",\"failed\":\"{}\",\"requestBytes\":\"{}\",\"mutations\":\"{}\",\"queue\":{},\"execution\":{},\"errors\":{{",OP_NAMES[i],load(&a.attempted),load(&a.accepted),load(&a.rejected),load(&b.dispatched),completed,succeeded,failed,load(&a.request_bytes),load(&b.mutations),b.queue.json(),b.execution.json());
+			let _=write!(output,"\"{}\":{{\"attempted\":\"{}\",\"accepted\":\"{}\",\"rejected\":\"{}\",\"dispatched\":\"{}\",\"completed\":\"{}\",\"succeeded\":\"{}\",\"failed\":\"{}\",\"requestBytes\":\"{}\",\"mutations\":\"{}\",\"queue\":{},\"execution\":{},\"errors\":{{",OP_NAMES[i],load(&a.attempted),load(&a.accepted),load(&a.rejected),b.dispatched,completed,succeeded,failed,load(&a.request_bytes),load(&op.actor.mutations),b.queue.json(),b.execution.json());
 			for (j, error) in ERROR_CODES.iter().chain(std::iter::once(&"other")).enumerate() {
 				if j > 0 {
 					output.push(',');
 				}
-				let _ = write!(output, "\"{error}\":\"{}\"", load(&b.errors[j]));
+				let _ = write!(output, "\"{error}\":\"{}\"", load(&op.actor.errors[j]));
 			}
 			output.push_str("}}");
 		}
@@ -459,6 +520,7 @@ impl Drop for Metrics {
 pub(crate) struct Ticket {
 	metrics: Arc<Metrics>,
 	operation: usize,
+	worker: Option<usize>,
 	bytes: u64,
 	accepted: bool,
 	dispatched: bool,
@@ -468,6 +530,22 @@ pub(crate) struct Ticket {
 	execution: Option<Duration>,
 }
 impl Ticket {
+	pub(crate) fn bind_worker(&mut self, worker: usize) {
+		if self.worker.is_none()
+			&& !self.dispatched
+			&& !self.settled
+			&& (5..8).contains(&self.operation)
+			&& worker < self.metrics.search_workers.len()
+		{
+			self.worker = Some(worker);
+		}
+	}
+	fn actor(&self) -> &ActorCounters {
+		self.worker
+			.map_or(&self.metrics.operations[self.operation].actor.counters, |worker| {
+				&self.metrics.search_workers[worker][self.operation - 5]
+			})
+	}
 	pub(crate) fn accepted(&self) -> bool {
 		self.accepted
 	}
@@ -488,7 +566,7 @@ impl Ticket {
 	pub(crate) fn dispatch(&mut self) {
 		if self.accepted && !self.dispatched {
 			self.dispatched = true;
-			add(&self.metrics.operations[self.operation].actor.dispatched, 1);
+			add(&self.actor().dispatched, 1);
 		}
 	}
 	pub(crate) fn start(&mut self) {
@@ -500,7 +578,7 @@ impl Ticket {
 		}
 		self.dispatch();
 		if let Some(enqueued) = self.enqueued {
-			self.metrics.operations[self.operation].actor.queue.record(
+			self.actor().queue.record(
 				started.saturating_duration_since(enqueued),
 				self.metrics.histograms.load(Relaxed),
 			);
@@ -522,26 +600,25 @@ impl Ticket {
 		}
 		self.settled = true;
 		let op = &self.metrics.operations[self.operation];
+		let actor = self.actor();
 		if !self.accepted {
 			return;
 		} else {
 			if self.dispatched {
-				op.actor.dispatched.fetch_sub(1, Relaxed);
+				actor.dispatched.fetch_sub(1, Relaxed);
 			}
 			if let Some(execution) = self.execution.or_else(|| self.started.map(|started| started.elapsed())) {
-				op.actor
-					.execution
-					.record(execution, self.metrics.histograms.load(Relaxed));
+				actor.execution.record(execution, self.metrics.histograms.load(Relaxed));
 			} else if let Some(enqueued) = self.enqueued {
-				op.actor
+				actor
 					.queue
 					.record(enqueued.elapsed(), self.metrics.histograms.load(Relaxed));
 			}
 			add(
 				if error.is_none() {
-					&op.actor.succeeded
+					&actor.succeeded
 				} else {
-					&op.actor.failed
+					&actor.failed
 				},
 				1,
 			);
@@ -574,8 +651,8 @@ mod tests {
 		ticket.start_at(origin + Duration::from_millis(2));
 		ticket.finish_at(origin + Duration::from_millis(5));
 		ticket.settle(None);
-		assert_eq!(load(&metrics.operations[5].actor.queue.sum), 2_000_000);
-		assert_eq!(load(&metrics.operations[5].actor.execution.sum), 3_000_000);
+		assert_eq!(load(&metrics.operations[5].actor.counters.queue.sum), 2_000_000);
+		assert_eq!(load(&metrics.operations[5].actor.counters.execution.sum), 3_000_000);
 		assert_eq!(metrics.test_counts(5), [1, 1, 0, 0, 1, 1, 0]);
 	}
 
@@ -594,8 +671,8 @@ mod tests {
 		ticket.start();
 		ticket.settle(None);
 		assert_eq!(metrics.test_counts(5), [1, 1, 0, 0, 1, 1, 0]);
-		assert_eq!(load(&metrics.operations[5].actor.queue.count), 1);
-		assert_eq!(load(&metrics.operations[5].actor.execution.count), 1);
+		assert_eq!(load(&metrics.operations[5].actor.counters.queue.count), 1);
+		assert_eq!(load(&metrics.operations[5].actor.counters.execution.count), 1);
 	}
 
 	#[test]
@@ -603,8 +680,8 @@ mod tests {
 		let metrics = Metrics::new();
 		let operation = &metrics.operations[0];
 		operation.admission.attempted.store(9, Relaxed);
-		operation.actor.succeeded.store(u64::MAX, Relaxed);
-		operation.actor.failed.store(2, Relaxed);
+		operation.actor.counters.succeeded.store(u64::MAX, Relaxed);
+		operation.actor.counters.failed.store(2, Relaxed);
 		assert_eq!(metrics.test_counts(0), [9, 0, 0, 0, 1, u64::MAX, 2]);
 	}
 
@@ -654,9 +731,12 @@ mod tests {
 		assert_eq!(load(&op.admission.attempted), 2);
 		assert_eq!(load(&op.admission.accepted), 1);
 		assert_eq!(load(&op.admission.rejected), 1);
-		assert_eq!(load(&op.actor.succeeded).wrapping_add(load(&op.actor.failed)), 1);
-		assert_eq!(load(&op.actor.failed), 1);
-		assert_eq!(load(&op.actor.dispatched), 0);
+		assert_eq!(
+			load(&op.actor.counters.succeeded).wrapping_add(load(&op.actor.counters.failed)),
+			1
+		);
+		assert_eq!(load(&op.actor.counters.failed), 1);
+		assert_eq!(load(&op.actor.counters.dispatched), 0);
 	}
 	#[test]
 	fn repeat_arm_settle_and_error_slots() {
@@ -675,32 +755,229 @@ mod tests {
 		}
 	}
 	#[test]
+	fn worker_banks_aggregate_all_search_classes_and_shared_drain() {
+		let metrics = Metrics::with_search_workers(4);
+		std::thread::scope(|scope| {
+			for worker in 0..4 {
+				let metrics = &metrics;
+				scope.spawn(move || {
+					for operation in 5..8 {
+						metrics.attempt(operation);
+						let mut ticket = metrics.ticket(operation, 1);
+						ticket.arm();
+						ticket.bind_worker(worker);
+						ticket.start();
+						ticket.settle(None);
+					}
+				});
+			}
+		});
+		for operation in 5..8 {
+			metrics.attempt(operation);
+			metrics.reject(operation, "E_QUEUE_FULL");
+			metrics.attempt(operation);
+			let mut queued = metrics.ticket(operation, 1);
+			queued.arm();
+			drop(queued);
+			assert_eq!(metrics.test_counts(operation), [6, 5, 1, 0, 5, 4, 1]);
+			let values = metrics.actor_values(operation);
+			assert_eq!(values.queue.count, 5);
+			assert_eq!(values.execution.count, 4);
+			assert_eq!(load(&metrics.operations[operation].actor.errors[0]), 1);
+		}
+		let json = metrics.json("{}");
+		assert!(json.contains("\"completed\":\"5\""));
+	}
+	#[test]
+	fn worker_binding_is_stable_across_invalid_rebinding_and_thread_migration() {
+		let metrics = Metrics::with_search_workers(2);
+		let mut ticket = metrics.ticket(5, 0);
+		ticket.arm();
+		ticket.bind_worker(usize::MAX);
+		assert_eq!(ticket.worker, None);
+		ticket.bind_worker(0);
+		ticket.bind_worker(1);
+		assert_eq!(ticket.worker, Some(0));
+		ticket.start();
+		std::thread::spawn(move || {
+			ticket.bind_worker(1);
+			ticket.settle(None);
+		})
+		.join()
+		.unwrap();
+		assert_eq!(load(&metrics.search_workers[0][0].succeeded), 1);
+		assert_eq!(load(&metrics.search_workers[1][0].succeeded), 0);
+		let mut fallback = metrics.ticket(6, 0);
+		fallback.arm();
+		fallback.dispatch();
+		fallback.bind_worker(1);
+		assert_eq!(fallback.worker, None);
+		fallback.settle(None);
+		assert_eq!(load(&metrics.operations[6].actor.counters.succeeded), 1);
+		let mut writer = metrics.ticket(0, 0);
+		writer.bind_worker(0);
+		assert_eq!(writer.worker, None);
+	}
+	#[test]
+	fn duplicate_worker_assignment_keeps_rmw_updates_lossless() {
+		let metrics = Metrics::with_search_workers(1);
+		std::thread::scope(|scope| {
+			for _ in 0..4 {
+				let metrics = &metrics;
+				scope.spawn(move || {
+					for _ in 0..1000 {
+						let mut ticket = metrics.ticket(5, 0);
+						ticket.arm();
+						ticket.bind_worker(0);
+						ticket.start();
+						ticket.settle(None);
+					}
+				});
+			}
+		});
+		assert_eq!(metrics.test_counts(5), [0, 4000, 0, 0, 4000, 4000, 0]);
+	}
+	#[test]
+	fn bank_aggregation_wraps_all_scalar_and_histogram_fields() {
+		let metrics = Metrics::with_search_workers(2);
+		for counters in [&metrics.operations[5].actor.counters, &metrics.search_workers[0][0]] {
+			counters.dispatched.store(u64::MAX, Relaxed);
+			counters.succeeded.store(u64::MAX, Relaxed);
+			counters.failed.store(u64::MAX, Relaxed);
+			for latency in [&counters.queue, &counters.execution] {
+				latency.count.store(u64::MAX, Relaxed);
+				latency.sum.store(u64::MAX, Relaxed);
+				latency.histogram_count.store(u64::MAX, Relaxed);
+				latency.histogram_sum.store(u64::MAX, Relaxed);
+				for bucket in &latency.buckets {
+					bucket.store(u64::MAX, Relaxed);
+				}
+			}
+		}
+		let values = metrics.actor_values(5);
+		assert_eq!(values.dispatched, u64::MAX - 1);
+		assert_eq!(values.succeeded, u64::MAX - 1);
+		assert_eq!(values.failed, u64::MAX - 1);
+		for latency in [values.queue, values.execution] {
+			assert_eq!(latency.count, u64::MAX - 1);
+			assert_eq!(latency.sum, u64::MAX - 1);
+			assert_eq!(latency.histogram_count, u64::MAX - 1);
+			assert_eq!(latency.histogram_sum, u64::MAX - 1);
+			assert!(latency.buckets.iter().all(|value| *value == u64::MAX - 1));
+		}
+		assert!(metrics.json("{}").contains("\"completed\":\"18446744073709551612\""));
+	}
+	#[test]
+	fn bank_histograms_follow_configuration_without_resetting_totals() {
+		let metrics = Metrics::with_search_workers(1);
+		for enabled in [false, true, false] {
+			metrics.histograms.store(enabled, Relaxed);
+			let mut ticket = metrics.ticket(7, 0);
+			ticket.arm();
+			ticket.bind_worker(0);
+			ticket.start();
+			ticket.settle(None);
+		}
+		let values = metrics.actor_values(7);
+		assert_eq!(values.queue.count, 3);
+		assert_eq!(values.execution.count, 3);
+		assert_eq!(values.queue.histogram_count, 1);
+		assert_eq!(values.execution.histogram_count, 1);
+	}
+	#[test]
+	fn compact_bank_storage_is_bounded_by_configured_workers() {
+		assert_eq!(std::mem::size_of::<ActorCounters>(), 384);
+		for (workers, bytes) in [(1, 1152), (4, 4608), (64, 73728)] {
+			let metrics = Metrics::with_search_workers(workers);
+			assert_eq!(std::mem::size_of_val(&*metrics.search_workers), bytes);
+		}
+		assert!(Metrics::new().search_workers.is_empty());
+	}
+	#[test]
 	#[ignore]
 	fn metrics_recording_microbenchmark() {
 		for threads in [1, 4] {
-			for enabled in [false, true] {
-				let m = Metrics::new();
-				m.histograms.store(enabled, Relaxed);
-				let started = Instant::now();
-				std::thread::scope(|scope| {
-					for _ in 0..threads {
-						let m = &m;
-						scope.spawn(move || {
-							for _ in 0..100_000 {
-								m.attempt(5);
-								let mut t = m.ticket(5, 64);
-								t.arm();
-								t.start();
-								t.settle(None);
-							}
-						});
-					}
-				});
-				eprintln!(
-					"threads={threads} histograms={enabled} operations={} elapsed_ns={}",
-					threads * 100_000,
-					started.elapsed().as_nanos()
-				);
+			for banked in [false, true] {
+				for enabled in [false, true] {
+					let m = Metrics::with_search_workers(if banked { threads } else { 0 });
+					m.histograms.store(enabled, Relaxed);
+					let started = Instant::now();
+					std::thread::scope(|scope| {
+						for worker in 0..threads {
+							let m = &m;
+							scope.spawn(move || {
+								for _ in 0..100_000 {
+									m.attempt(5);
+									let mut t = m.ticket(5, 64);
+									t.bind_worker(worker);
+									t.arm();
+									t.start();
+									t.settle(None);
+								}
+							});
+						}
+					});
+					eprintln!(
+						"threads={threads} banked={banked} histograms={enabled} operations={} elapsed_ns={}",
+						threads * 100_000,
+						started.elapsed().as_nanos()
+					);
+				}
+			}
+		}
+	}
+	#[test]
+	#[ignore]
+	fn metrics_producer_worker_microbenchmark() {
+		for workers in [1, 4] {
+			for banked in [false, true] {
+				for enabled in [false, true] {
+					let metrics = Metrics::with_search_workers(if banked { workers } else { 0 });
+					metrics.histograms.store(enabled, Relaxed);
+					let started = Instant::now();
+					std::thread::scope(|scope| {
+						let mut senders = Vec::new();
+						for worker in 0..workers {
+							let (sender, receiver) = std::sync::mpsc::sync_channel::<Ticket>(256);
+							senders.push(sender);
+							scope.spawn(move || {
+								for mut ticket in receiver {
+									ticket.bind_worker(worker);
+									let started = Instant::now();
+									ticket.start_at(started);
+									let mut value = 1u64;
+									while started.elapsed() < Duration::from_micros(10) {
+										value = std::hint::black_box(
+											value.wrapping_mul(6364136223846793005).wrapping_add(1),
+										);
+									}
+									ticket.finish_at(Instant::now());
+									ticket.settle(None);
+								}
+							});
+						}
+						for operation in 0..10_000 * workers {
+							metrics.attempt(5);
+							let mut ticket = metrics.ticket(5, 64);
+							ticket.arm();
+							senders[operation % workers].send(ticket).unwrap();
+						}
+					});
+					let elapsed = started.elapsed().as_nanos();
+					assert_eq!(
+						metrics.test_counts(5),
+						[
+							(10_000 * workers) as u64,
+							(10_000 * workers) as u64,
+							0,
+							0,
+							(10_000 * workers) as u64,
+							(10_000 * workers) as u64,
+							0
+						]
+					);
+					eprintln!("single_producer_workers={workers} banked={banked} histograms={enabled} busywork_target_us=10 operations={} elapsed_ns={elapsed}", workers * 10_000);
+				}
 			}
 		}
 	}

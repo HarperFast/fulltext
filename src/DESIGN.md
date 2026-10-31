@@ -280,3 +280,20 @@ require a matching facade/addon.
 The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
 additional tail rejects. A future extension needs explicit framing/versioning rather than appending
 an ambiguous optional value.
+
+## Telemetry worker banks
+
+Each search completion binds a valid worker bank at most once before first dispatch. The ticket
+retains that selection through settlement, panic and Drop, including a future thread migration.
+Ordinary, flexible, expired and closing execution paths pass the stable worker index; test-only
+pre-delay dispatch binds first too. Unbound queued drains/rejections retain the shared fallback.
+Every update remains a relaxed atomic RMW, so accidental duplicate worker assignment cannot
+lose updates. Snapshots sum wrapping scalar values before JSON serialization. This preserves
+existing nontransactional snapshot semantics, exact-once settlement and histogram-toggle behavior.
+
+Only dispatched/succeeded/failed and queue/execution latency storage are banked. Rare errors
+and mutation totals remain shared. Three 384-byte banks per worker add 1,152 bytes per configured
+search worker on the measured arm64 target, plus a fixed 1,024-byte shared-Actor alignment increase
+and container overhead. Retained tokens retain these scalar banks after close; scrape work grows
+with configured workers. The ownership tests cover rebinding/migration, shared drains, duplicate
+bank writers, wrapping sums and disabled/enabled histogram histories.
