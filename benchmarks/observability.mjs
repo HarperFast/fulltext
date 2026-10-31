@@ -22,7 +22,12 @@ const percentile = (values, fraction) => values.toSorted((a, b) => a - b)[Math.c
 const median = (values) => percentile(values, 0.5);
 const serialize = (value) => JSON.stringify(value, (_, item) => (typeof item === 'bigint' ? item.toString() : item), 2);
 
+const supportedOperations = ['ordinary', 'ordinary-cheap', 'expensive'];
+
 if (options.child) {
+	assert(supportedOperations.includes(options.operation), 'Unknown operation');
+	const cheapOrdinary = options.operation === 'ordinary-cheap';
+	assert(!cheapOrdinary || integer('documents', 2_000) >= 8, 'ordinary-cheap requires at least eight documents');
 	const { openNativeFullTextIndex, runtimeInfo } = await import(pathToFileURL(path.resolve(options.module)).href);
 	const root = await mkdtemp(path.join(os.tmpdir(), 'fulltext-observability-'));
 	const indexes = [];
@@ -74,16 +79,18 @@ if (options.child) {
 		const indexingMilliseconds = performance.now() - setupStart;
 		const indexingCpu = process.cpuUsage(setupCpuStart);
 		const request = {
-			text: 'catalog',
+			text: cheapOrdinary ? 'product7' : 'catalog',
 			mode: options.operation === 'expensive' ? 'prefix' : 'any',
 			limit: 10,
 			exactTotal: options.operation === 'expensive',
 		};
 		const queryClass = options.operation === 'expensive' ? 'expensiveSearch' : 'search';
 		const otherQueryClass = queryClass === 'search' ? 'expensiveSearch' : 'search';
-		const expectedIds = Array.from({ length: documentCount }, (_, id) => String(id))
-			.sort()
-			.slice(0, 10);
+		const expectedIds = cheapOrdinary
+			? ['7']
+			: Array.from({ length: documentCount }, (_, id) => String(id))
+					.sort()
+					.slice(0, 10);
 		const operationCounts = () =>
 			indexes.map((index) => {
 				const snapshot = index.telemetry();
@@ -93,8 +100,14 @@ if (options.child) {
 		const beforeWarmup = profile === 'baseline' ? undefined : operationCounts();
 		const check = async (index) => {
 			const result = await index.search(request);
-			assert.strictEqual(result.total, request.exactTotal ? documentCount : Math.min(documentCount, 10));
-			assert.strictEqual(result.totalRelation, request.exactTotal || documentCount <= 10 ? 'exact' : 'lower-bound');
+			assert.strictEqual(
+				result.total,
+				cheapOrdinary ? 1 : request.exactTotal ? documentCount : Math.min(documentCount, 10),
+			);
+			assert.strictEqual(
+				result.totalRelation,
+				cheapOrdinary || request.exactTotal || documentCount <= 10 ? 'exact' : 'lower-bound',
+			);
 			assert.strictEqual(result.hits.length, expectedIds.length);
 			assert.strictEqual(new Set(result.hits.map((hit) => hit.id)).size, expectedIds.length);
 			assert.deepStrictEqual(
@@ -170,6 +183,7 @@ if (options.child) {
 			serialize({
 				profile,
 				operation: options.operation,
+				collectorScenario: cheapOrdinary ? 'single-hit' : 'tie-heavy',
 				queryClass,
 				queryClassVerification: beforeWarmup ? 'native-operation-counters' : 'matching-request-classification',
 				request,
@@ -217,6 +231,17 @@ if (options.child) {
 		'Required: --baseline=/absolute/dist/native.js --candidate=/absolute/dist/native.js --output=/absolute/results.json',
 	);
 	const pairs = integer('pairs', 7);
+	const operations = (options.operations ?? supportedOperations.join(',')).split(',');
+	assert(
+		operations.length > 0 &&
+			new Set(operations).size === operations.length &&
+			operations.every((operation) => supportedOperations.includes(operation)),
+		'operations must contain distinct known operation names',
+	);
+	assert(
+		!operations.includes('ordinary-cheap') || integer('documents', 2_000) >= 8,
+		'ordinary-cheap requires at least eight documents',
+	);
 	const profiles = (options.profiles ?? 'off,on,polling,bytes').split(',');
 	assert(
 		profiles.every((profile) => ['off', 'on', 'polling', 'bytes'].includes(profile)),
@@ -256,7 +281,7 @@ if (options.child) {
 		});
 	for (const callers of [1, 4])
 		for (const indexes of [1, 2])
-			for (const operation of ['ordinary', 'expensive'])
+			for (const operation of operations)
 				for (const profile of profiles) {
 					const configuration = {
 						child: 1,

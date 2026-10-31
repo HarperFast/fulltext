@@ -3,9 +3,10 @@
 Native Tantivy full-text indexing for Node.js.
 
 **Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.8.0.** The engine is compiled
-into the native addon; no separate Tantivy installation is required. This source tree has
-version 0.8.0 in its package manifests. The metadata sorting, aggregation, new filter and query-control
-APIs documented here remain unreleased until publication; they are absent from the published 0.7.0 artifacts. See
+into the native addon; no separate Tantivy installation is required. This source tree retains
+version 0.8.0 in its package manifests, but adds unreleased telemetry API 1 and native ABI 14.
+The published 0.8.0 artifacts use ABI 13 and do not include telemetry. Metadata sorting,
+aggregation, new filters and query controls shipped in 0.8.0; they are absent from 0.7.0. See
 [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
 before deploying a build from this tree.
 
@@ -526,9 +527,10 @@ indexes fail closed and rebuild instead of silently changing recall.
 
 ## Upgrading from 0.7.x
 
-The unreleased metadata and query-control APIs use query API version 7 and native ABI version 14. Deploy the
-JavaScript facade and native addon built from the same revision; the published 0.7.0 addon cannot
-serve these requests. Indexes with a string `filterFields` entry need rebuilding because string
+The metadata and query-control APIs introduced in 0.8.0 use query API version 7. This source tree
+also adds unreleased telemetry, requiring native ABI 14 instead of the published 0.8.0 ABI 13.
+Deploy the JavaScript facade and native addon built from the same revision; the published 0.7.0
+addon cannot serve the metadata and query-control requests. Indexes with a string `filterFields` entry need rebuilding because string
 metadata now also uses raw fast fields. Open and inspection report `E_IDENTITY_MISMATCH` for the
 old schema. Indexes with only numeric/boolean filter fields, or no filter fields, retain their
 existing identity when the rest of the configuration is unchanged.
