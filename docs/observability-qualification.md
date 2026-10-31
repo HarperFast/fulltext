@@ -16,7 +16,7 @@ throughput sums fully drained 1,024-result query windows with validation outside
 Every result is still checked. Query CPU/event-loop observations use those same windows; mixed
 CPU/elapsed retain validation and 20 mutation/publication cycles. This scope differs from the
 historical reports below; do not reinterpret those raw values. Median query-window event-loop
-utilization was 95.8–100%, so this fixture is substantially constrained by JavaScript/event-loop
+utilization was 95.0–100%, so this fixture is substantially constrained by JavaScript/event-loop
 work and cannot isolate per-worker native CPU savings.
 
 The worker banks improved four-caller/histograms-off throughput in every observed pair at both
@@ -64,6 +64,23 @@ Private raw-report SHA-256 values:
 
 - optimization: `9a0ecaa41e873f38e120ca78175868beb5f187ae12e84d76048e1326d9a9cf6f`.
 - total: `ce48fec2dfcc41e51859c9ea50133c815ffe251c17a27838838d291e6015a016`.
+
+### Reproducing the measurement shapes
+
+The committed [paired driver](../benchmarks/observability.mjs) defaults to a baseline with no
+telemetry calls. Set `--baseline-profile=match` when the baseline already supports telemetry;
+that matches histogram/polling/byte settings and labels the result optimization-only, with no
+feature-cost target claim. The recorded optimization protocol used `--operations=ordinary-cheap`,
+`--profiles=off,on`, `--pairs=7`, `--queries=40000`, `--documents=2000` and `--validation-window=1024`.
+Use the same immutable package copies identified above; source/artifact identity matters.
+The new launcher controls were smoke-tested separately with one pair and 100 queries, without
+replacing or adding to the measured qualification tables.
+
+The committed [idle scrape driver](../benchmarks/observability-scrape-cost.mjs) reproduces the five
+selected worker/handle topologies using `--baseline` and `--candidate` absolute module paths.
+Defaults are 25 warmup rounds and 120 sample rounds, histograms off/on, one handle per event-loop
+turn and explicit process budgets. Both round counts are bounded. Its correctness smoke is
+separate from the original measurements; no export-duration gate is inferred from either run.
 
 ### Native recorder control
 

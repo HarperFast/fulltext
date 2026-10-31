@@ -27,6 +27,9 @@ const measurementVersion = 2;
 const validationWindow = integer('validation-window', 1_024);
 assert(validationWindow <= 65_536, 'validation-window must not exceed 65536 results');
 const pollIntervalMilliseconds = integer('poll-interval-ms', 1_000);
+const minimumPollsPerHandle = integer('minimum-polls-per-handle', 10);
+const baselineProfile = options['baseline-profile'] ?? 'none';
+assert(['none', 'match'].includes(baselineProfile), 'baseline-profile must be none or match');
 
 if (options.child) {
 	assert(supportedOperations.includes(options.operation), 'Unknown operation');
@@ -46,7 +49,10 @@ if (options.child) {
 	const mutationPublicationLatencies = [];
 	let pollingError;
 	let poll;
-	const polls = Array.from({ length: indexCount }, () => ({ count: 0, durationsMilliseconds: [] }));
+	const polls = Array.from({ length: indexCount }, () => ({
+		count: 0,
+		durationsMilliseconds: [],
+	}));
 	let clean = false;
 	const setupStart = performance.now();
 	const setupCpuStart = process.cpuUsage();
@@ -205,7 +211,9 @@ if (options.child) {
 			for (let i = 0; i < 20; i++) {
 				const index = indexes[i % indexes.length];
 				const cycleStart = performance.now();
-				await index.applyMutationBatch({ upserts: [{ id: '0', fields: { text: `catalog common changed${i}` } }] });
+				await index.applyMutationBatch({
+					upserts: [{ id: '0', fields: { text: `catalog common changed${i}` } }],
+				});
 				const before = performance.now();
 				await index.publish(`publication-${i}`);
 				publicationLatencies.push(performance.now() - before);
@@ -246,6 +254,8 @@ if (options.child) {
 					enabled: profile === 'polling',
 					intervalPerHandleMilliseconds: pollIntervalMilliseconds,
 					timerTurnDelayMilliseconds: pollTimerDelayMilliseconds,
+					minimumPollsPerHandle,
+					samplesSufficient: profile === 'polling' ? polls.every(({ count }) => count >= minimumPollsPerHandle) : null,
 					schedule: 'one-handle-per-timer-turn-staggered',
 					histograms: profile === 'on',
 					snapshotBytes: profile === 'bytes',
@@ -347,6 +357,7 @@ if (options.child) {
 						child: 1,
 						'validation-window': validationWindow,
 						'poll-interval-ms': pollIntervalMilliseconds,
+						'minimum-polls-per-handle': minimumPollsPerHandle,
 						callers,
 						indexes,
 						operation,
@@ -361,7 +372,7 @@ if (options.child) {
 							for (const entry of entries)
 								results[entry] = await run({
 									...configuration,
-									profile: entry,
+									profile: entry === 'baseline' && baselineProfile === 'match' ? profile : entry,
 									module: path.resolve(entry === 'baseline' ? options.baseline : options.candidate),
 								});
 						} catch (error) {
@@ -378,7 +389,11 @@ if (options.child) {
 							);
 							throw error;
 						}
-						paired.push({ pair, baseline: results.baseline, candidate: results[profile] });
+						paired.push({
+							pair,
+							baseline: results.baseline,
+							candidate: results[profile],
+						});
 					}
 					const throughputLoss = paired.map(
 						({ baseline, candidate }) => 1 - candidate.throughput / baseline.throughput,
@@ -386,13 +401,23 @@ if (options.child) {
 					const p99Increase = paired.map(
 						({ baseline, candidate }) => candidate.p99Milliseconds / baseline.p99Milliseconds - 1,
 					);
-					const target = profile === 'off' ? 0.01 : profile === 'on' ? 0.03 : null;
+					const target = baselineProfile === 'match' ? null : profile === 'off' ? 0.01 : profile === 'on' ? 0.03 : null;
+					const pollingSufficient =
+						profile !== 'polling' ||
+						paired.every(
+							({ baseline, candidate }) =>
+								candidate.polling.samplesSufficient &&
+								(baselineProfile !== 'match' || baseline.polling.samplesSufficient),
+						);
 					const observedThroughputLoss = median(throughputLoss);
 					const observedP99Increase = median(p99Increase);
 					// A range of paired observations is deliberately conservative; it is not a confidence interval.
-					const status =
-						target === null
-							? 'cost-observation-only'
+					const status = !pollingSufficient
+						? 'insufficient-polling-samples'
+						: target === null
+							? baselineProfile === 'match'
+								? 'matched-profile-comparison-only'
+								: 'cost-observation-only'
 							: throughputLoss.every((value) => value <= target) &&
 								  (profile === 'off' || p99Increase.every((value) => value <= 0.05))
 								? 'within-target-in-every-pair'
@@ -402,11 +427,16 @@ if (options.child) {
 									: 'inconclusive';
 					const result = {
 						profile,
+						baselineProfile,
+						comparisonScope:
+							baselineProfile === 'match'
+								? 'optimization-only-matching-telemetry-profiles'
+								: 'feature-cost-versus-no-telemetry-baseline',
 						callers,
 						indexes,
 						operation,
 						targetMedianThroughputLoss: target,
-						targetMedianP99Increase: profile === 'on' ? 0.05 : null,
+						targetMedianP99Increase: baselineProfile === 'none' && profile === 'on' ? 0.05 : null,
 						observedThroughputLoss,
 						observedP99Increase,
 						throughputLossRange: [Math.min(...throughputLoss), Math.max(...throughputLoss)],
@@ -423,6 +453,8 @@ if (options.child) {
 							measurementVersion,
 							validationWindow,
 							pollIntervalMilliseconds,
+							minimumPollsPerHandle,
+							baselineProfile,
 							baselineModule: path.resolve(options.baseline),
 							candidateModule: path.resolve(options.candidate),
 							baselineRevision: options['baseline-revision'] ?? 'unspecified',

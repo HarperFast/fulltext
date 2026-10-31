@@ -1,5 +1,8 @@
 import assert from 'node:assert';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
@@ -63,4 +66,124 @@ for (const argument of ['--validation-window=65537', '--validation-window=1.5', 
 		assert.ifError(result.error);
 		assert.notStrictEqual(result.status, 0);
 		assert.match(result.stderr, /validation-window|poll-interval-ms/);
+	});
+
+function paired(arguments_) {
+	const root = mkdtempSync(path.join(tmpdir(), 'observability-driver-test-'));
+	try {
+		const module = fileURLToPath(new URL('./fixtures/observability-benchmark-clock.mjs', import.meta.url));
+		const output = path.join(root, 'results.json');
+		const result = spawnSync(
+			process.execPath,
+			[
+				fileURLToPath(new URL('../benchmarks/observability.mjs', import.meta.url)),
+				`--baseline=${module}`,
+				`--candidate=${module}`,
+				`--output=${output}`,
+				'--pairs=1',
+				'--operations=ordinary',
+				'--documents=8',
+				'--queries=3',
+				...arguments_,
+			],
+			{ encoding: 'utf8', timeout: 20_000 },
+		);
+		assert.ifError(result.error);
+		assert.strictEqual(result.status, 0, result.stderr);
+		return JSON.parse(readFileSync(output, 'utf8'));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}
+
+test('matched telemetry profiles compare optimization only and preserve histogram configuration', () => {
+	const report = paired(['--profiles=on', '--baseline-profile=match']);
+	assert.strictEqual(report.baselineProfile, 'match');
+	for (const sample of report.samples) {
+		assert.strictEqual(sample.status, 'matched-profile-comparison-only');
+		assert.strictEqual(sample.targetMedianThroughputLoss, null);
+		assert.strictEqual(sample.targetMedianP99Increase, null);
+		for (const side of ['baseline', 'candidate']) {
+			assert.strictEqual(sample.paired[0][side].profile, 'on');
+			assert.deepStrictEqual(
+				sample.paired[0][side].runtime.configurations,
+				Array.from({ length: sample.indexes }, () => ({
+					histograms: true,
+					snapshotBytes: false,
+				})),
+			);
+		}
+	}
+});
+
+test('default paired baseline never configures telemetry and retains feature-cost targets', () => {
+	const report = paired(['--profiles=off']);
+	assert.strictEqual(report.baselineProfile, 'none');
+	for (const sample of report.samples) {
+		assert.deepStrictEqual(sample.paired[0].baseline.runtime.configurations, []);
+		assert.strictEqual(sample.paired[0].baseline.profile, 'baseline');
+		assert.strictEqual(sample.targetMedianThroughputLoss, 0.01);
+	}
+});
+
+test('polling with too few observed scrapes is explicitly insufficient', () => {
+	const report = paired(['--profiles=polling', '--minimum-polls-per-handle=10']);
+	for (const sample of report.samples) {
+		assert.strictEqual(sample.status, 'insufficient-polling-samples');
+		const polling = sample.paired[0].candidate.polling;
+		assert.strictEqual(polling.intervalPerHandleMilliseconds, 1_000);
+		assert.strictEqual(polling.minimumPollsPerHandle, 10);
+		assert.strictEqual(polling.samplesSufficient, false);
+		assert(polling.handles.every(({ count }) => count === 0));
+	}
+});
+
+for (const topology of ['4x4', '64x1'])
+	test(`idle scrape driver measures exact bounded per-handle samples at ${topology}`, () => {
+		const result = spawnSync(
+			process.execPath,
+			[
+				fileURLToPath(new URL('../benchmarks/observability-scrape-cost.mjs', import.meta.url)),
+				'--child=1',
+				`--module=${fileURLToPath(new URL('./fixtures/observability-scrape-clock.mjs', import.meta.url))}`,
+				`--topology=${topology}`,
+				'--histograms=true',
+				'--warmup-rounds=2',
+				'--sample-rounds=3',
+			],
+			{ encoding: 'utf8', timeout: 20_000 },
+		);
+		assert.ifError(result.error);
+		assert.strictEqual(result.status, 0, result.stderr);
+		const report = JSON.parse(result.stdout);
+		assert.strictEqual(report.samplesPerHandle, 3);
+		assert.strictEqual(report.warmupRounds, 2);
+		assert.strictEqual(report.p50Milliseconds, 2);
+		assert.strictEqual(report.p99Milliseconds, 2);
+		assert.deepStrictEqual(
+			report.durationsMilliseconds,
+			Array.from({ length: report.handles }, () => [2, 2, 2]),
+		);
+		assert.strictEqual(report.runtime.runtimeConfiguration.maxSearchThreads, report.workers * report.handles);
+		for (const handle of report.runtime.handles) {
+			assert.strictEqual(handle.queries, 100);
+			assert.strictEqual(handle.scrapes, 5);
+			assert.strictEqual(handle.limits.searchThreads, report.workers);
+			assert.deepStrictEqual(handle.configuration, {
+				histograms: true,
+				snapshotBytes: false,
+			});
+		}
+	});
+
+for (const argument of ['--sample-rounds=10001', '--warmup-rounds=1001'])
+	test(`idle scrape driver rejects unbounded option ${argument}`, () => {
+		const result = spawnSync(
+			process.execPath,
+			[fileURLToPath(new URL('../benchmarks/observability-scrape-cost.mjs', import.meta.url)), argument],
+			{ encoding: 'utf8', timeout: 20_000 },
+		);
+		assert.ifError(result.error);
+		assert.notStrictEqual(result.status, 0);
+		assert.match(result.stderr, /must be a positive integer/);
 	});

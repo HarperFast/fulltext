@@ -5,7 +5,9 @@
 `observability.mjs` uses fresh child processes and separate baseline/candidate module paths, with
 alternating order inside each pair. It cannot silently swap an addon under an already loaded
 facade. Keep workload/correctness identical across profiles; baseline deliberately makes no
-telemetry API calls. Optional snapshot-byte cost and polling are separate profiles. Preserve raw
+telemetry API calls. `--baseline-profile=match` instead compares matching telemetry settings;
+that output is explicitly optimization-only and carries no feature-cost budget classification.
+Optional snapshot-byte cost and polling are separate profiles. Preserve raw
 pairs and mark noisy measurements inconclusive instead of treating a rounded median as proof of
 the 1%/3% throughput targets. Finite local CPU/RSS observations are not sustained-memory evidence.
 
@@ -23,6 +25,16 @@ its timer. CPU and event-loop utilization are sampled over those same windows; m
 still include validation and 20 mutation/publication cycles. Polling defaults to 1,000 ms per handle,
 one handle per timer turn, and reports actual counts and synchronous scrape durations. A short
 run with few scrapes cannot qualify that schedule; retain 10 ms only as an explicit stress setting.
+The default ten-poll/handle descriptive floor labels undersampled cells insufficient; it is not
+an acceptance threshold or statistical confidence statement.
+
+`observability-scrape-cost.mjs` retains the separate idle-handle protocol: immutable baseline and
+candidate modules, serial fresh children, 100 searches/handle, default 25 warmup rounds and 120
+measured calls/handle with event-loop turns between them. The five selected topologies cap total
+search workers at 64 and handles at 16. Explicit aggregate queue budget covers writer, ordinary
+and expensive queues. Results pool per-call quantiles per child and retain every per-handle
+sample; they do not bound active workload stalls. Test fixtures verify configuration, warmup and
+sample counts without treating a fake clock as native performance evidence.
 Historical reports used validation-inclusive percentiles; preserve and label them rather than
 reinterpreting their p99 values as API completion latency.
 

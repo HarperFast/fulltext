@@ -43,6 +43,11 @@ oldest age, capacity and whether capacity is shared. Queue `bytes` is current oc
 handle-owned capacity. Legacy `status().metrics.searchQueueNanoseconds` already includes post-dequeue permit wait, as does telemetry queue timing. The observations overlap; do not add them together. An empty/unavailable queue has no oldest age. There is no active native
 cancellation API: deadline timeouts are errors, not cancellation counts.
 
+Writer operation execution starts before the legacy inner-command timer and ends at settlement;
+close includes teardown before settlement. `status().metrics.writerExecutionNanoseconds` stops
+at inner command completion, so these overlapping spans are not interchangeable. Test-addon
+diagnostic writes can add instrumentation cost to those spans.
+
 `native.phases` reports commit, reader-reload and teardown success/failure counts and timing
 independently of whole-operation timing. A successful commit phase does not imply a reader-visible publication. Explicit close
 records its result before resolving the callback. Final telemetry remains readable after close;
@@ -113,7 +118,10 @@ scenarios set `exactTotal: false`; the single-hit case avoids the tie fallback's
 pass. Prefix requests use the expensive-search queue. `--operations=ordinary-cheap` selects one
 scenario; the comma-separated filter accepts only distinct known names. Candidate warmup
 verifies both the selected native operation counter and the absence of attempts in the other
-class before timing starts. Baseline routing follows the same request classifier. Historical
+class before timing starts. The default `--baseline-profile=none` measures feature cost against
+a package without telemetry calls. Use `--baseline-profile=match` for a telemetry-capable control;
+its matched settings compare optimization only and do not apply the feature-cost targets.
+Baseline routing follows the same request classifier. Historical
 results used exact totals for both labels and therefore did not measure the ordinary queue.
 
 ```sh
@@ -149,7 +157,9 @@ tuning is part of the protocol.
 See [recorded qualification results](observability-qualification.md) for classified fixture-specific
 comparisons and historical evidence. The polling profile defaults to `--poll-interval-ms=1000` per handle, staggers one handle per timer
 turn and reports actual per-handle counts and synchronous durations. Check those counts before
-interpreting short runs. It leaves histograms disabled to isolate
+interpreting short runs. `--minimum-polls-per-handle=10` is a disclosed sample-sufficiency setting,
+not a performance gate or confidence claim; shorter paired polling cells are labeled
+`insufficient-polling-samples`. It leaves histograms disabled to isolate
 scraping cost; the initial recorded matrix used histograms enabled while polling.
 The final-source optional control measures that isolated profile only at four callers/two indexes
 for single-hit ordinary and expensive-prefix searches. Its 10 ms stress interval has measurable
@@ -169,3 +179,8 @@ parses the result on the calling JavaScript thread. Do not scrape every index in
 stagger or yield between handles and choose an export interval appropriate to the workload.
 The stress profile demonstrates aggregate polling cost, not a directly measured per-call pause
 or a bound for a large number of indexes. Benchmark the intended exporter schedule before rollout.
+
+The [idle scrape-cost driver](../benchmarks/observability-scrape-cost.mjs) records per-call durations
+for selected worker/handle topologies. [The qualification guide](observability-qualification.md)
+separates populated-idle measurements from active one-second polling controls and preserves both
+raw report identities. Neither is a universal pause bound.

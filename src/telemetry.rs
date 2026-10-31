@@ -436,6 +436,13 @@ impl Metrics {
 		json
 	}
 	#[cfg(test)]
+	pub(crate) fn test_actor_counts(&self, operation: usize, worker: Option<usize>) -> [u64; 3] {
+		let actor = worker.map_or(&self.operations[operation].actor.counters, |worker| {
+			&self.search_workers[worker][operation - 5]
+		});
+		[load(&actor.dispatched), load(&actor.succeeded), load(&actor.failed)]
+	}
+	#[cfg(test)]
 	pub(crate) fn test_counts(&self, operation: usize) -> [u64; 7] {
 		let o = &self.operations[operation];
 		let actor = self.actor_values(operation);

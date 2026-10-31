@@ -1464,21 +1464,7 @@ impl Runtime {
 	}
 
 	fn force_close(&self) {
-		if self
-			.state
-			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-				if state == STATE_CLOSED || state == STATE_CLOSING {
-					None
-				} else {
-					Some(STATE_CLOSING)
-				}
-			})
-			.is_err()
-		{
-			return;
-		}
-		self.notify_expensive_waiters();
-		let _ = self.writer_queue.push_force(
+		let queued = self.writer_queue.push_force_tracked_if(
 			WriterCommand {
 				operation: WriterOperation::Close { rollback: true },
 				completion: Completion {
@@ -1488,7 +1474,23 @@ impl Runtime {
 				},
 			},
 			0,
+			|| {
+				self.state
+					.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+						if state == STATE_CLOSED || state == STATE_CLOSING {
+							None
+						} else {
+							Some(STATE_CLOSING)
+						}
+					})
+					.map(|_| ())
+					.map_err(|_| FulltextError::new("E_CLOSED", "index is closing or closed"))
+			},
+			|_, _| {},
 		);
+		if queued.is_ok() {
+			self.notify_expensive_waiters();
+		}
 	}
 
 	fn poison(&self, error: FulltextError) {
@@ -1746,7 +1748,17 @@ impl<T> BoundedQueue<T> {
 		self.push_force_tracked(value, bytes, |_, _| {})
 	}
 
-	fn push_force_tracked(&self, mut value: T, bytes: usize, accepted: impl FnOnce(&mut T, Instant)) -> Result<()> {
+	fn push_force_tracked(&self, value: T, bytes: usize, accepted: impl FnOnce(&mut T, Instant)) -> Result<()> {
+		self.push_force_tracked_if(value, bytes, || Ok(()), accepted)
+	}
+
+	fn push_force_tracked_if(
+		&self,
+		mut value: T,
+		bytes: usize,
+		admit: impl FnOnce() -> Result<()>,
+		accepted: impl FnOnce(&mut T, Instant),
+	) -> Result<()> {
 		if self.shared_budget.is_some() {
 			return Err(FulltextError::new(
 				"E_NATIVE_FAILURE",
@@ -1757,6 +1769,7 @@ impl<T> BoundedQueue<T> {
 		if state.closed {
 			return Err(FulltextError::new("E_CLOSED", "operation queue is closed"));
 		}
+		admit()?;
 		let enqueued = Instant::now();
 		accepted(&mut value, enqueued);
 		state.bytes += bytes;
@@ -2465,13 +2478,10 @@ fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		let mut queued = queued;
 		#[cfg(feature = "test-panic")]
 		{
-			queued.value.completion.bind_worker(worker);
-			queued.value.completion.dispatch();
-		}
-		#[cfg(feature = "test-panic")]
-		{
 			let milliseconds = runtime.ordinary_search_delay_milliseconds.swap(0, Ordering::AcqRel);
 			if milliseconds > 0 {
+				queued.value.completion.bind_worker(worker);
+				queued.value.completion.dispatch();
 				thread::sleep(Duration::from_millis(milliseconds));
 			}
 		}
@@ -3785,6 +3795,89 @@ mod tests {
 		runtime.force_close();
 		assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), STATE_CLOSED);
 		assert_eq!(runtime.writer_queue.snapshot().0, 0);
+	}
+
+	#[test]
+	fn telemetry_forced_close_preserves_terminal_poison_when_writer_queue_is_closed() {
+		let runtime = telemetry_runtime_fixture();
+		runtime.state.store(STATE_POISONED, Ordering::Relaxed);
+		drop(runtime.writer_queue.close());
+		runtime.force_close();
+		assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), STATE_POISONED);
+		assert_eq!(runtime.writer_queue.snapshot().0, 0);
+	}
+
+	#[test]
+	fn telemetry_forced_close_transitions_only_with_one_queued_rollback() {
+		for initial in [STATE_OPEN, STATE_POISONED] {
+			let runtime = telemetry_runtime_fixture();
+			runtime.state.store(initial, Ordering::Relaxed);
+			runtime.force_close();
+			assert_eq!(runtime.state.load(Ordering::Relaxed), STATE_CLOSING);
+			assert_eq!(runtime.writer_queue.snapshot().0, 1);
+			runtime.force_close();
+			assert_eq!(runtime.writer_queue.snapshot().0, 1);
+			let command = runtime.writer_queue.try_pop().unwrap();
+			assert!(matches!(
+				command.value.operation,
+				WriterOperation::Close { rollback: true }
+			));
+		}
+	}
+
+	#[test]
+	fn telemetry_production_search_loops_settle_in_assigned_worker_banks() {
+		for (flexible, operation) in [(false, 5), (true, 5), (true, 6), (true, 7)] {
+			let mut runtime = telemetry_runtime_fixture();
+			let fixture = Arc::get_mut(&mut runtime).unwrap();
+			fixture.metrics = Metrics::with_search_workers(2);
+			fixture.state = fixture.metrics.state.clone();
+			fixture.config.identity.fields = vec![crate::protocol::FieldConfig {
+				name: "text".into(),
+				weight: 1.0,
+			}];
+			fixture.config.limits.search_threads = 2;
+			fixture.expensive_search_queue = Some(Arc::new(BoundedQueue::new(1, 64)));
+			fixture.search_wake = Some(Arc::new(QueueWake::new()));
+			let engine = Arc::new(Engine::open(tantivy::directory::RamDirectory::create(), &runtime.config).unwrap());
+			let reader = Arc::new(SnapshotReader::new(engine.reader().unwrap(), runtime.metrics.clone()));
+			let search = if operation == 7 {
+				SearchOperation::Trace(Vec::new())
+			} else {
+				SearchOperation::Search {
+					bytes: Vec::new(),
+					expensive: operation == 6,
+				}
+			};
+			runtime.metrics.attempt(operation);
+			runtime
+				.search_queue(operation != 5)
+				.try_push_tracked(
+					SearchCommand {
+						operation: search,
+						completion: tracked_completion(&runtime.metrics, operation),
+					},
+					8,
+					|| Ok(()),
+					|command, enqueued| command.completion.arm_at(enqueued),
+				)
+				.unwrap();
+			runtime.ordinary_search_queue.shutdown_after_drain();
+			runtime.expensive_search_queue.as_ref().unwrap().shutdown_after_drain();
+			let worker = usize::from(flexible);
+			if flexible {
+				flexible_search_loop(runtime.clone(), engine, reader, worker);
+			} else {
+				ordinary_search_loop(runtime.clone(), engine, reader, worker);
+			}
+			assert_eq!(runtime.metrics.test_counts(operation), [1, 1, 0, 0, 1, 0, 1]);
+			assert_eq!(runtime.metrics.test_actor_counts(operation, Some(worker)), [0, 0, 1]);
+			assert_eq!(runtime.metrics.test_actor_counts(operation, None), [0, 0, 0]);
+			assert_eq!(
+				runtime.metrics.test_actor_counts(operation, Some(1 - worker)),
+				[0, 0, 0]
+			);
+		}
 	}
 
 	#[test]

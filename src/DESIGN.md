@@ -297,3 +297,9 @@ search worker on the measured arm64 target, plus a fixed 1,024-byte shared-Actor
 and container overhead. Retained tokens retain these scalar banks after close; scrape work grows
 with configured workers. The ownership tests cover rebinding/migration, shared drains, duplicate
 bank writers, wrapping sums and disabled/enabled histogram histories.
+
+Forced environment cleanup may see a terminal poisoned runtime after its writer queue has closed.
+The forced-admission helper checks queue availability and changes lifecycle state under the same
+queue mutex, before enqueueing rollback close. Unavailable queues therefore cannot turn a final
+poisoned state back into closing. The native loop regression inspects bank versus shared-fallback
+outcomes, so deleting production worker binding fails even when aggregate totals still conserve.
