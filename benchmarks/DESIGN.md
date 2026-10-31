@@ -9,6 +9,13 @@ telemetry API calls. Optional snapshot-byte cost and polling are separate profil
 pairs and mark noisy measurements inconclusive instead of treating a rounded median as proof of
 the 1%/3% throughput targets. Finite local CPU/RSS observations are not sustained-memory evidence.
 
+Default scenarios cover tie-heavy ordinary collection, single-hit `ordinary-cheap`, and expensive
+prefix/exact-total work. `--operations` filters distinct known scenario names without changing
+other matrix dimensions. Both ordinary shapes use bounded totals; requesting exact totals routes
+to the expensive queue. Candidate warmup asserts actual native class counters. The catalog tie
+case invokes the stable fallback after TopDocs, so it cannot bound the cheapest ordinary path.
+The unique product7 case requires ID7/total1/exact, and ID0-only publications cannot change it.
+
 ## Mixed metadata soak
 
 `metadata-soak.mjs` gives each in-flight query a lease on a reader that is never reloaded. Its

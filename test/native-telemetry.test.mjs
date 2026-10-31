@@ -212,6 +212,12 @@ test('closed telemetry tokens preserve final outcomes without blocking immediate
 	assert.strictEqual(final.native.operations.close.completed, 1n);
 	assert.strictEqual(final.native.phases.teardown.count, 1n);
 	assert.throws(() => index.configureTelemetry({}), { code: 'E_CLOSED' });
+	await assert.rejects(index.search({ text: 'hello' }), { code: 'E_CLOSED' });
+	await assert.rejects(index.traceMatches({ text: 'hello' }, []), { code: 'E_CLOSED' });
+	const rejectedAfterClose = snapshot(index);
+	assert.strictEqual(rejectedAfterClose.preparationRejections.search.errors.E_CLOSED, 1n);
+	assert.strictEqual(rejectedAfterClose.preparationRejections.trace.errors.E_CLOSED, 1n);
+	assert.deepStrictEqual(rejectedAfterClose.native.operations, final.native.operations);
 	const retired = await resetNativeFullTextIndex({ path: config.path, indexId: config.indexId });
 	assert.strictEqual(retired.state, 'reset');
 	assert.strictEqual(snapshot(index).native.operations.close.completed, 1n);

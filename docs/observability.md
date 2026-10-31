@@ -26,6 +26,11 @@ queue/execution timing. Request bytes count admitted payloads; native mutation t
 cannot be attributed to a handle; facade preparation failures appear separately under
 `preparationRejections` and do not become native attempts.
 
+Failures before the native search class is known, including classifier panic, are attributed to
+`search`, not expensive-search admission. Public closed-facade search/trace guards count as
+preparation rejections. Direct calls with unknown or released native handles remain outside
+attributed per-handle counters; the wrapper does not retain tombstones to infer their owner.
+
 At quiescence, attempted equals accepted plus rejected. Native `completed` is derived from succeeded
 plus failed; attempts remain independently recorded. Accepted work is completed, queued or dispatched. `dispatched` is a current gauge that decreases on settlement, not a cumulative dispatch counter. It includes any wait for
 a permit after dequeue; its wait contributes to queue time, not execution. Scrapes read relaxed
@@ -98,18 +103,21 @@ reason. Operations continue; telemetry configuration then reports capability fai
 [The paired driver](../benchmarks/observability.mjs) loads separately prepared baseline and
 candidate packages by absolute module path. It never swaps their native binaries. Each sample
 runs in a fresh process; pair order alternates to reduce time-order bias. The default matrix covers
-ordinary/prefix searches, one/four callers, one/two indexes, histograms off/on, 10 ms polling and
+three search scenarios, one/four callers, one/two indexes, histograms off/on, 10 ms polling and
 optional snapshot bytes. It records correctness checks, throughput, latency, indexing/publication
 cost, process CPU/RSS, runtime versions and caller-supplied source revisions.
 
-Ordinary requests use `any` with `exactTotal: false`, checking the known bounded total and stable
-top IDs. Prefix requests retain exact totals and use the expensive-search queue. Candidate warmup
+The default scenarios are `ordinary` (tie-heavy catalog/`any` with bounded totals), `ordinary-cheap`
+(unique product7/`any`, one exact ID7 hit), and `expensive` (prefix with exact totals). Both ordinary
+scenarios set `exactTotal: false`; the single-hit case avoids the tie fallback's second collector
+pass. Prefix requests use the expensive-search queue. `--operations=ordinary-cheap` selects one
+scenario; the comma-separated filter accepts only distinct known names. Candidate warmup
 verifies both the selected native operation counter and the absence of attempts in the other
 class before timing starts. Baseline routing follows the same request classifier. Historical
 results used exact totals for both labels and therefore did not measure the ordinary queue.
 
 ```sh
-node benchmarks/observability.mjs \
+npm run benchmark:observability -- \
   --baseline=/absolute/baseline/dist/native.js \
   --candidate=/absolute/candidate/dist/native.js \
   --baseline-revision=BASE_SHA --candidate-revision=HEAD_SHA \
@@ -127,6 +135,6 @@ microbenchmarks complement these end-to-end measurements; neither proves product
 sustained memory behavior or per-index native memory attribution. No forced GC or allocator/OS
 tuning is part of the protocol.
 
-See [recorded qualification results](observability-qualification.md) for the historical initial
-matrix and its limitations. The current polling profile leaves histograms disabled to isolate
+See [recorded qualification results](observability-qualification.md) for classified fixture-specific
+comparisons and historical evidence. The current polling profile leaves histograms disabled to isolate
 scraping cost; the initial recorded matrix used histograms enabled while polling.

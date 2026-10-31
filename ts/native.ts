@@ -730,6 +730,7 @@ export class NativeFullTextIndex {
 	): Promise<SearchPageResult> {
 		let nativeStarted = false;
 		try {
+			this.#assertPreparationOpen();
 			const preparationStarted = traversal ? performance.now() : 0;
 			const expression = normalizeSearchExpression(request, this.#queryLimits.maxQueryClauses);
 			if (!traversal && request.continuation !== undefined) {
@@ -821,6 +822,7 @@ export class NativeFullTextIndex {
 					}
 				}
 			}
+			this.#assertPreparationOpen();
 			nativeStarted = true;
 			const cursor = await invoke((callback) => loadAddon().__nativeSearch(this.#handle, frame.bytes, callback));
 			const total = safeNumber(cursor.u64(), 'search total');
@@ -886,6 +888,7 @@ export class NativeFullTextIndex {
 	): Promise<TraceMatchesResult> {
 		let nativeStarted = false;
 		try {
+			this.#assertPreparationOpen();
 			if (typeof request.text !== 'string') throw new FulltextError('E_INVALID_ARGUMENT', 'traceMatches requires text');
 			const text = request.text;
 			const queryOptions = normalizeQueryOptions(request);
@@ -942,6 +945,7 @@ export class NativeFullTextIndex {
 					records: packedRecords,
 					budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
 				});
+				this.#assertPreparationOpen();
 				nativeStarted = true;
 				loadAddon().__nativeTraceMatches(this.#handle, frame, callback);
 			});

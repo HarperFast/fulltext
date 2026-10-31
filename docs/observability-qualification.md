@@ -1,12 +1,137 @@
 # Observability qualification
 
+## Classified catalog and prefix comparison
+
+This comparison measured runtime [`62bb041`](https://github.com/HarperFast/fulltext/commit/62bb041d65b6726344b16b810a1650dab536f8a4)
+against unchanged [baseline `bb4fac1`](https://github.com/HarperFast/fulltext/commit/bb4fac150bae3f17e16a18c106b959966ba1bd83),
+on Node.js 24.16.0/Darwin arm64. The 16 off/on cells used seven alternating-order pairs,
+2,000 documents per index, 40,000 timed queries per process, one/four callers and one/two indexes.
+All **224 fresh children and 8,960,000 timed correctness checks completed**. Every candidate
+verified its selected native search-operation counter and absence of the other class during
+warmup. No runtime after the named measured commit is qualified by these observations.
+
+Ordinary `catalog`/`any` requests used bounded totals and the native ordinary queue. Prefix
+requests retained exact totals and used the expensive queue. The catalog fixture gives all
+documents tied scores at the page boundary, invoking the stable tie fallback after TopDocs.
+It therefore measures a two-pass ordinary collector case, **not the cheapest ordinary path**.
+The single-hit scenario is recorded separately below.
+
+The complete tight targets remain **unestablished**: at most 1% median throughput loss with
+histograms off, or 3% throughput loss/5% p99 increase with histograms on. Four cells were within
+target in every observed pair and 12 were inconclusive; none was outside target in every pair.
+The wide ranges are retained, including outliers, without relaxing a target. Neither a negative
+median nor an individually successful cell proves a general overhead bound.
+
+All values below are percentages: median paired change followed by the full seven-pair range.
+Throughput loss is `1 − candidate / baseline`; p99 increase is `candidate / baseline − 1`.
+These ranges are not confidence intervals.
+
+| Search    | Callers | Indexes | Histograms | Throughput loss: median [range] | p99 increase: median [range] |
+| --------- | ------- | ------- | ---------- | ------------------------------- | ---------------------------- |
+| ordinary  | 1       | 1       | off        | -3.71 [-4.96, 2.17]             | 5.15 [-7.04, 24.68]          |
+| ordinary  | 1       | 1       | on         | -5.48 [-58.34, 29.84]           | 0.00 [-85.40, 198.84]        |
+| expensive | 1       | 1       | off        | -4.02 [-7.21, 4.52]             | 3.53 [-1.78, 22.79]          |
+| expensive | 1       | 1       | on         | -3.08 [-28.19, 62.70]           | -2.31 [-36.12, 2113.69]      |
+| ordinary  | 1       | 2       | off        | -3.82 [-6.02, -0.36]            | 1.16 [-4.51, 49.68]          |
+| ordinary  | 1       | 2       | on         | -7.17 [-48.49, 1.82]            | -8.55 [-76.98, 0.16]         |
+| expensive | 1       | 2       | off        | -7.19 [-9.65, -1.81]            | -2.71 [-21.02, 12.85]        |
+| expensive | 1       | 2       | on         | -5.58 [-8.35, -1.31]            | -3.73 [-30.77, 24.31]        |
+| ordinary  | 4       | 1       | off        | -3.15 [-16.44, 15.35]           | -0.36 [-20.77, 100.68]       |
+| ordinary  | 4       | 1       | on         | 0.04 [-20.74, 2.71]             | -2.41 [-24.00, 51.84]        |
+| expensive | 4       | 1       | off        | -1.44 [-8.78, 17.83]            | 5.09 [2.10, 42.40]           |
+| expensive | 4       | 1       | on         | -5.31 [-16.30, 5.96]            | -4.88 [-17.25, 24.99]        |
+| ordinary  | 4       | 2       | off        | -0.06 [-2.75, 44.81]            | 7.90 [-15.16, 230.35]        |
+| ordinary  | 4       | 2       | on         | -2.49 [-11.31, 5.08]            | 0.00 [-18.18, 7.94]          |
+| expensive | 4       | 2       | off        | -22.70 [-97.37, -2.42]          | -40.92 [-61.87, 1.84]        |
+| expensive | 4       | 2       | on         | -4.39 [-8.23, 1.82]             | -1.49 [-7.27, 8.80]          |
+
+The CPU/write/memory summary is the range of eight cell medians per profile, not the full raw
+range. Mixed process CPU includes timed queries, correctness checks, 20 mutation/publication
+cycles and RSS sampling. Setup CPU separately covers open, indexing and initial publication.
+Publication p99 changes are observations, not an additional passed gate.
+
+| Observation                                   | Histograms off     | Histograms on      |
+| --------------------------------------------- | ------------------ | ------------------ |
+| Mixed query/write process CPU change          | −4.50% to +0.48%   | −7.42% to −2.17%   |
+| Setup process CPU change                      | −4.11% to +7.72%   | −4.23% to +4.43%   |
+| Open/index/initial-publication elapsed change | −13.44% to +16.39% | −25.52% to +7.21%  |
+| Publication p50 callback latency change       | −4.65% to +19.30%  | −9.83% to +8.89%   |
+| Publication p99 callback latency change       | −12.46% to +11.89% | −6.96% to +32.17%  |
+| Mutation-plus-publication p50 change          | −4.73% to +19.24%  | −9.80% to +8.86%   |
+| Mutation-plus-publication p99 change          | −12.36% to +11.90% | −7.00% to +32.15%  |
+| Sampled peak process RSS difference           | −1.78 to +3.22 MiB | −3.48 to +2.89 MiB |
+
+Peak RSS uses 25 ms mixed-phase sampling plus the terminal observation, excludes setup peaks,
+and can miss inter-sample spikes. It includes JavaScript/driver/native allocations and provides
+no per-index attribution or sustained-retention/headroom guarantee. These are finite local
+synthetic measurements, not production qualification.
+
+The complete raw report remains private and unchanged. SHA-256:
+`b1efa7ea648fab6f1bd1ceafcbd2a2906c9772bf5bb2d358d64754230aba5c0d`.
+
+## Single-hit ordinary comparison
+
+The additional `ordinary-cheap` scenario uses unique term `product7`, `any`, bounded totals and
+limit 10 against the same corpus. Its oracle requires exactly ID7, total1 and exact relation;
+publication cycles mutate only ID0. One result avoids the page-boundary tie fallback. Production
+smokes exercised baseline with eight documents and candidate off/on/polling/bytes with 100
+documents; invalid operation filters and an undersized cheap corpus were rejected.
+
+Full paired results measured benchmark commit [`bff340d`](https://github.com/HarperFast/fulltext/commit/bff340dbf0fe0481548c3e35e9e9f9dd13b8b3c6)
+with unchanged `62bb041` runtime against baseline `bb4fac1`, on the same Node.js 24.16.0/Darwin arm64
+host. All **eight cells, 112 fresh children and 4,480,000 timed correctness checks completed**,
+using seven pairs and 40,000 queries per process. Every candidate verified ordinary-class routing
+through native counters before timing. The actual request and single-hit oracle were also checked
+across every raw process report.
+
+All eight cells were inconclusive under the unchanged targets. Several medians exceed their
+numeric targets: off/one-caller/one-index throughput loss 1.54%, off/four-callers/two-indexes 3.26%,
+and on/four-callers/one-index throughput loss 5.42% with p99 increase 5.07%. Their full paired
+ranges cross target boundaries; this is neither a passed tight bound nor a demonstrated stable
+regression with an identified cause. No result was discarded or gate relaxed.
+
+| Callers | Indexes | Histograms | Throughput loss: median [range] | p99 increase: median [range] |
+| ------- | ------- | ---------- | ------------------------------- | ---------------------------- |
+| 1       | 1       | off        | 1.54 [-13.71, 8.21]             | 0.49 [-15.38, 54.96]         |
+| 1       | 1       | on         | 1.57 [-25.09, 20.84]            | -2.98 [-4.26, 11.82]         |
+| 1       | 2       | off        | -0.66 [-15.35, 17.82]           | 3.31 [-23.29, 9.64]          |
+| 1       | 2       | on         | -0.06 [-12.04, 12.34]           | -4.53 [-8.82, 5.61]          |
+| 4       | 1       | off        | 0.26 [-8.51, 7.46]              | -1.98 [-11.16, 13.06]        |
+| 4       | 1       | on         | 5.42 [-8.77, 13.22]             | 5.07 [-9.69, 84.28]          |
+| 4       | 2       | off        | 3.26 [-2.74, 12.53]             | 1.97 [-7.00, 24.67]          |
+| 4       | 2       | on         | -1.66 [-11.49, 0.53]            | -3.80 [-5.98, 5.05]          |
+
+CPU/write/memory ranges use four cell medians per profile and the same measurement scope as
+the classified catalog matrix. The single-hit query is cheaper than that tie-heavy query; its
+measurements must not be replaced by the catalog results.
+
+| Observation                                   | Histograms off     | Histograms on      |
+| --------------------------------------------- | ------------------ | ------------------ |
+| Mixed query/write process CPU change          | −1.19% to +3.59%   | −1.29% to +3.64%   |
+| Setup process CPU change                      | −3.16% to +7.54%   | −1.46% to +2.51%   |
+| Open/index/initial-publication elapsed change | −6.72% to +29.67%  | −3.01% to +2.56%   |
+| Publication p50 callback latency change       | −4.78% to +12.56%  | −5.30% to +2.20%   |
+| Publication p99 callback latency change       | −15.36% to +14.05% | −12.37% to +7.61%  |
+| Mutation-plus-publication p50 change          | −4.93% to +12.55%  | −5.28% to +2.25%   |
+| Mutation-plus-publication p99 change          | −15.33% to +14.04% | −12.37% to +7.63%  |
+| Sampled peak process RSS difference           | −1.28 to +2.05 MiB | +0.05 to +2.22 MiB |
+
+Raw report SHA-256:
+`246a9eeb7f2c6a4a434770d6d02ae4c178bbce547d70e398716a10f4a1220b1c`.
+The artifact remains private and unchanged. Across the classified and single-hit matrices,
+13,440,000 timed queries were correct; **the complete 1%/3%/5% overhead qualification remains
+unestablished**. These measurements do not establish production capacity or sustained memory.
+
+<details>
+<summary>Historical exact-total-only measurements and recorder microbenchmark</summary>
+
 > **Historical classification correction:** every matrix and phase-control run recorded below used
 > `exactTotal: true`. The native classifier routes exact-total requests to the expensive-search
 > queue, including the raw reports' `ordinary`/`any` labels. Both historical query shapes therefore
 > measured expensive-queue work. They provide **no ordinary-queue or ordinary-contention evidence**.
 > Raw reports and measurements remain unchanged. The corrected driver uses `any` with bounded
 > totals for ordinary work and verifies candidate routing through native operation counters;
-> that corrected workload has not yet been measured here.
+> none of the results within this historical section measures that corrected workload.
 
 ## Initial paired matrix
 
@@ -219,11 +344,19 @@ workload need their own measured evidence; these runs cannot qualify changes aft
 
 At runtime commit [`8ebe625`](https://github.com/HarperFast/fulltext/commit/8ebe6257e97187980cc4741a0f4dcf4763e146ce), the optimized ignored Rust microbenchmark completed 100,000 operations per thread, including ticket ownership, admission, dispatch, queue/execution clocks and settlement. These are single local trials, not confidence intervals or end-to-end overhead percentages. Four threads share the same metrics, deliberately exercising counter contention.
 
-| Threads | Histograms | Operations | Elapsed milliseconds | Wall nanoseconds per operation |
-| ------- | ---------- | ---------- | -------------------- | ------------------------------ |
-| 1       | off        | 100,000    | 9.325250             | 93.25                          |
-| 1       | on         | 100,000    | 9.634834             | 96.35                          |
-| 4       | off        | 400,000    | 74.081334            | 185.20                         |
-| 4       | on         | 400,000    | 102.700208           | 256.75                         |
+| Threads | Histograms | Operations | Elapsed milliseconds | Aggregate wall ns/operation | Run wall ns ÷ 100,000 per-thread operations |
+| ------- | ---------- | ---------- | -------------------- | --------------------------- | ------------------------------------------- |
+| 1       | off        | 100,000    | 9.325250             | 93.25                       | 93.25                                       |
+| 1       | on         | 100,000    | 9.634834             | 96.35                       | 96.35                                       |
+| 4       | off        | 400,000    | 74.081334            | 185.20                      | 740.81                                      |
+| 4       | on         | 400,000    | 102.700208           | 256.75                      | 1,027.00                                    |
+
+Elapsed time includes thread startup, joining and scheduling. Dividing run wall time by each
+thread's 100,000 operations is a normalization, not measured per-thread CPU time or a formal upper
+bound. Four-thread admission contention differs from production admission by one owning JavaScript
+thread, and the microbenchmark uses a standalone clock path. This is an artificial stress fixture,
+not a production execution model or performance guarantee.
 
 The refined recorder removes the redundant completed-counter update and constructor clock. It preserves independent admission attempts; completed totals derive from success plus failure. This microbenchmark does not establish the whole-wrapper 1%/3% targets.
+
+</details>
