@@ -142,3 +142,9 @@ The final-source optional control measures that isolated profile only at four ca
 for single-hit ordinary and expensive-prefix searches. Its 10 ms stress interval has measurable
 cost and is not an export-interval recommendation. Byte-cost timings do not await the final
 post-settlement observer tail; successful final byte values are not a full-drain timing bound.
+
+Each `telemetry()` call synchronously snapshots native queues/counters and serializes them, then
+parses the result on the calling JavaScript thread. Do not scrape every index in one tight loop:
+stagger or yield between handles and choose an export interval appropriate to the workload.
+The stress profile demonstrates aggregate polling cost, not a directly measured per-call pause
+or a bound for a large number of indexes. Benchmark the intended exporter schedule before rollout.
