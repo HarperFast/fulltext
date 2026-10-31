@@ -26,15 +26,15 @@ queue/execution timing. Request bytes count admitted payloads; native mutation t
 cannot be attributed to a handle; facade preparation failures appear separately under
 `preparationRejections` and do not become native attempts.
 
-At quiescence, attempted equals accepted plus rejected, and completed equals succeeded plus
-failed. Accepted work is completed, queued or dispatched. Dispatched work includes any wait for
+At quiescence, attempted equals accepted plus rejected. Native `completed` is derived from succeeded
+plus failed; attempts remain independently recorded. Accepted work is completed, queued or dispatched. `dispatched` is a current gauge that decreases on settlement, not a cumulative dispatch counter. It includes any wait for
 a permit after dequeue; its wait contributes to queue time, not execution. Scrapes read relaxed
 observations and may temporarily disagree across fields during a transition. Native cumulative
 counters wrap modulo 2^64; exporters should handle a decrease as a wrap/restart boundary rather
 than calculate a negative rate.
 
 `native.queues` reports writer, ordinary-search and expensive-search occupancy, admitted bytes,
-oldest age, capacity and whether capacity is shared. A process-wide permit pool is not a separate
+oldest age, capacity and whether capacity is shared. Queue `bytes` is current occupancy; operation `requestBytes` is cumulative admitted payload. A process-wide permit pool is not a separate
 handle-owned capacity. An empty/unavailable queue has no oldest age. There is no active native
 cancellation API: deadline timeouts are errors, not cancellation counts.
 
@@ -83,7 +83,7 @@ This excludes small metadata, older pinned snapshots, uncommitted files and in-p
 files; it is **not total directory size or resident memory**. Work runs after command settlement,
 outside reader/cache locks, and can increase subsequent queue wait. Unchanged segment/deletion
 sets reuse the last successful byte observation. `snapshotBytesAgeNanoseconds` tracks that measurement separately from the cheap reader observation age. Pending/error/duration fields distinguish missing,
-stale and completed measurements. Scraping never initiates I/O. Observation failures do not change
+stale and completed measurements. Byte duration describes the last attempt; disabling observations preserves cached values, so exporters should also inspect `snapshotBytesEnabled` and measurement age. Scraping never initiates I/O. Observation failures do not change
 the result of publication or reload.
 
 `native.unsupported` explicitly explains unavailable total-directory bytes, automatic-merge
@@ -120,3 +120,7 @@ callback latency; later writer commands can wait for the prior observation. Nati
 microbenchmarks complement these end-to-end measurements; neither proves production capacity,
 sustained memory behavior or per-index native memory attribution. No forced GC or allocator/OS
 tuning is part of the protocol.
+
+See [recorded qualification results](observability-qualification.md) for the historical initial
+matrix and its limitations. The current polling profile leaves histograms disabled to isolate
+scraping cost; the initial recorded matrix used histograms enabled while polling.

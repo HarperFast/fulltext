@@ -103,7 +103,6 @@ struct Admission {
 #[repr(align(128))]
 struct Actor {
 	dispatched: AtomicU64,
-	completed: AtomicU64,
 	succeeded: AtomicU64,
 	failed: AtomicU64,
 	mutations: AtomicU64,
@@ -115,7 +114,6 @@ impl Default for Actor {
 	fn default() -> Self {
 		Self {
 			dispatched: AtomicU64::new(0),
-			completed: AtomicU64::new(0),
 			succeeded: AtomicU64::new(0),
 			failed: AtomicU64::new(0),
 			mutations: AtomicU64::new(0),
@@ -163,7 +161,8 @@ pub(crate) struct Metrics {
 	operations: [Operation; 8],
 	pub(crate) histograms: AtomicBool,
 	pub(crate) snapshot_bytes: AtomicBool,
-	pub(crate) state: AtomicU8,
+	pub(crate) state: Arc<AtomicU8>,
+	teardown_started: Mutex<Option<Instant>>,
 	phases: [Latency; 3],
 	phase_succeeded: [AtomicU64; 3],
 	phase_failed: [AtomicU64; 3],
@@ -180,7 +179,8 @@ impl Metrics {
 			operations: std::array::from_fn(|_| Operation::default()),
 			histograms: AtomicBool::new(false),
 			snapshot_bytes: AtomicBool::new(false),
-			state: AtomicU8::new(0),
+			state: Arc::new(AtomicU8::new(0)),
+			teardown_started: Mutex::new(None),
 			phases: std::array::from_fn(|_| Latency::default()),
 			phase_succeeded: std::array::from_fn(|_| AtomicU64::new(0)),
 			phase_failed: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -207,9 +207,34 @@ impl Metrics {
 			accepted: false,
 			dispatched: false,
 			settled: false,
-			enqueued: Instant::now(),
+			enqueued: None,
 			started: None,
 		}
+	}
+
+	pub(crate) fn begin_teardown(&self) {
+		self.begin_teardown_at(Instant::now());
+	}
+	fn begin_teardown_at(&self, started: Instant) {
+		self.teardown_started
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.get_or_insert(started);
+	}
+	pub(crate) fn finish_teardown(&self, success: bool) {
+		self.finish_teardown_at(Instant::now(), success);
+	}
+	fn finish_teardown_at(&self, finished: Instant, success: bool) {
+		if let Some(started) = self.teardown_started.lock().unwrap_or_else(|e| e.into_inner()).take() {
+			self.phase(2, finished.saturating_duration_since(started), success);
+		}
+	}
+	#[cfg(test)]
+	pub(crate) fn teardown_pending(&self) -> bool {
+		self.teardown_started
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.is_some()
 	}
 	pub(crate) fn phase(&self, phase: usize, duration: Duration, success: bool) {
 		add(
@@ -320,14 +345,16 @@ impl Metrics {
 	#[cfg(test)]
 	pub(crate) fn test_counts(&self, operation: usize) -> [u64; 7] {
 		let o = &self.operations[operation];
+		let succeeded = load(&o.actor.succeeded);
+		let failed = load(&o.actor.failed);
 		[
 			load(&o.admission.attempted),
 			load(&o.admission.accepted),
 			load(&o.admission.rejected),
 			load(&o.actor.dispatched),
-			load(&o.actor.completed),
-			load(&o.actor.succeeded),
-			load(&o.actor.failed),
+			succeeded.wrapping_add(failed),
+			succeeded,
+			failed,
 		]
 	}
 	pub(crate) fn json(&self, queues: &str) -> String {
@@ -350,7 +377,10 @@ impl Metrics {
 			}
 			let a = &op.admission;
 			let b = &op.actor;
-			let _=write!(output,"\"{}\":{{\"attempted\":\"{}\",\"accepted\":\"{}\",\"rejected\":\"{}\",\"dispatched\":\"{}\",\"completed\":\"{}\",\"succeeded\":\"{}\",\"failed\":\"{}\",\"requestBytes\":\"{}\",\"mutations\":\"{}\",\"queue\":{},\"execution\":{},\"errors\":{{",OP_NAMES[i],load(&a.attempted),load(&a.accepted),load(&a.rejected),load(&b.dispatched),load(&b.completed),load(&b.succeeded),load(&b.failed),load(&a.request_bytes),load(&b.mutations),b.queue.json(),b.execution.json());
+			let succeeded = load(&b.succeeded);
+			let failed = load(&b.failed);
+			let completed = succeeded.wrapping_add(failed);
+			let _=write!(output,"\"{}\":{{\"attempted\":\"{}\",\"accepted\":\"{}\",\"rejected\":\"{}\",\"dispatched\":\"{}\",\"completed\":\"{}\",\"succeeded\":\"{}\",\"failed\":\"{}\",\"requestBytes\":\"{}\",\"mutations\":\"{}\",\"queue\":{},\"execution\":{},\"errors\":{{",OP_NAMES[i],load(&a.attempted),load(&a.accepted),load(&a.rejected),load(&b.dispatched),completed,succeeded,failed,load(&a.request_bytes),load(&b.mutations),b.queue.json(),b.execution.json());
 			for (j, error) in ERROR_CODES.iter().chain(std::iter::once(&"other")).enumerate() {
 				if j > 0 {
 					output.push(',');
@@ -400,7 +430,7 @@ pub(crate) struct Ticket {
 	accepted: bool,
 	dispatched: bool,
 	settled: bool,
-	enqueued: Instant,
+	enqueued: Option<Instant>,
 	started: Option<Instant>,
 }
 impl Ticket {
@@ -413,7 +443,7 @@ impl Ticket {
 	pub(crate) fn arm_at(&mut self, enqueued: Instant) {
 		if !self.accepted {
 			self.accepted = true;
-			self.enqueued = enqueued;
+			self.enqueued = Some(enqueued);
 			add(&self.metrics.operations[self.operation].admission.accepted, 1);
 			add(
 				&self.metrics.operations[self.operation].admission.request_bytes,
@@ -428,13 +458,19 @@ impl Ticket {
 		}
 	}
 	pub(crate) fn start(&mut self) {
+		if !self.accepted || self.started.is_some() || self.settled {
+			return;
+		}
 		self.dispatch();
-		self.metrics.operations[self.operation]
-			.actor
-			.queue
-			.record(self.enqueued.elapsed(), self.metrics.histograms.load(Relaxed));
+		if let Some(enqueued) = self.enqueued {
+			self.metrics.operations[self.operation]
+				.actor
+				.queue
+				.record(enqueued.elapsed(), self.metrics.histograms.load(Relaxed));
+		}
 		self.started = Some(Instant::now());
 	}
+
 	pub(crate) fn mutations(&self, count: u64) {
 		add(&self.metrics.operations[self.operation].actor.mutations, count);
 	}
@@ -454,12 +490,11 @@ impl Ticket {
 				op.actor
 					.execution
 					.record(started.elapsed(), self.metrics.histograms.load(Relaxed));
-			} else {
+			} else if let Some(enqueued) = self.enqueued {
 				op.actor
 					.queue
-					.record(self.enqueued.elapsed(), self.metrics.histograms.load(Relaxed));
+					.record(enqueued.elapsed(), self.metrics.histograms.load(Relaxed));
 			}
-			add(&op.actor.completed, 1);
 			add(
 				if error.is_none() {
 					&op.actor.succeeded
@@ -487,6 +522,49 @@ impl Drop for Ticket {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn ticket_uses_admission_timestamp_without_constructor_clock() {
+		let metrics = Metrics::new();
+		metrics.attempt(5);
+		let mut ticket = metrics.ticket(5, 0);
+		assert!(ticket.enqueued.is_none());
+		ticket.start();
+		assert!(ticket.started.is_none());
+		let enqueued = Instant::now();
+		ticket.arm_at(enqueued);
+		assert_eq!(ticket.enqueued, Some(enqueued));
+		ticket.start();
+		ticket.start();
+		ticket.settle(None);
+		assert_eq!(metrics.test_counts(5), [1, 1, 0, 0, 1, 1, 0]);
+		assert_eq!(load(&metrics.operations[5].actor.queue.count), 1);
+		assert_eq!(load(&metrics.operations[5].actor.execution.count), 1);
+	}
+
+	#[test]
+	fn completed_is_derived_from_explicit_outcomes_with_wrapping() {
+		let metrics = Metrics::new();
+		let operation = &metrics.operations[0];
+		operation.admission.attempted.store(9, Relaxed);
+		operation.actor.succeeded.store(u64::MAX, Relaxed);
+		operation.actor.failed.store(2, Relaxed);
+		assert_eq!(metrics.test_counts(0), [9, 0, 0, 0, 1, u64::MAX, 2]);
+	}
+
+	#[test]
+	fn teardown_phase_covers_writer_close_through_cleanup_once() {
+		let metrics = Metrics::new();
+		let origin = Instant::now();
+		metrics.begin_teardown_at(origin);
+		metrics.begin_teardown_at(origin + Duration::from_secs(2));
+		metrics.finish_teardown_at(origin + Duration::from_secs(3), false);
+		metrics.finish_teardown_at(origin + Duration::from_secs(4), true);
+		assert_eq!(load(&metrics.phases[2].count), 1);
+		assert_eq!(load(&metrics.phases[2].sum), 3_000_000_000);
+		assert_eq!(load(&metrics.phase_failed[2]), 1);
+		assert_eq!(load(&metrics.phase_succeeded[2]), 0);
+	}
+
 	#[test]
 	fn boundaries_and_disabled_histograms() {
 		let l = Latency::default();
@@ -519,7 +597,7 @@ mod tests {
 		assert_eq!(load(&op.admission.attempted), 2);
 		assert_eq!(load(&op.admission.accepted), 1);
 		assert_eq!(load(&op.admission.rejected), 1);
-		assert_eq!(load(&op.actor.completed), 1);
+		assert_eq!(load(&op.actor.succeeded).wrapping_add(load(&op.actor.failed)), 1);
 		assert_eq!(load(&op.actor.failed), 1);
 		assert_eq!(load(&op.actor.dispatched), 0);
 	}

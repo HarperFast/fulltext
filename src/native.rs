@@ -106,7 +106,7 @@ struct Runtime {
 	ordinary_search_queue: Arc<BoundedQueue<SearchCommand>>,
 	expensive_search_queue: Option<Arc<BoundedQueue<SearchCommand>>>,
 	search_wake: Option<Arc<QueueWake>>,
-	state: AtomicU8,
+	state: Arc<AtomicU8>,
 	environment: Arc<EnvironmentState>,
 	uncommitted_mutations: AtomicU64,
 	commit_opstamp: AtomicU64,
@@ -124,6 +124,8 @@ struct Runtime {
 	reload_alignment_faults: AtomicU8,
 	#[cfg(feature = "test-panic")]
 	poison_before_admission: AtomicBool,
+	#[cfg(feature = "test-panic")]
+	search_panic: AtomicBool,
 	#[cfg(feature = "test-panic")]
 	close_fault: AtomicU8,
 	#[cfg(feature = "test-panic")]
@@ -426,15 +428,13 @@ impl TelemetryToken {
 		Ok(())
 	}
 	fn queues(&self) -> String {
+		self.queues_after_state_sample(|| {})
+	}
+	fn queues_after_state_sample(&self, after_sample: impl FnOnce()) -> String {
 		let runtime = self.runtime.upgrade();
-		if let Some(runtime) = &runtime {
-			self.metrics
-				.state
-				.store(runtime.state.load(Ordering::Relaxed), Ordering::Relaxed);
-		}
-		let available = runtime
-			.as_ref()
-			.is_some_and(|r| r.state.load(Ordering::Relaxed) == STATE_OPEN);
+		let sampled_state = runtime.as_ref().map(|r| r.state.load(Ordering::Relaxed));
+		after_sample();
+		let available = sampled_state == Some(STATE_OPEN);
 		let snapshot = |queue: Option<&Arc<BoundedQueue<SearchCommand>>>, shared: bool| {
 			queue_json(
 				queue.map(|q| q.snapshot()),
@@ -477,17 +477,26 @@ fn queue_json(
 #[cfg(feature = "test-panic")]
 static FAIL_TELEMETRY_TOKEN: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "test-panic")]
-#[napi(catch_unwind, js_name = "__testFailNextTelemetryToken")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailNextTelemetryToken")]
 pub fn test_fail_next_telemetry_token() {
 	FAIL_TELEMETRY_TOKEN.store(true, Ordering::Relaxed);
 }
 #[cfg(feature = "test-panic")]
-#[napi(catch_unwind, js_name = "__testLiveTelemetryMetrics")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testLiveTelemetryMetrics")]
 pub fn test_live_telemetry_metrics() -> u32 {
 	crate::telemetry::live_metrics()
 }
 #[cfg(feature = "test-panic")]
-#[napi(catch_unwind, js_name = "__testFailNextTelemetryObservation")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testPanicNextSearch")]
+pub fn test_panic_next_search(env: Env, handle: u32) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		runtime(&env, handle)?.search_panic.store(true, Ordering::Release);
+		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailNextTelemetryObservation")]
 pub fn test_fail_next_telemetry_observation(env: Env, handle: u32) -> boundary::Result<()> {
 	runtime(&env, handle)?.metrics.fail_next_observation();
 	Ok(())
@@ -539,8 +548,17 @@ fn observe_phase<T>(metrics: &Metrics, phase: usize, run: impl FnOnce() -> Resul
 	}
 }
 
-fn classify_search(metrics: &Metrics, classify: impl FnOnce() -> Result<bool>) -> boundary::Result<Result<bool>> {
-	match catch_unwind(AssertUnwindSafe(classify)) {
+fn classify_search(
+	metrics: &Metrics,
+	require_open: impl FnOnce() -> Result<()>,
+	validate_header: impl FnOnce() -> Result<()>,
+	classify: impl FnOnce() -> Result<bool>,
+) -> boundary::Result<Result<bool>> {
+	match catch_unwind(AssertUnwindSafe(|| {
+		require_open()?;
+		validate_header()?;
+		classify()
+	})) {
 		Ok(classification) => Ok(classification),
 		Err(_) => {
 			metrics.attempt(5);
@@ -550,21 +568,21 @@ fn classify_search(metrics: &Metrics, classify: impl FnOnce() -> Result<bool>) -
 	}
 }
 fn observe_operation(
-	runtime: &Runtime,
+	metrics: &Metrics,
 	operation: usize,
 	run: impl FnOnce() -> boundary::Result<()>,
 ) -> boundary::Result<()> {
-	runtime.metrics.attempt(operation);
+	metrics.attempt(operation);
 	let result = catch_unwind(AssertUnwindSafe(run));
 	match result {
 		Ok(result) => {
 			if let Err(error) = &result {
-				runtime.metrics.reject(operation, error.status);
+				metrics.reject(operation, error.status);
 			}
 			result
 		}
 		Err(_) => {
-			runtime.metrics.reject(operation, "E_NATIVE_PANIC");
+			metrics.reject(operation, "E_NATIVE_PANIC");
 			Err(napi_error("E_NATIVE_PANIC", "native operation panicked"))
 		}
 	}
@@ -579,7 +597,7 @@ pub fn native_apply(
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		observe_operation(&runtime, 0, || {
+		observe_operation(&runtime.metrics, 0, || {
 			runtime.require_writable().map_err(fulltext_napi_error)?;
 			validate_batch_header(&packed_batch, runtime.config.limits.max_batch_bytes).map_err(fulltext_napi_error)?;
 			runtime
@@ -604,7 +622,7 @@ pub fn native_apply(
 pub fn native_commit(env: Env, handle: u32, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		observe_operation(&runtime, 1, || {
+		observe_operation(&runtime.metrics, 1, || {
 			runtime.require_writable().map_err(fulltext_napi_error)?;
 			let mut completion = completion(callback, &runtime.environment)?;
 			completion.ticket = Some(runtime.metrics.ticket(1, 0));
@@ -628,7 +646,7 @@ pub fn native_publish(
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		observe_operation(&runtime, 2, || {
+		observe_operation(&runtime.metrics, 2, || {
 			if payload.len() > crate::engine::MAX_COMMIT_PAYLOAD_BYTES {
 				return Err(fulltext_napi_error(FulltextError::invalid(format!(
 					"commit payload exceeds {} UTF-8 bytes",
@@ -654,7 +672,7 @@ pub fn native_publish(
 pub fn native_reload(env: Env, handle: u32, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		observe_operation(&runtime, 3, || {
+		observe_operation(&runtime.metrics, 3, || {
 			let mut completion = completion(callback, &runtime.environment)?;
 			completion.ticket = Some(runtime.metrics.ticket(3, 0));
 			runtime.enqueue_writer(
@@ -677,17 +695,18 @@ pub fn native_search(
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		let classification = classify_search(&runtime.metrics, || {
-			search_is_expensive_for_config(&packed_request, &runtime.config)
-		})?;
+		let classification = classify_search(
+			&runtime.metrics,
+			|| runtime.require_open(),
+			|| validate_search_header(&packed_request),
+			|| search_is_expensive_for_config(&packed_request, &runtime.config),
+		)?;
 		let metric_op = if classification.as_ref().copied().unwrap_or(false) {
 			6
 		} else {
 			5
 		};
-		observe_operation(&runtime, metric_op, || {
-			runtime.require_open().map_err(fulltext_napi_error)?;
-			validate_search_header(&packed_request).map_err(fulltext_napi_error)?;
+		observe_operation(&runtime.metrics, metric_op, || {
 			let expensive = classification.map_err(fulltext_napi_error)?;
 			let queue = runtime.search_queue(expensive);
 			queue
@@ -723,7 +742,7 @@ pub fn native_trace_matches(
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		observe_operation(&runtime, 7, || {
+		observe_operation(&runtime.metrics, 7, || {
 			runtime.require_open().map_err(fulltext_napi_error)?;
 			validate_trace_header(&packed_request).map_err(fulltext_napi_error)?;
 			let queue = runtime.search_queue(true);
@@ -752,7 +771,7 @@ pub fn native_trace_matches(
 pub fn native_close(env: Env, handle: u32, rollback: bool, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		observe_operation(&runtime, 4, || {
+		observe_operation(&runtime.metrics, 4, || {
 			let mut completion = completion(callback, &runtime.environment)?;
 			completion.ticket = Some(runtime.metrics.ticket(4, 0));
 			match runtime
@@ -760,7 +779,6 @@ pub fn native_close(env: Env, handle: u32, rollback: bool, callback: CompletionC
 				.compare_exchange(STATE_OPEN, STATE_CLOSING, Ordering::AcqRel, Ordering::Acquire)
 			{
 				Ok(_) => {
-					runtime.metrics.state.store(STATE_CLOSING, Ordering::Relaxed);
 					runtime.notify_expensive_waiters();
 					#[cfg(feature = "test-panic")]
 					runtime.poison_before_admission();
@@ -1268,6 +1286,7 @@ impl Runtime {
 				search_wake.clone(),
 			))
 		});
+		let state = metrics.state.clone();
 		let runtime = Arc::new(Self {
 			metrics,
 			handle,
@@ -1279,7 +1298,7 @@ impl Runtime {
 			ordinary_search_queue,
 			expensive_search_queue,
 			search_wake,
-			state: AtomicU8::new(STATE_OPEN),
+			state,
 			environment,
 			uncommitted_mutations: AtomicU64::new(0),
 			commit_opstamp: AtomicU64::new(0),
@@ -1297,6 +1316,8 @@ impl Runtime {
 			reload_alignment_faults: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
 			poison_before_admission: AtomicBool::new(false),
+			#[cfg(feature = "test-panic")]
+			search_panic: AtomicBool::new(false),
 			#[cfg(feature = "test-panic")]
 			close_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
@@ -1435,11 +1456,19 @@ impl Runtime {
 	}
 
 	fn force_close(&self) {
-		let previous = self.state.swap(STATE_CLOSING, Ordering::AcqRel);
-		if previous == STATE_CLOSED || previous == STATE_CLOSING {
+		if self
+			.state
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+				if state == STATE_CLOSED || state == STATE_CLOSING {
+					None
+				} else {
+					Some(STATE_CLOSING)
+				}
+			})
+			.is_err()
+		{
 			return;
 		}
-		self.metrics.state.store(STATE_CLOSING, Ordering::Relaxed);
 		self.notify_expensive_waiters();
 		let _ = self.writer_queue.push_force(
 			WriterCommand {
@@ -1456,7 +1485,6 @@ impl Runtime {
 
 	fn poison(&self, error: FulltextError) {
 		self.state.store(STATE_POISONED, Ordering::Release);
-		self.metrics.state.store(STATE_POISONED, Ordering::Relaxed);
 		self.notify_expensive_waiters();
 		let mut close = None;
 		for command in self.writer_queue.drain() {
@@ -2236,12 +2264,17 @@ pub(crate) fn finish_writer_close(writer: &mut Option<Writer>, read_only: bool) 
 	}
 }
 
+fn observe_writer_close(metrics: &Metrics, close: impl FnOnce() -> WriterCloseOutcome) -> WriterCloseOutcome {
+	metrics.begin_teardown();
+	close()
+}
+
 fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>) -> WriterCloseOutcome {
 	#[cfg(feature = "test-panic")]
 	writer_diagnostic(_runtime.handle, "close", "close-start", Duration::ZERO);
 	#[cfg(feature = "test-panic")]
 	let started = Instant::now();
-	let outcome = finish_writer_close(writer, _runtime.read_only);
+	let outcome = observe_writer_close(&_runtime.metrics, || finish_writer_close(writer, _runtime.read_only));
 	#[cfg(feature = "test-panic")]
 	writer_diagnostic(_runtime.handle, "close", "close-end", started.elapsed());
 	#[cfg(feature = "test-panic")]
@@ -2268,7 +2301,6 @@ fn finish_runtime(
 	reader: Arc<SnapshotReader>,
 	mut outcome: WriterCloseOutcome,
 ) -> WriterCloseOutcome {
-	let teardown_started = Instant::now();
 	runtime.ordinary_search_queue.shutdown_after_drain();
 	if let Some(queue) = &runtime.expensive_search_queue {
 		queue.shutdown_after_drain();
@@ -2294,12 +2326,10 @@ fn finish_runtime(
 	runtime.writer_queue.close();
 	if outcome.quiesced {
 		runtime.state.store(STATE_CLOSED, Ordering::Release);
-		runtime.metrics.state.store(STATE_CLOSED, Ordering::Relaxed);
 		runtime.release_reservation();
 		release_runtime(runtime.handle, &runtime.path_identity, &runtime.environment);
 	} else {
 		runtime.state.store(STATE_POISONED, Ordering::Release);
-		runtime.metrics.state.store(STATE_POISONED, Ordering::Relaxed);
 		runtime.retain_reservation_until_restart();
 		release_runtime_handle(
 			runtime.handle,
@@ -2319,16 +2349,13 @@ fn finish_runtime(
 		},
 		Duration::ZERO,
 	);
-	runtime.metrics.phase(
-		2,
-		teardown_started.elapsed(),
-		outcome.quiesced && outcome.error.is_none(),
-	);
+	runtime
+		.metrics
+		.finish_teardown(outcome.quiesced && outcome.error.is_none());
 	outcome
 }
 
 fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
-	let teardown_started = Instant::now();
 	runtime.ordinary_search_queue.shutdown_after_drain();
 	if let Some(queue) = &runtime.expensive_search_queue {
 		queue.shutdown_after_drain();
@@ -2338,7 +2365,6 @@ fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
 	}
 	runtime.writer_queue.close();
 	runtime.state.store(STATE_POISONED, Ordering::Release);
-	runtime.metrics.state.store(STATE_POISONED, Ordering::Relaxed);
 	runtime.retain_reservation_until_restart();
 	release_runtime_handle(
 		runtime.handle,
@@ -2346,7 +2372,7 @@ fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
 		&runtime.path_identity,
 		&runtime.environment,
 	);
-	runtime.metrics.phase(2, teardown_started.elapsed(), false);
+	runtime.metrics.finish_teardown(false);
 }
 
 fn close_result(outcome: WriterCloseOutcome) -> Result<Vec<u8>> {
@@ -2406,7 +2432,10 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 }
 
 fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
-	while let Some(mut queued) = runtime.ordinary_search_queue.pop() {
+	while let Some(queued) = runtime.ordinary_search_queue.pop() {
+		#[cfg(feature = "test-panic")]
+		let mut queued = queued;
+		#[cfg(feature = "test-panic")]
 		queued.value.completion.dispatch();
 		#[cfg(feature = "test-panic")]
 		{
@@ -2548,6 +2577,10 @@ fn execute_search_command(
 				None
 			};
 			completion.start();
+			#[cfg(feature = "test-panic")]
+			if runtime.search_panic.swap(false, Ordering::AcqRel) {
+				panic!("injected native search actor panic");
+			}
 			let started = Instant::now();
 			#[cfg(feature = "test-panic")]
 			{
@@ -3587,14 +3620,201 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 mod tests {
 	use super::*;
 
+	fn telemetry_runtime_fixture() -> Arc<Runtime> {
+		let metrics = Metrics::new();
+		let config = EngineConfig {
+			identity: crate::protocol::EngineIdentityConfig {
+				index_id: "telemetry".into(),
+				generation: "one".into(),
+				fields: vec![],
+				analyzer: "english@2".into(),
+				stop_words: false,
+				positions: true,
+				surface_terms: false,
+				synonyms: vec![],
+				filter_fields: vec![],
+			},
+			limits: crate::protocol::Limits {
+				max_query_terms: 64,
+				max_query_clauses: 256,
+				indexing_threads: 1,
+				search_threads: 1,
+				writer_memory_bytes: 15_000_000,
+				max_queued_commands: 1,
+				max_queued_bytes: 64,
+				max_batch_bytes: 64,
+			},
+		};
+		Arc::new(Runtime {
+			state: metrics.state.clone(),
+			metrics,
+			handle: 0,
+			path: PathBuf::new(),
+			#[cfg(unix)]
+			path_identity: PathIdentity::Unix(0, 0),
+			#[cfg(not(unix))]
+			path_identity: PathIdentity::Path(PathBuf::new()),
+			config,
+			read_only: false,
+			writer_queue: Arc::new(BoundedQueue::new(1, 64)),
+			ordinary_search_queue: Arc::new(BoundedQueue::new(1, 64)),
+			expensive_search_queue: None,
+			search_wake: None,
+			environment: Arc::new(EnvironmentState {
+				callbacks: Arc::new(CallbackGate::new()),
+				handles: Mutex::new(HashMap::new()),
+			}),
+			uncommitted_mutations: AtomicU64::new(0),
+			commit_opstamp: AtomicU64::new(0),
+			writer_queue_nanoseconds: AtomicU64::new(0),
+			writer_execution_nanoseconds: AtomicU64::new(0),
+			search_queue_nanoseconds: AtomicU64::new(0),
+			search_execution_nanoseconds: AtomicU64::new(0),
+			search_threads: Mutex::new(vec![]),
+			closed: Arc::new(CompletionSignal::new()),
+			reservation: Mutex::new(None),
+			expensive_search_budget: None,
+			#[cfg(feature = "test-panic")]
+			publish_fault: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
+			reload_alignment_faults: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
+			poison_before_admission: AtomicBool::new(false),
+			#[cfg(feature = "test-panic")]
+			search_panic: AtomicBool::new(false),
+			#[cfg(feature = "test-panic")]
+			close_fault: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
+			expensive_search_delay_milliseconds: AtomicU64::new(0),
+			#[cfg(feature = "test-panic")]
+			ordinary_search_delay_milliseconds: AtomicU64::new(0),
+		})
+	}
+	#[test]
+	fn telemetry_stale_scrape_cannot_overwrite_terminal_or_reopened_state() {
+		let runtime = telemetry_runtime_fixture();
+		assert!(Arc::ptr_eq(&runtime.state, &runtime.metrics.state));
+		let token = TelemetryToken {
+			metrics: runtime.metrics.clone(),
+			runtime: Arc::downgrade(&runtime),
+			environment: 0,
+			max_commands: 1,
+			max_bytes: 64,
+			isolated: false,
+		};
+		for terminal in [STATE_CLOSED, STATE_POISONED] {
+			runtime.state.store(STATE_CLOSING, Ordering::Relaxed);
+			token.queues_after_state_sample(|| runtime.state.store(terminal, Ordering::Relaxed));
+			assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), terminal);
+			drop(token.queues());
+			assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), terminal);
+		}
+		runtime.state.store(STATE_CLOSING, Ordering::Relaxed);
+		assert!(runtime
+			.state
+			.compare_exchange(STATE_CLOSING, STATE_OPEN, Ordering::AcqRel, Ordering::Acquire)
+			.is_ok());
+		assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), STATE_OPEN);
+	}
+	#[test]
+	fn telemetry_forced_close_preserves_an_already_terminal_state() {
+		let runtime = telemetry_runtime_fixture();
+		runtime.state.store(STATE_CLOSED, Ordering::Relaxed);
+		runtime.force_close();
+		assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), STATE_CLOSED);
+		assert_eq!(runtime.writer_queue.snapshot().0, 0);
+	}
+
+	#[test]
+	fn telemetry_writer_close_begins_teardown_before_native_join_work() {
+		let metrics = Metrics::new();
+		let result = observe_writer_close(&metrics, || {
+			assert!(metrics.teardown_pending());
+			WriterCloseOutcome {
+				quiesced: true,
+				error: None,
+			}
+		});
+		assert!(result.quiesced);
+		assert!(metrics.teardown_pending());
+		metrics.finish_teardown(true);
+		assert!(!metrics.teardown_pending());
+	}
+	#[cfg(feature = "test-panic")]
+	#[test]
+	fn telemetry_poison_before_real_queue_admission_rejects_once() {
+		let runtime = telemetry_runtime_fixture();
+		runtime.poison_before_admission.store(true, Ordering::Relaxed);
+		let error = observe_operation(&runtime.metrics, 1, || {
+			runtime.enqueue_writer(
+				WriterCommand {
+					operation: WriterOperation::Commit,
+					completion: tracked_completion(&runtime.metrics, 1),
+				},
+				0,
+			)
+		})
+		.unwrap_err();
+		assert_eq!(error.status, "E_POISONED");
+		assert_eq!(runtime.metrics.test_counts(1), [1, 0, 1, 0, 0, 0, 0]);
+	}
+	#[test]
+	fn telemetry_native_boundary_panic_rejects_once_without_poisoning_state() {
+		let runtime = telemetry_runtime_fixture();
+		let error = observe_operation(&runtime.metrics, 1, || panic!("native boundary fault")).unwrap_err();
+		assert_eq!(error.status, "E_NATIVE_PANIC");
+		assert_eq!(runtime.metrics.test_counts(1), [1, 0, 1, 0, 0, 0, 0]);
+		assert_eq!(runtime.state.load(Ordering::Relaxed), STATE_OPEN);
+	}
+
+	#[test]
+	fn telemetry_search_prechecks_reject_before_classification_once() {
+		for code in ["E_CLOSED", "E_INVALID_ARGUMENT"] {
+			let metrics = Metrics::new();
+			let header_checked = AtomicBool::new(false);
+			let classified = AtomicBool::new(false);
+			let classification = classify_search(
+				&metrics,
+				|| {
+					if code == "E_CLOSED" {
+						Err(FulltextError::new(code, "closed"))
+					} else {
+						Ok(())
+					}
+				},
+				|| {
+					header_checked.store(true, Ordering::Relaxed);
+					Err(FulltextError::new("E_INVALID_ARGUMENT", "header"))
+				},
+				|| {
+					classified.store(true, Ordering::Relaxed);
+					Ok(true)
+				},
+			)
+			.unwrap();
+			let error = observe_operation(&metrics, 5, || {
+				classification.map_err(fulltext_napi_error)?;
+				Ok(())
+			})
+			.unwrap_err();
+			assert_eq!(error.status, code);
+			assert_eq!(header_checked.load(Ordering::Relaxed), code != "E_CLOSED");
+			assert!(!classified.load(Ordering::Relaxed));
+			assert_eq!(metrics.test_counts(5), [1, 0, 1, 0, 0, 0, 0]);
+			assert_eq!(metrics.test_counts(6), [0, 0, 0, 0, 0, 0, 0]);
+		}
+	}
+
 	#[test]
 	fn telemetry_classifier_panic_records_one_unaccepted_attempt() {
 		let metrics = Metrics::new();
-		let error = classify_search(&metrics, || panic!("classifier fault")).unwrap_err();
+		let error = classify_search(&metrics, || Ok(()), || Ok(()), || panic!("classifier fault")).unwrap_err();
 		assert_eq!(error.status, "E_NATIVE_PANIC");
 		assert_eq!(metrics.test_counts(5), [1, 0, 1, 0, 0, 0, 0]);
 		assert_eq!(metrics.test_counts(6), [0, 0, 0, 0, 0, 0, 0]);
-		assert!(classify_search(&metrics, || Ok(true)).unwrap().unwrap());
+		assert!(classify_search(&metrics, || Ok(()), || Ok(()), || Ok(true))
+			.unwrap()
+			.unwrap());
 		assert_eq!(metrics.test_counts(5), [1, 0, 1, 0, 0, 0, 0]);
 	}
 

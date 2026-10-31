@@ -52,7 +52,9 @@ function snapshot(index) {
 	assert.strictEqual(value.native.apiVersion, 1);
 	return value;
 }
-function conserved(operation) {
+// Call only after operation promises settle: this identity assumes no queued work.
+function conservedAtQuiescence(operation) {
+	assert.strictEqual(operation.dispatched, 0n);
 	assert.strictEqual(operation.attempted, operation.accepted + operation.rejected);
 	assert.strictEqual(operation.completed, operation.succeeded + operation.failed);
 	assert.strictEqual(operation.accepted, operation.completed + operation.dispatched);
@@ -82,7 +84,7 @@ test('telemetry reports native operations separately from facade logical batches
 	assert.strictEqual(telemetry.native.reader.documents, 2n);
 	assert(telemetry.native.reader.segments > 0n);
 	assert.strictEqual(typeof telemetry.native.reader.generationId, 'bigint');
-	for (const operation of Object.values(telemetry.native.operations)) conserved(operation);
+	for (const operation of Object.values(telemetry.native.operations)) conservedAtQuiescence(operation);
 	assert.deepStrictEqual(Object.keys(index.status()).sort(), originalStatus);
 	assert.strictEqual(telemetry.cancellation.available, false);
 	assert.strictEqual(typeof telemetry.native.unsupported.perIndexRss, 'string');
@@ -263,7 +265,7 @@ test('native queue saturation and queued expiry preserve conservation and error 
 	await assert.rejects(index.search({ text: 'trai', mode: 'fuzzy-prefix' }), { code: 'E_QUEUE_FULL' });
 	await Promise.all([first, expired]);
 	const operation = snapshot(index).native.operations.expensiveSearch;
-	conserved(operation);
+	conservedAtQuiescence(operation);
 	assert.strictEqual(operation.attempted, 3n);
 	assert.strictEqual(operation.accepted, 2n);
 	assert.strictEqual(operation.rejected, 1n);
@@ -286,7 +288,7 @@ for (const afterCommit of [false, true]) {
 		assert.strictEqual(telemetry.native.reader.documents, 0n);
 		assert.strictEqual(telemetry.native.phases.commit.succeeded, afterCommit ? 1n : 0n);
 		assert.strictEqual(telemetry.native.phases.readerReload.count, 0n);
-		conserved(telemetry.native.operations.publish);
+		conservedAtQuiescence(telemetry.native.operations.publish);
 	});
 }
 
@@ -296,11 +298,11 @@ test('dirty close is rejected while a final rollback close is fully accounted', 
 	await assert.rejects(index.close(), { code: 'E_DIRTY_CLOSE' });
 	const dirty = snapshot(index).native.operations.close;
 	assert.strictEqual(dirty.errors.E_DIRTY_CLOSE, 1n);
-	conserved(dirty);
+	conservedAtQuiescence(dirty);
 	await index.close({ mode: 'rollback' });
 	const final = snapshot(index).native.operations.close;
 	assert.strictEqual(final.succeeded, 1n);
-	conserved(final);
+	conservedAtQuiescence(final);
 });
 
 test('committing alone does not advance the reader observation; reload installs it', async (context) => {
@@ -407,4 +409,87 @@ test('facade rejection labels whitelist codes and cannot replace a caller failur
 	const telemetry = snapshot(index);
 	assert.deepStrictEqual(telemetry.preparationRejections.search, { total: 2n, errors: { other: 2n } });
 	assert.strictEqual(telemetry.native.operations.search.attempted, 0n);
+});
+
+test('trace encoding getters retain normalized API errors and count one preparation rejection', async (context) => {
+	const { index } = await fixture(context);
+	const original = new Error('caller encoding getter failed');
+	const typed = new FulltextError('E_INVALID_ARGUMENT', 'caller encoding getter rejected');
+	for (const failure of [original, typed]) {
+		await assert.rejects(
+			index.traceMatches(
+				{
+					text: 'private-query',
+					get fields() {
+						throw failure;
+					},
+				},
+				[],
+			),
+			(error) => {
+				assert(error instanceof FulltextError);
+				if (failure === typed) assert.strictEqual(error, typed);
+				else {
+					assert.strictEqual(error.code, 'E_NATIVE_FAILURE');
+					assert.strictEqual(error.cause, original);
+				}
+				return true;
+			},
+		);
+	}
+	const telemetry = snapshot(index);
+	assert.deepStrictEqual(telemetry.preparationRejections.trace, {
+		total: 2n,
+		errors: { E_NATIVE_FAILURE: 1n, E_INVALID_ARGUMENT: 1n },
+	});
+	assert.strictEqual(telemetry.native.operations.trace.attempted, 0n);
+});
+
+test('an actual search actor panic records one failure and preserves final counters after close', async (context) => {
+	const { index, addon, handle } = await rawFixture(context);
+	addon.__testPanicNextSearch(handle);
+	await assert.rejects(index.search({ text: 'hello' }), { code: 'E_NATIVE_PANIC' });
+	await waitFor(() => snapshot(index).native.state === 'poisoned');
+	const poisoned = snapshot(index).native.operations.search;
+	assert.strictEqual(poisoned.attempted, 1n);
+	assert.strictEqual(poisoned.accepted, 1n);
+	assert.strictEqual(poisoned.rejected, 0n);
+	assert.strictEqual(poisoned.completed, 1n);
+	assert.strictEqual(poisoned.failed, 1n);
+	assert.strictEqual(poisoned.succeeded, 0n);
+	assert.strictEqual(poisoned.errors.E_NATIVE_PANIC, 1n);
+	conservedAtQuiescence(poisoned);
+	const result = await index.close({ mode: 'rollback' });
+	assert.strictEqual(result.cleanupError, undefined);
+	const final = snapshot(index).native;
+	assert.strictEqual(final.state, 'closed');
+	assert.deepStrictEqual(final.operations.search, poisoned);
+	assert.strictEqual(final.operations.close.completed, 1n);
+	assert.strictEqual(final.operations.close.succeeded, 1n);
+	conservedAtQuiescence(final.operations.close);
+});
+
+test('poison before native admission rejects one attempt without inventing a completed command', async (context) => {
+	const { index, addon, handle } = await rawFixture(context);
+	addon.__testPoisonBeforeNextAdmission(handle);
+	await assert.rejects(index.commit(), { code: 'E_POISONED' });
+	const poisoned = snapshot(index).native;
+	assert.strictEqual(poisoned.state, 'poisoned');
+	const rejected = poisoned.operations.commit;
+	assert.strictEqual(rejected.attempted, 1n);
+	assert.strictEqual(rejected.rejected, 1n);
+	assert.strictEqual(rejected.accepted, 0n);
+	assert.strictEqual(rejected.completed, 0n);
+	assert.strictEqual(rejected.succeeded, 0n);
+	assert.strictEqual(rejected.failed, 0n);
+	assert.strictEqual(rejected.errors.E_POISONED, 1n);
+	conservedAtQuiescence(rejected);
+	const result = await index.close({ mode: 'rollback' });
+	assert.strictEqual(result.cleanupError, undefined);
+	const final = snapshot(index).native;
+	assert.strictEqual(final.state, 'closed');
+	assert.deepStrictEqual(final.operations.commit, rejected);
+	assert.strictEqual(final.operations.close.completed, 1n);
+	assert.strictEqual(final.operations.close.succeeded, 1n);
+	conservedAtQuiescence(final.operations.close);
 });

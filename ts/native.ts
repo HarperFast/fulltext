@@ -43,6 +43,10 @@ export type {
 	TelemetryLatency,
 	TelemetryOperation,
 	TelemetryPhase,
+	TelemetryQueue,
+	TelemetryHistogram,
+	BatchSizeDistribution,
+	FacadeTelemetrySnapshot,
 } from './telemetry.js';
 
 const snapshotHexBytes = 64;
@@ -929,16 +933,18 @@ export class NativeFullTextIndex {
 			if (!Number.isInteger(maxFragments) || maxFragments < 1 || maxFragments > 5) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'maxFragmentsPerValue must be an integer between 1 and 5');
 			}
-			const frame = encodeTrace({
-				text,
-				...queryOptions,
-				fields: request.fields ?? [],
-				candidateIds: request.candidateIds,
-				records: packedRecords,
-				budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
+			const cursor = await invoke((callback) => {
+				const frame = encodeTrace({
+					text,
+					...queryOptions,
+					fields: request.fields ?? [],
+					candidateIds: request.candidateIds,
+					records: packedRecords,
+					budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
+				});
+				nativeStarted = true;
+				loadAddon().__nativeTraceMatches(this.#handle, frame, callback);
 			});
-			nativeStarted = true;
-			const cursor = await invoke((callback) => loadAddon().__nativeTraceMatches(this.#handle, frame, callback));
 			const complete = cursor.u8() === 1;
 			const recordCount = cursor.u16();
 			const matched = Array.from({ length: recordCount }, () => {

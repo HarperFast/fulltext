@@ -60,7 +60,7 @@ if (options.child) {
 			indexes.push(index);
 			if (profile !== 'baseline')
 				index.configureTelemetry({
-					histograms: profile === 'on' || profile === 'polling',
+					histograms: profile === 'on',
 					snapshotBytes: profile === 'bytes',
 				});
 			await index.applyMutationBatch({
@@ -265,25 +265,27 @@ if (options.child) {
 					const p99Increase = paired.map(
 						({ baseline, candidate }) => candidate.p99Milliseconds / baseline.p99Milliseconds - 1,
 					);
-					const target = profile === 'off' ? 0.01 : 0.03;
+					const target = profile === 'off' ? 0.01 : profile === 'on' ? 0.03 : null;
 					const observedThroughputLoss = median(throughputLoss);
 					const observedP99Increase = median(p99Increase);
 					// A range of paired observations is deliberately conservative; it is not a confidence interval.
 					const status =
-						throughputLoss.every((value) => value <= target) &&
-						(profile === 'off' || p99Increase.every((value) => value <= 0.05))
-							? 'within-target-in-every-pair'
-							: throughputLoss.every((value) => value > target) ||
-								  (profile !== 'off' && p99Increase.every((value) => value > 0.05))
-								? 'outside-target-in-every-pair'
-								: 'inconclusive';
+						target === null
+							? 'cost-observation-only'
+							: throughputLoss.every((value) => value <= target) &&
+								  (profile === 'off' || p99Increase.every((value) => value <= 0.05))
+								? 'within-target-in-every-pair'
+								: throughputLoss.every((value) => value > target) ||
+									  (profile !== 'off' && p99Increase.every((value) => value > 0.05))
+									? 'outside-target-in-every-pair'
+									: 'inconclusive';
 					const result = {
 						profile,
 						callers,
 						indexes,
 						operation,
 						targetMedianThroughputLoss: target,
-						targetMedianP99Increase: profile === 'off' ? null : 0.05,
+						targetMedianP99Increase: profile === 'on' ? 0.05 : null,
 						observedThroughputLoss,
 						observedP99Increase,
 						throughputLossRange: [Math.min(...throughputLoss), Math.max(...throughputLoss)],
