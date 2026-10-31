@@ -277,10 +277,19 @@ fn validate_histogram_doc(histograms: &[HistogramColumns], doc: u32) -> tantivy:
 	}
 	Ok(())
 }
-struct DeadlineCollector<C> {
+pub(crate) struct DeadlineCollector<C> {
 	histograms: Vec<HistogramCheck>,
 	inner: C,
 	deadline: Option<Instant>,
+}
+impl<C> DeadlineCollector<C> {
+	pub(crate) fn new(inner: C, deadline: Option<Instant>) -> Self {
+		Self {
+			histograms: Vec::new(),
+			inner,
+			deadline,
+		}
+	}
 }
 impl<C: Collector> Collector for DeadlineCollector<C> {
 	type Fruit = C::Fruit;

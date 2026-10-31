@@ -928,9 +928,12 @@ impl Engine {
 			let (retained, match_count, mut scored_docs) = searcher
 				.search(
 					query.query.as_ref(),
-					&StableScoreTieCollector::new(request.offset..window_end.saturating_add(1)),
+					&catalog::DeadlineCollector::new(
+						StableScoreTieCollector::new(request.offset..window_end.saturating_add(1)),
+						deadline,
+					),
 				)
-				.map_err(index_error)??;
+				.map_err(collection_error)??;
 			check_deadline(deadline)?;
 			scored_docs.truncate(request.limit);
 			let hits = search_hits(searcher, scored_docs)?;
@@ -954,9 +957,12 @@ impl Engine {
 				let (_, match_count, scored_docs) = searcher
 					.search(
 						query.query.as_ref(),
-						&StableScoreTieCollector::new(request.offset..window_end),
+						&catalog::DeadlineCollector::new(
+							StableScoreTieCollector::new(request.offset..window_end),
+							deadline,
+						),
 					)
-					.map_err(index_error)??;
+					.map_err(collection_error)??;
 				let hits = search_hits(searcher, scored_docs)?;
 				(hits, Some(match_count))
 			} else {
@@ -1021,7 +1027,7 @@ impl Engine {
 				None => {
 					check_deadline(deadline)?;
 					(
-						catalog::count_matches(searcher, query.query.as_ref(), deadline).map_err(count_error)?,
+						catalog::count_matches(searcher, query.query.as_ref(), deadline).map_err(collection_error)?,
 						TotalRelation::Exact,
 					)
 				}
@@ -3396,7 +3402,7 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 	FulltextError::new("E_STORAGE", error.to_string())
 }
 
-fn count_error(error: tantivy::TantivyError) -> FulltextError {
+fn collection_error(error: tantivy::TantivyError) -> FulltextError {
 	match &error {
 		tantivy::TantivyError::InvalidArgument(message) if message == crate::error::SEARCH_TIMEOUT_MESSAGE => {
 			FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE)
@@ -6852,6 +6858,160 @@ mod tests {
 		};
 		assert_eq!(error.code, "E_INCOMPLETE_CREATE");
 	}
+	#[test]
+	fn ordinary_stable_collection_aborts_before_visiting_all_matches() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		use tantivy::query::{EnableScoring, Explanation, Scorer, Weight};
+		use tantivy::DocSet;
+		#[derive(Debug)]
+		struct ObservedQuery {
+			inner: Box<dyn Query>,
+			visited: Arc<AtomicUsize>,
+			deadline: Instant,
+		}
+		impl Clone for ObservedQuery {
+			fn clone(&self) -> Self {
+				Self {
+					inner: self.inner.box_clone(),
+					visited: self.visited.clone(),
+					deadline: self.deadline,
+				}
+			}
+		}
+		struct ObservedWeight {
+			inner: Box<dyn Weight>,
+			visited: Arc<AtomicUsize>,
+			deadline: Instant,
+		}
+		struct ObservedScorer {
+			inner: Box<dyn Scorer>,
+			visited: Arc<AtomicUsize>,
+			deadline: Instant,
+		}
+		impl Query for ObservedQuery {
+			fn weight(&self, scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+				Ok(Box::new(ObservedWeight {
+					inner: self.inner.weight(scoring)?,
+					visited: self.visited.clone(),
+					deadline: self.deadline,
+				}))
+			}
+		}
+		impl Weight for ObservedWeight {
+			fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+				Ok(Box::new(ObservedScorer {
+					inner: self.inner.scorer(reader, boost)?,
+					visited: self.visited.clone(),
+					deadline: self.deadline,
+				}))
+			}
+			fn explain(&self, reader: &SegmentReader, doc: DocId) -> tantivy::Result<Explanation> {
+				self.inner.explain(reader, doc)
+			}
+		}
+		impl DocSet for ObservedScorer {
+			fn advance(&mut self) -> DocId {
+				self.visited.fetch_add(1, Ordering::Relaxed);
+				self.inner.advance()
+			}
+			fn doc(&self) -> DocId {
+				self.inner.doc()
+			}
+			fn size_hint(&self) -> u32 {
+				self.inner.size_hint()
+			}
+		}
+		impl Scorer for ObservedScorer {
+			fn score(&mut self) -> Score {
+				if self.visited.load(Ordering::Relaxed) == 0 {
+					while Instant::now() < self.deadline {
+						std::thread::yield_now();
+					}
+				}
+				self.inner.score()
+			}
+		}
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		writer
+			.apply(MutationBatch {
+				upserts: (0..4096)
+					.map(|id| crate::protocol::Upsert {
+						id: format!("doc-{id}"),
+						version: None,
+						fields: vec![("title".to_owned(), vec!["amber stone quartz ruby".to_owned()])],
+						filters: Vec::new(),
+					})
+					.collect(),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let mut request = admission_request(SearchMode::All);
+		request.expression = expression("amber stone quartz ruby", SearchMode::All, vec!["title".to_owned()]);
+		let mut query = engine.query(&searcher, &request).unwrap();
+		assert!(query.stable_scores);
+		let visited = Arc::new(AtomicUsize::new(0));
+		let deadline = Instant::now() + std::time::Duration::from_secs(1);
+		query.query = Box::new(ObservedQuery {
+			inner: query.query,
+			visited: visited.clone(),
+			deadline,
+		});
+		let error = engine
+			.collect_search(&searcher, &request, Some(deadline), None, None, query)
+			.unwrap_err();
+		assert_eq!(error.code, "E_TIMEOUT");
+		assert!(visited.load(Ordering::Relaxed) > 0);
+		assert!(
+			visited.load(Ordering::Relaxed) <= 1024,
+			"collection must abort before a full scan"
+		);
+		assert_eq!(engine.search(&searcher, &request).unwrap().hits.len(), request.limit);
+		writer
+			.apply(MutationBatch {
+				upserts: Vec::new(),
+				deletes: vec!["doc-0".to_owned()],
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		assert!(searcher
+			.segment_readers()
+			.iter()
+			.any(|segment| segment.alive_bitset().is_some()));
+		let query = engine.query(&searcher, &request).unwrap();
+		let (_, count, expected) = searcher
+			.search(query.query.as_ref(), &StableScoreTieCollector::new(0..request.limit))
+			.unwrap()
+			.unwrap();
+		assert_eq!(count, 4095);
+		let expected = search_hits(&searcher, expected).unwrap();
+		request.exact_total = true;
+		let actual = engine
+			.search_with_deadline(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
+			.unwrap();
+		assert_eq!(actual.total, 4095);
+		assert_eq!(
+			actual
+				.hits
+				.iter()
+				.map(|hit| (&hit.id, hit.score.to_bits()))
+				.collect::<Vec<_>>(),
+			expected
+				.iter()
+				.map(|hit| (&hit.id, hit.score.to_bits()))
+				.collect::<Vec<_>>()
+		);
+		assert!(!actual.hits.iter().any(|hit| hit.id == "doc-0"));
+		writer.close().unwrap();
+	}
+
 	#[test]
 	fn ordinary_exact_count_preserves_native_error_classification() {
 		use tantivy::query::{EnableScoring, Weight};

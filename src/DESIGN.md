@@ -4,8 +4,10 @@ Status: verified against Tantivy 0.27.0 source and local macOS arm64 tests · Ow
 Engineering · Last verified: 2026-10-28
 
 `TraversalScoreTieCollector` owns its scorer loop so it can return `E_TIMEOUT` between document
-batches. Keep the ordinary `StableScoreTieCollector` independent: traversal-only boundary and
-deadline checks must not enter its per-match path.
+batches. The ordinary `StableScoreTieCollector` stays independent of traversal boundaries. Ordinary stable
+passes reuse the shared `catalog::DeadlineCollector` scorer loop and check deadlines every 1,024
+visited documents, including the boundary-tie rerun. The wrapper respects deletions and returns an
+error instead of partial hits; its timeout sentinel maps to `E_TIMEOUT`.
 
 Traversal must use the same scoring path on every page. In pinned Tantivy 0.27.0,
 `BooleanWeight::for_each` and `BooleanWeight::scorer` both construct `BufferedUnionScorer` for term
@@ -291,7 +293,7 @@ Completed prefix input delegates to the term builder and inherits this fact. Non
 
 The stable path scans matches and resolves ID ordinals even for low limits. Like the existing Any path, affected queries fail closed if any matching document lacks an ID ordinal, including matches outside the returned page. Admission policy remains
 unchanged, so broad three-term conjunctions can do this work in the ordinary lane, subject to existing
-term/clause admission bounds. As for the existing Any stable path, ordinary search checks its deadline after collection, not per match; this is not a strict latency bound. The added All/AND/OR scan cost is measured only by the small paired workload, not qualified at catalog scale. The four-term raw-TopDocs/scorer canary and public bounded-page
+term/clause admission bounds. Ordinary stable collection checks deadlines every 1,024 visited documents through the shared collector, plus before and after collection. These cooperative checks do not interrupt a single slow scorer operation and are not a strict latency bound. The added All/AND/OR scan cost is measured only by the small paired workload, not qualified at catalog scale. The four-term raw-TopDocs/scorer canary and public bounded-page
 regressions pin this mitigation for Tantivy upgrades. This is not a repair of every possible native
 block-max rounding bound; the underlying two-term and cross-segment bounds remain upstream concerns.
 
