@@ -1433,7 +1433,11 @@ function normalizeExpression(
 	)
 		throw new FulltextError('E_INVALID_ARGUMENT', 'optional scoring controls belong on an optional expression');
 	if ('text' in expression) {
-		if (typeof expression.text !== 'string' || (expression.mode !== undefined && expression.operator !== undefined)) {
+		if (
+			typeof expression.text !== 'string' ||
+			(expression.operator !== undefined &&
+				(expression.mode !== undefined || (expression.operator !== 'any' && expression.operator !== 'all')))
+		) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search clause');
 		}
 		return {

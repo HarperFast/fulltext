@@ -924,8 +924,7 @@ impl Engine {
 		let window_end = request.offset + request.limit;
 		let stable_any = request.candidate_ids.is_none()
 			&& request.filter.is_none()
-			&& query.clauses > 1
-			&& is_any_expression(&request.expression);
+			&& needs_stable_any(&request.expression, query.clauses);
 		let (hits, bounded_total, bounded_total_relation, collected_total) = if stable_any {
 			let (retained, match_count, mut scored_docs) = searcher
 				.search(
@@ -1489,10 +1488,36 @@ impl Engine {
 			SearchExpression::And(children) => self.boolean_query(searcher, children, Occur::Must, budget),
 			SearchExpression::Or(children) => self.boolean_query(searcher, children, Occur::Should, budget),
 			SearchExpression::Boost { boost, clause } => {
-				let child = self.expression_query_inner(searcher, clause, budget)?;
+				let child = match clause.as_ref() {
+					SearchExpression::Clause(leaf) if matches!(leaf.mode, SearchMode::Any | SearchMode::All) => {
+						// Keep term scorers visible to Tantivy's pruning collector.
+						let fields: Vec<_> = self
+							.selected_fields(&leaf.fields)?
+							.into_iter()
+							.cloned()
+							.map(|mut field| {
+								field.weight *= *boost;
+								field
+							})
+							.collect();
+						let fields: Vec<_> = fields.iter().collect();
+						let occur = if leaf.mode == SearchMode::Any {
+							Occur::Should
+						} else {
+							Occur::Must
+						};
+						let (query, clauses) = self.term_query(&leaf.text, &fields, occur)?;
+						BuiltQuery { query, clauses }
+					}
+					_ => {
+						let mut child = self.expression_query_inner(searcher, clause, budget)?;
+						child.query = boosted(child.query, *boost);
+						child
+					}
+				};
 				self.check_total_clause_count(child.clauses, 1)?;
 				Ok(BuiltQuery {
-					query: boosted(child.query, *boost),
+					query: child.query,
 					clauses: child.clauses + 1,
 				})
 			}
@@ -2338,10 +2363,10 @@ fn resolve_string_ordinals(
 	Ok(values)
 }
 
-fn is_any_expression(expression: &SearchExpression) -> bool {
+fn needs_stable_any(expression: &SearchExpression, clauses: usize) -> bool {
 	match expression {
-		SearchExpression::Clause(clause) => clause.mode == SearchMode::Any,
-		SearchExpression::Boost { clause, .. } => is_any_expression(clause),
+		SearchExpression::Clause(clause) => clause.mode == SearchMode::Any && clauses > 1,
+		SearchExpression::Boost { clause, .. } => needs_stable_any(clause, clauses.saturating_sub(1)),
 		_ => false,
 	}
 }
@@ -5632,6 +5657,31 @@ mod tests {
 			]
 		);
 		writer.close().unwrap();
+	}
+
+	#[test]
+	fn simple_boosts_preserve_term_query_topology_and_collector_route() {
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		for mode in [SearchMode::Any, SearchMode::All] {
+			for boost in [0.0, 1.0, 2.5] {
+				let expression = SearchExpression::Boost {
+					boost,
+					clause: Box::new(SearchExpression::Clause(SearchClause {
+						text: "trail".to_owned(),
+						mode,
+						options: QueryOptions::default(),
+						fields: vec!["title".to_owned()],
+					})),
+				};
+				let built = engine.expression_query(&searcher, &expression).unwrap();
+				assert_eq!(built.clauses, 2);
+				assert!(!needs_stable_any(&expression, built.clauses));
+				let topology = format!("{:?}", built.query);
+				assert!(topology.starts_with("BooleanQuery"), "{topology}");
+			}
+		}
 	}
 
 	#[test]
