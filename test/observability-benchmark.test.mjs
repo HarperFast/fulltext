@@ -188,7 +188,7 @@ for (const argument of ['--sample-rounds=10001', '--warmup-rounds=1001'])
 		assert.match(result.stderr, /must be a positive integer/);
 	});
 
-for (const failure of ['primary-and-close', 'close'])
+for (const failure of ['primary-and-close', 'close', 'partial-open'])
 	test(`idle scrape driver preserves ${failure} failure and publishes no success report`, () => {
 		const root = mkdtempSync(path.join(tmpdir(), 'observability-cleanup-test-'));
 		const marker = path.join(root, 'marker.json');
@@ -213,12 +213,23 @@ for (const failure of ['primary-and-close', 'close'])
 			);
 			assert.ifError(result.error);
 			assert.notStrictEqual(result.status, 0);
-			assert.strictEqual(result.stdout, '', 'A cleanup failure must not publish a successful child report');
+			assert.strictEqual(
+				result.stdout,
+				'',
+				'A failed measurement or cleanup must not publish a successful child report',
+			);
 			const state = JSON.parse(readFileSync(marker, 'utf8'));
 			fixtureRoot = state.root;
-			assert.strictEqual(state.closeAttempts, 4, 'All handles must get a close attempt after failure');
-			assert(existsSync(fixtureRoot), 'An index root must be retained when any close is unproven');
-			assert.match(result.stderr, /E_SCRAPE_CLOSE/);
+			assert.strictEqual(
+				state.closeAttempts,
+				failure === 'partial-open' ? 1 : 4,
+				'All returned handles must get a close attempt after failure',
+			);
+			assert(existsSync(fixtureRoot), 'An index root must be retained after a measurement or cleanup failure');
+			if (failure === 'partial-open') {
+				assert.match(result.stderr, /E_SCRAPE_OPEN/);
+				assert(result.stderr.includes(fixtureRoot), 'A retained fixture path must be reported');
+			} else assert.match(result.stderr, /E_SCRAPE_CLOSE/);
 			if (failure === 'primary-and-close') {
 				assert.match(result.stderr, /AggregateError: Scrape measurement and cleanup failed/);
 				assert.match(result.stderr, /E_SCRAPE_PRIMARY/);

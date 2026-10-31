@@ -21,6 +21,7 @@ export async function openNativeFullTextIndex(options) {
 	handles.push(counts);
 	fixtureRoot = path.dirname(options.path);
 	record();
+	if (failure === 'partial-open' && handles.length === 2) throw new Error('E_SCRAPE_OPEN');
 	return {
 		configureTelemetry(options) {
 			counts.configuration = options;

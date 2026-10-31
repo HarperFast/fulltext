@@ -35,7 +35,8 @@ search workers at 64 and handles at 16. Explicit aggregate queue budget covers w
 and expensive queues. Results pool per-call quantiles per child and retain every per-handle
 sample; they do not bound active workload stalls. Emit the child report only after verified close
 and directory cleanup; preserve a primary measurement failure with any secondary cleanup errors,
-and retain the directory whenever quiescence is unproven. Test fixtures verify configuration, warmup and
+and retain the directory on every failed measurement, including a failed open without an owned
+handle that could prove quiescence. Test fixtures verify configuration, warmup and
 sample counts without treating a fake clock as native performance evidence.
 Historical reports used validation-inclusive percentiles; preserve and label them rather than
 reinterpreting their p99 values as API completion latency.

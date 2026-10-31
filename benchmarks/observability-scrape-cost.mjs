@@ -130,13 +130,14 @@ if (options.child) {
 			} catch (error) {
 				cleanupErrors.push(error);
 			}
-		if (cleanupErrors.length === 0)
+		if (!failed && cleanupErrors.length === 0)
 			try {
 				await rm(root, { recursive: true, force: true });
 			} catch (error) {
 				cleanupErrors.push(error);
 			}
 	}
+	if (failed || cleanupErrors.length > 0) console.error(`Scrape fixture retained for inspection: ${root}`);
 	if (failed && cleanupErrors.length > 0)
 		throw new AggregateError([primaryError, ...cleanupErrors], 'Scrape measurement and cleanup failed', {
 			cause: primaryError,
