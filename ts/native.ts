@@ -1391,6 +1391,7 @@ function normalizeSearchExpression(
 	if (
 		('boost' in request && request.boost !== undefined) ||
 		('optional' in request && request.optional !== undefined) ||
+		('required' in request && request.required !== undefined) ||
 		('should' in request && request.should !== undefined)
 	)
 		throw new FulltextError('E_INVALID_ARGUMENT', 'scoring controls belong in a query expression');
@@ -1425,13 +1426,26 @@ function normalizeExpression(
 	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > maxExpressionDepth) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search expression');
 	}
-	if ('boost' in expression && expression.operator !== 'boost')
+	if ('boost' in expression && expression.boost !== undefined && expression.operator !== 'boost')
 		throw new FulltextError('E_INVALID_ARGUMENT', 'boost belongs on a boost expression');
 	if (
-		(('optional' in expression || 'required' in expression) && expression.operator !== 'optional') ||
-		'should' in expression
+		((('optional' in expression && expression.optional !== undefined) ||
+			('required' in expression && expression.required !== undefined)) &&
+			expression.operator !== 'optional') ||
+		('should' in expression && expression.should !== undefined)
 	)
 		throw new FulltextError('E_INVALID_ARGUMENT', 'optional scoring controls belong on an optional expression');
+	if (
+		('clause' in expression &&
+			expression.clause !== undefined &&
+			expression.operator !== 'boost' &&
+			expression.operator !== 'not') ||
+		('clauses' in expression &&
+			expression.clauses !== undefined &&
+			expression.operator !== 'and' &&
+			expression.operator !== 'or')
+	)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'conflicting search expression children');
 	if ('text' in expression) {
 		if (
 			typeof expression.text !== 'string' ||
@@ -1446,6 +1460,11 @@ function normalizeExpression(
 			fields: expression.fields ?? [],
 		};
 	}
+	if (
+		('mode' in expression && expression.mode !== undefined) ||
+		('fields' in expression && expression.fields !== undefined)
+	)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'text options belong on search clauses');
 	if (
 		('fuzzyDistance' in expression && expression.fuzzyDistance !== undefined) ||
 		('fuzzyTranspositions' in expression && expression.fuzzyTranspositions !== undefined)
@@ -1471,7 +1490,7 @@ function normalizeExpression(
 		return {
 			operator: 'optional',
 			required: normalizeExpression(required, depth + 1, budget),
-			optional: optional.map((clause) => normalizeExpression(clause, depth + 1, budget)),
+			optional: Array.from({ length: optional.length }, (_, i) => normalizeExpression(optional[i], depth + 1, budget)),
 		};
 	}
 	const children = expression.clauses;

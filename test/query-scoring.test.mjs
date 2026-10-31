@@ -246,6 +246,15 @@ test('misplaced scoring controls and conflicting expression shapes fail closed',
 		{ operator: 'and', clauses: [clause], required: leaf('quartz') },
 		{ ...boost(clause, 2), text: 'quartz' },
 		{ ...optional(clause, leaf('quartz')), text: 'quartz' },
+		{ ...boost(clause, 2), clauses: [leaf('quartz')] },
+		{ ...optional(clause, leaf('quartz')), clause: leaf('stone') },
+		{ ...optional(clause, leaf('quartz')), clauses: [leaf('stone')] },
+		{ ...clause, clause: leaf('stone') },
+		{ operator: 'and', clauses: [clause], clause: leaf('stone') },
+		{ ...boost(clause, 2), fields: ['body'] },
+		{ ...optional(clause, leaf('quartz')), mode: 'all' },
+		{ operator: 'optional', required: clause, optional: new Array(1) },
+		{ operator: 'optional', required: clause, optional: [, leaf('quartz')] },
 	]) {
 		await context.test(JSON.stringify(query), async () => {
 			await assert.rejects(index.search({ query }), invalid);
@@ -254,13 +263,24 @@ test('misplaced scoring controls and conflicting expression shapes fail closed',
 	}
 	await assert.rejects(index.search({ query: clause, should: [leaf('quartz')] }), invalid);
 	await assert.rejects(index.searchPage({ query: clause, should: [leaf('quartz')] }), invalid);
+	await assert.rejects(index.search({ text: 'amber', required: clause }), invalid);
+	const unsetControls = { boost: undefined, optional: undefined, required: undefined, should: undefined };
+	const expected = await index.search({ query: clause });
+	assert.deepStrictEqual(await index.search({ query: { ...clause, ...unsetControls } }), expected);
+	assert.deepStrictEqual(await index.search({ query: clause, ...unsetControls }), expected);
+	assert.deepStrictEqual(
+		await index.search({
+			query: { ...boost(clause, 2), clauses: undefined, optional: undefined, required: undefined },
+		}),
+		await index.search({ query: boost(clause, 2) }),
+	);
 });
 
 test('multi-term Any scoring has identical search and continuation score sequences', async (context) => {
 	const { index } = await fixture(context, records);
 	for (const query of [
-		boost({ text: 'amber stone', mode: 'any', fields: ['title'] }, 0.7),
-		optional({ text: 'amber stone', mode: 'any', fields: ['title'] }, boost(leaf('quartz'), 0.3)),
+		boost({ text: 'amber stone quartz', mode: 'any', fields: ['title'] }, 0.7),
+		optional({ text: 'amber stone quartz', mode: 'any', fields: ['title'] }, boost(leaf('quartz'), 0.3)),
 	]) {
 		const expected = await index.search({ query, exactTotal: true, limit: 20 });
 		const hits = [];

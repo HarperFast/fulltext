@@ -5680,6 +5680,20 @@ mod tests {
 				assert!(!needs_stable_any(&expression, built.clauses));
 				let topology = format!("{:?}", built.query);
 				assert!(topology.starts_with("BooleanQuery"), "{topology}");
+				if mode == SearchMode::Any {
+					let wide = SearchExpression::Boost {
+						boost,
+						clause: Box::new(SearchExpression::Clause(SearchClause {
+							text: "trail waterproof shoe".to_owned(),
+							mode: SearchMode::Any,
+							options: QueryOptions::default(),
+							fields: vec!["title".to_owned()],
+						})),
+					};
+					let built = engine.expression_query(&searcher, &wide).unwrap();
+					assert_eq!(built.clauses, 4);
+					assert!(needs_stable_any(&wide, built.clauses));
+				}
 			}
 		}
 	}

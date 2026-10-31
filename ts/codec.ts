@@ -887,7 +887,10 @@ function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpr
 		return;
 	}
 	const unsupported: never = expression;
-	throw new FulltextError('E_INVALID_ARGUMENT', `unknown search expression type: ${String(unsupported)}`);
+	throw new FulltextError(
+		'E_INVALID_ARGUMENT',
+		`unknown search expression type: ${String((unsupported as { operator?: unknown }).operator)}`,
+	);
 }
 
 function encodeQueryOptions(writer: ByteWriter, clause: PackedSearchClause): void {
@@ -1097,7 +1100,10 @@ class ByteWriter {
 
 	f32(value: number, name: string, allowZero = false): void {
 		if (!Number.isFinite(value) || (allowZero ? value < 0 : value <= 0)) {
-			throw new FulltextError('E_INVALID_ARGUMENT', `${name} must be finite and greater than zero`);
+			throw new FulltextError(
+				'E_INVALID_ARGUMENT',
+				`${name} must be finite and ${allowZero ? 'non-negative' : 'greater than zero'}`,
+			);
 		}
 		const buffer = Buffer.allocUnsafe(4);
 		buffer.writeFloatLE(value);
