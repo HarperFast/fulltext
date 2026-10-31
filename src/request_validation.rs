@@ -65,6 +65,14 @@ fn validate_expression_options(expression: &SearchExpression) -> Result<bool> {
 			}
 			Ok(contains_prefix)
 		}
+		SearchExpression::Boost { clause, .. } => validate_expression_options(clause),
+		SearchExpression::Optional { required, optional } => {
+			let mut contains_prefix = validate_expression_options(required)?;
+			for clause in optional {
+				contains_prefix |= validate_expression_options(clause)?;
+			}
+			Ok(contains_prefix)
+		}
 		SearchExpression::Not(child) => validate_expression_options(child),
 	}
 }
@@ -150,6 +158,47 @@ mod tests {
 
 	fn invalid(result: Result<()>) {
 		assert_eq!(result.unwrap_err().code, "E_INVALID_ARGUMENT");
+	}
+
+	#[test]
+	fn direct_scoring_requests_validate_boosts_and_optional_prefixes() {
+		let base = request(SearchMode::Any);
+		for boost in [-0.0, -1.0, 101.0, f32::NAN, f32::INFINITY] {
+			let mut query = base.clone();
+			query.expression = SearchExpression::Boost {
+				boost,
+				clause: Box::new(base.expression.clone()),
+			};
+			invalid(validate_search_admission(&query));
+		}
+		for boost in [0.0, 0.5, 1.0, 100.0] {
+			let mut query = base.clone();
+			query.expression = SearchExpression::Boost {
+				boost,
+				clause: Box::new(base.expression.clone()),
+			};
+			validate_search_admission(&query).unwrap();
+		}
+		let mut query = base.clone();
+		query.expression = SearchExpression::Optional {
+			required: Box::new(base.expression.clone()),
+			optional: Vec::new(),
+		};
+		invalid(validate_search_admission(&query));
+		query.expression = SearchExpression::Optional {
+			required: Box::new(base.expression),
+			optional: vec![SearchExpression::Boost {
+				boost: 2.0,
+				clause: Box::new(request(SearchMode::Prefix).expression),
+			}],
+		};
+		query.offset = 1;
+		invalid(validate_search_admission(&query));
+		query.offset = 0;
+		query.limit = 101;
+		invalid(validate_search_admission(&query));
+		query.limit = 10;
+		validate_search_admission(&query).unwrap();
 	}
 
 	#[test]

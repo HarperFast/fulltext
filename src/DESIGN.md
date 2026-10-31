@@ -244,7 +244,7 @@ structured-filter bounds remain fixed. The facade's frozen `queryLimits` getter 
 snapshot, not mutable caller options. Native validation remains authoritative for raw frames and
 direct Rust opens.
 
-`SearchStructureBudget` charges `S = sum(AND/OR child counts) + 2 × NOT count` before descending.
+`SearchStructureBudget` charges `S = sum(AND/OR child counts) + 2 × NOT count + Boost count + sum(Optional child counts)` before descending.
 The compiler charges those same edges plus nonnegative leaf costs, so `S <= compiled clauses`
 and AST nodes are at most `S + 1`. This protects allocation without duplicating Tantivy analysis.
 The Node normalizer charges before visiting children; the native admission scanner uses the actual
@@ -275,3 +275,10 @@ require a matching facade/addon.
 The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
 additional tail rejects. A future extension needs explicit framing/versioning rather than appending
 an ambiguous optional value.
+
+## Query scoring
+
+Boost and Optional preserve child/required membership through native BoostQuery and Must/Should lowering.
+Every query walker charges Boost1 and Optional1+n before descending; optional-only anchors cannot make a complement-driven required branch cheap.
+Scoring admission is inherited from all children; boosted ANY routing looks through boosts to retain stable collection.
+Negative-zero boosts reject before execution. The direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts under ABI14/queryAPI8. Persisted identity is unchanged.

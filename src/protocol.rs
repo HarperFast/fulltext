@@ -223,6 +223,15 @@ impl SearchStructureBudget {
 	}
 }
 
+pub(crate) fn validate_query_boost(boost: f32) -> Result<()> {
+	if !boost.is_finite() || boost.is_sign_negative() || boost > 100.0 {
+		return Err(FulltextError::invalid(
+			"boost must be finite between 0 and 100 without negative zero",
+		));
+	}
+	Ok(())
+}
+
 pub(crate) fn validate_search_structure(expression: &SearchExpression, clauses: usize, fields: usize) -> Result<()> {
 	fn visit(expression: &SearchExpression, depth: usize, budget: &mut SearchStructureBudget) -> Result<()> {
 		budget.depth(depth)?;
@@ -231,6 +240,20 @@ pub(crate) fn validate_search_structure(expression: &SearchExpression, clauses: 
 			SearchExpression::And(children) | SearchExpression::Or(children) => {
 				budget.children(children.len())?;
 				for child in children {
+					visit(child, depth + 1, budget)?;
+				}
+				Ok(())
+			}
+			SearchExpression::Boost { boost, clause } => {
+				validate_query_boost(*boost)?;
+				budget.charge(1)?;
+				visit(clause, depth + 1, budget)
+			}
+			SearchExpression::Optional { required, optional } => {
+				budget.children(optional.len())?;
+				budget.charge(1)?;
+				visit(required, depth + 1, budget)?;
+				for child in optional {
 					visit(child, depth + 1, budget)?;
 				}
 				Ok(())
@@ -359,12 +382,20 @@ pub struct SearchClause {
 	pub fields: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SearchExpression {
 	Clause(SearchClause),
 	And(Vec<SearchExpression>),
 	Or(Vec<SearchExpression>),
 	Not(Box<SearchExpression>),
+	Boost {
+		boost: f32,
+		clause: Box<SearchExpression>,
+	},
+	Optional {
+		required: Box<SearchExpression>,
+		optional: Vec<SearchExpression>,
+	},
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -813,6 +844,32 @@ fn scan_search_expression(
 				has_positive_anchor: false,
 			})
 		}
+		4 => {
+			validate_query_boost(cursor.f32()?)?;
+			structure.charge(1)?;
+			let child = scan_search_expression(cursor, depth + 1, structure, raised_profile_fields)?;
+			Ok(SearchCost {
+				construction_upper: child.construction_upper.saturating_add(1),
+				..child
+			})
+		}
+		5 => {
+			let count = cursor.u16()? as usize;
+			structure.children(count)?;
+			structure.charge(1)?;
+			let required = scan_search_expression(cursor, depth + 1, structure, raised_profile_fields)?;
+			let mut cost = SearchCost {
+				construction_upper: required.construction_upper.saturating_add(count + 1),
+				..required
+			};
+			for _ in 0..count {
+				let child = scan_search_expression(cursor, depth + 1, structure, raised_profile_fields)?;
+				cost.terms_upper = cost.terms_upper.max(child.terms_upper);
+				cost.construction_upper = cost.construction_upper.saturating_add(child.construction_upper);
+				cost.has_expensive_mode |= child.has_expensive_mode;
+			}
+			Ok(cost)
+		}
 		_ => Err(FulltextError::invalid("unknown search expression type")),
 	}
 }
@@ -1244,6 +1301,24 @@ fn decode_search_expression(
 				structure,
 			)?)))
 		}
+		4 => {
+			let boost = cursor.f32()?;
+			validate_query_boost(boost)?;
+			structure.charge(1)?;
+			let clause = Box::new(decode_search_expression(cursor, depth + 1, structure)?);
+			Ok(SearchExpression::Boost { boost, clause })
+		}
+		5 => {
+			let count = cursor.u16()? as usize;
+			structure.children(count)?;
+			structure.charge(1)?;
+			let required = Box::new(decode_search_expression(cursor, depth + 1, structure)?);
+			let mut optional = Vec::with_capacity(count);
+			for _ in 0..count {
+				optional.push(decode_search_expression(cursor, depth + 1, structure)?);
+			}
+			Ok(SearchExpression::Optional { required, optional })
+		}
 		_ => Err(FulltextError::invalid("unknown search expression type")),
 	}
 }
@@ -1604,6 +1679,134 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn scoring_nodes_share_validation_and_preserve_cost_anchors() {
+		fn leaf(mode: u8) -> Vec<u8> {
+			let mut bytes = vec![0];
+			bytes.extend_from_slice(&5u32.to_le_bytes());
+			bytes.extend_from_slice(b"alpha");
+			bytes.extend_from_slice(&[mode, 1, 1, 0, 0]);
+			bytes
+		}
+		fn boost(value: f32, child: &[u8]) -> Vec<u8> {
+			[vec![4], value.to_le_bytes().to_vec(), child.to_vec()].concat()
+		}
+		fn optional(required: &[u8], optional: &[u8]) -> Vec<u8> {
+			[vec![5, 1, 0], required.to_vec(), optional.to_vec()].concat()
+		}
+		let ordinary = leaf(0);
+		let prefix = leaf(3);
+		let negated = [vec![3], ordinary.clone()].concat();
+		let cases = [
+			(boost(0.0, &ordinary), false),
+			(boost(2.5, &ordinary), false),
+			(optional(&ordinary, &ordinary), false),
+			(optional(&negated, &ordinary), true),
+			(optional(&ordinary, &prefix), true),
+			(boost(2.5, &prefix), true),
+		];
+		for (bytes, expensive) in cases {
+			let mut cursor = Cursor {
+				bytes: &bytes,
+				offset: 0,
+			};
+			let cost = scan_search_expression(
+				&mut cursor,
+				0,
+				&mut SearchStructureBudget::new(256, MAX_FIELDS).unwrap(),
+				None,
+			)
+			.unwrap();
+			assert_eq!(cost.has_expensive_mode || !cost.has_positive_anchor, expensive);
+			assert_eq!(cursor.offset, bytes.len());
+			let mut cursor = Cursor {
+				bytes: &bytes,
+				offset: 0,
+			};
+			let expression = decode_search_expression(
+				&mut cursor,
+				0,
+				&mut SearchStructureBudget::new(256, MAX_FIELDS).unwrap(),
+			)
+			.unwrap();
+			assert_eq!(cursor.offset, bytes.len());
+			validate_search_structure(&expression, 256, MAX_FIELDS).unwrap();
+			for length in 0..bytes.len() {
+				let mut cursor = Cursor {
+					bytes: &bytes[..length],
+					offset: 0,
+				};
+				assert!(scan_search_expression(
+					&mut cursor,
+					0,
+					&mut SearchStructureBudget::new(256, MAX_FIELDS).unwrap(),
+					None
+				)
+				.is_err());
+				let mut cursor = Cursor {
+					bytes: &bytes[..length],
+					offset: 0,
+				};
+				assert!(decode_search_expression(
+					&mut cursor,
+					0,
+					&mut SearchStructureBudget::new(256, MAX_FIELDS).unwrap()
+				)
+				.is_err());
+			}
+		}
+		for value in [-0.0, -1.0, 101.0, f32::INFINITY, f32::NAN] {
+			let bytes = boost(value, &ordinary);
+			let mut cursor = Cursor {
+				bytes: &bytes,
+				offset: 0,
+			};
+			assert!(scan_search_expression(
+				&mut cursor,
+				0,
+				&mut SearchStructureBudget::new(256, MAX_FIELDS).unwrap(),
+				None
+			)
+			.is_err());
+			let mut cursor = Cursor {
+				bytes: &bytes,
+				offset: 0,
+			};
+			assert!(decode_search_expression(
+				&mut cursor,
+				0,
+				&mut SearchStructureBudget::new(256, MAX_FIELDS).unwrap()
+			)
+			.is_err());
+		}
+		for count in [0u16, 256, u16::MAX] {
+			let bytes = [vec![5], count.to_le_bytes().to_vec()].concat();
+			let mut cursor = Cursor {
+				bytes: &bytes,
+				offset: 0,
+			};
+			assert!(scan_search_expression(
+				&mut cursor,
+				0,
+				&mut SearchStructureBudget::new(256, MAX_FIELDS).unwrap(),
+				None
+			)
+			.is_err());
+			assert_eq!(cursor.offset, 3);
+			let mut cursor = Cursor {
+				bytes: &bytes,
+				offset: 0,
+			};
+			assert!(decode_search_expression(
+				&mut cursor,
+				0,
+				&mut SearchStructureBudget::new(256, MAX_FIELDS).unwrap()
+			)
+			.is_err());
+			assert_eq!(cursor.offset, 3);
+		}
+	}
 
 	#[test]
 	fn catalog_counts_and_depth_are_checked_before_allocation() {

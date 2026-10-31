@@ -409,8 +409,11 @@ export interface PackedSearchClause {
 
 export type PackedSearchExpression =
 	| PackedSearchClause
-	| { operator: 'and' | 'or'; clauses: PackedSearchExpression[] }
-	| { operator: 'not'; clause: PackedSearchExpression };
+	| { operator: 'and'; clauses: PackedSearchExpression[] }
+	| { operator: 'or'; clauses: PackedSearchExpression[] }
+	| { operator: 'not'; clause: PackedSearchExpression }
+	| { operator: 'boost'; boost: number; clause: PackedSearchExpression }
+	| { operator: 'optional'; required: PackedSearchExpression; optional: PackedSearchExpression[] };
 
 export type PackedFilterExpression =
 	| {
@@ -834,6 +837,17 @@ function encodeFilterExpression(writer: ByteWriter, expression: PackedFilterExpr
 	for (const clause of expression.clauses) encodeFilterExpression(writer, clause, depth + 1);
 }
 
+export function normalizeQueryBoost(value: unknown): number {
+	if (typeof value !== 'number') throw new FulltextError('E_INVALID_ARGUMENT', 'boost must be a number');
+	const boost = Math.fround(value);
+	if (!Number.isFinite(boost) || boost < 0 || boost > 100 || Object.is(boost, -0))
+		throw new FulltextError(
+			'E_INVALID_ARGUMENT',
+			'boost must round to a finite float32 between 0 and 100 without negative zero',
+		);
+	return boost;
+}
+
 function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpression, depth: number): void {
 	if (depth > maxExpressionDepth)
 		throw new FulltextError('E_INVALID_ARGUMENT', `search expression nesting exceeds ${maxExpressionDepth} levels`);
@@ -851,9 +865,29 @@ function encodeSearchExpression(writer: ByteWriter, expression: PackedSearchExpr
 		encodeSearchExpression(writer, expression.clause, depth + 1);
 		return;
 	}
-	writer.u8(expression.operator === 'and' ? 1 : 2, 'expression type');
-	writer.u16(expression.clauses.length, 'clauses.length');
-	for (const clause of expression.clauses) encodeSearchExpression(writer, clause, depth + 1);
+	if (expression.operator === 'boost') {
+		writer.u8(4, 'expression type');
+		writer.f32(normalizeQueryBoost(expression.boost), 'boost', true);
+		encodeSearchExpression(writer, expression.clause, depth + 1);
+		return;
+	}
+	if (expression.operator === 'optional') {
+		writer.u8(5, 'expression type');
+		if (!Array.isArray(expression.optional) || expression.optional.length === 0)
+			throw new FulltextError('E_INVALID_ARGUMENT', 'optional scoring requires at least one optional clause');
+		writer.u16(expression.optional.length, 'optional.length');
+		encodeSearchExpression(writer, expression.required, depth + 1);
+		for (const clause of expression.optional) encodeSearchExpression(writer, clause, depth + 1);
+		return;
+	}
+	if (expression.operator === 'and' || expression.operator === 'or') {
+		writer.u8(expression.operator === 'and' ? 1 : 2, 'expression type');
+		writer.u16(expression.clauses.length, 'clauses.length');
+		for (const clause of expression.clauses) encodeSearchExpression(writer, clause, depth + 1);
+		return;
+	}
+	const unsupported: never = expression;
+	throw new FulltextError('E_INVALID_ARGUMENT', `unknown search expression type: ${String(unsupported)}`);
 }
 
 function encodeQueryOptions(writer: ByteWriter, clause: PackedSearchClause): void {
@@ -1061,8 +1095,8 @@ class ByteWriter {
 		this.bytes(buffer);
 	}
 
-	f32(value: number, name: string): void {
-		if (!Number.isFinite(value) || value <= 0) {
+	f32(value: number, name: string, allowZero = false): void {
+		if (!Number.isFinite(value) || (allowZero ? value < 0 : value <= 0)) {
 			throw new FulltextError('E_INVALID_ARGUMENT', `${name} must be finite and greater than zero`);
 		}
 		const buffer = Buffer.allocUnsafe(4);

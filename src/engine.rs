@@ -925,7 +925,7 @@ impl Engine {
 		let stable_any = request.candidate_ids.is_none()
 			&& request.filter.is_none()
 			&& query.clauses > 1
-			&& matches!(&request.expression, SearchExpression::Clause(clause) if clause.mode == SearchMode::Any);
+			&& is_any_expression(&request.expression);
 		let (hits, bounded_total, bounded_total_relation, collected_total) = if stable_any {
 			let (retained, match_count, mut scored_docs) = searcher
 				.search(
@@ -1488,6 +1488,32 @@ impl Engine {
 			SearchExpression::Clause(clause) => self.clause_query(searcher, clause, budget),
 			SearchExpression::And(children) => self.boolean_query(searcher, children, Occur::Must, budget),
 			SearchExpression::Or(children) => self.boolean_query(searcher, children, Occur::Should, budget),
+			SearchExpression::Boost { boost, clause } => {
+				let child = self.expression_query_inner(searcher, clause, budget)?;
+				self.check_total_clause_count(child.clauses, 1)?;
+				Ok(BuiltQuery {
+					query: boosted(child.query, *boost),
+					clauses: child.clauses + 1,
+				})
+			}
+			SearchExpression::Optional { required, optional } => {
+				let mut clauses = optional.len() + 1;
+				let required = self.expression_query_inner(searcher, required, budget)?;
+				self.check_total_clause_count(clauses, required.clauses)?;
+				clauses += required.clauses;
+				let mut queries = Vec::with_capacity(optional.len() + 1);
+				queries.push((Occur::Must, required.query));
+				for child in optional {
+					let child = self.expression_query_inner(searcher, child, budget)?;
+					self.check_total_clause_count(clauses, child.clauses)?;
+					clauses += child.clauses;
+					queries.push((Occur::Should, child.query));
+				}
+				Ok(BuiltQuery {
+					query: Box::new(BooleanQuery::new(queries)),
+					clauses,
+				})
+			}
 			SearchExpression::Not(child) => {
 				let child = self.expression_query_inner(searcher, child, budget)?;
 				self.check_total_clause_count(child.clauses, 2)?;
@@ -2310,6 +2336,14 @@ fn resolve_string_ordinals(
 		return Err(FulltextError::new("E_NATIVE_FAILURE", missing_message));
 	}
 	Ok(values)
+}
+
+fn is_any_expression(expression: &SearchExpression) -> bool {
+	match expression {
+		SearchExpression::Clause(clause) => clause.mode == SearchMode::Any,
+		SearchExpression::Boost { clause, .. } => is_any_expression(clause),
+		_ => false,
+	}
 }
 
 fn boosted(query: Box<dyn Query>, weight: f32) -> Box<dyn Query> {
@@ -5668,26 +5702,42 @@ mod tests {
 				},
 				fields: Vec::new(),
 			});
-			let built = engine.expression_query(&searcher, &clause).unwrap();
-			let weight = built
-				.query
-				.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
-				.unwrap();
-			for reader in searcher.segment_readers() {
-				let mut scorer = weight.scorer(reader, 1.0).unwrap();
-				let mut scored = Vec::new();
-				while scorer.doc() != tantivy::TERMINATED {
-					scored.push((scorer.doc(), scorer.score().to_bits()));
-					scorer.advance();
-				}
-				let mut enumerated = Vec::new();
-				weight
-					.for_each(reader, &mut |doc, score| enumerated.push((doc, score.to_bits())))
+			for clause in [
+				clause.clone(),
+				SearchExpression::Boost {
+					boost: 0.0,
+					clause: Box::new(clause.clone()),
+				},
+				SearchExpression::Boost {
+					boost: 2.5,
+					clause: Box::new(clause.clone()),
+				},
+				SearchExpression::Optional {
+					required: Box::new(clause.clone()),
+					optional: vec![clause.clone()],
+				},
+			] {
+				let built = engine.expression_query(&searcher, &clause).unwrap();
+				let weight = built
+					.query
+					.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
 					.unwrap();
-				assert!(!scored.is_empty(), "fixture must match {text}");
-				scored.sort_unstable();
-				enumerated.sort_unstable();
-				assert_eq!(scored, enumerated, "scoring topology changed for {text}");
+				for reader in searcher.segment_readers() {
+					let mut scorer = weight.scorer(reader, 1.0).unwrap();
+					let mut scored = Vec::new();
+					while scorer.doc() != tantivy::TERMINATED {
+						scored.push((scorer.doc(), scorer.score().to_bits()));
+						scorer.advance();
+					}
+					let mut enumerated = Vec::new();
+					weight
+						.for_each(reader, &mut |doc, score| enumerated.push((doc, score.to_bits())))
+						.unwrap();
+					assert!(!scored.is_empty(), "fixture must match {text}");
+					scored.sort_unstable();
+					enumerated.sort_unstable();
+					assert_eq!(scored, enumerated, "scoring topology changed for {text}");
+				}
 			}
 		}
 		writer.close().unwrap();

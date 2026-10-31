@@ -11,3 +11,5 @@
 - [Query capacity policy](src/DESIGN.md#query-capacity-policy) — immutable operational limits, construction guards, and raised-profile admission.
 
 - [Query controls and source membership](src/DESIGN.md#query-controls-and-source-membership) — native fuzzy policy, source tracing and shared semantic admission.
+
+- [Query scoring](src/DESIGN.md#query-scoring) — native boost/optional membership, cost propagation and score parity.
