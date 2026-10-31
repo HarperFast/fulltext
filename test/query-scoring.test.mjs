@@ -400,6 +400,7 @@ test('compiled term sums preserve small-window search and paging scores without 
 	const terms = ['amber', 'stone', 'quartz', 'ruby'];
 	const documents = Array.from({ length: 300 }, (_, id) => ({
 		id: `all-${id}`,
+		filters: { enabled: id % 2 === 0 },
 		fields: {
 			title: [
 				...terms.flatMap((term, position) => Array(1 + ((id * (7 + position * 4)) % (11 + position * 6))).fill(term)),
@@ -408,8 +409,23 @@ test('compiled term sums preserve small-window search and paging scores without 
 		},
 	}));
 	const all = { text: terms.join(' '), mode: 'all', fields: ['title'] };
-	for (const [name, weight, query] of [
+	const and = { operator: 'and', clauses: terms.map((text) => leaf(text)) };
+	const candidates = documents.slice(0, 150).map(({ id }) => id);
+	const enabled = { field: 'enabled', comparator: 'equals', value: true };
+	for (const [name, weight, query, restrictions = {}] of [
 		['boosted All', 0.7, boost(all, 0.3)],
+		...[
+			['All', all],
+			['AND', and],
+		].flatMap(([name, query]) => [
+			[
+				`${name} candidate restriction`,
+				Math.fround(Math.fround(0.7) * Math.fround(0.3)),
+				query,
+				{ candidateIds: candidates },
+			],
+			[`${name} enabled filter`, Math.fround(Math.fround(0.7) * Math.fround(0.3)), query, { filter: enabled }],
+		]),
 		[
 			'prefix completed terms',
 			Math.fround(Math.fround(0.7) * Math.fround(0.3)),
@@ -452,16 +468,24 @@ test('compiled term sums preserve small-window search and paging scores without 
 			await index.applyMutationBatch({ upserts: documents.slice(150) });
 			await index.commit();
 			await index.reload();
-			const page = await index.searchPage({ query, limit: 6 });
-			assert.strictEqual(page.total, documents.length);
+			const admitted = new Set(
+				documents
+					.filter(({ id }) => !restrictions.candidateIds || restrictions.candidateIds.includes(id))
+					.filter(({ filters }) => !restrictions.filter || filters.enabled)
+					.map(({ id }) => id),
+			);
+			assert.strictEqual(admitted.size, restrictions.candidateIds || restrictions.filter ? 150 : 300);
+			const page = await index.searchPage({ query, ...restrictions, limit: 6 });
+			assert.strictEqual(page.total, admitted.size);
+			assert(page.hits.every(({ id }) => admitted.has(id)));
 			assert.strictEqual(page.hits.length, 6);
 			assert.notStrictEqual(page.hits[4].score, page.hits[5].score, 'the search cutoff must not trigger a tie rerun');
-			const searched = await index.search({ query, limit: 5, exactTotal: false });
+			const searched = await index.search({ query, ...restrictions, limit: 5, exactTotal: false });
 			assert.deepStrictEqual(searched.hits, page.hits.slice(0, 5));
 			assert(!searched.hits.some(({ id }) => id === 'distractor'));
-			const first = await index.searchPage({ query, limit: 5 });
+			const first = await index.searchPage({ query, ...restrictions, limit: 5 });
 			assert.deepStrictEqual(first.hits, searched.hits);
-			const next = await index.searchPage({ query, limit: 1, continuation: first.continuation });
+			const next = await index.searchPage({ query, ...restrictions, limit: 1, continuation: first.continuation });
 			assert.deepStrictEqual(next.hits, page.hits.slice(5));
 		});
 	}
