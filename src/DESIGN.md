@@ -44,7 +44,7 @@ and its UTF-16 spans independently of indexed stems.
 `QueryOptions` resolves fuzzy distance 0–2/default 1 and transpositions default true per leaf.
 The facade rejects supplied fuzzy controls on Boolean groups before reading their children;
 controls belong to text leaves and are never inherited.
-Protocol 8 encodes u8/bool after each mode; ABI 13/query API 7 require a matching facade. Options
+Protocol 8 encodes u8/bool after each mode; ABI 14/query API 8 require a matching facade. Options
 are absent from persisted identity and included in continuation digests. Nondefault fuzzy traces
 lazily use requested native automata on the existing analyzed/surface branches, sharing a matcher
 when query terms are identical. Distance zero uses equality/prefix checks without a DFA. Current-source
@@ -215,7 +215,7 @@ aggregation children map directly to native `sub_aggregation` trees. Resource ad
 for collector construction and possible parent instances before collection. Histogram parents use
 position spans, with native query-scoped probes when conservative admission fails. Histogram safety
 checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
-checks protect each recursive wire/API walker. Current packed protocol 8, query API 7 and ABI 13
+checks protect each recursive wire/API walker. Current packed protocol 8, query API 8 and ABI 14
 include metadata, query-capacity open support and per-leaf matching controls. Neither change alters persisted identity v8.
 
 Sorted snapshot continuation and metadata-derived score adjustment remain outside this
@@ -244,7 +244,7 @@ structured-filter bounds remain fixed. The facade's frozen `queryLimits` getter 
 snapshot, not mutable caller options. Native validation remains authoritative for raw frames and
 direct Rust opens.
 
-`SearchStructureBudget` charges `S = sum(AND/OR child counts) + 2 × NOT count` before descending.
+`SearchStructureBudget` charges `S = sum(AND/OR child counts) + 2 × NOT count + Boost count + sum(Optional child counts)` before descending.
 The compiler charges those same edges plus nonnegative leaf costs, so `S <= compiled clauses`
 and AST nodes are at most `S + 1`. This protects allocation without duplicating Tantivy analysis.
 The Node normalizer charges before visiting children; the native admission scanner uses the actual
@@ -264,14 +264,24 @@ above that. Fuzzy traces compare at most 16 eligible alternatives. Branch-local 
 makes completion checks constant-time. Boundary and construction regressions live in `query-capacity.test.mjs` and the
 engine tests.
 
-Raised-policy admission compares maximum per-leaf term cost and summed compiled-clause cost against the default envelope. Boolean child counts and NOT’s two synthetic clauses are included, matching native query construction; term counts across independent leaves are not added. Protocol boundary tests and the two-handle optimized admission test enforce this distinction.
+Raised-policy admission compares maximum per-leaf term cost and summed compiled-clause cost against the default envelope. Each Boolean child costs one structural clause, NOT costs two, boost costs one, and optional scoring costs one per required or optional child, matching native query construction; term counts across independent leaves are not added. Protocol boundary tests and the two-handle optimized admission test enforce this distinction.
 
 Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
 non-ASCII input conservatively uses the expensive lane because normalization can expand text.
 Default-policy classification is unchanged. The optimized two-handle regression pins ordinary
-isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 13
+isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 14
 require a matching facade/addon.
 
 The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
 additional tail rejects. A future extension needs explicit framing/versioning rather than appending
 an ambiguous optional value.
+
+## Query scoring
+
+Boost preserves its child's membership; Optional requires its required branch and adds scores from matching optional branches through native Must/Should composition. Every walker charges one structural clause per boost and one per required or optional child before descending. Optional-only anchors cannot make a complement-driven required branch cheap. Admission inherits expensive work from all children.
+
+A boost directly over an Any/All leaf multiplies the selected field weights before constructing term queries. This keeps bare term scorers visible to Tantivy's native pruning paths. The reference-score tests check exact float32 bits against BoostQuery: BoostWeight's scorer multiplies the outer boost into the leaf's existing boost, matching this lowering. Boosted multi-clause Any expressions retain stable collection for search/paging score parity.
+
+Other modes and composite subtrees remain wrapped in native BoostQuery. At the root, that wrapper uses Tantivy's generic pruning iterator rather than the specialized Boolean block-WAND paths; optional required-All composition also incurs scoring work beyond the required-only intersection. The paired optimized workload in benchmarks/query-scoring.mjs measures these accepted costs. Recheck topology, score bits and these comparisons when upgrading Tantivy; the measurements do not establish a catalog-scale latency guarantee.
+
+Negative-zero boosts reject before execution. Direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts with native ABI 14 and query API 8. Persisted identity is unchanged.

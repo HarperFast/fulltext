@@ -924,8 +924,7 @@ impl Engine {
 		let window_end = request.offset + request.limit;
 		let stable_any = request.candidate_ids.is_none()
 			&& request.filter.is_none()
-			&& query.clauses > 1
-			&& matches!(&request.expression, SearchExpression::Clause(clause) if clause.mode == SearchMode::Any);
+			&& needs_stable_any(&request.expression, query.clauses);
 		let (hits, bounded_total, bounded_total_relation, collected_total) = if stable_any {
 			let (retained, match_count, mut scored_docs) = searcher
 				.search(
@@ -1488,6 +1487,58 @@ impl Engine {
 			SearchExpression::Clause(clause) => self.clause_query(searcher, clause, budget),
 			SearchExpression::And(children) => self.boolean_query(searcher, children, Occur::Must, budget),
 			SearchExpression::Or(children) => self.boolean_query(searcher, children, Occur::Should, budget),
+			SearchExpression::Boost { boost, clause } => {
+				let child = match clause.as_ref() {
+					SearchExpression::Clause(leaf) if matches!(leaf.mode, SearchMode::Any | SearchMode::All) => {
+						// Keep term scorers visible to Tantivy's pruning collector.
+						let fields: Vec<_> = self
+							.selected_fields(&leaf.fields)?
+							.into_iter()
+							.cloned()
+							.map(|mut field| {
+								field.weight *= *boost;
+								field
+							})
+							.collect();
+						let fields: Vec<_> = fields.iter().collect();
+						let occur = if leaf.mode == SearchMode::Any {
+							Occur::Should
+						} else {
+							Occur::Must
+						};
+						let (query, clauses) = self.term_query(&leaf.text, &fields, occur)?;
+						BuiltQuery { query, clauses }
+					}
+					_ => {
+						let mut child = self.expression_query_inner(searcher, clause, budget)?;
+						child.query = boosted(child.query, *boost);
+						child
+					}
+				};
+				self.check_total_clause_count(child.clauses, 1)?;
+				Ok(BuiltQuery {
+					query: child.query,
+					clauses: child.clauses + 1,
+				})
+			}
+			SearchExpression::Optional { required, optional } => {
+				let mut clauses = optional.len() + 1;
+				let required = self.expression_query_inner(searcher, required, budget)?;
+				self.check_total_clause_count(clauses, required.clauses)?;
+				clauses += required.clauses;
+				let mut queries = Vec::with_capacity(optional.len() + 1);
+				queries.push((Occur::Must, required.query));
+				for child in optional {
+					let child = self.expression_query_inner(searcher, child, budget)?;
+					self.check_total_clause_count(clauses, child.clauses)?;
+					clauses += child.clauses;
+					queries.push((Occur::Should, child.query));
+				}
+				Ok(BuiltQuery {
+					query: Box::new(BooleanQuery::new(queries)),
+					clauses,
+				})
+			}
 			SearchExpression::Not(child) => {
 				let child = self.expression_query_inner(searcher, child, budget)?;
 				self.check_total_clause_count(child.clauses, 2)?;
@@ -2310,6 +2361,14 @@ fn resolve_string_ordinals(
 		return Err(FulltextError::new("E_NATIVE_FAILURE", missing_message));
 	}
 	Ok(values)
+}
+
+fn needs_stable_any(expression: &SearchExpression, clauses: usize) -> bool {
+	match expression {
+		SearchExpression::Clause(clause) => clause.mode == SearchMode::Any && clauses > 1,
+		SearchExpression::Boost { clause, .. } => needs_stable_any(clause, clauses.saturating_sub(1)),
+		_ => false,
+	}
 }
 
 fn boosted(query: Box<dyn Query>, weight: f32) -> Box<dyn Query> {
@@ -5601,6 +5660,45 @@ mod tests {
 	}
 
 	#[test]
+	fn simple_boosts_preserve_term_query_topology_and_collector_route() {
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		for mode in [SearchMode::Any, SearchMode::All] {
+			for boost in [0.0, 1.0, 2.5] {
+				let expression = SearchExpression::Boost {
+					boost,
+					clause: Box::new(SearchExpression::Clause(SearchClause {
+						text: "trail".to_owned(),
+						mode,
+						options: QueryOptions::default(),
+						fields: vec!["title".to_owned()],
+					})),
+				};
+				let built = engine.expression_query(&searcher, &expression).unwrap();
+				assert_eq!(built.clauses, 2);
+				assert!(!needs_stable_any(&expression, built.clauses));
+				let topology = format!("{:?}", built.query);
+				assert!(topology.starts_with("BooleanQuery"), "{topology}");
+				if mode == SearchMode::Any {
+					let wide = SearchExpression::Boost {
+						boost,
+						clause: Box::new(SearchExpression::Clause(SearchClause {
+							text: "trail waterproof shoe".to_owned(),
+							mode: SearchMode::Any,
+							options: QueryOptions::default(),
+							fields: vec!["title".to_owned()],
+						})),
+					};
+					let built = engine.expression_query(&searcher, &wide).unwrap();
+					assert_eq!(built.clauses, 4);
+					assert!(needs_stable_any(&wide, built.clauses));
+				}
+			}
+		}
+	}
+
+	#[test]
 	fn scorer_and_for_each_preserve_score_bits() {
 		let mut config = config();
 		config.identity.surface_terms = true;
@@ -5668,26 +5766,60 @@ mod tests {
 				},
 				fields: Vec::new(),
 			});
-			let built = engine.expression_query(&searcher, &clause).unwrap();
-			let weight = built
-				.query
-				.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
-				.unwrap();
-			for reader in searcher.segment_readers() {
-				let mut scorer = weight.scorer(reader, 1.0).unwrap();
-				let mut scored = Vec::new();
-				while scorer.doc() != tantivy::TERMINATED {
-					scored.push((scorer.doc(), scorer.score().to_bits()));
-					scorer.advance();
-				}
-				let mut enumerated = Vec::new();
-				weight
-					.for_each(reader, &mut |doc, score| enumerated.push((doc, score.to_bits())))
+			for clause in [
+				clause.clone(),
+				SearchExpression::Boost {
+					boost: 0.0,
+					clause: Box::new(clause.clone()),
+				},
+				SearchExpression::Boost {
+					boost: 2.5,
+					clause: Box::new(clause.clone()),
+				},
+				SearchExpression::Optional {
+					required: Box::new(clause.clone()),
+					optional: vec![clause.clone()],
+				},
+			] {
+				let built = engine.expression_query(&searcher, &clause).unwrap();
+				let reference = if let SearchExpression::Boost { boost, clause } = &clause {
+					let child = engine.expression_query(&searcher, clause).unwrap();
+					Some(boosted(child.query, *boost))
+				} else {
+					None
+				};
+				let weight = built
+					.query
+					.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
 					.unwrap();
-				assert!(!scored.is_empty(), "fixture must match {text}");
-				scored.sort_unstable();
-				enumerated.sort_unstable();
-				assert_eq!(scored, enumerated, "scoring topology changed for {text}");
+				for reader in searcher.segment_readers() {
+					let mut scorer = weight.scorer(reader, 1.0).unwrap();
+					let mut scored = Vec::new();
+					while scorer.doc() != tantivy::TERMINATED {
+						scored.push((scorer.doc(), scorer.score().to_bits()));
+						scorer.advance();
+					}
+					let mut enumerated = Vec::new();
+					weight
+						.for_each(reader, &mut |doc, score| enumerated.push((doc, score.to_bits())))
+						.unwrap();
+					assert!(!scored.is_empty(), "fixture must match {text}");
+					if let Some(reference) = &reference {
+						let reference_weight = reference
+							.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
+							.unwrap();
+						let mut reference_scorer = reference_weight.scorer(reader, 1.0).unwrap();
+						let mut expected = Vec::new();
+						while reference_scorer.doc() != tantivy::TERMINATED {
+							expected.push((reference_scorer.doc(), reference_scorer.score().to_bits()));
+							reference_scorer.advance();
+						}
+						assert_eq!(scored, expected, "lowered boost changed score bits for {text}");
+					}
+					scored.sort_unstable();
+					enumerated.sort_unstable();
+					assert_eq!(scored, enumerated, "scoring topology changed for {text}");
+				}
 			}
 		}
 		writer.close().unwrap();

@@ -3,9 +3,10 @@
 Native Tantivy full-text indexing for Node.js.
 
 **Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.8.0.** The engine is compiled
-into the native addon; no separate Tantivy installation is required. This source tree has
-version 0.8.0 in its package manifests. The metadata sorting, aggregation, new filter and query-control
-APIs documented here remain unreleased until publication; they are absent from the published 0.7.0 artifacts. See
+into the native addon; no separate Tantivy installation is required. Published 0.8.0 artifacts use
+native ABI 13 / query API 7. This unreleased query-scoring source still carries version 0.8.0 in
+its manifests but requires native ABI 14 / query API 8; it is not interchangeable with the
+published 0.8.0 facade or addon. Deploy matching artifacts built from the same source revision. See
 [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
 before deploying a build from this tree.
 
@@ -456,6 +457,57 @@ collection. Removing unauthorized hits afterward cannot remove their bucket or n
 See the executable [metadata example](examples/metadata-search.mjs), including typed resource-error
 recovery and rejected metadata continuation, and the [premerge qualification](docs/metadata-premerge.md).
 
+### Query-time scoring
+
+Use `boost` to multiply a text subtree's scores, or `optional` to reward additional matches while
+requiring the same records as its `required` expression:
+
+```js
+const result = await index.search({
+	query: {
+		operator: 'optional',
+		required: { text: 'waterproof boots', mode: 'all' },
+		optional: [
+			{
+				operator: 'boost',
+				boost: 3,
+				clause: { text: 'waterproof boots', mode: 'phrase', fields: ['title'] },
+			},
+		],
+	},
+	limit: 10,
+	exactTotal: true,
+});
+```
+
+Every required match remains eligible even when no optional clause matches; an optional-only match
+cannot enter the result. Optional scores add to the required score. The `optional` list must be
+nonempty. Use existing `or` expressions for optional-only matching, or `and` with an `or` subtree
+when at least one additional clause must match.
+
+Boosts are rounded to float32 and must then be finite, between 0 and 100 inclusive, with negative
+zero rejected. A zero boost preserves membership and gives that subtree zero score. Nested boosts
+multiply; non-finite result scores reject explicitly. Boosts compose with configured field weights.
+Boost a field-restricted clause to tune a field per request; this API does not replace the index's
+field weights. Neither scoring node changes persisted identity or requires an index rebuild.
+
+Both nodes work with nested Boolean expressions, filters, candidates, exact totals and score/ID
+paging. Boosting preserves the child's admission class; optional scoring takes its positive anchor
+only from the required branch and inherits expensive work from any branch. Existing byte, depth,
+term, compiled-clause and deadline limits apply to every subtree. Each boost costs one structural
+clause; an optional node with `n` optional children costs `n + 1`, plus its child costs.
+
+`traceMatches()` remains a simple-clause source-tracing API. Consumers may trace the positive
+required and optional clauses against their current source values; boosts do not alter spans.
+Authorize every referenced field before indexed search, including fields used only for optional
+ranking. A leaf that omits `fields` searches every configured text field, including inside an
+optional branch; callers must authorize access to all of those fields. Defined `boost`, `optional`,
+`required` and `should` properties on incompatible request or expression shapes now reject with
+`E_INVALID_ARGUMENT`. Misplaced `clause` and `clauses` properties also reject, as do leaf-only
+`mode` and `fields` properties on groups, including existing Boolean groups. Older facades could
+ignore these properties. Properties set to `undefined`
+are treated as absent. These additions require a matching ABI 14 / query API 8 facade and addon.
+
 ### Configurable query capacity
 
 Hosts can set `limits.maxQueryTerms` and `limits.maxQueryClauses` when opening a writer or reader.
@@ -469,13 +521,14 @@ When constructing `NativeFullTextIndex` directly around a native handle, supply 
 in `searchLimits`; the constructor validates it but cannot inspect the native handle’s policy.
 Search requests cannot raise them. Apply the same policy to every worker serving a logical index;
 changing it requires reopening handles but no index rebuild. The facade and native addon must match
-ABI 13, query API 7, and packed protocol 8. The open frame retains its optional policy extension,
+ABI 14, query API 8, and packed protocol 8. The open frame retains its optional policy extension,
 with defaults when absent.
 
 The clause setting covers compiled text queries, including field multiplication and expansion.
 It also bounds text-tree structure before allocation: each AND/OR child costs one clause and each
-NOT costs two, even for empty or stopword-only branches. Analysis determines the remaining compiled
-cost. For example, 300 single-term, single-field OR branches need 600 clauses. There is no separate
+NOT costs two. A boost costs one clause. Optional scoring costs one clause for its required child
+and one for each optional child. These costs apply even to empty or stopword-only branches. Analysis
+determines the remaining compiled cost. For example, 300 single-term, single-field OR branches need 600 clauses. There is no separate
 256-child text cap. Structured filters retain their independent 256 leaves/children and `in` values;
 text and filter costs are not combined. A lower clause setting can reject NOT or multi-field queries
 even when a one-term query succeeds.
@@ -525,9 +578,12 @@ indexes fail closed and rebuild instead of silently changing recall.
 
 ## Upgrading from 0.7.x
 
-The unreleased metadata and query-control APIs use query API version 7 and native ABI version 13. Deploy the
-JavaScript facade and native addon built from the same revision; the published 0.7.0 addon cannot
-serve these requests. Indexes with a string `filterFields` entry need rebuilding because string
+Published 0.8.0 metadata and query-control artifacts use query API 7 and native ABI 13. This
+unreleased query-scoring branch requires query API 8 and native ABI 14 despite retaining 0.8.0
+in its source manifests; deploy the JavaScript facade and native addon built from the same revision.
+The scoring change preserves persisted index identity from published 0.8.0 and does not require
+a rebuild. When upgrading from 0.7.x, indexes with a string
+`filterFields` entry need rebuilding because string
 metadata now also uses raw fast fields. Open and inspection report `E_IDENTITY_MISMATCH` for the
 old schema. Indexes with only numeric/boolean filter fields, or no filter fields, retain their
 existing identity when the rest of the configuration is unchanged.
@@ -802,7 +858,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 13, query API 7, and packed protocol 8. The loader rejects older addon
+This API uses native ABI 14, query API 8, and packed protocol 8. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
 columns. Previously released string-metadata indexes must
