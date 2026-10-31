@@ -3,9 +3,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
-import { NativeFullTextIndex, openNativeFullTextIndex } from '@harperfast/fulltext/native';
+import { NativeFullTextIndex } from '@harperfast/fulltext/native';
 
-import { encodeOpen, encodeSearch, encodeTrace } from '../dist/codec.js';
+import { encodeOpen, encodeSearch } from '../dist/codec.js';
 import { invoke } from '../dist/invoke.js';
 import { loadAddon } from '../dist/load-addon.js';
 import { closeIndex } from '../benchmarks/metadata-cleanup.mjs';
@@ -44,7 +44,7 @@ async function fixture(context, documents, extra = {}) {
 	const handle = opened.u32();
 	assert.strictEqual(opened.u8(), 0);
 	opened.finish();
-	let index = new NativeFullTextIndex({
+	const index = new NativeFullTextIndex({
 		handle,
 		maxBatchBytes: options.limits.maxBatchBytes,
 		fieldNames: options.fields.map(({ name }) => name),
@@ -60,13 +60,7 @@ async function fixture(context, documents, extra = {}) {
 	return {
 		handle,
 		addon,
-		get index() {
-			return index;
-		},
-		async reopen() {
-			await closeIndex(index);
-			index = await openNativeFullTextIndex(options);
-		},
+		index,
 	};
 }
 
@@ -228,9 +222,11 @@ test('expression wire tags preserve existing Boolean encodings and append scorin
 test('optional exact counts remain complete when the hit window requires a separate count', async (context) => {
 	const { index } = await fixture(context, records);
 	const required = leaf('amber');
-	const base = await index.search({ query: required, exactTotal: true, limit: 1 });
+	const filter = { field: 'enabled', comparator: 'equals', value: true };
+	const base = await index.search({ query: required, exactTotal: true, limit: 1, filter });
 	const scored = await index.search({
 		query: optional(required, boost(leaf('quartz'), 3)),
+		filter,
 		exactTotal: true,
 		limit: 1,
 	});

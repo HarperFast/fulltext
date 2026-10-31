@@ -339,6 +339,13 @@ Exhaustive matches must handle `FilterExpression::Not(Box<FilterExpression>)` an
 `SearchResult` and the filter enums are source changes to the pre-1.0 Rust API; the JavaScript
 facade uses packed protocol 8, native ABI 14, and query API 8 with its matching addon.
 
+Exhaustive `SearchExpression` matches now also handle `Boost { boost: f32, clause:
+Box<SearchExpression> }` and `Optional { required: Box<SearchExpression>, optional:
+Vec<SearchExpression> }`. The optional list must be nonempty. Boosts must be finite in `0..=100`
+and cannot be negative zero. `SearchExpression` no longer implements `Eq` because it contains
+float32 boosts; use its `PartialEq` implementation for comparisons and remove `Eq` derives from
+containing types that require it.
+
 Direct Rust `SearchClause` literals also supply `options: QueryOptions::default()` or validated
 fuzzy controls. Shared semantic checks cover candidate count/bytes before deduplication,
 finite filter numbers, continuation score/ID, legacy prefix offset zero/limit 100, and trace

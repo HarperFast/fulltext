@@ -499,7 +499,8 @@ clause; an optional node with `n` optional children costs `n + 1`, plus its chil
 `traceMatches()` remains a simple-clause source-tracing API. Consumers may trace the positive
 required and optional clauses against their current source values; boosts do not alter spans.
 Authorize every referenced field before indexed search, including fields used only for optional
-ranking. These additions require a matching ABI 14 / query API 8 facade and addon.
+ranking. A leaf that omits `fields` searches every configured text field, including inside an
+optional branch; callers must authorize access to all of those fields. These additions require a matching ABI 14 / query API 8 facade and addon.
 
 ### Configurable query capacity
 
