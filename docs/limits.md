@@ -309,7 +309,7 @@ The native many-segment qualification demonstrates this flow. These Rust source/
 accompany the pre-1.0 package change from 0.5 to 0.6; they do not introduce a `searchPage` method on
 `Engine`.
 
-## Direct Rust API compatibility for the unreleased metadata APIs
+## Direct Rust API compatibility in 0.8.0
 
 Direct Rust `protocol::Limits` literals now also supply `max_query_terms: 64` and
 `max_query_clauses: 256` for default policy, or validated configured values. They are operational
@@ -337,7 +337,8 @@ it: its cached wire representation is crate-private.
 Exhaustive matches must handle `FilterExpression::Not(Box<FilterExpression>)` and
 `FilterComparator::{Exists, Missing}`. Presence clauses carry `values: Vec::new()`.
 `SearchResult` and the filter enums are source changes to the pre-1.0 Rust API; the JavaScript
-facade uses packed protocol 8, native ABI 13, and query API 7 with its matching addon.
+facade in this source tree uses packed protocol 8, native ABI 14, and query API 7 with its matching addon.
+The published 0.8.0 facade/addon pair uses ABI 13; ABI 14 accompanies this source tree’s unreleased telemetry API.
 
 Direct Rust `SearchClause` literals also supply `options: QueryOptions::default()` or validated
 fuzzy controls. Shared semantic checks cover candidate count/bytes before deduplication,

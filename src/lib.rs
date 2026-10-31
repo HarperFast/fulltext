@@ -8,6 +8,8 @@ pub mod engine;
 pub mod error;
 pub mod protocol;
 mod request_validation;
+#[cfg(feature = "node-api")]
+mod telemetry;
 
 #[cfg(feature = "node-api")]
 mod boundary;
@@ -25,7 +27,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "test-panic")]
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const NATIVE_ABI_VERSION: u32 = 13;
+pub const NATIVE_ABI_VERSION: u32 = 14;
 pub const TANTIVY_VERSION: &str = "0.27.0";
 
 #[cfg(feature = "node-api")]
@@ -72,6 +74,7 @@ pub struct RuntimeInfo {
 	pub tantivy_version: String,
 	pub native_abi_version: u32,
 	pub query_api_version: u32,
+	pub telemetry_api_version: u32,
 	pub query_class_isolation_minimum_search_threads: u32,
 	pub storage_backends: Vec<String>,
 	pub limits: RuntimeLimits,
@@ -85,6 +88,7 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 		tantivy_version: TANTIVY_VERSION.to_owned(),
 		native_abi_version: NATIVE_ABI_VERSION,
 		query_api_version: 7,
+		telemetry_api_version: 1,
 		query_class_isolation_minimum_search_threads: 2,
 		storage_backends: vec!["native".to_owned()],
 		limits: RuntimeLimits {

@@ -8,7 +8,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use napi::bindgen_prelude::{Buffer, Function};
+use crate::telemetry::{Metrics, Ticket};
+use napi::bindgen_prelude::{Buffer, External, Function};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Status};
 use napi_derive::napi;
@@ -95,6 +96,7 @@ enum PathIdentity {
 }
 
 struct Runtime {
+	metrics: Arc<Metrics>,
 	handle: u32,
 	path: PathBuf,
 	path_identity: PathIdentity,
@@ -104,7 +106,7 @@ struct Runtime {
 	ordinary_search_queue: Arc<BoundedQueue<SearchCommand>>,
 	expensive_search_queue: Option<Arc<BoundedQueue<SearchCommand>>>,
 	search_wake: Option<Arc<QueueWake>>,
-	state: AtomicU8,
+	state: Arc<AtomicU8>,
 	environment: Arc<EnvironmentState>,
 	uncommitted_mutations: AtomicU64,
 	commit_opstamp: AtomicU64,
@@ -122,6 +124,8 @@ struct Runtime {
 	reload_alignment_faults: AtomicU8,
 	#[cfg(feature = "test-panic")]
 	poison_before_admission: AtomicBool,
+	#[cfg(feature = "test-panic")]
+	search_panic: AtomicBool,
 	#[cfg(feature = "test-panic")]
 	close_fault: AtomicU8,
 	#[cfg(feature = "test-panic")]
@@ -199,6 +203,7 @@ struct RuntimeParts {
 }
 
 struct SnapshotReader {
+	metrics: Arc<Metrics>,
 	active: RwLock<Searcher>,
 	staging: Mutex<IndexReader>,
 }
@@ -257,6 +262,7 @@ struct SearchQueueInspection {
 }
 
 struct Completion {
+	ticket: Option<Ticket>,
 	callback: Option<CompletionThreadsafeFunction>,
 	callbacks: Arc<CallbackGate>,
 }
@@ -403,6 +409,193 @@ pub fn native_reset(env: Env, packed_config: Buffer, callback: CompletionCallbac
 	})?
 }
 
+pub struct TelemetryToken {
+	metrics: Arc<Metrics>,
+	runtime: Weak<Runtime>,
+	environment: usize,
+	max_commands: usize,
+	max_bytes: usize,
+	isolated: bool,
+}
+impl TelemetryToken {
+	fn validate(&self, env: &Env) -> boundary::Result<()> {
+		if self.environment != env.raw() as usize {
+			return Err(napi_error(
+				"E_NATIVE_FAILURE",
+				"telemetry belongs to another Node environment",
+			));
+		}
+		Ok(())
+	}
+	fn queues(&self) -> String {
+		self.queues_after_state_sample(|| {})
+	}
+	fn queues_after_state_sample(&self, after_sample: impl FnOnce()) -> String {
+		let runtime = self.runtime.upgrade();
+		let sampled_state = runtime.as_ref().map(|r| r.state.load(Ordering::Relaxed));
+		after_sample();
+		let available = sampled_state == Some(STATE_OPEN);
+		let snapshot = |queue: Option<&Arc<BoundedQueue<SearchCommand>>>, shared: bool| {
+			queue_json(
+				queue.map(|q| q.snapshot()),
+				available && queue.is_some(),
+				self.max_commands,
+				self.max_bytes,
+				shared,
+			)
+		};
+		let writer = queue_json(
+			runtime.as_ref().map(|r| r.writer_queue.snapshot()),
+			available,
+			self.max_commands,
+			self.max_bytes,
+			false,
+		);
+		let ordinary = snapshot(runtime.as_ref().map(|r| &r.ordinary_search_queue), self.isolated);
+		let expensive = snapshot(
+			runtime.as_ref().and_then(|r| r.expensive_search_queue.as_ref()),
+			self.isolated,
+		);
+		format!("{{\"writer\":{writer},\"ordinarySearch\":{ordinary},\"expensiveSearch\":{expensive}}}")
+	}
+}
+fn queue_json(
+	snapshot: Option<(u64, u64, u64)>,
+	available: bool,
+	max_commands: usize,
+	max_bytes: usize,
+	shared: bool,
+) -> String {
+	let (commands, bytes, oldest) = snapshot.unwrap_or_default();
+	let oldest = if commands == 0 || !available {
+		"null".to_owned()
+	} else {
+		format!("\"{oldest}\"")
+	};
+	format!("{{\"available\":{available},\"commands\":\"{commands}\",\"bytes\":\"{bytes}\",\"oldestAgeNanoseconds\":{oldest},\"maxCommands\":\"{max_commands}\",\"maxBytes\":\"{max_bytes}\",\"sharedCapacity\":{shared}}}")
+}
+#[cfg(feature = "test-panic")]
+static FAIL_TELEMETRY_TOKEN: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailNextTelemetryToken")]
+pub fn test_fail_next_telemetry_token() {
+	FAIL_TELEMETRY_TOKEN.store(true, Ordering::Relaxed);
+}
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testLiveTelemetryMetrics")]
+pub fn test_live_telemetry_metrics() -> u32 {
+	crate::telemetry::live_metrics()
+}
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testPanicNextSearch")]
+pub fn test_panic_next_search(env: Env, handle: u32) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		runtime(&env, handle)?.search_panic.store(true, Ordering::Release);
+		Ok(())
+	})?
+}
+
+#[cfg(feature = "test-panic")]
+#[napi(catch_unwind, skip_typescript, js_name = "__testFailNextTelemetryObservation")]
+pub fn test_fail_next_telemetry_observation(env: Env, handle: u32) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		runtime(&env, handle)?.metrics.fail_next_observation();
+		Ok(())
+	})?
+}
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeCreateTelemetry")]
+pub fn native_create_telemetry(env: Env, handle: u32) -> boundary::Result<External<TelemetryToken>> {
+	boundary::run_stateless(|| {
+		let runtime = runtime(&env, handle)?;
+		#[cfg(feature = "test-panic")]
+		if FAIL_TELEMETRY_TOKEN.swap(false, Ordering::Relaxed) {
+			return Err(napi_error("E_NATIVE_FAILURE", "injected telemetry acquisition failure"));
+		}
+		Ok(External::new(TelemetryToken {
+			metrics: runtime.metrics.clone(),
+			runtime: Arc::downgrade(&runtime),
+			environment: env.raw() as usize,
+			max_commands: runtime.config.limits.max_queued_commands,
+			max_bytes: runtime.config.limits.max_queued_bytes,
+			isolated: runtime.expensive_search_queue.is_some(),
+		}))
+	})?
+}
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeTelemetry")]
+pub fn native_telemetry(env: Env, token: &External<TelemetryToken>) -> boundary::Result<String> {
+	boundary::run_stateless(|| {
+		token.validate(&env)?;
+		Ok(token.metrics.json(&token.queues()))
+	})?
+}
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeConfigureTelemetry")]
+pub fn native_configure_telemetry(
+	env: Env,
+	token: &External<TelemetryToken>,
+	histograms: bool,
+	snapshot_bytes: bool,
+) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		token.validate(&env)?;
+		let runtime = token
+			.runtime
+			.upgrade()
+			.ok_or_else(|| napi_error("E_CLOSED", "index is closed"))?;
+		runtime.require_open().map_err(fulltext_napi_error)?;
+		token.metrics.configure(histograms, snapshot_bytes);
+		Ok(())
+	})?
+}
+fn observe_phase<T>(metrics: &Metrics, phase: usize, run: impl FnOnce() -> Result<T>) -> Result<T> {
+	let started = Instant::now();
+	let result = catch_unwind(AssertUnwindSafe(run));
+	metrics.phase(phase, started.elapsed(), matches!(&result, Ok(Ok(_))));
+	match result {
+		Ok(result) => result,
+		Err(payload) => std::panic::resume_unwind(payload),
+	}
+}
+
+fn classify_search(
+	metrics: &Metrics,
+	require_open: impl FnOnce() -> Result<()>,
+	validate_header: impl FnOnce() -> Result<()>,
+	classify: impl FnOnce() -> Result<bool>,
+) -> boundary::Result<Result<bool>> {
+	match catch_unwind(AssertUnwindSafe(|| {
+		require_open()?;
+		validate_header()?;
+		classify()
+	})) {
+		Ok(classification) => Ok(classification),
+		Err(_) => {
+			metrics.attempt(5);
+			metrics.reject(5, "E_NATIVE_PANIC");
+			Err(napi_error("E_NATIVE_PANIC", "native operation panicked"))
+		}
+	}
+}
+fn observe_operation(
+	metrics: &Metrics,
+	operation: usize,
+	run: impl FnOnce() -> boundary::Result<()>,
+) -> boundary::Result<()> {
+	metrics.attempt(operation);
+	let result = catch_unwind(AssertUnwindSafe(run));
+	match result {
+		Ok(result) => {
+			if let Err(error) = &result {
+				metrics.reject(operation, error.status);
+			}
+			result
+		}
+		Err(_) => {
+			metrics.reject(operation, "E_NATIVE_PANIC");
+			Err(napi_error("E_NATIVE_PANIC", "native operation panicked"))
+		}
+	}
+}
+
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeApply")]
 pub fn native_apply(
 	env: Env,
@@ -412,21 +605,24 @@ pub fn native_apply(
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		runtime.require_writable().map_err(fulltext_napi_error)?;
-		validate_batch_header(&packed_batch, runtime.config.limits.max_batch_bytes).map_err(fulltext_napi_error)?;
-		runtime
-			.writer_queue
-			.check_capacity(packed_batch.len())
-			.map_err(fulltext_napi_error)?;
-		let completion = completion(callback, &runtime.environment)?;
-		let bytes = packed_batch.to_vec();
-		runtime.enqueue_writer(
-			WriterCommand {
-				operation: WriterOperation::Apply(bytes),
-				completion,
-			},
-			packed_batch.len(),
-		)
+		observe_operation(&runtime.metrics, 0, || {
+			runtime.require_writable().map_err(fulltext_napi_error)?;
+			validate_batch_header(&packed_batch, runtime.config.limits.max_batch_bytes).map_err(fulltext_napi_error)?;
+			runtime
+				.writer_queue
+				.check_capacity(packed_batch.len())
+				.map_err(fulltext_napi_error)?;
+			let mut completion = completion(callback, &runtime.environment)?;
+			completion.ticket = Some(runtime.metrics.ticket(0, packed_batch.len()));
+			let bytes = packed_batch.to_vec();
+			runtime.enqueue_writer(
+				WriterCommand {
+					operation: WriterOperation::Apply(bytes),
+					completion,
+				},
+				packed_batch.len(),
+			)
+		})
 	})?
 }
 
@@ -434,15 +630,18 @@ pub fn native_apply(
 pub fn native_commit(env: Env, handle: u32, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		runtime.require_writable().map_err(fulltext_napi_error)?;
-		let completion = completion(callback, &runtime.environment)?;
-		runtime.enqueue_writer(
-			WriterCommand {
-				operation: WriterOperation::Commit,
-				completion,
-			},
-			0,
-		)
+		observe_operation(&runtime.metrics, 1, || {
+			runtime.require_writable().map_err(fulltext_napi_error)?;
+			let mut completion = completion(callback, &runtime.environment)?;
+			completion.ticket = Some(runtime.metrics.ticket(1, 0));
+			runtime.enqueue_writer(
+				WriterCommand {
+					operation: WriterOperation::Commit,
+					completion,
+				},
+				0,
+			)
+		})
 	})?
 }
 
@@ -454,23 +653,26 @@ pub fn native_publish(
 	callback: CompletionCallback<'_>,
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
-		if payload.len() > crate::engine::MAX_COMMIT_PAYLOAD_BYTES {
-			return Err(fulltext_napi_error(FulltextError::invalid(format!(
-				"commit payload exceeds {} UTF-8 bytes",
-				crate::engine::MAX_COMMIT_PAYLOAD_BYTES
-			))));
-		}
 		let runtime = runtime(&env, handle)?;
-		runtime.require_writable().map_err(fulltext_napi_error)?;
-		let completion = completion(callback, &runtime.environment)?;
-		let bytes = payload.len();
-		runtime.enqueue_writer(
-			WriterCommand {
-				operation: WriterOperation::Publish(payload),
-				completion,
-			},
-			bytes,
-		)
+		observe_operation(&runtime.metrics, 2, || {
+			if payload.len() > crate::engine::MAX_COMMIT_PAYLOAD_BYTES {
+				return Err(fulltext_napi_error(FulltextError::invalid(format!(
+					"commit payload exceeds {} UTF-8 bytes",
+					crate::engine::MAX_COMMIT_PAYLOAD_BYTES
+				))));
+			}
+			runtime.require_writable().map_err(fulltext_napi_error)?;
+			let mut completion = completion(callback, &runtime.environment)?;
+			completion.ticket = Some(runtime.metrics.ticket(2, payload.len()));
+			let bytes = payload.len();
+			runtime.enqueue_writer(
+				WriterCommand {
+					operation: WriterOperation::Publish(payload),
+					completion,
+				},
+				bytes,
+			)
+		})
 	})?
 }
 
@@ -478,14 +680,17 @@ pub fn native_publish(
 pub fn native_reload(env: Env, handle: u32, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		let completion = completion(callback, &runtime.environment)?;
-		runtime.enqueue_writer(
-			WriterCommand {
-				operation: WriterOperation::Reload,
-				completion,
-			},
-			0,
-		)
+		observe_operation(&runtime.metrics, 3, || {
+			let mut completion = completion(callback, &runtime.environment)?;
+			completion.ticket = Some(runtime.metrics.ticket(3, 0));
+			runtime.enqueue_writer(
+				WriterCommand {
+					operation: WriterOperation::Reload,
+					completion,
+				},
+				0,
+			)
+		})
 	})?
 }
 
@@ -498,28 +703,41 @@ pub fn native_search(
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		runtime.require_open().map_err(fulltext_napi_error)?;
-		validate_search_header(&packed_request).map_err(fulltext_napi_error)?;
-		let expensive =
-			search_is_expensive_for_config(&packed_request, &runtime.config).map_err(fulltext_napi_error)?;
-		let queue = runtime.search_queue(expensive);
-		queue
-			.check_capacity(packed_request.len())
-			.map_err(fulltext_napi_error)?;
-		let completion = completion(callback, &runtime.environment)?;
-		let request = packed_request.to_vec();
-		queue
-			.try_push(
-				SearchCommand {
-					operation: SearchOperation::Search {
-						bytes: request,
-						expensive,
+		let classification = classify_search(
+			&runtime.metrics,
+			|| runtime.require_open(),
+			|| validate_search_header(&packed_request),
+			|| search_is_expensive_for_config(&packed_request, &runtime.config),
+		)?;
+		let metric_op = if classification.as_ref().copied().unwrap_or(false) {
+			6
+		} else {
+			5
+		};
+		observe_operation(&runtime.metrics, metric_op, || {
+			let expensive = classification.map_err(fulltext_napi_error)?;
+			let queue = runtime.search_queue(expensive);
+			queue
+				.check_capacity(packed_request.len())
+				.map_err(fulltext_napi_error)?;
+			let mut completion = completion(callback, &runtime.environment)?;
+			completion.ticket = Some(runtime.metrics.ticket(metric_op, packed_request.len()));
+			let request = packed_request.to_vec();
+			queue
+				.try_push_tracked(
+					SearchCommand {
+						operation: SearchOperation::Search {
+							bytes: request,
+							expensive,
+						},
+						completion,
 					},
-					completion,
-				},
-				packed_request.len(),
-			)
-			.map_err(fulltext_napi_error)
+					packed_request.len(),
+					|| Ok(()),
+					|command, enqueued| command.completion.arm_at(enqueued),
+				)
+				.map_err(fulltext_napi_error)
+		})
 	})?
 }
 
@@ -532,23 +750,28 @@ pub fn native_trace_matches(
 ) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		runtime.require_open().map_err(fulltext_napi_error)?;
-		validate_trace_header(&packed_request).map_err(fulltext_napi_error)?;
-		let queue = runtime.search_queue(true);
-		queue
-			.check_capacity(packed_request.len())
-			.map_err(fulltext_napi_error)?;
-		let completion = completion(callback, &runtime.environment)?;
-		let request = packed_request.to_vec();
-		queue
-			.try_push(
-				SearchCommand {
-					operation: SearchOperation::Trace(request),
-					completion,
-				},
-				packed_request.len(),
-			)
-			.map_err(fulltext_napi_error)
+		observe_operation(&runtime.metrics, 7, || {
+			runtime.require_open().map_err(fulltext_napi_error)?;
+			validate_trace_header(&packed_request).map_err(fulltext_napi_error)?;
+			let queue = runtime.search_queue(true);
+			queue
+				.check_capacity(packed_request.len())
+				.map_err(fulltext_napi_error)?;
+			let mut completion = completion(callback, &runtime.environment)?;
+			completion.ticket = Some(runtime.metrics.ticket(7, packed_request.len()));
+			let request = packed_request.to_vec();
+			queue
+				.try_push_tracked(
+					SearchCommand {
+						operation: SearchOperation::Trace(request),
+						completion,
+					},
+					packed_request.len(),
+					|| Ok(()),
+					|command, enqueued| command.completion.arm_at(enqueued),
+				)
+				.map_err(fulltext_napi_error)
+		})
 	})?
 }
 
@@ -556,45 +779,51 @@ pub fn native_trace_matches(
 pub fn native_close(env: Env, handle: u32, rollback: bool, callback: CompletionCallback<'_>) -> boundary::Result<()> {
 	boundary::run_stateless(|| {
 		let runtime = runtime(&env, handle)?;
-		let completion = completion(callback, &runtime.environment)?;
-		match runtime
-			.state
-			.compare_exchange(STATE_OPEN, STATE_CLOSING, Ordering::AcqRel, Ordering::Acquire)
-		{
-			Ok(_) => {
-				runtime.notify_expensive_waiters();
-				#[cfg(feature = "test-panic")]
-				runtime.poison_before_admission();
-				runtime
+		observe_operation(&runtime.metrics, 4, || {
+			let mut completion = completion(callback, &runtime.environment)?;
+			completion.ticket = Some(runtime.metrics.ticket(4, 0));
+			match runtime
+				.state
+				.compare_exchange(STATE_OPEN, STATE_CLOSING, Ordering::AcqRel, Ordering::Acquire)
+			{
+				Ok(_) => {
+					runtime.notify_expensive_waiters();
+					#[cfg(feature = "test-panic")]
+					runtime.poison_before_admission();
+					runtime
+						.writer_queue
+						.push_force_tracked(
+							WriterCommand {
+								operation: WriterOperation::Close { rollback },
+								completion,
+							},
+							0,
+							|command, enqueued| command.completion.arm_at(enqueued),
+						)
+						.map_err(fulltext_napi_error)
+				}
+				Err(STATE_CLOSED) => {
+					completion.arm();
+					completion.success(Vec::new());
+					Ok(())
+				}
+				Err(STATE_POISONED) => runtime
 					.writer_queue
-					.push_force(
+					.push_force_tracked(
 						WriterCommand {
-							operation: WriterOperation::Close { rollback },
+							operation: WriterOperation::Close { rollback: true },
 							completion,
 						},
 						0,
+						|command, enqueued| command.completion.arm_at(enqueued),
 					)
-					.map_err(fulltext_napi_error)
+					.map_err(fulltext_napi_error),
+				Err(_) => Err(fulltext_napi_error(FulltextError::new(
+					"E_CLOSED",
+					"index is closing or poisoned",
+				))),
 			}
-			Err(STATE_CLOSED) => {
-				completion.success(Vec::new());
-				Ok(())
-			}
-			Err(STATE_POISONED) => runtime
-				.writer_queue
-				.push_force(
-					WriterCommand {
-						operation: WriterOperation::Close { rollback: true },
-						completion,
-					},
-					0,
-				)
-				.map_err(fulltext_napi_error),
-			Err(_) => Err(fulltext_napi_error(FulltextError::new(
-				"E_CLOSED",
-				"index is closing or poisoned",
-			))),
-		}
+		})
 	})?
 }
 
@@ -1038,7 +1267,8 @@ impl Runtime {
 		let read_only = parts.read_only;
 		let expensive_search_budget = parts.reservation.budget();
 		let engine = Arc::new(parts.engine);
-		let reader = Arc::new(SnapshotReader::new(parts.reader));
+		let metrics = Metrics::with_search_workers(search_thread_count);
+		let reader = Arc::new(SnapshotReader::new(parts.reader, metrics.clone()));
 		let writer_queue = Arc::new(BoundedQueue::new(
 			parts.config.limits.max_queued_commands,
 			parts.config.limits.max_queued_bytes,
@@ -1064,7 +1294,9 @@ impl Runtime {
 				search_wake.clone(),
 			))
 		});
+		let state = metrics.state.clone();
 		let runtime = Arc::new(Self {
+			metrics,
 			handle,
 			path: parts.path,
 			path_identity: parts.path_identity,
@@ -1074,7 +1306,7 @@ impl Runtime {
 			ordinary_search_queue,
 			expensive_search_queue,
 			search_wake,
-			state: AtomicU8::new(STATE_OPEN),
+			state,
 			environment,
 			uncommitted_mutations: AtomicU64::new(0),
 			commit_opstamp: AtomicU64::new(0),
@@ -1092,6 +1324,8 @@ impl Runtime {
 			reload_alignment_faults: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
 			poison_before_admission: AtomicBool::new(false),
+			#[cfg(feature = "test-panic")]
+			search_panic: AtomicBool::new(false),
 			#[cfg(feature = "test-panic")]
 			close_fault: AtomicU8::new(0),
 			#[cfg(feature = "test-panic")]
@@ -1114,9 +1348,9 @@ impl Runtime {
 				.name(format!("fulltext-search-{handle}-{worker}"))
 				.spawn(move || {
 					if worker == 0 || search_runtime.expensive_search_queue.is_none() {
-						ordinary_search_loop(search_runtime, search_engine, search_reader);
+						ordinary_search_loop(search_runtime, search_engine, search_reader, worker);
 					} else {
-						flexible_search_loop(search_runtime, search_engine, search_reader);
+						flexible_search_loop(search_runtime, search_engine, search_reader, worker);
 					}
 				}) {
 				Ok(join) => join,
@@ -1213,7 +1447,12 @@ impl Runtime {
 		#[cfg(feature = "test-panic")]
 		self.poison_before_admission();
 		self.writer_queue
-			.try_push_if(command, bytes, || self.require_open())
+			.try_push_tracked(
+				command,
+				bytes,
+				|| self.require_open(),
+				|command, enqueued| command.completion.arm_at(enqueued),
+			)
 			.map_err(fulltext_napi_error)
 	}
 
@@ -1225,21 +1464,33 @@ impl Runtime {
 	}
 
 	fn force_close(&self) {
-		let previous = self.state.swap(STATE_CLOSING, Ordering::AcqRel);
-		if previous == STATE_CLOSED || previous == STATE_CLOSING {
-			return;
-		}
-		self.notify_expensive_waiters();
-		let _ = self.writer_queue.push_force(
+		let queued = self.writer_queue.push_force_tracked_if(
 			WriterCommand {
 				operation: WriterOperation::Close { rollback: true },
 				completion: Completion {
+					ticket: None,
 					callback: None,
 					callbacks: self.environment.callbacks.clone(),
 				},
 			},
 			0,
+			|| {
+				self.state
+					.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+						if state == STATE_CLOSED || state == STATE_CLOSING {
+							None
+						} else {
+							Some(STATE_CLOSING)
+						}
+					})
+					.map(|_| ())
+					.map_err(|_| FulltextError::new("E_CLOSED", "index is closing or closed"))
+			},
+			|_, _| {},
 		);
+		if queued.is_ok() {
+			self.notify_expensive_waiters();
+		}
 	}
 
 	fn poison(&self, error: FulltextError) {
@@ -1298,9 +1549,11 @@ impl Runtime {
 }
 
 impl SnapshotReader {
-	fn new(reader: IndexReader) -> Self {
+	fn new(reader: IndexReader, metrics: Arc<Metrics>) -> Self {
 		let searcher = reader.searcher();
+		metrics.observe_reader(&searcher);
 		Self {
+			metrics,
 			active: RwLock::new(searcher),
 			staging: Mutex::new(reader),
 		}
@@ -1361,10 +1614,16 @@ impl SnapshotReader {
 	}
 
 	fn replace(&self, searcher: Searcher) {
+		self.replace_after_swap(searcher, || {});
+	}
+	fn replace_after_swap(&self, searcher: Searcher, after_swap: impl FnOnce()) {
+		let observation = Metrics::prepare_reader(&searcher);
 		let previous = {
 			let mut active = self.active.write().unwrap_or_else(|error| error.into_inner());
 			mem::replace(&mut *active, searcher)
 		};
+		after_swap();
+		self.metrics.install_reader(observation);
 		drop(previous);
 	}
 }
@@ -1422,26 +1681,48 @@ impl<T> BoundedQueue<T> {
 		}
 	}
 
+	#[cfg(test)]
 	fn try_push(&self, value: T, bytes: usize) -> Result<()> {
 		self.try_push_if(value, bytes, || Ok(()))
 	}
 
+	#[cfg(test)]
 	fn try_push_if(&self, value: T, bytes: usize, admit: impl FnOnce() -> Result<()>) -> Result<()> {
+		self.try_push_tracked(value, bytes, admit, |_, _| {})
+	}
+
+	fn try_push_tracked(
+		&self,
+		mut value: T,
+		bytes: usize,
+		admit: impl FnOnce() -> Result<()>,
+		accepted: impl FnOnce(&mut T, Instant),
+	) -> Result<()> {
 		let mut state = lock(&self.state);
 		admit()?;
 		self.validate_capacity(&state, bytes)?;
 		self.reserve_shared(bytes)?;
+		let enqueued = Instant::now();
+		accepted(&mut value, enqueued);
 		state.bytes += bytes;
-		state.items.push_back(Queued {
-			value,
-			bytes,
-			enqueued: Instant::now(),
-		});
+		state.items.push_back(Queued { value, bytes, enqueued });
 		self.queued_commands.fetch_add(1, Ordering::Relaxed);
 		self.queued_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
 		self.ready.notify_one();
 		self.notify_shared(false);
 		Ok(())
+	}
+
+	fn snapshot(&self) -> (u64, u64, u64) {
+		let state = lock(&self.state);
+		(
+			state.items.len() as u64,
+			state.bytes as u64,
+			state
+				.items
+				.front()
+				.map_or(0, |item| duration_ns(item.enqueued.elapsed())),
+		)
 	}
 
 	fn check_capacity(&self, bytes: usize) -> Result<()> {
@@ -1464,6 +1745,20 @@ impl<T> BoundedQueue<T> {
 	}
 
 	fn push_force(&self, value: T, bytes: usize) -> Result<()> {
+		self.push_force_tracked(value, bytes, |_, _| {})
+	}
+
+	fn push_force_tracked(&self, value: T, bytes: usize, accepted: impl FnOnce(&mut T, Instant)) -> Result<()> {
+		self.push_force_tracked_if(value, bytes, || Ok(()), accepted)
+	}
+
+	fn push_force_tracked_if(
+		&self,
+		mut value: T,
+		bytes: usize,
+		admit: impl FnOnce() -> Result<()>,
+		accepted: impl FnOnce(&mut T, Instant),
+	) -> Result<()> {
 		if self.shared_budget.is_some() {
 			return Err(FulltextError::new(
 				"E_NATIVE_FAILURE",
@@ -1474,12 +1769,11 @@ impl<T> BoundedQueue<T> {
 		if state.closed {
 			return Err(FulltextError::new("E_CLOSED", "operation queue is closed"));
 		}
+		admit()?;
+		let enqueued = Instant::now();
+		accepted(&mut value, enqueued);
 		state.bytes += bytes;
-		state.items.push_back(Queued {
-			value,
-			bytes,
-			enqueued: Instant::now(),
-		});
+		state.items.push_back(Queued { value, bytes, enqueued });
 		self.queued_commands.fetch_add(1, Ordering::Relaxed);
 		self.queued_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
 		self.ready.notify_one();
@@ -1681,11 +1975,53 @@ fn drain_queue<T>(state: &mut QueueState<T>, commands: &AtomicU64, bytes: &Atomi
 }
 
 impl Completion {
+	fn arm_at(&mut self, enqueued: Instant) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.arm_at(enqueued);
+		}
+	}
+	fn arm(&mut self) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.arm();
+		}
+	}
+	fn bind_worker(&mut self, worker: usize) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.bind_worker(worker);
+		}
+	}
+	fn dispatch(&mut self) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.dispatch();
+		}
+	}
+	fn start(&mut self) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.start();
+		}
+	}
+	fn start_at(&mut self, started: Instant) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.start_at(started);
+		}
+	}
+	fn finish_at(&mut self, finished: Instant) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.finish_at(finished);
+		}
+	}
+	fn record(&mut self, error: Option<&str>) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.settle(error);
+		}
+	}
 	fn success(mut self, body: Vec<u8>) {
+		self.record(None);
 		self.send(success_envelope(body));
 	}
 
 	fn failure(mut self, error: FulltextError) {
+		self.record(Some(error.code));
 		self.send(error_envelope(error));
 	}
 
@@ -1720,6 +2056,10 @@ impl CallbackGate {
 
 impl Drop for Completion {
 	fn drop(&mut self) {
+		if self.ticket.as_ref().is_some_and(|ticket| !ticket.accepted()) {
+			return;
+		}
+		self.record(Some("E_CLOSED"));
 		if self.callback.is_some() {
 			self.send(error_envelope(FulltextError::new(
 				"E_CLOSED",
@@ -1757,7 +2097,12 @@ fn writer_loop_inner(
 		runtime
 			.writer_queue_nanoseconds
 			.fetch_add(duration_ns(queued.enqueued.elapsed()), Ordering::Relaxed);
-		let WriterCommand { operation, completion } = queued.value;
+		let WriterCommand {
+			operation,
+			mut completion,
+		} = queued.value;
+		completion.start();
+		let refresh_bytes = matches!(&operation, WriterOperation::Reload | WriterOperation::Publish(_));
 		#[cfg(feature = "test-panic")]
 		let diagnostic_operation = match &operation {
 			WriterOperation::Apply(_) => "apply",
@@ -1774,6 +2119,9 @@ fn writer_loop_inner(
 				match decode_batch(&bytes).and_then(|batch| active_writer(&writer)?.prepare(batch)) {
 					Ok(prepared) => match active_writer(&writer).and_then(|writer| writer.apply_prepared(prepared)) {
 						Ok(count) => {
+							if let Some(ticket) = &completion.ticket {
+								ticket.mutations(count);
+							}
 							runtime.uncommitted_mutations.fetch_add(count, Ordering::AcqRel);
 							WriterOutcome::Continue(Ok(u64_body(count)))
 						}
@@ -1788,7 +2136,9 @@ fn writer_loop_inner(
 					Err(error) => WriterOutcome::Continue(Err(error)),
 				}
 			}
-			WriterOperation::Commit => match active_writer_mut(&mut writer).and_then(|writer| writer.commit()) {
+			WriterOperation::Commit => match active_writer_mut(&mut writer)
+				.and_then(|writer| observe_phase(&runtime.metrics, 0, || writer.commit()))
+			{
 				Ok(opstamp) => {
 					runtime.uncommitted_mutations.store(0, Ordering::Release);
 					runtime.commit_opstamp.store(opstamp, Ordering::Release);
@@ -1807,12 +2157,14 @@ fn writer_loop_inner(
 				.and_then(|writer| {
 					#[cfg(feature = "test-panic")]
 					fail_publish_at(&runtime, 1)?;
-					writer.commit_with_payload(Some(&payload))
+					observe_phase(&runtime.metrics, 0, || writer.commit_with_payload(Some(&payload)))
 				})
 				.and_then(|opstamp| {
 					#[cfg(feature = "test-panic")]
 					fail_publish_at(&runtime, 2)?;
-					reader.reload_after_owned_publish().map_err(FulltextError::native)?;
+					observe_phase(&runtime.metrics, 1, || {
+						reader.reload_after_owned_publish().map_err(FulltextError::native)
+					})?;
 					Ok(opstamp)
 				}) {
 				Ok(opstamp) => {
@@ -1829,7 +2181,8 @@ fn writer_loop_inner(
 				),
 			},
 			WriterOperation::Reload => WriterOutcome::Continue(
-				reload_payload(&reader, &engine, &runtime).map(|payload| payload_body(payload.as_deref())),
+				observe_phase(&runtime.metrics, 1, || reload_payload(&reader, &engine, &runtime))
+					.map(|payload| payload_body(payload.as_deref())),
 			),
 			WriterOperation::Close { rollback } => {
 				let dirty = runtime.uncommitted_mutations.load(Ordering::Acquire) > 0;
@@ -1854,7 +2207,13 @@ fn writer_loop_inner(
 		#[cfg(feature = "test-panic")]
 		let diagnostic_elapsed = started.elapsed();
 		match outcome {
-			Ok(WriterOutcome::Continue(result)) => settle(completion, result),
+			Ok(WriterOutcome::Continue(result)) => {
+				let refreshed = refresh_bytes && result.is_ok();
+				settle(completion, result);
+				if refreshed && runtime.metrics.snapshot_bytes.load(Ordering::Relaxed) {
+					runtime.metrics.observe_bytes(&reader.searcher());
+				}
+			}
 			Ok(WriterOutcome::Stop(outcome)) => {
 				let cleanup_runtime = runtime.clone();
 				match catch_unwind(AssertUnwindSafe(move || {
@@ -1946,12 +2305,17 @@ pub(crate) fn finish_writer_close(writer: &mut Option<Writer>, read_only: bool) 
 	}
 }
 
+fn observe_writer_close(metrics: &Metrics, close: impl FnOnce() -> WriterCloseOutcome) -> WriterCloseOutcome {
+	metrics.begin_teardown();
+	close()
+}
+
 fn close_writer(_runtime: &Runtime, writer: &mut Option<Writer>) -> WriterCloseOutcome {
 	#[cfg(feature = "test-panic")]
 	writer_diagnostic(_runtime.handle, "close", "close-start", Duration::ZERO);
 	#[cfg(feature = "test-panic")]
 	let started = Instant::now();
-	let outcome = finish_writer_close(writer, _runtime.read_only);
+	let outcome = observe_writer_close(&_runtime.metrics, || finish_writer_close(writer, _runtime.read_only));
 	#[cfg(feature = "test-panic")]
 	writer_diagnostic(_runtime.handle, "close", "close-end", started.elapsed());
 	#[cfg(feature = "test-panic")]
@@ -2026,6 +2390,9 @@ fn finish_runtime(
 		},
 		Duration::ZERO,
 	);
+	runtime
+		.metrics
+		.finish_teardown(outcome.quiesced && outcome.error.is_none());
 	outcome
 }
 
@@ -2046,6 +2413,7 @@ fn finish_unproven_runtime(runtime: &Arc<Runtime>) {
 		&runtime.path_identity,
 		&runtime.environment,
 	);
+	runtime.metrics.finish_teardown(false);
 }
 
 fn close_result(outcome: WriterCloseOutcome) -> Result<Vec<u8>> {
@@ -2104,22 +2472,26 @@ fn active_writer_mut(writer: &mut Option<Writer>) -> Result<&mut Writer> {
 		.ok_or_else(|| FulltextError::new("E_POISONED", "writer is unavailable"))
 }
 
-fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
+fn ordinary_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>, worker: usize) {
 	while let Some(queued) = runtime.ordinary_search_queue.pop() {
+		#[cfg(feature = "test-panic")]
+		let mut queued = queued;
 		#[cfg(feature = "test-panic")]
 		{
 			let milliseconds = runtime.ordinary_search_delay_milliseconds.swap(0, Ordering::AcqRel);
 			if milliseconds > 0 {
+				queued.value.completion.bind_worker(worker);
+				queued.value.completion.dispatch();
 				thread::sleep(Duration::from_millis(milliseconds));
 			}
 		}
-		if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+		if !execute_search_command(&runtime, &engine, &reader, queued, None, worker) {
 			return;
 		}
 	}
 }
 
-fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>) {
+fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<SnapshotReader>, worker: usize) {
 	let expensive = runtime.expensive_search_queue.as_ref().unwrap();
 	let wake = runtime.search_wake.as_ref().unwrap();
 	loop {
@@ -2130,7 +2502,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		if has_expensive && (permit.is_some() || runtime.expensive_search_budget.is_none()) {
 			if let Some(queued) = expensive.try_pop() {
 				drop(wake_demand);
-				if !execute_search_command(&runtime, &engine, &reader, queued, permit) {
+				if !execute_search_command(&runtime, &engine, &reader, queued, permit, worker) {
 					return;
 				}
 				continue;
@@ -2147,7 +2519,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		};
 		let had_expired = !inspection.expired.is_empty();
 		for queued in inspection.expired {
-			if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+			if !execute_search_command(&runtime, &engine, &reader, queued, None, worker) {
 				return;
 			}
 		}
@@ -2162,7 +2534,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		if ordinary_steal_allowed {
 			if let Some(queued) = runtime.ordinary_search_queue.try_pop() {
 				drop(wake_demand);
-				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+				if !execute_search_command(&runtime, &engine, &reader, queued, None, worker) {
 					return;
 				}
 				continue;
@@ -2171,7 +2543,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		if runtime.state.load(Ordering::Acquire) != STATE_OPEN {
 			if let Some(queued) = expensive.try_pop() {
 				drop(wake_demand);
-				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+				if !execute_search_command(&runtime, &engine, &reader, queued, None, worker) {
 					return;
 				}
 				continue;
@@ -2180,7 +2552,7 @@ fn flexible_search_loop(runtime: Arc<Runtime>, engine: Arc<Engine>, reader: Arc<
 		if expensive_closed {
 			drop(wake_demand);
 			while let Some(queued) = runtime.ordinary_search_queue.pop() {
-				if !execute_search_command(&runtime, &engine, &reader, queued, None) {
+				if !execute_search_command(&runtime, &engine, &reader, queued, None, worker) {
 					return;
 				}
 			}
@@ -2224,6 +2596,7 @@ fn execute_search_command(
 	reader: &SnapshotReader,
 	queued: Queued<SearchCommand>,
 	preacquired_permit: Option<ExpensiveSearchPermit>,
+	worker: usize,
 ) -> bool {
 	let queued_for = queued.enqueued.elapsed();
 	runtime
@@ -2233,6 +2606,8 @@ fn execute_search_command(
 		operation,
 		mut completion,
 	} = queued.value;
+	completion.bind_worker(worker);
+	completion.dispatch();
 	let result = catch_unwind(AssertUnwindSafe(|| match operation {
 		SearchOperation::Search { bytes, expensive } => {
 			let deadline = operation_deadline(search_budget(&bytes)?, queued.enqueued.elapsed())?;
@@ -2245,6 +2620,11 @@ fn execute_search_command(
 				None
 			};
 			let started = Instant::now();
+			completion.start_at(started);
+			#[cfg(feature = "test-panic")]
+			if runtime.search_panic.swap(false, Ordering::AcqRel) {
+				panic!("injected native search actor panic");
+			}
 			#[cfg(feature = "test-panic")]
 			{
 				let milliseconds = if expensive {
@@ -2268,9 +2648,12 @@ fn execute_search_command(
 						Ok(response)
 					})
 			});
-			runtime
-				.search_execution_nanoseconds
-				.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+			let finished = Instant::now();
+			completion.finish_at(finished);
+			runtime.search_execution_nanoseconds.fetch_add(
+				duration_ns(finished.saturating_duration_since(started)),
+				Ordering::Relaxed,
+			);
 			result
 		}
 		SearchOperation::Trace(bytes) => {
@@ -2280,6 +2663,7 @@ fn execute_search_command(
 				None => runtime.expensive_search_permit(deadline)?,
 			};
 			let started = Instant::now();
+			completion.start_at(started);
 			#[cfg(feature = "test-panic")]
 			if _permit.is_some() {
 				let milliseconds = runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel);
@@ -2301,14 +2685,20 @@ fn execute_search_command(
 				}
 				Ok(response)
 			});
-			runtime
-				.search_execution_nanoseconds
-				.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+			let finished = Instant::now();
+			completion.finish_at(finished);
+			runtime.search_execution_nanoseconds.fetch_add(
+				duration_ns(finished.saturating_duration_since(started)),
+				Ordering::Relaxed,
+			);
 			result
 		}
 	}));
 	match result {
-		Ok(Ok(response)) => completion.send(response),
+		Ok(Ok(response)) => {
+			completion.record(None);
+			completion.send(response);
+		}
 		Ok(Err(error)) => completion.failure(error),
 		Err(_) => {
 			completion.failure(FulltextError::new("E_NATIVE_PANIC", "native search actor panicked"));
@@ -2892,6 +3282,7 @@ fn completion(callback: CompletionCallback<'_>, environment: &Arc<EnvironmentSta
 		.build()
 		.map_err(|error| napi_error("E_NATIVE_FAILURE", error))?;
 	Ok(Completion {
+		ticket: None,
 		callback: Some(callback),
 		callbacks: environment.callbacks.clone(),
 	})
@@ -3277,6 +3668,399 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn telemetry_runtime_fixture() -> Arc<Runtime> {
+		let metrics = Metrics::new();
+		let config = EngineConfig {
+			identity: crate::protocol::EngineIdentityConfig {
+				index_id: "telemetry".into(),
+				generation: "one".into(),
+				fields: vec![],
+				analyzer: "english@2".into(),
+				stop_words: false,
+				positions: true,
+				surface_terms: false,
+				synonyms: vec![],
+				filter_fields: vec![],
+			},
+			limits: crate::protocol::Limits {
+				max_query_terms: 64,
+				max_query_clauses: 256,
+				indexing_threads: 1,
+				search_threads: 1,
+				writer_memory_bytes: 15_000_000,
+				max_queued_commands: 1,
+				max_queued_bytes: 64,
+				max_batch_bytes: 64,
+			},
+		};
+		Arc::new(Runtime {
+			state: metrics.state.clone(),
+			metrics,
+			handle: 0,
+			path: PathBuf::new(),
+			#[cfg(unix)]
+			path_identity: PathIdentity::Unix(0, 0),
+			#[cfg(not(unix))]
+			path_identity: PathIdentity::Path(PathBuf::new()),
+			config,
+			read_only: false,
+			writer_queue: Arc::new(BoundedQueue::new(1, 64)),
+			ordinary_search_queue: Arc::new(BoundedQueue::new(1, 64)),
+			expensive_search_queue: None,
+			search_wake: None,
+			environment: Arc::new(EnvironmentState {
+				callbacks: Arc::new(CallbackGate::new()),
+				handles: Mutex::new(HashMap::new()),
+			}),
+			uncommitted_mutations: AtomicU64::new(0),
+			commit_opstamp: AtomicU64::new(0),
+			writer_queue_nanoseconds: AtomicU64::new(0),
+			writer_execution_nanoseconds: AtomicU64::new(0),
+			search_queue_nanoseconds: AtomicU64::new(0),
+			search_execution_nanoseconds: AtomicU64::new(0),
+			search_threads: Mutex::new(vec![]),
+			closed: Arc::new(CompletionSignal::new()),
+			reservation: Mutex::new(None),
+			expensive_search_budget: None,
+			#[cfg(feature = "test-panic")]
+			publish_fault: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
+			reload_alignment_faults: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
+			poison_before_admission: AtomicBool::new(false),
+			#[cfg(feature = "test-panic")]
+			search_panic: AtomicBool::new(false),
+			#[cfg(feature = "test-panic")]
+			close_fault: AtomicU8::new(0),
+			#[cfg(feature = "test-panic")]
+			expensive_search_delay_milliseconds: AtomicU64::new(0),
+			#[cfg(feature = "test-panic")]
+			ordinary_search_delay_milliseconds: AtomicU64::new(0),
+		})
+	}
+	#[test]
+	fn telemetry_reader_generation_is_published_only_after_searcher_installation() {
+		let mut schema = tantivy::schema::Schema::builder();
+		let text = schema.add_text_field("text", tantivy::schema::TEXT);
+		let index = tantivy::Index::create_in_ram(schema.build());
+		let reader: IndexReader = index
+			.reader_builder()
+			.reload_policy(tantivy::ReloadPolicy::Manual)
+			.try_into()
+			.unwrap();
+		let metrics = Metrics::new();
+		let snapshot = SnapshotReader::new(reader.clone(), metrics.clone());
+		let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+		writer.add_document(tantivy::doc!(text=>"new")).unwrap();
+		writer.commit().unwrap();
+		reader.reload().unwrap();
+		snapshot.replace_after_swap(reader.searcher(), || {
+			assert_eq!(snapshot.searcher().num_docs(), 1);
+			assert_eq!(metrics.test_reader_documents(), 0);
+		});
+		assert_eq!(metrics.test_reader_documents(), 1);
+	}
+
+	#[test]
+	fn telemetry_stale_scrape_cannot_overwrite_terminal_or_reopened_state() {
+		let runtime = telemetry_runtime_fixture();
+		assert!(Arc::ptr_eq(&runtime.state, &runtime.metrics.state));
+		let token = TelemetryToken {
+			metrics: runtime.metrics.clone(),
+			runtime: Arc::downgrade(&runtime),
+			environment: 0,
+			max_commands: 1,
+			max_bytes: 64,
+			isolated: false,
+		};
+		for terminal in [STATE_CLOSED, STATE_POISONED] {
+			runtime.state.store(STATE_CLOSING, Ordering::Relaxed);
+			token.queues_after_state_sample(|| runtime.state.store(terminal, Ordering::Relaxed));
+			assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), terminal);
+			drop(token.queues());
+			assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), terminal);
+		}
+		runtime.state.store(STATE_CLOSING, Ordering::Relaxed);
+		assert!(runtime
+			.state
+			.compare_exchange(STATE_CLOSING, STATE_OPEN, Ordering::AcqRel, Ordering::Acquire)
+			.is_ok());
+		assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), STATE_OPEN);
+	}
+	#[test]
+	fn telemetry_forced_close_preserves_an_already_terminal_state() {
+		let runtime = telemetry_runtime_fixture();
+		runtime.state.store(STATE_CLOSED, Ordering::Relaxed);
+		runtime.force_close();
+		assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), STATE_CLOSED);
+		assert_eq!(runtime.writer_queue.snapshot().0, 0);
+	}
+
+	#[test]
+	fn telemetry_forced_close_preserves_terminal_poison_when_writer_queue_is_closed() {
+		let runtime = telemetry_runtime_fixture();
+		runtime.state.store(STATE_POISONED, Ordering::Relaxed);
+		drop(runtime.writer_queue.close());
+		runtime.force_close();
+		assert_eq!(runtime.metrics.state.load(Ordering::Relaxed), STATE_POISONED);
+		assert_eq!(runtime.writer_queue.snapshot().0, 0);
+	}
+
+	#[test]
+	fn telemetry_forced_close_transitions_only_with_one_queued_rollback() {
+		for initial in [STATE_OPEN, STATE_POISONED] {
+			let runtime = telemetry_runtime_fixture();
+			runtime.state.store(initial, Ordering::Relaxed);
+			runtime.force_close();
+			assert_eq!(runtime.state.load(Ordering::Relaxed), STATE_CLOSING);
+			assert_eq!(runtime.writer_queue.snapshot().0, 1);
+			runtime.force_close();
+			assert_eq!(runtime.writer_queue.snapshot().0, 1);
+			let command = runtime.writer_queue.try_pop().unwrap();
+			assert!(matches!(
+				command.value.operation,
+				WriterOperation::Close { rollback: true }
+			));
+		}
+	}
+
+	#[test]
+	fn telemetry_production_search_loops_settle_in_assigned_worker_banks() {
+		for (flexible, operation) in [(false, 5), (true, 5), (true, 6), (true, 7)] {
+			let mut runtime = telemetry_runtime_fixture();
+			let fixture = Arc::get_mut(&mut runtime).unwrap();
+			fixture.metrics = Metrics::with_search_workers(2);
+			fixture.state = fixture.metrics.state.clone();
+			fixture.config.identity.fields = vec![crate::protocol::FieldConfig {
+				name: "text".into(),
+				weight: 1.0,
+			}];
+			fixture.config.limits.search_threads = 2;
+			fixture.expensive_search_queue = Some(Arc::new(BoundedQueue::new(1, 64)));
+			fixture.search_wake = Some(Arc::new(QueueWake::new()));
+			let engine = Arc::new(Engine::open(tantivy::directory::RamDirectory::create(), &runtime.config).unwrap());
+			let reader = Arc::new(SnapshotReader::new(engine.reader().unwrap(), runtime.metrics.clone()));
+			let search = if operation == 7 {
+				SearchOperation::Trace(Vec::new())
+			} else {
+				SearchOperation::Search {
+					bytes: Vec::new(),
+					expensive: operation == 6,
+				}
+			};
+			runtime.metrics.attempt(operation);
+			runtime
+				.search_queue(operation != 5)
+				.try_push_tracked(
+					SearchCommand {
+						operation: search,
+						completion: tracked_completion(&runtime.metrics, operation),
+					},
+					8,
+					|| Ok(()),
+					|command, enqueued| command.completion.arm_at(enqueued),
+				)
+				.unwrap();
+			runtime.ordinary_search_queue.shutdown_after_drain();
+			runtime.expensive_search_queue.as_ref().unwrap().shutdown_after_drain();
+			let worker = usize::from(flexible);
+			if flexible {
+				flexible_search_loop(runtime.clone(), engine, reader, worker);
+			} else {
+				ordinary_search_loop(runtime.clone(), engine, reader, worker);
+			}
+			assert_eq!(runtime.metrics.test_counts(operation), [1, 1, 0, 0, 1, 0, 1]);
+			assert_eq!(runtime.metrics.test_actor_counts(operation, Some(worker)), [0, 0, 1]);
+			assert_eq!(runtime.metrics.test_actor_counts(operation, None), [0, 0, 0]);
+			assert_eq!(
+				runtime.metrics.test_actor_counts(operation, Some(1 - worker)),
+				[0, 0, 0]
+			);
+		}
+	}
+
+	#[test]
+	fn telemetry_writer_close_begins_teardown_before_native_join_work() {
+		let metrics = Metrics::new();
+		let result = observe_writer_close(&metrics, || {
+			assert!(metrics.teardown_pending());
+			WriterCloseOutcome {
+				quiesced: true,
+				error: None,
+			}
+		});
+		assert!(result.quiesced);
+		assert!(metrics.teardown_pending());
+		metrics.finish_teardown(true);
+		assert!(!metrics.teardown_pending());
+	}
+	#[cfg(feature = "test-panic")]
+	#[test]
+	fn telemetry_poison_before_real_queue_admission_rejects_once() {
+		let runtime = telemetry_runtime_fixture();
+		runtime.poison_before_admission.store(true, Ordering::Relaxed);
+		let error = observe_operation(&runtime.metrics, 1, || {
+			runtime.enqueue_writer(
+				WriterCommand {
+					operation: WriterOperation::Commit,
+					completion: tracked_completion(&runtime.metrics, 1),
+				},
+				0,
+			)
+		})
+		.unwrap_err();
+		assert_eq!(error.status, "E_POISONED");
+		assert_eq!(runtime.metrics.test_counts(1), [1, 0, 1, 0, 0, 0, 0]);
+	}
+	#[test]
+	fn telemetry_native_boundary_panic_rejects_once_without_poisoning_state() {
+		let runtime = telemetry_runtime_fixture();
+		let error = observe_operation(&runtime.metrics, 1, || panic!("native boundary fault")).unwrap_err();
+		assert_eq!(error.status, "E_NATIVE_PANIC");
+		assert_eq!(runtime.metrics.test_counts(1), [1, 0, 1, 0, 0, 0, 0]);
+		assert_eq!(runtime.state.load(Ordering::Relaxed), STATE_OPEN);
+	}
+
+	#[test]
+	fn telemetry_search_prechecks_reject_before_classification_once() {
+		for code in ["E_CLOSED", "E_INVALID_ARGUMENT"] {
+			let metrics = Metrics::new();
+			let header_checked = AtomicBool::new(false);
+			let classified = AtomicBool::new(false);
+			let classification = classify_search(
+				&metrics,
+				|| {
+					if code == "E_CLOSED" {
+						Err(FulltextError::new(code, "closed"))
+					} else {
+						Ok(())
+					}
+				},
+				|| {
+					header_checked.store(true, Ordering::Relaxed);
+					Err(FulltextError::new("E_INVALID_ARGUMENT", "header"))
+				},
+				|| {
+					classified.store(true, Ordering::Relaxed);
+					Ok(true)
+				},
+			)
+			.unwrap();
+			let error = observe_operation(&metrics, 5, || {
+				classification.map_err(fulltext_napi_error)?;
+				Ok(())
+			})
+			.unwrap_err();
+			assert_eq!(error.status, code);
+			assert_eq!(header_checked.load(Ordering::Relaxed), code != "E_CLOSED");
+			assert!(!classified.load(Ordering::Relaxed));
+			assert_eq!(metrics.test_counts(5), [1, 0, 1, 0, 0, 0, 0]);
+			assert_eq!(metrics.test_counts(6), [0, 0, 0, 0, 0, 0, 0]);
+		}
+	}
+
+	#[test]
+	fn telemetry_classifier_panic_records_one_unaccepted_attempt() {
+		let metrics = Metrics::new();
+		let error = classify_search(&metrics, || Ok(()), || Ok(()), || panic!("classifier fault")).unwrap_err();
+		assert_eq!(error.status, "E_NATIVE_PANIC");
+		assert_eq!(metrics.test_counts(5), [1, 0, 1, 0, 0, 0, 0]);
+		assert_eq!(metrics.test_counts(6), [0, 0, 0, 0, 0, 0, 0]);
+		assert!(classify_search(&metrics, || Ok(()), || Ok(()), || Ok(true))
+			.unwrap()
+			.unwrap());
+		assert_eq!(metrics.test_counts(5), [1, 0, 1, 0, 0, 0, 0]);
+	}
+
+	#[test]
+	fn telemetry_queue_age_is_null_without_an_available_entry() {
+		assert!(queue_json(None, false, 8, 64, false).contains("\"oldestAgeNanoseconds\":null"));
+		assert!(queue_json(Some((0, 0, 0)), true, 8, 64, false).contains("\"oldestAgeNanoseconds\":null"));
+		assert!(queue_json(Some((1, 8, 123)), false, 8, 64, false).contains("\"oldestAgeNanoseconds\":null"));
+		assert!(queue_json(Some((1, 8, 123)), true, 8, 64, false).contains("\"oldestAgeNanoseconds\":\"123\""));
+	}
+
+	fn tracked_completion(metrics: &Arc<Metrics>, operation: usize) -> Completion {
+		Completion {
+			ticket: Some(metrics.ticket(operation, 8)),
+			callback: None,
+			callbacks: Arc::new(CallbackGate::new()),
+		}
+	}
+	#[test]
+	fn telemetry_rejected_insertion_never_activates_completion() {
+		let metrics = Metrics::new();
+		let queue = BoundedQueue::new(0, 0);
+		metrics.attempt(0);
+		let completion = tracked_completion(&metrics, 0);
+		let error = queue
+			.try_push_tracked(completion, 8, || Ok(()), |c, enqueued| c.arm_at(enqueued))
+			.err()
+			.unwrap();
+		metrics.reject(0, error.code);
+		assert_eq!(metrics.test_counts(0), [1, 0, 1, 0, 0, 0, 0]);
+	}
+	#[test]
+	fn telemetry_accepted_drain_settles_without_execution() {
+		let metrics = Metrics::new();
+		let queue = BoundedQueue::new(1, 8);
+		metrics.attempt(0);
+		queue
+			.try_push_tracked(
+				tracked_completion(&metrics, 0),
+				8,
+				|| Ok(()),
+				|c, enqueued| c.arm_at(enqueued),
+			)
+			.unwrap();
+		drop(queue.close());
+		assert_eq!(metrics.test_counts(0), [1, 1, 0, 0, 1, 0, 1]);
+	}
+	#[test]
+	fn telemetry_preserved_close_requeue_arms_only_once() {
+		let metrics = Metrics::new();
+		let queue = BoundedQueue::new(1, 8);
+		metrics.attempt(4);
+		let close = WriterCommand {
+			operation: WriterOperation::Close { rollback: false },
+			completion: tracked_completion(&metrics, 4),
+		};
+		queue
+			.push_force_tracked(close, 0, |c, enqueued| c.completion.arm_at(enqueued))
+			.unwrap();
+		let close = queue.drain().pop().unwrap().value.force_rollback();
+		queue
+			.push_force_tracked(close, 0, |c, enqueued| c.completion.arm_at(enqueued))
+			.unwrap();
+		let mut close = queue.pop().unwrap().value;
+		close.completion.start();
+		close.completion.success(Vec::new());
+		assert_eq!(metrics.test_counts(4), [1, 1, 0, 0, 1, 1, 0]);
+	}
+	#[test]
+	fn telemetry_activation_precedes_immediate_consumer() {
+		let metrics = Metrics::new();
+		let queue: Arc<BoundedQueue<Completion>> = Arc::new(BoundedQueue::new(1, 8));
+		metrics.attempt(5);
+		std::thread::scope(|scope| {
+			let consumer = queue.clone();
+			scope.spawn(move || {
+				let mut completion = consumer.pop().unwrap().value;
+				completion.start();
+				completion.success(Vec::new());
+			});
+			queue
+				.try_push_tracked(
+					tracked_completion(&metrics, 5),
+					8,
+					|| Ok(()),
+					|c, enqueued| c.arm_at(enqueued),
+				)
+				.unwrap();
+		});
+		assert_eq!(metrics.test_counts(5), [1, 1, 0, 0, 1, 1, 0]);
+	}
 
 	#[cfg(feature = "test-panic")]
 	#[test]

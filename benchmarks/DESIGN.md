@@ -1,5 +1,46 @@
 # Qualification measurement
 
+## Observability comparisons
+
+`observability.mjs` uses fresh child processes and separate baseline/candidate module paths, with
+alternating order inside each pair. It cannot silently swap an addon under an already loaded
+facade. Keep workload/correctness identical across profiles; baseline deliberately makes no
+telemetry API calls. `--baseline-profile=match` instead compares matching telemetry settings;
+that output is explicitly optimization-only and carries no feature-cost budget classification.
+Optional snapshot-byte cost and polling are separate profiles. Preserve raw
+pairs and mark noisy measurements inconclusive instead of treating a rounded median as proof of
+the 1%/3% throughput targets. Finite local CPU/RSS observations are not sustained-memory evidence.
+
+Default scenarios cover tie-heavy ordinary collection, single-hit `ordinary-cheap`, and expensive
+prefix/exact-total work. `--operations` filters distinct known scenario names without changing
+other matrix dimensions. Both ordinary shapes use bounded totals; requesting exact totals routes
+to the expensive queue. Candidate warmup asserts actual native class counters. The catalog tie
+case invokes the stable fallback after TopDocs, so it cannot bound the cheapest ordinary path.
+The unique product7 case requires ID7/total1/exact, and ID0-only publications cannot change it.
+
+Per-query timers stop when the search API resolves, before correctness validation. The report
+labels API latency separately from query-window throughput/time (`measurementVersion: 2`). Each
+bounded window (default 1,024 results) drains every caller before validating every result outside
+its timer. CPU and event-loop utilization are sampled over those same windows; mixed CPU/elapsed
+still include validation and 20 mutation/publication cycles. Polling defaults to 1,000 ms per handle,
+one handle per timer turn, and reports actual counts and synchronous scrape durations. A short
+run with few scrapes cannot qualify that schedule; retain 10 ms only as an explicit stress setting.
+The default ten-poll/handle descriptive floor labels undersampled cells insufficient; it is not
+an acceptance threshold or statistical confidence statement.
+
+`observability-scrape-cost.mjs` retains the separate idle-handle protocol: immutable baseline and
+candidate modules, serial fresh children, 100 searches/handle, default 25 warmup rounds and 120
+measured calls/handle with event-loop turns between them. The five selected topologies cap total
+search workers at 64 and handles at 16. Explicit aggregate queue budget covers writer, ordinary
+and expensive queues. Results pool per-call quantiles per child and retain every per-handle
+sample; they do not bound active workload stalls. Emit the child report only after verified close
+and directory cleanup; preserve a primary measurement failure with any secondary cleanup errors,
+and retain the directory on every failed measurement, including a failed open without an owned
+handle that could prove quiescence. Test fixtures verify configuration, warmup and
+sample counts without treating a fake clock as native performance evidence.
+Historical reports used validation-inclusive percentiles; preserve and label them rather than
+reinterpreting their p99 values as API completion latency.
+
 ## Mixed metadata soak
 
 `metadata-soak.mjs` gives each in-flight query a lease on a reader that is never reloaded. Its

@@ -44,7 +44,7 @@ and its UTF-16 spans independently of indexed stems.
 `QueryOptions` resolves fuzzy distance 0–2/default 1 and transpositions default true per leaf.
 The facade rejects supplied fuzzy controls on Boolean groups before reading their children;
 controls belong to text leaves and are never inherited.
-Protocol 8 encodes u8/bool after each mode; ABI 13/query API 7 require a matching facade. Options
+Protocol 8 encodes u8/bool after each mode; ABI 14/query API 7 require a matching facade. Options
 are absent from persisted identity and included in continuation digests. Nondefault fuzzy traces
 lazily use requested native automata on the existing analyzed/surface branches, sharing a matcher
 when query terms are identical. Distance zero uses equality/prefix checks without a DFA. Current-source
@@ -100,6 +100,11 @@ ownership contract remains separate from this native-handle fix.
 `FULLTEXT_TEST_WRITER_DIAGNOSTICS=1` is captured once per process at its first native open entry and emits fixed writer/close/cleanup stages only in the `test-panic` addon. Records carry handle, process, epoch time and operation duration; prefixed single-buffer writes ignore output failures. Production builds omit the native trace code. Enabled diagnostics perform synchronous stderr writes that can block on pipe backpressure, so timings are instrumented observations; a missing event alone cannot prove a native stall. Writer execution timing starts after its start record is emitted; `writer-end` is emitted after completion settlement, with the operation duration captured before settlement. Close execution timing includes nested close-stage writes. Native and JavaScript writers do not share a lock, so overlapping output may require manual inspection rather than line parsing. The worker fixture retains directories whenever successful quiescent reopen/close is unproven, preserving the primary failure; partial multiple-index opens are settled and closed before reporting errors.
 
 The workload heartbeat reuses public status counters: queued commands identify admission waits; commit opstamp, uncommitted mutations and completed execution metrics distinguish native completion from pending JavaScript delivery. Executing work with low process CPU still requires further native stack/file evidence; this is not a deadlock diagnosis. The original Windows failure occurred in the debug test phase before production rebuild. Keep workloads and deadlines unchanged; instrumented observations do not establish production performance or explain a prior failure merely because the next run passes.
+
+Optional snapshot-byte observation runs after command completion settlement and before the current
+`writer-end` diagnostic. Its work is excluded from the recorded operation duration, but included
+in the gap between event timestamps. A missing `writer-end` alone therefore cannot establish that
+the engine operation is still running.
 
 ## Request preparation
 
@@ -215,7 +220,7 @@ aggregation children map directly to native `sub_aggregation` trees. Resource ad
 for collector construction and possible parent instances before collection. Histogram parents use
 position spans, with native query-scoped probes when conservative admission fails. Histogram safety
 checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
-checks protect each recursive wire/API walker. Current packed protocol 8, query API 7 and ABI 13
+checks protect each recursive wire/API walker. Current packed protocol 8, query API 7 and ABI 14
 include metadata, query-capacity open support and per-leaf matching controls. Neither change alters persisted identity v8.
 
 Sorted snapshot continuation and metadata-derived score adjustment remain outside this
@@ -269,9 +274,32 @@ Raised-policy admission compares maximum per-leaf term cost and summed compiled-
 Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
 non-ASCII input conservatively uses the expensive lane because normalization can expand text.
 Default-policy classification is unchanged. The optimized two-handle regression pins ordinary
-isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 13
+isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 14
 require a matching facade/addon.
 
 The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
 additional tail rejects. A future extension needs explicit framing/versioning rather than appending
 an ambiguous optional value.
+
+## Telemetry worker banks
+
+Each search completion binds a valid worker bank at most once before first dispatch. The ticket
+retains that selection through settlement, panic and Drop, including a future thread migration.
+Ordinary, flexible, expired and closing execution paths pass the stable worker index; test-only
+pre-delay dispatch binds first too. Unbound queued drains/rejections retain the shared fallback.
+Every update remains a relaxed atomic RMW, so accidental duplicate worker assignment cannot
+lose updates. Snapshots sum wrapping scalar values before JSON serialization. This preserves
+existing nontransactional snapshot semantics, exact-once settlement and histogram-toggle behavior.
+
+Only dispatched/succeeded/failed and queue/execution latency storage are banked. Rare errors
+and mutation totals remain shared. Three 384-byte banks per worker add 1,152 bytes per configured
+search worker on the measured arm64 target, plus a fixed 1,024-byte shared-Actor alignment increase
+and container overhead. Retained tokens retain these scalar banks after close; scrape work grows
+with configured workers. The ownership tests cover rebinding/migration, shared drains, duplicate
+bank writers, wrapping sums and disabled/enabled histogram histories.
+
+Forced environment cleanup may see a terminal poisoned runtime after its writer queue has closed.
+The forced-admission helper checks queue availability and changes lifecycle state under the same
+queue mutex, before enqueueing rollback close. Unavailable queues therefore cannot turn a final
+poisoned state back into closing. The native loop regression inspects bank versus shared-fallback
+outcomes, so deleting production worker binding fails even when aggregate totals still conserve.

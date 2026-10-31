@@ -1,12 +1,13 @@
 # Metadata index migration
 
-Status: draft release; Kyle approved the API/migration direction on 2026-10-28. Local procedure
-qualification passed, including a controlled local Harper Table catch-up/cutover rehearsal. Production cutover remains untested.
+Status: the metadata API shipped in 0.8.0. Kyle approved the API/migration direction on 2026-10-28.
+Local procedure qualification passed, including a controlled local Harper Table catch-up/cutover
+rehearsal. Production cutover remains untested.
 
-The source manifests prepare version 0.8.0, aligning the root package, Cargo package, exact platform
-dependencies and lockfiles. This version remains unreleased until publication. Do not install the
-published 0.7.0 package expecting this metadata API. Publication verification remains part of
-[Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
+Published 0.8.0 includes the metadata API and uses native ABI 13. The unreleased observability source
+tree requires ABI 14 and matching source-built facade/addon artifacts; selecting its package version
+remains release work. Do not install 0.7.0 expecting the metadata API. Remaining qualification is
+tracked in [Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
 
 ## Decide whether to rebuild
 
