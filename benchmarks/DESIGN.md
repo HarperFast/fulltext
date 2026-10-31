@@ -72,6 +72,8 @@ The opt-in writer-diagnostics helper emits five-second process CPU/RSS and exist
 
 Twenty warm sequential searches per row use limit 20, with exact totals disabled and enabled separately. The paired root-boost OR/AND rows compare complete request latency with composite wrapping; optional with required All compares native Must/Should composition against its required-only baseline. Repeated score ties can force the unboosted top-docs collector to rerun through stable collection, so these rows dilute specialized-pruning differences and do not isolate the cost of losing block-WAND. These costs remain accepted rather than introducing custom scorer or composite boost distribution semantics.
 
+The two-term Any baseline and boosted Any rows both use stable collection, so they do not measure the root leaf lowering's specialized pruning. There is no boosted-All row; native topology and reference-score tests qualify that lowering, rather than these timings.
+
 A same-process optimized run on 2026-10-31, macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 produced these local p50 milliseconds:
 
 | Query                      | Exact totals off | Exact totals on |
