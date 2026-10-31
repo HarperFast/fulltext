@@ -111,26 +111,26 @@ The current driver adds a single-term baseline and root-lowered/native-wrapped c
 
 In the varied corpus, ranks 20 and 21 must differ for every non-optional row. The three/four-term All baseline and lowered rows now use stable collection; the native-wrapped controls use generic native TopDocs iteration. Two-term All starts with native pruning, while tied cutoffs can trigger the existing stable rerun. The tied mode deliberately retains that confound.
 
-An optimized 2026-10-31 run after moving the stable-score fact into query construction, on macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 measured these p50 milliseconds (20 warm sequential samples, limit 20). Native artifact SHA256: `ce875b5a1ee0bea5486c5f3195c29925e62301dded248023113e7b6f2e219bd8`. Both modes passed all 40 correctness rows and observed four committed segments.
+An optimized 2026-10-31 run after moving the stable-score fact into query construction and adding shared deadline checks to ordinary stable collection, on macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 measured these p50 milliseconds (20 warm sequential samples, limit 20). Native artifact SHA256: `652d1aaafd045641c1880a6c08e1a52099df5aa599de91fabf64f1ec6191cd6b`. Both modes passed all 40 correctness rows and observed four committed segments.
 
 | Query                         | Tied, exact off | Tied, exact on | Varied, exact off | Varied, exact on |
 | ----------------------------- | --------------: | -------------: | ----------------: | ---------------: |
-| Single term baseline          |           0.101 |          0.110 |             0.094 |            0.099 |
-| Single term root lowered      |           0.110 |          0.108 |             0.091 |            0.100 |
-| Single term native wrapped    |           0.111 |          0.111 |             0.091 |            0.101 |
-| Two-term All baseline         |           0.133 |          0.123 |             0.080 |            0.106 |
-| Two-term All root lowered     |           0.131 |          0.129 |             0.081 |            0.107 |
-| Two-term All native wrapped   |           0.139 |          0.134 |             0.100 |            0.131 |
-| Three-term All baseline       |           0.108 |          0.112 |             0.157 |            0.144 |
-| Three-term All root lowered   |           0.111 |          0.103 |             0.158 |            0.147 |
-| Three-term All native wrapped |           0.166 |          0.159 |             0.128 |            0.168 |
-| Four-term All baseline        |           0.131 |          0.130 |             0.168 |            0.171 |
-| Four-term All root lowered    |           0.129 |          0.131 |             0.173 |            0.171 |
-| Four-term All native wrapped  |           0.203 |          0.204 |             0.151 |            0.195 |
+| Single term baseline          |           0.116 |          0.109 |             0.093 |            0.092 |
+| Single term root lowered      |           0.119 |          0.110 |             0.091 |            0.096 |
+| Single term native wrapped    |           0.115 |          0.113 |             0.094 |            0.099 |
+| Two-term All baseline         |           0.135 |          0.131 |             0.077 |            0.104 |
+| Two-term All root lowered     |           0.140 |          0.132 |             0.078 |            0.104 |
+| Two-term All native wrapped   |           0.143 |          0.139 |             0.102 |            0.126 |
+| Three-term All baseline       |           0.119 |          0.119 |             0.163 |            0.153 |
+| Three-term All root lowered   |           0.120 |          0.118 |             0.162 |            0.158 |
+| Three-term All native wrapped |           0.179 |          0.171 |             0.127 |            0.162 |
+| Four-term All baseline        |           0.140 |          0.131 |             0.177 |            0.176 |
+| Four-term All root lowered    |           0.139 |          0.133 |             0.177 |            0.173 |
+| Four-term All native wrapped  |           0.210 |          0.208 |             0.143 |            0.195 |
 
 These are total-request comparisons. The wrapper control adds an AST node, stable collection resolves ID ordinals, exact totals can add a separate native count, and tied TopDocs can rerun collection. Those differences prevent attributing the timing delta solely to pruning or ordinal lookup. The small single-term differences do not establish an optimization benefit; the two-term and wider-All rows expose costs on this corpus only. Historical tables above describe earlier fixtures/builds and are not a matched before/after speedup comparison.
 
-Correctness evidence is separate: the old installed addon fails the permanent 300-document, two-commit four-term All/AND/empty-body regressions with a distinct cutoff; the three-term control passes on that addon. The native canary independently compares raw TopDocs with scorer iteration at four terms. The new route passes both. Three-term routing is a conservative mitigation, not a demonstrated three-term failure or a claim of universal safety for smaller native queries. Ordinary stable collection checks deadlines after collection; these measurements do not establish strict latency bounds, customer-distribution throughput, or catalog-scale memory limits.
+Correctness evidence is separate: the old installed addon fails the permanent 300-document, two-commit four-term All/AND/empty-body regressions with a distinct cutoff; the three-term control passes on that addon. The native canary independently compares raw TopDocs with scorer iteration at four terms. The new route passes both. Three-term routing is a conservative mitigation, not a demonstrated three-term failure or a claim of universal safety for smaller native queries. Ordinary stable collection cooperatively checks deadlines every 1,024 visited documents; these measurements do not establish strict latency bounds, customer-distribution throughput, or catalog-scale memory limits.
 
 ### Additional compiler routing shapes
 
@@ -138,21 +138,21 @@ Use `node scripts/run-local.mjs benchmarks/query-scoring.mjs --routing-shapes` a
 
 Each family has an explicit expected total: OR, short-Fuzzy and one-token two-field Phrase match 7,500 documents; exact prefix and three-term two-field All match 5,000. The exact prefix has two completed terms and a singleton final `ruby` expansion. Complete correctness reads use 100-hit traversal pages because ordinary prefix search rejects limits above 100; timed ordinary requests remain at limit 20. Complete membership, totals and exact doubled baseline scores must agree with `boost(2, boost(1, query))` before timing. The native wrapper retains generic scoring. The varied mode requires distinct ranks 20/21 for all 20 rows; the tied mode deliberately retains boundary ties.
 
-On the same unchanged optimized artifact `ce875b5a1ee0bea5486c5f3195c29925e62301dded248023113e7b6f2e219bd8`, Node 24.16.0/macOS arm64, all 20 rows passed in each mode. P50 milliseconds:
+On the same unchanged optimized artifact `652d1aaafd045641c1880a6c08e1a52099df5aa599de91fabf64f1ec6191cd6b`, Node 24.16.0/macOS arm64, all 20 rows passed in each mode. P50 milliseconds:
 
 | Query                                       | Tied, exact off | Tied, exact on | Varied, exact off | Varied, exact on |
 | ------------------------------------------- | --------------: | -------------: | ----------------: | ---------------: |
-| OR baseline                                 |           0.102 |          0.099 |             0.137 |            0.130 |
-| OR native wrapped                           |           0.167 |          0.156 |             0.107 |            0.129 |
-| Exact singleton prefix baseline             |           0.111 |          0.106 |             0.142 |            0.142 |
-| Exact singleton prefix native wrapped       |           0.160 |          0.155 |             0.121 |            0.155 |
-| Two short Fuzzy terms baseline              |           0.099 |          0.099 |             0.129 |            0.127 |
-| Two short Fuzzy terms native wrapped        |           0.232 |          0.155 |             0.105 |            0.130 |
-| One-token Phrase, two fields baseline       |           0.103 |          0.101 |             0.131 |            0.131 |
-| One-token Phrase, two fields native wrapped |           0.240 |          0.161 |             0.108 |            0.139 |
-| Three-term All, two fields baseline         |           0.204 |          0.200 |             0.240 |            0.237 |
-| Three-term All, two fields native wrapped   |           0.372 |          0.348 |             0.221 |            0.327 |
+| OR baseline                                 |           0.125 |          0.117 |             0.152 |            0.156 |
+| OR native wrapped                           |           0.169 |          0.166 |             0.110 |            0.130 |
+| Exact singleton prefix baseline             |           0.149 |          0.118 |             0.159 |            0.150 |
+| Exact singleton prefix native wrapped       |           0.209 |          0.176 |             0.129 |            0.166 |
+| Two short Fuzzy terms baseline              |           0.189 |          0.117 |             0.156 |            0.145 |
+| Two short Fuzzy terms native wrapped        |           0.235 |          0.160 |             0.112 |            0.131 |
+| One-token Phrase, two fields baseline       |           0.121 |          0.123 |             0.156 |            0.155 |
+| One-token Phrase, two fields native wrapped |           0.180 |          0.177 |             0.114 |            0.146 |
+| Three-term All, two fields baseline         |           0.226 |          0.223 |             0.251 |            0.261 |
+| Three-term All, two fields native wrapped   |           0.372 |          0.413 |             0.227 |            0.349 |
 
-The default driver already measured its original OR pair on this artifact: tied baseline/root boost p50 was 0.110/0.160 ms with exact totals off and 0.105/0.165 ms on; varied was 0.138/0.104 ms off and 0.140/0.134 ms on. The routing-mode OR rows use the augmented corpus, so they are not matched before/after comparisons with those default rows.
+The default driver also measured its original OR pair on this artifact: tied baseline/root boost p50 was 0.126/0.172 ms with exact totals off and 0.123/0.175 ms on; varied was 0.156/0.108 ms off and 0.158/0.118 ms on. The routing-mode OR rows use the augmented corpus, so they are not matched before/after comparisons with those default rows.
 
 These samples measure total requests, including JavaScript/native calls, query construction, stable ID-ordinal resolution and possible separate exact counts. Wrapped controls add AST nodes and double scores; tied cutoffs can trigger a stable rerun. None of these pairs isolates pruning or compiler overhead, and timing differences change with totals and corpus. The added families make the small-workload costs visible; they establish no general speedup, strict deadline bound, catalog-scale throughput or memory qualification.
