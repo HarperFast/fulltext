@@ -505,7 +505,9 @@ optional branch; callers must authorize access to all of those fields. Defined `
 `required` and `should` properties on incompatible request or expression shapes now reject with
 `E_INVALID_ARGUMENT`. Misplaced `clause` and `clauses` properties also reject, as do leaf-only
 `mode` and `fields` properties on groups, including existing Boolean groups. Older facades could
-ignore these properties. Properties set to `undefined`
+ignore these properties. Nested text leaves now reject legacy `operator` mode aliases other than
+`any` and `all`; use `mode: 'prefix'` instead of `operator: 'prefix'` inside `query`.
+The top-level request's legacy `operator: 'prefix'` alias remains supported. Properties set to `undefined`
 are treated as absent. These additions require a matching ABI 14 / query API 8 facade and addon.
 
 ### Configurable query capacity

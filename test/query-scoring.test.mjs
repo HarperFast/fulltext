@@ -279,6 +279,7 @@ test('misplaced scoring controls and conflicting expression shapes fail closed',
 	const clause = leaf('amber');
 	for (const query of [
 		{ ...clause, boost: 2 },
+		{ ...clause, operator: 'prefix' },
 		{ ...clause, optional: [leaf('quartz')] },
 		{ ...clause, required: leaf('quartz') },
 		{ operator: 'and', clauses: [clause], optional: [leaf('quartz')] },
@@ -300,6 +301,10 @@ test('misplaced scoring controls and conflicting expression shapes fail closed',
 			await assert.rejects(index.searchPage({ query }), invalid);
 		});
 	}
+	assert.deepStrictEqual(
+		await index.search({ text: 'amber', operator: 'prefix' }),
+		await index.search({ text: 'amber', mode: 'prefix' }),
+	);
 	await assert.rejects(index.search({ query: clause, should: [leaf('quartz')] }), invalid);
 	await assert.rejects(index.searchPage({ query: clause, should: [leaf('quartz')] }), invalid);
 	await assert.rejects(index.search({ text: 'amber', required: clause }), invalid);
@@ -316,12 +321,30 @@ test('misplaced scoring controls and conflicting expression shapes fail closed',
 });
 
 test('multi-term Any scoring has identical search and continuation score sequences', async (context) => {
-	const { index } = await fixture(context, records);
-	for (const query of [
-		boost({ text: 'amber stone quartz', mode: 'any', fields: ['title'] }, 0.7),
-		optional({ text: 'amber stone quartz', mode: 'any', fields: ['title'] }, boost(leaf('quartz'), 0.3)),
-	]) {
-		const expected = await index.search({ query, exactTotal: true, limit: 20 });
+	const terms = ['amber', 'stone', 'quartz', 'ruby', 'sapphire', 'opal', 'silver', 'copper'];
+	const documents = Array.from({ length: 127 }, (_, id) => ({
+		id: String(id).padStart(2, '0'),
+		fields: {
+			title: terms
+				.flatMap((term, index) =>
+					Array.from({ length: (id + 1) & (1 << index) ? (((id + 3) * (index + 1)) % 11) + 1 : 0 }, () => term),
+				)
+				.join(' '),
+			body: terms
+				.flatMap((term, index) => Array.from({ length: (((id + 7) * (index + 3)) % 13) + 1 }, () => term))
+				.join(' '),
+		},
+	}));
+	const { index } = await fixture(context, documents, {
+		fields: [
+			{ name: 'title', weight: 0.7 },
+			{ name: 'body', weight: 1.3 },
+		],
+	});
+	const any = { text: terms.join(' '), mode: 'any', fields: ['title'] };
+	for (const query of [boost(any, 0.7), optional(any, boost(leaf('quartz'), 0.3))]) {
+		const expected = await index.search({ query, exactTotal: true, limit: documents.length });
+		assert.strictEqual(expected.total, documents.length);
 		const hits = [];
 		let continuation;
 		do {
@@ -331,5 +354,44 @@ test('multi-term Any scoring has identical search and continuation score sequenc
 			assert(hits.length <= expected.total);
 		} while (continuation);
 		assert.deepStrictEqual(hits, expected.hits);
+	}
+});
+
+test('optional scoring snapshots Proxy array length before charging and reading children', async (context) => {
+	const { index } = await fixture(context, records);
+	for (const method of ['search', 'searchPage']) {
+		let lengthReads = 0;
+		let childReads = 0;
+		const clauses = new Proxy([leaf('quartz')], {
+			get(target, key, receiver) {
+				if (key === 'length') return ++lengthReads <= 2 ? 1 : 100_000;
+				if (typeof key === 'string' && /^\d+$/.test(key)) {
+					childReads++;
+					assert.strictEqual(key, '0', 'an uncharged child must never be read');
+				}
+				return Reflect.get(target, key, receiver);
+			},
+		});
+		const query = { operator: 'optional', required: leaf('amber'), optional: clauses };
+		assert.deepStrictEqual(
+			await index[method]({ query }),
+			await index[method]({ query: optional(leaf('amber'), leaf('quartz')) }),
+		);
+		assert.strictEqual(lengthReads, 1);
+		assert.strictEqual(childReads, 1);
+
+		lengthReads = 0;
+		const overBudget = new Proxy([leaf('quartz')], {
+			get(target, key, receiver) {
+				if (key === 'length') {
+					lengthReads++;
+					return 100_000;
+				}
+				if (typeof key === 'string' && /^\d+$/.test(key)) assert.fail('over-budget children must not be read');
+				return Reflect.get(target, key, receiver);
+			},
+		});
+		await assert.rejects(index[method]({ query: { ...query, optional: overBudget } }), invalid);
+		assert.strictEqual(lengthReads, 1);
 	}
 });

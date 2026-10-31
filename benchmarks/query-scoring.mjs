@@ -137,7 +137,7 @@ try {
 				distinctBoundary,
 				rounds,
 				p50Milliseconds: times[Math.floor(rounds / 2)],
-				p95Milliseconds: times[Math.floor(rounds * 0.95)],
+				p95Milliseconds: times[Math.ceil(rounds * 0.95) - 1],
 			});
 		}
 	}

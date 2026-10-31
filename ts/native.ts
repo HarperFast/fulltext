@@ -1484,13 +1484,14 @@ function normalizeExpression(
 	if (expression.operator === 'optional') {
 		const optional = expression.optional;
 		const required = expression.required;
-		if (!Array.isArray(optional) || optional.length === 0)
+		const count = Array.isArray(optional) ? optional.length : 0;
+		if (!Number.isSafeInteger(count) || count < 1)
 			throw new FulltextError('E_INVALID_ARGUMENT', 'optional scoring requires at least one optional clause');
-		chargeSearchStructure(budget, optional.length + 1);
+		chargeSearchStructure(budget, count + 1);
 		return {
 			operator: 'optional',
 			required: normalizeExpression(required, depth + 1, budget),
-			optional: Array.from({ length: optional.length }, (_, i) => normalizeExpression(optional[i], depth + 1, budget)),
+			optional: Array.from({ length: count }, (_, i) => normalizeExpression(optional[i], depth + 1, budget)),
 		};
 	}
 	const children = expression.clauses;
