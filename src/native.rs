@@ -498,8 +498,10 @@ pub fn test_panic_next_search(env: Env, handle: u32) -> boundary::Result<()> {
 #[cfg(feature = "test-panic")]
 #[napi(catch_unwind, skip_typescript, js_name = "__testFailNextTelemetryObservation")]
 pub fn test_fail_next_telemetry_observation(env: Env, handle: u32) -> boundary::Result<()> {
-	runtime(&env, handle)?.metrics.fail_next_observation();
-	Ok(())
+	boundary::run_stateless(|| {
+		runtime(&env, handle)?.metrics.fail_next_observation();
+		Ok(())
+	})?
 }
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeCreateTelemetry")]
 pub fn native_create_telemetry(env: Env, handle: u32) -> boundary::Result<External<TelemetryToken>> {
@@ -1604,11 +1606,16 @@ impl SnapshotReader {
 	}
 
 	fn replace(&self, searcher: Searcher) {
-		self.metrics.observe_reader(&searcher);
+		self.replace_after_swap(searcher, || {});
+	}
+	fn replace_after_swap(&self, searcher: Searcher, after_swap: impl FnOnce()) {
+		let observation = Metrics::prepare_reader(&searcher);
 		let previous = {
 			let mut active = self.active.write().unwrap_or_else(|error| error.into_inner());
 			mem::replace(&mut *active, searcher)
 		};
+		after_swap();
+		self.metrics.install_reader(observation);
 		drop(previous);
 	}
 }
@@ -1967,6 +1974,16 @@ impl Completion {
 	fn start(&mut self) {
 		if let Some(ticket) = &mut self.ticket {
 			ticket.start();
+		}
+	}
+	fn start_at(&mut self, started: Instant) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.start_at(started);
+		}
+	}
+	fn finish_at(&mut self, finished: Instant) {
+		if let Some(ticket) = &mut self.ticket {
+			ticket.finish_at(finished);
 		}
 	}
 	fn record(&mut self, error: Option<&str>) {
@@ -2576,12 +2593,12 @@ fn execute_search_command(
 			} else {
 				None
 			};
-			completion.start();
+			let started = Instant::now();
+			completion.start_at(started);
 			#[cfg(feature = "test-panic")]
 			if runtime.search_panic.swap(false, Ordering::AcqRel) {
 				panic!("injected native search actor panic");
 			}
-			let started = Instant::now();
 			#[cfg(feature = "test-panic")]
 			{
 				let milliseconds = if expensive {
@@ -2605,9 +2622,12 @@ fn execute_search_command(
 						Ok(response)
 					})
 			});
-			runtime
-				.search_execution_nanoseconds
-				.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+			let finished = Instant::now();
+			completion.finish_at(finished);
+			runtime.search_execution_nanoseconds.fetch_add(
+				duration_ns(finished.saturating_duration_since(started)),
+				Ordering::Relaxed,
+			);
 			result
 		}
 		SearchOperation::Trace(bytes) => {
@@ -2616,8 +2636,8 @@ fn execute_search_command(
 				Some(permit) => Some(permit),
 				None => runtime.expensive_search_permit(deadline)?,
 			};
-			completion.start();
 			let started = Instant::now();
+			completion.start_at(started);
 			#[cfg(feature = "test-panic")]
 			if _permit.is_some() {
 				let milliseconds = runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel);
@@ -2639,9 +2659,12 @@ fn execute_search_command(
 				}
 				Ok(response)
 			});
-			runtime
-				.search_execution_nanoseconds
-				.fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+			let finished = Instant::now();
+			completion.finish_at(finished);
+			runtime.search_execution_nanoseconds.fetch_add(
+				duration_ns(finished.saturating_duration_since(started)),
+				Ordering::Relaxed,
+			);
 			result
 		}
 	}));
@@ -3690,6 +3713,29 @@ mod tests {
 			ordinary_search_delay_milliseconds: AtomicU64::new(0),
 		})
 	}
+	#[test]
+	fn telemetry_reader_generation_is_published_only_after_searcher_installation() {
+		let mut schema = tantivy::schema::Schema::builder();
+		let text = schema.add_text_field("text", tantivy::schema::TEXT);
+		let index = tantivy::Index::create_in_ram(schema.build());
+		let reader: IndexReader = index
+			.reader_builder()
+			.reload_policy(tantivy::ReloadPolicy::Manual)
+			.try_into()
+			.unwrap();
+		let metrics = Metrics::new();
+		let snapshot = SnapshotReader::new(reader.clone(), metrics.clone());
+		let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+		writer.add_document(tantivy::doc!(text=>"new")).unwrap();
+		writer.commit().unwrap();
+		reader.reload().unwrap();
+		snapshot.replace_after_swap(reader.searcher(), || {
+			assert_eq!(snapshot.searcher().num_docs(), 1);
+			assert_eq!(metrics.test_reader_documents(), 0);
+		});
+		assert_eq!(metrics.test_reader_documents(), 1);
+	}
+
 	#[test]
 	fn telemetry_stale_scrape_cannot_overwrite_terminal_or_reopened_state() {
 		let runtime = telemetry_runtime_fixture();

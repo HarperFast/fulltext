@@ -493,3 +493,71 @@ test('poison before native admission rejects one attempt without inventing a com
 	assert.strictEqual(final.operations.close.succeeded, 1n);
 	conservedAtQuiescence(final.operations.close);
 });
+
+test('concurrent search callers remain correct while telemetry is repeatedly scraped', async (context) => {
+	const { index } = await rawFixture(context, { searchThreads: 4 });
+	const records = Array.from({ length: 64 }, (_, number) => ({
+		id: `item-${number}`,
+		fields: { text: 'shared catalog product' },
+	}));
+	const ids = new Set(records.map((record) => record.id));
+	await index.applyMutationBatch({ upserts: records });
+	await index.publish('one');
+	index.configureTelemetry({ histograms: true });
+
+	const callerCount = 4;
+	const queriesPerCaller = 12;
+	let finishedCallers = 0;
+	let scrapesWhilePending = 0;
+	const callers = Array.from({ length: callerCount }, async () => {
+		try {
+			for (let query = 0; query < queriesPerCaller; query++) {
+				const result = await index.search({ text: 'shared', exactTotal: true, limit: 3 });
+				assert.strictEqual(result.total, records.length);
+				assert.strictEqual(result.totalRelation, 'exact');
+				assert.strictEqual(result.hits.length, 3);
+				assert(result.hits.every((hit) => ids.has(hit.id)));
+				await setImmediate();
+			}
+		} finally {
+			finishedCallers++;
+		}
+	});
+	const scraper = (async () => {
+		for (let round = 0; round < callerCount * queriesPerCaller; round++) {
+			for (let sample = 0; sample < 3; sample++) {
+				const telemetry = snapshot(index).native;
+				if (finishedCallers < callerCount) scrapesWhilePending++;
+				assert(telemetry.operations.search.dispatched >= 0n);
+				assert(telemetry.operations.search.dispatched <= BigInt(callerCount));
+				for (const queue of Object.values(telemetry.queues)) {
+					assert.strictEqual(queue.available, true);
+					assert(queue.commands >= 0n && queue.commands <= queue.maxCommands);
+					assert(queue.bytes >= 0n && queue.bytes <= queue.maxBytes);
+					if (queue.oldestAgeNanoseconds !== null) assert(queue.oldestAgeNanoseconds >= 0n);
+				}
+			}
+			await setImmediate();
+		}
+	})();
+	const results = await Promise.allSettled([...callers, scraper]);
+	for (const result of results) {
+		if (result.status === 'rejected') throw result.reason;
+	}
+	assert(scrapesWhilePending >= 3);
+	const final = snapshot(index).native;
+	const searches = final.operations.search;
+	const totalQueries = BigInt(callerCount * queriesPerCaller);
+	assert.strictEqual(searches.attempted, totalQueries);
+	assert.strictEqual(searches.accepted, totalQueries);
+	assert.strictEqual(searches.succeeded, totalQueries);
+	assert.strictEqual(searches.failed, 0n);
+	assert.strictEqual(searches.rejected, 0n);
+	assert.strictEqual(searches.execution.histogram.count, totalQueries);
+	conservedAtQuiescence(searches);
+	for (const queue of Object.values(final.queues)) {
+		assert.strictEqual(queue.commands, 0n);
+		assert.strictEqual(queue.bytes, 0n);
+		assert.strictEqual(queue.oldestAgeNanoseconds, null);
+	}
+});

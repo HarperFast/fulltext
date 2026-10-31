@@ -148,6 +148,18 @@ struct ReaderStats {
 	bytes_duration: u64,
 }
 
+struct ReaderValues {
+	documents: u64,
+	deleted: u64,
+	segments: u64,
+	generation: u64,
+	signature: BTreeMap<SegmentId, Option<Opstamp>>,
+}
+pub(crate) struct ReaderObservation {
+	values: Option<ReaderValues>,
+	duration: u64,
+}
+
 #[cfg(feature = "test-panic")]
 static LIVE_METRICS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "test-panic")]
@@ -209,6 +221,7 @@ impl Metrics {
 			settled: false,
 			enqueued: None,
 			started: None,
+			execution: None,
 		}
 	}
 
@@ -248,21 +261,36 @@ impl Metrics {
 		self.phases[phase].record(duration, self.histograms.load(Relaxed));
 	}
 	pub(crate) fn observe_reader(&self, searcher: &Searcher) {
+		self.install_reader(Self::prepare_reader(searcher));
+	}
+	pub(crate) fn prepare_reader(searcher: &Searcher) -> ReaderObservation {
 		let started = Instant::now();
-		let observation = catch_unwind(AssertUnwindSafe(|| {
-			let mut deleted = 0;
-			for segment in searcher.segment_readers() {
-				deleted += u64::from(segment.num_deleted_docs());
-			}
-			(
-				searcher.num_docs(),
-				deleted,
-				searcher.segment_readers().len() as u64,
-				searcher.generation().generation_id(),
-				searcher.generation().segments().clone(),
-			)
-		}));
-		if let Ok((documents, deleted, segments, generation, signature)) = observation {
+		let values = catch_unwind(AssertUnwindSafe(|| ReaderValues {
+			documents: searcher.num_docs(),
+			deleted: searcher
+				.segment_readers()
+				.iter()
+				.map(|segment| u64::from(segment.num_deleted_docs()))
+				.sum(),
+			segments: searcher.segment_readers().len() as u64,
+			generation: searcher.generation().generation_id(),
+			signature: searcher.generation().segments().clone(),
+		}))
+		.ok();
+		ReaderObservation {
+			values,
+			duration: nanos(started.elapsed()),
+		}
+	}
+	pub(crate) fn install_reader(&self, observation: ReaderObservation) {
+		if let Some(ReaderValues {
+			documents,
+			deleted,
+			segments,
+			generation,
+			signature,
+		}) = observation.values
+		{
 			let mut reader = self.reader.lock().unwrap_or_else(|e| e.into_inner());
 			reader.available = true;
 			reader.error = None;
@@ -270,9 +298,8 @@ impl Metrics {
 			reader.deleted = deleted;
 			reader.segments = segments;
 			reader.generation = generation;
-			reader.signature = signature.clone();
 			reader.observed = Some(Instant::now());
-			reader.duration = nanos(started.elapsed());
+			reader.duration = observation.duration;
 			if reader.bytes_signature.as_ref() != Some(&signature) {
 				reader.bytes = None;
 				reader.bytes_observed = None;
@@ -281,10 +308,16 @@ impl Metrics {
 			}
 			reader.bytes_pending =
 				self.snapshot_bytes.load(Relaxed) && reader.bytes_signature.as_ref() != Some(&signature);
+			reader.signature = signature;
 		} else {
 			self.reader.lock().unwrap_or_else(|e| e.into_inner()).error = Some("E_NATIVE_PANIC");
 		}
 	}
+	#[cfg(test)]
+	pub(crate) fn test_reader_documents(&self) -> u64 {
+		self.reader.lock().unwrap_or_else(|e| e.into_inner()).documents
+	}
+
 	#[cfg(feature = "test-panic")]
 	pub(crate) fn fail_next_observation(&self) {
 		self.fail_observation.store(true, Relaxed);
@@ -432,6 +465,7 @@ pub(crate) struct Ticket {
 	settled: bool,
 	enqueued: Option<Instant>,
 	started: Option<Instant>,
+	execution: Option<Duration>,
 }
 impl Ticket {
 	pub(crate) fn accepted(&self) -> bool {
@@ -458,17 +492,25 @@ impl Ticket {
 		}
 	}
 	pub(crate) fn start(&mut self) {
+		self.start_at(Instant::now());
+	}
+	pub(crate) fn start_at(&mut self, started: Instant) {
 		if !self.accepted || self.started.is_some() || self.settled {
 			return;
 		}
 		self.dispatch();
 		if let Some(enqueued) = self.enqueued {
-			self.metrics.operations[self.operation]
-				.actor
-				.queue
-				.record(enqueued.elapsed(), self.metrics.histograms.load(Relaxed));
+			self.metrics.operations[self.operation].actor.queue.record(
+				started.saturating_duration_since(enqueued),
+				self.metrics.histograms.load(Relaxed),
+			);
 		}
-		self.started = Some(Instant::now());
+		self.started = Some(started);
+	}
+	pub(crate) fn finish_at(&mut self, finished: Instant) {
+		if !self.settled && self.execution.is_none() {
+			self.execution = self.started.map(|started| finished.saturating_duration_since(started));
+		}
 	}
 
 	pub(crate) fn mutations(&self, count: u64) {
@@ -486,10 +528,10 @@ impl Ticket {
 			if self.dispatched {
 				op.actor.dispatched.fetch_sub(1, Relaxed);
 			}
-			if let Some(started) = self.started {
+			if let Some(execution) = self.execution.or_else(|| self.started.map(|started| started.elapsed())) {
 				op.actor
 					.execution
-					.record(started.elapsed(), self.metrics.histograms.load(Relaxed));
+					.record(execution, self.metrics.histograms.load(Relaxed));
 			} else if let Some(enqueued) = self.enqueued {
 				op.actor
 					.queue
@@ -522,6 +564,21 @@ impl Drop for Ticket {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn ticket_reuses_actor_clocks_for_exact_queue_and_execution_spans() {
+		let metrics = Metrics::new();
+		metrics.attempt(5);
+		let origin = Instant::now();
+		let mut ticket = metrics.ticket(5, 0);
+		ticket.arm_at(origin);
+		ticket.start_at(origin + Duration::from_millis(2));
+		ticket.finish_at(origin + Duration::from_millis(5));
+		ticket.settle(None);
+		assert_eq!(load(&metrics.operations[5].actor.queue.sum), 2_000_000);
+		assert_eq!(load(&metrics.operations[5].actor.execution.sum), 3_000_000);
+		assert_eq!(metrics.test_counts(5), [1, 1, 0, 0, 1, 1, 0]);
+	}
+
 	#[test]
 	fn ticket_uses_admission_timestamp_without_constructor_clock() {
 		let metrics = Metrics::new();

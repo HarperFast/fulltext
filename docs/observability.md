@@ -35,7 +35,7 @@ than calculate a negative rate.
 
 `native.queues` reports writer, ordinary-search and expensive-search occupancy, admitted bytes,
 oldest age, capacity and whether capacity is shared. Queue `bytes` is current occupancy; operation `requestBytes` is cumulative admitted payload. A process-wide permit pool is not a separate
-handle-owned capacity. Legacy `status().metrics.searchQueueNanoseconds` keeps its existing dequeue-only span; telemetry queue timing also includes subsequent permit wait. Do not add the two observations together. An empty/unavailable queue has no oldest age. There is no active native
+handle-owned capacity. Legacy `status().metrics.searchQueueNanoseconds` already includes post-dequeue permit wait, as does telemetry queue timing. The observations overlap; do not add them together. An empty/unavailable queue has no oldest age. There is no active native
 cancellation API: deadline timeouts are errors, not cancellation counts.
 
 `native.phases` reports commit, reader-reload and teardown success/failure counts and timing

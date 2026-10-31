@@ -210,7 +210,7 @@ if (options.child) {
 				stderr += data;
 			});
 			child.on('error', reject);
-			child.on('exit', (code, signal) => {
+			child.on('close', (code, signal) => {
 				if (code !== 0) reject(new Error(`Qualification child failed (${code ?? signal}): ${stderr}`));
 				else {
 					try {
