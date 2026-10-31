@@ -396,7 +396,7 @@ test('optional scoring snapshots Proxy array length before charging and reading 
 	}
 });
 
-test('single-field All and AND preserve small-window search and paging scores without boundary ties', async (context) => {
+test('compiled term sums preserve small-window search and paging scores without boundary ties', async (context) => {
 	const terms = ['amber', 'stone', 'quartz', 'ruby'];
 	const documents = Array.from({ length: 300 }, (_, id) => ({
 		id: `all-${id}`,
@@ -410,6 +410,17 @@ test('single-field All and AND preserve small-window search and paging scores wi
 	const all = { text: terms.join(' '), mode: 'all', fields: ['title'] };
 	for (const [name, weight, query] of [
 		['boosted All', 0.7, boost(all, 0.3)],
+		[
+			'prefix completed terms',
+			Math.fround(Math.fround(0.7) * Math.fround(0.3)),
+			{ ...all, mode: 'prefix', text: all.text + ' ' },
+		],
+		[
+			'fuzzy-prefix completed terms',
+			Math.fround(Math.fround(0.7) * Math.fround(0.3)),
+			{ ...all, mode: 'fuzzy-prefix', text: all.text + ' ' },
+		],
+		['prefix singleton expansion', Math.fround(Math.fround(0.7) * Math.fround(0.3)), { ...all, mode: 'prefix' }],
 		['bare All with folded weight', Math.fround(Math.fround(0.7) * Math.fround(0.3)), all],
 		[
 			'three-term All across segments',

@@ -111,22 +111,22 @@ The current driver adds a single-term baseline and root-lowered/native-wrapped c
 
 In the varied corpus, ranks 20 and 21 must differ for every non-optional row. The three/four-term All baseline and lowered rows now use stable collection; the native-wrapped controls use generic native TopDocs iteration. Two-term All starts with native pruning, while tied cutoffs can trigger the existing stable rerun. The tied mode deliberately retains that confound.
 
-An optimized 2026-10-31 run on macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 measured these p50 milliseconds (20 warm sequential samples, limit 20):
+An optimized 2026-10-31 run after moving the stable-score fact into query construction, on macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 measured these p50 milliseconds (20 warm sequential samples, limit 20). Native artifact SHA256: `ce875b5a1ee0bea5486c5f3195c29925e62301dded248023113e7b6f2e219bd8`. Both modes passed all 40 correctness rows and observed four committed segments.
 
 | Query                         | Tied, exact off | Tied, exact on | Varied, exact off | Varied, exact on |
 | ----------------------------- | --------------: | -------------: | ----------------: | ---------------: |
-| Single term baseline          |           0.109 |          0.109 |             0.102 |            0.094 |
-| Single term root lowered      |           0.106 |          0.101 |             0.092 |            0.093 |
-| Single term native wrapped    |           0.114 |          0.106 |             0.093 |            0.099 |
-| Two-term All baseline         |           0.133 |          0.128 |             0.079 |            0.101 |
-| Two-term All root lowered     |           0.133 |          0.126 |             0.080 |            0.099 |
-| Two-term All native wrapped   |           0.138 |          0.132 |             0.101 |            0.122 |
-| Three-term All baseline       |           0.111 |          0.105 |             0.155 |            0.149 |
-| Three-term All root lowered   |           0.111 |          0.102 |             0.155 |            0.151 |
-| Three-term All native wrapped |           0.166 |          0.155 |             0.130 |            0.169 |
-| Four-term All baseline        |           0.132 |          0.128 |             0.172 |            0.158 |
-| Four-term All root lowered    |           0.130 |          0.125 |             0.172 |            0.167 |
-| Four-term All native wrapped  |           0.202 |          0.201 |             0.149 |            0.197 |
+| Single term baseline          |           0.101 |          0.110 |             0.094 |            0.099 |
+| Single term root lowered      |           0.110 |          0.108 |             0.091 |            0.100 |
+| Single term native wrapped    |           0.111 |          0.111 |             0.091 |            0.101 |
+| Two-term All baseline         |           0.133 |          0.123 |             0.080 |            0.106 |
+| Two-term All root lowered     |           0.131 |          0.129 |             0.081 |            0.107 |
+| Two-term All native wrapped   |           0.139 |          0.134 |             0.100 |            0.131 |
+| Three-term All baseline       |           0.108 |          0.112 |             0.157 |            0.144 |
+| Three-term All root lowered   |           0.111 |          0.103 |             0.158 |            0.147 |
+| Three-term All native wrapped |           0.166 |          0.159 |             0.128 |            0.168 |
+| Four-term All baseline        |           0.131 |          0.130 |             0.168 |            0.171 |
+| Four-term All root lowered    |           0.129 |          0.131 |             0.173 |            0.171 |
+| Four-term All native wrapped  |           0.203 |          0.204 |             0.151 |            0.195 |
 
 These are total-request comparisons. The wrapper control adds an AST node, stable collection resolves ID ordinals, exact totals can add a separate native count, and tied TopDocs can rerun collection. Those differences prevent attributing the timing delta solely to pruning or ordinal lookup. The small single-term differences do not establish an optimization benefit; the two-term and wider-All rows expose costs on this corpus only. Historical tables above describe earlier fixtures/builds and are not a matched before/after speedup comparison.
 

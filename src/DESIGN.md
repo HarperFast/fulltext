@@ -13,8 +13,9 @@ unions; `into_box_scorer` performs that construction for the latter. Preserve th
 upgrading Tantivy: a different floating-point summation order can change score ties and continuation
 boundaries. Pinned `block_wand_intersection` also groups four-term sums differently from
 `Intersection::score`. Ordinary unfiltered search therefore uses the existing stable collector for
-All leaves with three or more analyzed terms, root AND groups with three or more children, and
-root OR groups with two or more children. The three-term cutoff is conservative; the canary proves
+compiler-identified term unions and intersections, including exact prefix fallbacks, All leaves
+with three or more analyzed terms, root AND groups with three or more children, and root OR groups
+with two or more children. The three-term cutoff is conservative; the canary proves
 the four-term divergence, not a universal failure at three terms or universal safety at two.
 
 The test `traversal_retains_a_merged_snapshot_and_stops_collection_on_deadline` enforces
@@ -284,14 +285,9 @@ an ambiguous optional value.
 
 Boost preserves its child's membership; Optional requires its required branch and adds scores from matching optional branches through native Must/Should composition. Every walker charges one structural clause per boost and one per required or optional child before descending. Optional-only anchors cannot make a complement-driven required branch cheap. Admission inherits expensive work from all children.
 
-Only a root boost directly over an Any/All leaf multiplies the selected field weights before constructing term queries. This keeps bare term scorers visible to Tantivy's native pruning paths. The reference-score tests check exact float32 bits against BoostQuery: BoostWeight's scorer multiplies the outer boost into the leaf's existing boost, matching this lowering. Multi-clause Any retains its existing stable collection policy. All routing derives the analyzed
-term count from `term_query`'s exact invariant: compiled clauses equal distinct analyzed terms times
-selected fields. Fields are validated before collection; an omitted list uses every configured field.
-One/two-term All starts with TopDocs even with multiple fields; boundary ties can still trigger the existing stable rerun. All with three or more terms must be considered across
-all fields because empty per-segment field scorers can collapse unions into bare TermScorers.
-AND/OR use immediate child counts, since each child can collapse to one bare term scorer per segment.
-Candidate/filter wrappers add ConstScorers and already force generic native scoring. Native non-unit
-boost wrappers also force generic scoring; identity wrappers can disappear and inherit child routing.
+Only a root boost directly over an Any/All leaf multiplies the selected field weights before constructing term queries. This keeps bare term scorers visible to Tantivy's native pruning paths. The reference-score tests check exact float32 bits against BoostQuery: BoostWeight's scorer multiplies the outer boost into the leaf's existing boost, matching this lowering. Query builders record the required collection path in `BuiltQuery::stable_scores`; collection does not reconstruct topology from the input AST. Term unions retain the existing multi-clause Any policy. Term intersections with three or more analyzed terms use stable collection across all selected fields, because empty per-segment fields can collapse unions into bare TermScorers. One/two-term All starts with TopDocs; boundary ties can still trigger a stable rerun.
+
+Completed prefix input delegates to the term builder and inherits this fact. Nontrailing exact prefix queries with three or more conjuncts can also collapse singleton dictionary expansions into term intersections. Eligible fuzzy-prefix bonus branches retain generic scoring. A one-position phrase is a field term union; multi-position phrases retain native phrase scoring. Fuzzy queries conservatively use stable collection when two or more ineligible surface terms could survive as a term union after other branches disappear. AND/OR use immediate child counts, since each child can collapse to one bare term scorer per segment. Candidate/filter wrappers add ConstScorers and already force generic native scoring. Native non-unit boost wrappers clear the fact; identity wrappers inherit it. Root Any/All weight lowering carries the term builder's fact directly.
 
 The stable path scans matches and resolves ID ordinals even for low limits. Like the existing Any path, affected queries fail closed if any matching document lacks an ID ordinal, including matches outside the returned page. Admission policy remains
 unchanged, so broad three-term conjunctions can do this work in the ordinary lane, subject to existing

@@ -105,6 +105,7 @@ struct EngineFilterField {
 struct BuiltQuery {
 	query: Box<dyn Query>,
 	clauses: usize,
+	stable_scores: bool,
 }
 
 const MAX_PHRASE_CONSTRUCTION_TERMS: usize = 64 * 256;
@@ -922,9 +923,7 @@ impl Engine {
 			});
 		}
 		let window_end = request.offset + request.limit;
-		let stable_scores = request.candidate_ids.is_none()
-			&& request.filter.is_none()
-			&& needs_stable_scores(&request.expression, query.clauses, self.fields.len());
+		let stable_scores = request.candidate_ids.is_none() && request.filter.is_none() && query.stable_scores;
 		let (hits, bounded_total, bounded_total_relation, collected_total) = if stable_scores {
 			let (retained, match_count, mut scored_docs) = searcher
 				.search(
@@ -1464,11 +1463,16 @@ impl Engine {
 	}
 
 	fn query(&self, searcher: &Searcher, request: &SearchRequest) -> Result<BuiltQuery> {
-		let BuiltQuery { query, clauses } = self.expression_query(searcher, &request.expression)?;
+		let BuiltQuery {
+			query,
+			clauses,
+			stable_scores,
+		} = self.expression_query(searcher, &request.expression)?;
 		let query = self.with_candidates(query, request.candidate_ids.as_deref())?;
 		Ok(BuiltQuery {
 			query: self.with_filter(query, request.filter.as_ref())?,
 			clauses,
+			stable_scores,
 		})
 	}
 
@@ -1493,11 +1497,12 @@ impl Engine {
 					} else {
 						Occur::Must
 					};
-					let (query, clauses) = self.term_query(&leaf.text, &fields, occur)?;
+					let (query, clauses, stable_scores) = self.term_query(&leaf.text, &fields, occur)?;
 					self.check_total_clause_count(clauses, 1)?;
 					return Ok(BuiltQuery {
 						query,
 						clauses: clauses + 1,
+						stable_scores,
 					});
 				}
 			}
@@ -1519,6 +1524,7 @@ impl Engine {
 				let mut child = self.expression_query_inner(searcher, clause, budget)?;
 				self.check_total_clause_count(child.clauses, 1)?;
 				child.query = boosted(child.query, *boost);
+				child.stable_scores &= *boost == 1.0;
 				child.clauses += 1;
 				Ok(child)
 			}
@@ -1538,6 +1544,7 @@ impl Engine {
 				Ok(BuiltQuery {
 					query: Box::new(BooleanQuery::new(queries)),
 					clauses,
+					stable_scores: false,
 				})
 			}
 			SearchExpression::Not(child) => {
@@ -1552,6 +1559,7 @@ impl Engine {
 						0.0,
 					)),
 					clauses: child.clauses + 2,
+					stable_scores: false,
 				})
 			}
 		}
@@ -1575,6 +1583,7 @@ impl Engine {
 		Ok(BuiltQuery {
 			query: Box::new(BooleanQuery::new(queries)),
 			clauses,
+			stable_scores: children.len() > if occur == Occur::Must { 2 } else { 1 },
 		})
 	}
 
@@ -1585,7 +1594,7 @@ impl Engine {
 		budget: &mut QueryConstructionBudget,
 	) -> Result<BuiltQuery> {
 		let fields = self.selected_fields(&clause.fields)?;
-		let (query, clauses) = match clause.mode {
+		let (query, clauses, stable_scores) = match clause.mode {
 			SearchMode::Any => self.term_query(&clause.text, &fields, Occur::Should)?,
 			SearchMode::All => self.term_query(&clause.text, &fields, Occur::Must)?,
 			SearchMode::Phrase => self.phrase_query(&clause.text, &fields, budget)?,
@@ -1595,7 +1604,11 @@ impl Engine {
 				self.prefix_query(searcher, &clause.text, &fields, true, clause.options, budget)?
 			}
 		};
-		Ok(BuiltQuery { query, clauses })
+		Ok(BuiltQuery {
+			query,
+			clauses,
+			stable_scores,
+		})
 	}
 
 	fn analyze(&self, text: &str, surface: bool, deduplicate: bool) -> Result<Vec<String>> {
@@ -1639,10 +1652,10 @@ impl Engine {
 		Ok(terms)
 	}
 
-	fn term_query(&self, text: &str, fields: &[&EngineField], occur: Occur) -> Result<(Box<dyn Query>, usize)> {
+	fn term_query(&self, text: &str, fields: &[&EngineField], occur: Occur) -> Result<(Box<dyn Query>, usize, bool)> {
 		let terms = self.analyze(text, false, true)?;
 		if terms.is_empty() {
-			return Ok((Box::new(EmptyQuery), 0));
+			return Ok((Box::new(EmptyQuery), 0, false));
 		}
 		self.check_clause_count(terms.len(), fields.len())?;
 		let clauses = terms.len().saturating_mul(fields.len());
@@ -1657,8 +1670,9 @@ impl Engine {
 					alternatives.push((Occur::Should, boosted(query, field.weight)));
 				}
 			}
-			return Ok((Box::new(BooleanQuery::new(alternatives)), clauses));
+			return Ok((Box::new(BooleanQuery::new(alternatives)), clauses, clauses > 1));
 		}
+		let stable_scores = terms.len() > 2 && clauses > 0;
 		Ok((
 			Box::new(BooleanQuery::new(
 				terms
@@ -1667,6 +1681,7 @@ impl Engine {
 					.collect(),
 			)),
 			clauses,
+			stable_scores,
 		))
 	}
 
@@ -1675,18 +1690,18 @@ impl Engine {
 		text: &str,
 		fields: &[&EngineField],
 		budget: &mut QueryConstructionBudget,
-	) -> Result<(Box<dyn Query>, usize)> {
+	) -> Result<(Box<dyn Query>, usize, bool)> {
 		if !self.positions {
 			return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
 		}
 		let terms = self.analyze_positioned(text)?;
 		if terms.is_empty() {
-			return Ok((Box::new(EmptyQuery), 0));
+			return Ok((Box::new(EmptyQuery), 0, false));
 		}
 		self.check_clause_count(1, fields.len())?;
 		budget.phrase(terms.len(), fields.len())?;
 		if terms.len() == 1 {
-			return Ok((self.term_group(&terms[0].1, fields), fields.len()));
+			return Ok((self.term_group(&terms[0].1, fields), fields.len(), fields.len() > 1));
 		}
 		let alternatives = fields
 			.iter()
@@ -1701,7 +1716,7 @@ impl Engine {
 				(Occur::Should, boosted(query, field.weight))
 			})
 			.collect();
-		Ok((Box::new(BooleanQuery::new(alternatives)), fields.len()))
+		Ok((Box::new(BooleanQuery::new(alternatives)), fields.len(), false))
 	}
 
 	fn fuzzy_query(
@@ -1710,7 +1725,7 @@ impl Engine {
 		fields: &[&EngineField],
 		options: QueryOptions,
 		budget: &mut QueryConstructionBudget,
-	) -> Result<(Box<dyn Query>, usize)> {
+	) -> Result<(Box<dyn Query>, usize, bool)> {
 		let surface = self.analyze(text, true, true)?;
 		let mut pairs = Vec::new();
 		for surface_term in surface {
@@ -1720,7 +1735,7 @@ impl Engine {
 			}
 		}
 		if pairs.is_empty() {
-			return Ok((Box::new(EmptyQuery), 0));
+			return Ok((Box::new(EmptyQuery), 0, false));
 		}
 		let fuzzy_terms = pairs.iter().filter(|(_, term)| fuzzy_eligible(term)).count();
 		if fuzzy_terms > MAX_FUZZY_TERMS {
@@ -1730,6 +1745,7 @@ impl Engine {
 		}
 		self.check_clause_count(pairs.len(), fields.len().saturating_mul(3))?;
 		budget.fuzzy(fuzzy_terms, fields.len(), options.fuzzy_distance)?;
+		let stable_scores = pairs.len() - fuzzy_terms >= 2;
 		let exact_bonus = fields.iter().map(|field| field.weight).fold(0.0f32, f32::max) * 0.25 + 1.0;
 		let clause_count = pairs.len().saturating_mul(fields.len().saturating_mul(3));
 		let clauses = pairs
@@ -1753,7 +1769,7 @@ impl Engine {
 				))
 			})
 			.collect::<Result<Vec<_>>>()?;
-		Ok((Box::new(BooleanQuery::new(clauses)), clause_count))
+		Ok((Box::new(BooleanQuery::new(clauses)), clause_count, stable_scores))
 	}
 
 	fn prefix_query(
@@ -1764,14 +1780,14 @@ impl Engine {
 		fuzzy: bool,
 		options: QueryOptions,
 		budget: &mut QueryConstructionBudget,
-	) -> Result<(Box<dyn Query>, usize)> {
+	) -> Result<(Box<dyn Query>, usize, bool)> {
 		self.require_surface_fields(fields)?;
 		if text.chars().last().is_some_and(char::is_whitespace) {
 			return self.term_query(text, fields, Occur::Must);
 		}
 		let (completed, surface_prefix) = self.final_surface_term(text)?;
 		let Some(surface_prefix) = surface_prefix else {
-			return Ok((Box::new(EmptyQuery), 0));
+			return Ok((Box::new(EmptyQuery), 0, false));
 		};
 		let minimum = if fuzzy { 4 } else { 3 };
 		if surface_prefix.chars().count() < minimum {
@@ -1789,6 +1805,7 @@ impl Engine {
 				format!("prefix query exceeds {} clauses", self.max_query_clauses),
 			));
 		}
+		let stable_scores = completed.len() + 1 > 2 && !(fuzzy && fuzzy_eligible(&surface_prefix));
 		let mut clauses = Vec::with_capacity(completed.len() + 1);
 		for term in completed {
 			clauses.push((Occur::Must, self.term_group(&term, fields)));
@@ -1839,6 +1856,7 @@ impl Engine {
 		Ok((
 			Box::new(BooleanQuery::new(clauses)),
 			completed_clause_count + prefix_clause_count + fuzzy_clause_count,
+			stable_scores,
 		))
 	}
 
@@ -2362,42 +2380,6 @@ fn resolve_string_ordinals(
 		return Err(FulltextError::new("E_NATIVE_FAILURE", missing_message));
 	}
 	Ok(values)
-}
-
-fn needs_stable_scores(mut expression: &SearchExpression, mut clauses: usize, field_count: usize) -> bool {
-	if let SearchExpression::Boost { clause, .. } = expression {
-		if matches!(
-			clause.as_ref(),
-			SearchExpression::Clause(SearchClause {
-				mode: SearchMode::Any | SearchMode::All,
-				..
-			})
-		) {
-			expression = clause;
-			clauses = clauses.saturating_sub(1);
-		}
-	}
-	while let SearchExpression::Boost { boost, clause } = expression {
-		if *boost != 1.0 {
-			return false;
-		}
-		expression = clause;
-		clauses = clauses.saturating_sub(1);
-	}
-	match expression {
-		SearchExpression::Clause(clause) if clause.mode == SearchMode::Any => clauses > 1,
-		SearchExpression::Clause(clause) if clause.mode == SearchMode::All => {
-			let selected_fields = if clause.fields.is_empty() {
-				field_count
-			} else {
-				clause.fields.len()
-			};
-			clauses.checked_div(selected_fields).is_some_and(|terms| terms > 2)
-		}
-		SearchExpression::And(children) => children.len() > 2,
-		SearchExpression::Or(children) => children.len() > 1,
-		_ => false,
-	}
 }
 
 fn boosted(query: Box<dyn Query>, weight: f32) -> Box<dyn Query> {
@@ -3867,7 +3849,7 @@ mod tests {
 					} else {
 						FuzzyTermQuery::new(term, distance, transpositions)
 					};
-					let (query, _) = if prefix {
+					let (query, _, _) = if prefix {
 						engine
 							.prefix_query(
 								&searcher,
@@ -4001,7 +3983,7 @@ mod tests {
 				(true, "trail waterpro"),
 			] {
 				let mut budget = QueryConstructionBudget::default();
-				let (current, _) = if prefix {
+				let (current, _, _) = if prefix {
 					engine
 						.prefix_query(&searcher, text, &fields, true, options, &mut budget)
 						.unwrap()
@@ -4679,10 +4661,10 @@ mod tests {
 		config.identity.surface_terms = true;
 		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
 		let fields = engine.fields.iter().collect::<Vec<_>>();
-		let (flat_query, clauses) = engine.term_query("waterproof trail", &fields, Occur::Should).unwrap();
+		let (flat_query, clauses, _) = engine.term_query("waterproof trail", &fields, Occur::Should).unwrap();
 		assert_eq!(clauses, 4);
 		assert_eq!(format!("{flat_query:?}").matches("BooleanQuery").count(), 1);
-		let (grouped_query, _) = engine.term_query("waterproof trail", &fields, Occur::Must).unwrap();
+		let (grouped_query, _, _) = engine.term_query("waterproof trail", &fields, Occur::Must).unwrap();
 		assert_eq!(format!("{grouped_query:?}").matches("BooleanQuery").count(), 3);
 
 		let mut writer = engine.writer(&config).unwrap();
@@ -5788,7 +5770,7 @@ mod tests {
 				};
 				let built = engine.expression_query(&searcher, &expression).unwrap();
 				assert_eq!(built.clauses, 2);
-				assert!(!needs_stable_scores(&expression, built.clauses, engine.fields.len()));
+				assert!(!built.stable_scores);
 				let topology = format!("{:?}", built.query);
 				assert!(topology.starts_with("BooleanQuery"), "{topology}");
 				if mode == SearchMode::Any {
@@ -5803,7 +5785,7 @@ mod tests {
 					};
 					let built = engine.expression_query(&searcher, &wide).unwrap();
 					assert_eq!(built.clauses, 4);
-					assert!(needs_stable_scores(&wide, built.clauses, config.identity.fields.len()));
+					assert!(built.stable_scores);
 				}
 			}
 		}
@@ -6025,11 +6007,44 @@ mod tests {
 		] {
 			let built = engine.expression_query(&searcher, &expression).unwrap();
 			assert_eq!(built.clauses, expected_clauses, "{name}");
-			assert_eq!(
-				needs_stable_scores(&expression, built.clauses, engine.fields.len()),
-				expected_stable,
-				"{name}"
-			);
+			assert_eq!(built.stable_scores, expected_stable, "{name}");
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn query_builders_report_stable_collection_for_collapsible_term_scores() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "terms".to_owned(),
+					version: None,
+					fields: vec![("title".to_owned(), vec!["amber stone quartz ruby".to_owned()])],
+					filters: Vec::new(),
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		for (text, mode, fields, expected) in [
+			("amber", SearchMode::Phrase, vec![], true),
+			("amber", SearchMode::Phrase, vec!["title".to_owned()], false),
+			("amber stone", SearchMode::Phrase, vec![], false),
+			("xy zz", SearchMode::Fuzzy, vec![], true),
+			("amber stone", SearchMode::Fuzzy, vec![], false),
+			("amber stone quartz ruby ", SearchMode::Prefix, vec![], true),
+			("amber stone quartz ruby ", SearchMode::FuzzyPrefix, vec![], true),
+			("amber stone quartz ruby", SearchMode::Prefix, vec![], true),
+			("amber stone quartz ruby", SearchMode::FuzzyPrefix, vec![], false),
+		] {
+			let expression = expression(text, mode, fields);
+			let built = engine.expression_query(&searcher, &expression).unwrap();
+			assert_eq!(built.stable_scores, expected, "{text:?} {mode:?}");
 		}
 		writer.close().unwrap();
 	}
@@ -6924,6 +6939,7 @@ mod tests {
 						kind,
 					}),
 					clauses: real.clauses,
+					stable_scores: real.stable_scores,
 				},
 			);
 			assert_eq!(result.unwrap_err().code, expected);
@@ -7019,6 +7035,7 @@ mod tests {
 				weights: weights.clone(),
 			}),
 			clauses: query.clauses,
+			stable_scores: query.stable_scores,
 		};
 		let result = engine
 			.collect_search(
