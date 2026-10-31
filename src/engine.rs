@@ -5768,6 +5768,12 @@ mod tests {
 				},
 			] {
 				let built = engine.expression_query(&searcher, &clause).unwrap();
+				let reference = if let SearchExpression::Boost { boost, clause } = &clause {
+					let child = engine.expression_query(&searcher, clause).unwrap();
+					Some(boosted(child.query, *boost))
+				} else {
+					None
+				};
 				let weight = built
 					.query
 					.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
@@ -5784,6 +5790,18 @@ mod tests {
 						.for_each(reader, &mut |doc, score| enumerated.push((doc, score.to_bits())))
 						.unwrap();
 					assert!(!scored.is_empty(), "fixture must match {text}");
+					if let Some(reference) = &reference {
+						let reference_weight = reference
+							.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
+							.unwrap();
+						let mut reference_scorer = reference_weight.scorer(reader, 1.0).unwrap();
+						let mut expected = Vec::new();
+						while reference_scorer.doc() != tantivy::TERMINATED {
+							expected.push((reference_scorer.doc(), reference_scorer.score().to_bits()));
+							reference_scorer.advance();
+						}
+						assert_eq!(scored, expected, "lowered boost changed score bits for {text}");
+					}
 					scored.sort_unstable();
 					enumerated.sort_unstable();
 					assert_eq!(scored, enumerated, "scoring topology changed for {text}");
