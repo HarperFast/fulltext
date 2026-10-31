@@ -406,6 +406,56 @@ test('snapshot-byte freshness survives unchanged reloads and resets on a changed
 	assert.strictEqual(typeof recovered.snapshotBytesAgeNanoseconds, 'bigint');
 });
 
+test('delete-only publication invalidates snapshot bytes without changing the segment count', async (context) => {
+	const { index, addon, handle } = await rawFixture(context);
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'a', fields: { text: 'hello' } },
+			{ id: 'b', fields: { text: 'hello again' } },
+		],
+	});
+	await index.publish('before-delete');
+	index.configureTelemetry({ snapshotBytes: true });
+	await index.reload();
+	await waitFor(() => {
+		const reader = snapshot(index).native.reader;
+		return !reader.snapshotBytesPending && reader.snapshotBytes !== null;
+	});
+	const before = snapshot(index).native.reader;
+	assert.strictEqual(before.documents, 2n);
+	assert.strictEqual(before.deletedDocuments, 0n);
+	assert.strictEqual(before.segments, 1n);
+	assert(before.snapshotBytes > 0n);
+	assert.strictEqual(before.snapshotBytesError, null);
+
+	addon.__testFailNextTelemetryObservation(handle);
+	await index.applyMutationBatch({ deletes: ['a'] });
+	await index.publish('after-delete');
+	await waitFor(() => {
+		const reader = snapshot(index).native.reader;
+		return !reader.snapshotBytesPending && reader.snapshotBytesError === 'E_STORAGE';
+	});
+	const deleted = snapshot(index).native.reader;
+	assert.strictEqual(deleted.documents, 1n);
+	assert.strictEqual(deleted.deletedDocuments, 1n);
+	assert.strictEqual(deleted.segments, before.segments);
+	assert.strictEqual(deleted.snapshotBytes, null);
+	assert.strictEqual(deleted.snapshotBytesAgeNanoseconds, null);
+
+	await index.reload();
+	await waitFor(() => {
+		const reader = snapshot(index).native.reader;
+		return !reader.snapshotBytesPending && reader.snapshotBytes !== null;
+	});
+	const recovered = snapshot(index).native.reader;
+	assert.strictEqual(recovered.documents, 1n);
+	assert.strictEqual(recovered.deletedDocuments, 1n);
+	assert.strictEqual(recovered.segments, before.segments);
+	assert(recovered.snapshotBytes > 0n);
+	assert.strictEqual(recovered.snapshotBytesError, null);
+	assert.strictEqual(typeof recovered.snapshotBytesAgeNanoseconds, 'bigint');
+});
+
 test('snapshot-byte observer failure cannot change publication or search results', async (context) => {
 	const { index, addon, handle } = await rawFixture(context);
 	index.configureTelemetry({ snapshotBytes: true });
@@ -534,7 +584,7 @@ test('poison before native admission rejects one attempt without inventing a com
 });
 
 test('concurrent search callers remain correct while telemetry is repeatedly scraped', async (context) => {
-	const { index } = await rawFixture(context, { searchThreads: 4 });
+	const { index, addon, handle } = await rawFixture(context, { searchThreads: 4 });
 	const records = Array.from({ length: 64 }, (_, number) => ({
 		id: `item-${number}`,
 		fields: { text: 'shared catalog product' },
@@ -546,28 +596,35 @@ test('concurrent search callers remain correct while telemetry is repeatedly scr
 
 	const callerCount = 4;
 	const queriesPerCaller = 12;
-	let finishedCallers = 0;
-	let scrapesWhilePending = 0;
+	let scrapesWhileNativePending = 0;
+	addon.__testDelayNextOrdinarySearch(handle, 200);
 	const callers = Array.from({ length: callerCount }, async () => {
-		try {
-			for (let query = 0; query < queriesPerCaller; query++) {
-				const result = await index.search({ text: 'shared', mode: 'any', limit: records.length });
-				assert.strictEqual(result.total, records.length);
-				assert.strictEqual(result.totalRelation, 'exact');
-				assert.strictEqual(result.hits.length, records.length);
-				assert.strictEqual(new Set(result.hits.map((hit) => hit.id)).size, records.length);
-				assert(result.hits.every((hit) => ids.has(hit.id)));
-				await setImmediate();
-			}
-		} finally {
-			finishedCallers++;
+		for (let query = 0; query < queriesPerCaller; query++) {
+			const result = await index.search(
+				{ text: 'shared', mode: 'any', limit: records.length },
+				{ remainingBudgetMilliseconds: 1_000 },
+			);
+			assert.strictEqual(result.total, records.length);
+			assert.strictEqual(result.totalRelation, 'exact');
+			assert.strictEqual(result.hits.length, records.length);
+			assert.strictEqual(new Set(result.hits.map((hit) => hit.id)).size, records.length);
+			assert(result.hits.every((hit) => ids.has(hit.id)));
+			await setImmediate();
 		}
 	});
+	const nativePending = (telemetry) =>
+		telemetry.operations.search.dispatched > 0n || telemetry.queues.ordinarySearch.commands > 0n;
 	const scraper = (async () => {
+		await waitFor(() => {
+			const telemetry = snapshot(index).native;
+			if (!nativePending(telemetry)) return false;
+			scrapesWhileNativePending++;
+			return true;
+		});
 		for (let round = 0; round < callerCount * queriesPerCaller; round++) {
 			for (let sample = 0; sample < 3; sample++) {
 				const telemetry = snapshot(index).native;
-				if (finishedCallers < callerCount) scrapesWhilePending++;
+				if (nativePending(telemetry)) scrapesWhileNativePending++;
 				assert(telemetry.operations.search.dispatched >= 0n);
 				assert(telemetry.operations.search.dispatched <= BigInt(callerCount));
 				for (const queue of Object.values(telemetry.queues)) {
@@ -584,7 +641,7 @@ test('concurrent search callers remain correct while telemetry is repeatedly scr
 	for (const result of results) {
 		if (result.status === 'rejected') throw result.reason;
 	}
-	assert(scrapesWhilePending >= 3);
+	assert(scrapesWhileNativePending > 0);
 	const final = snapshot(index).native;
 	const searches = final.operations.search;
 	assert.strictEqual(final.operations.expensiveSearch.attempted, 0n);

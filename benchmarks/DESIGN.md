@@ -16,6 +16,12 @@ to the expensive queue. Candidate warmup asserts actual native class counters. T
 case invokes the stable fallback after TopDocs, so it cannot bound the cheapest ordinary path.
 The unique product7 case requires ID7/total1/exact, and ID0-only publications cannot change it.
 
+Per-query timers stop when the search API resolves, before correctness validation. The report
+labels API latency separately from validation-inclusive query-phase throughput/time. Mixed CPU
+and elapsed time also include 20 mutation/publication cycles.
+Historical reports used validation-inclusive percentiles; preserve and label them rather than
+reinterpreting their p99 values as API completion latency.
+
 ## Mixed metadata soak
 
 `metadata-soak.mjs` gives each in-flight query a lease on a reader that is never reloaded. Its

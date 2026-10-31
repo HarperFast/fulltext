@@ -99,7 +99,9 @@ if (options.child) {
 			});
 		const beforeWarmup = profile === 'baseline' ? undefined : operationCounts();
 		const check = async (index) => {
+			const before = performance.now();
 			const result = await index.search(request);
+			const elapsed = performance.now() - before;
 			assert.strictEqual(
 				result.total,
 				cheapOrdinary ? 1 : request.exactTotal ? documentCount : Math.min(documentCount, 10),
@@ -118,6 +120,7 @@ if (options.child) {
 				assert(Number.isSafeInteger(Number(hit.id)) && Number(hit.id) >= 0 && Number(hit.id) < documentCount);
 				assert(Number.isFinite(hit.score));
 			}
+			return elapsed;
 		};
 		for (let i = 0; i < 100; i++) await check(indexes[i % indexes.length]);
 		if (beforeWarmup) {
@@ -156,9 +159,7 @@ if (options.child) {
 				Array.from({ length: callers }, async () => {
 					while (next < queryCount) {
 						const id = next++;
-						const before = performance.now();
-						await check(indexes[id % indexes.length]);
-						latencies.push(performance.now() - before);
+						latencies.push(await check(indexes[id % indexes.length]));
 					}
 				}),
 			);
@@ -191,6 +192,8 @@ if (options.child) {
 				indexCount,
 				documentCount,
 				queryCount,
+				latencyScope: 'search-api-completion-before-validation',
+				queryPhaseScope: 'search-and-validation',
 				elapsedMilliseconds,
 				queryMilliseconds,
 				throughput: (queryCount * 1_000) / queryMilliseconds,

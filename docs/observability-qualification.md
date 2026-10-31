@@ -1,5 +1,15 @@
 # Observability qualification
 
+## Historical measurement scope
+
+All recorded search p50/p99 values below include each query’s correctness validation after the API
+completed. They are query-plus-validation measurements, not isolated API completion latency. The
+raw reports and numerical results are preserved; they cannot establish a search-API p99 bound.
+The corrected driver captures API completion before validation and labels that scope explicitly.
+Its query-phase elapsed time and throughput still include validation work; mixed CPU/elapsed
+also include 20 mutation/publication cycles. New API-latency measurements must be kept separate from these historical reports; the unresolved
+overhead decision and original targets are unchanged.
+
 ## Classified catalog and prefix comparison
 
 This comparison measured runtime [`62bb041`](https://github.com/HarperFast/fulltext/commit/62bb041d65b6726344b16b810a1650dab536f8a4)

@@ -124,6 +124,14 @@ npm run benchmark:observability -- \
   --pairs=7 --output=/absolute/observability-results.json
 ```
 
+Search p50/p99 sample the elapsed time until `search()` resolves, before validating its result;
+reports label this `latencyScope: 'search-api-completion-before-validation'`. Other concurrent
+callers and export work can still affect promise completion on the shared event loop.
+`queryMilliseconds` and throughput include search and validation (`queryPhaseScope:
+'search-and-validation'`). Mixed CPU and elapsed time additionally include 20 mutation/publication
+cycles. Historical reports measured query-plus-validation percentiles and
+are labeled separately; do not compare those percentiles as if they had the new API-only scope.
+
 Predeclared targets are at most 1% median throughput loss with histograms off, and 3% throughput
 loss/5% p99 increase with histograms enabled. Raw pairs and their ranges remain in the report.
 The driver's conservative per-pair classification is not a statistical confidence interval;
