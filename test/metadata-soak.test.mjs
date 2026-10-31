@@ -305,10 +305,13 @@ for (const scenario of ['success', 'throughput-failure', 'duration-default'])
 		if (!expectedFailure) await assert.rejects(access(path.join(artifacts, 'index')), { code: 'ENOENT' });
 	});
 
-for (const value of ['0', '-1', '1.5', 'NaN', '9007199254740992'])
+for (const value of ['0', '-1', '1.5', 'NaN', '9007199254740992', undefined])
 	test(`soak rejects invalid publication minimum ${value}`, { timeout: 45_000 }, async (context) => {
 		const { artifacts, args } = await fixture(context);
-		args[args.indexOf('--min-publications') + 1] = value;
+		if (value === undefined) {
+			args.splice(args.indexOf('--min-publications'), 2);
+			args.push('--min-publications');
+		} else args[args.indexOf('--min-publications') + 1] = value;
 		await assert.rejects(execute(process.execPath, args, { timeout: 40_000 }), /--min-publications must be positive/);
 		await assert.rejects(access(path.join(artifacts, 'manifest.json')), { code: 'ENOENT' });
 	});

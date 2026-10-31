@@ -24,8 +24,9 @@ assert(artifacts && path.isAbsolute(artifacts), '--artifacts requires a new abso
 const documents = positive('--documents', 50_000, true);
 assert(documents >= 200, '--documents must be at least 200');
 const mixedMilliseconds = positive('--mixed-seconds', 1800) * 1000;
-const minimumPublications =
-	argument('--min-publications') === undefined ? 0 : positive('--min-publications', undefined, true);
+const minimumPublications = process.argv.includes('--min-publications')
+	? positive('--min-publications', undefined, true)
+	: 0;
 const drainMilliseconds = positive('--drain-seconds', 600) * 1000;
 const readers = positive('--readers', 8, true);
 const writeInterval = positive('--write-interval-ms', 2000);

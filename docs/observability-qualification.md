@@ -1,5 +1,43 @@
 # Observability qualification
 
+## Short-soak publication completion control
+
+At [`0cd0bb5`](https://github.com/HarperFast/fulltext/commit/0cd0bb5788b73d77614e6fbf30828cff07be91d7),
+eight fresh-process runs exercised 24 short-soak scenarios and **1,376,424 validated queries**.
+A fixture delegates to the real native addon and delays 1,100 ms after the first mixed-phase
+publication, crossing the requested one-second mixed duration. With `--min-publications 2`, both
+the success case and an intentional throughput-gate failure completed two publications. The
+absent-option control recorded minimum zero and completed one publication in every run. All
+scenarios exercised every query case in both mixed and drain phases and reported no close errors.
+
+| Node    | V8 coverage | Runs | Scenarios | Validated queries |
+| ------- | ----------- | ---- | --------- | ----------------- |
+| 24.16.0 | off         | 2    | 6         | 381,172           |
+| 24.16.0 | on          | 2    | 6         | 325,670           |
+| 26.10.0 | off         | 2    | 6         | 367,337           |
+| 26.10.0 | on          | 2    | 6         | 302,245           |
+
+The unchanged driver failed the delayed success regression with `1 !== 2` before the fix. The
+new option supplies the completion condition that short fixtures need; the 40-second child and
+45-second test deadlines remain unchanged. The intentional failures emitted failure evidence
+and retained their indexes; success cases removed their indexes after verified cleanup.
+
+All 24 manifests and the local summary identify driver SHA-256
+`437d5ab46602d9e37f4c613dd813c14cbdd5d2b92a5c9acb33a82438f3d41762`.
+The private raw summary, `summary.json`, has SHA-256
+`c0f6aafd2d8bf6df74ae745f521320200eacb057477d49ca425e795d805fa535`.
+These finite local runs qualify fixture completion and failure reporting only. They do not
+establish a performance bound, sustained-memory acceptance or production capacity, and they do
+not supersede historical failed RSS gates or the measurement classifications below. The default
+30-minute mixed/10-minute drain workload and its gates remain unchanged.
+
+The full project check at `0cd0bb5` also passed with Node coverage enabled: 181 Rust tests
+(eight ignored) and 527 Node/worker/package tests. A subsequent argument review found that an
+explicit `--min-publications` without a value selected the absent-option default. The final narrow
+parser correction rejects that input before creating a manifest; all nine focused publication
+minimum cases passed under coverage afterward. This changes invalid-input handling only and
+does not relabel the eight recorded runs as measurements of that later parser revision.
+
 ## Worker-bank optimization and validation-excluded windows
 
 Runtime [`077dffc`](https://github.com/HarperFast/fulltext/commit/077dffc10d82e58a4e4186e65e1d0e037490905d)
