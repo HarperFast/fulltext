@@ -8,6 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::lifecycle::{STATE_CLOSED, STATE_CLOSING, STATE_OPEN, STATE_POISONED};
 use crate::telemetry::{Metrics, Ticket};
 use napi::bindgen_prelude::{Buffer, External, Function};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -27,10 +28,6 @@ use crate::protocol::{
 	validate_trace_header, EngineConfig, RuntimeBudgetLimits, PROTOCOL_VERSION,
 };
 
-const STATE_OPEN: u8 = 0;
-const STATE_CLOSING: u8 = 1;
-const STATE_CLOSED: u8 = 2;
-const STATE_POISONED: u8 = 3;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "test-panic")]
 static WRITER_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
@@ -3763,6 +3760,22 @@ mod tests {
 			assert_eq!(metrics.test_reader_documents(), 0);
 		});
 		assert_eq!(metrics.test_reader_documents(), 1);
+	}
+
+	#[test]
+	fn telemetry_state_labels_match_native_status_codes() {
+		let runtime = telemetry_runtime_fixture();
+		assert_eq!(runtime.state.load(Ordering::Relaxed), STATE_OPEN);
+		for (state, code, label) in [
+			(STATE_OPEN, 0, "open"),
+			(STATE_CLOSING, 1, "closing"),
+			(STATE_CLOSED, 2, "closed"),
+			(STATE_POISONED, 3, "poisoned"),
+		] {
+			runtime.state.store(state, Ordering::Relaxed);
+			assert_eq!(runtime.status_bytes()[0], code);
+			assert!(runtime.metrics.json("{}").contains(&format!("\"state\":\"{label}\"")));
+		}
 	}
 
 	#[test]

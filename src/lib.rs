@@ -6,6 +6,8 @@ pub mod catalog;
 mod directory_harness;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "node-api")]
+mod lifecycle;
 pub mod protocol;
 mod request_validation;
 #[cfg(feature = "node-api")]

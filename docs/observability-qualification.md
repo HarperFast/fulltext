@@ -1,5 +1,11 @@
 # Observability qualification
 
+## Preserve qualification source history
+
+Merge this PR with a merge commit so the measured source commits below remain reachable. Do not squash, rebase or force-push the measured history without first preserving those commits under durable refs and recording the old-to-new source mapping. A later source revision does not retroactively qualify an earlier measurement, and source labels must not be retargeted to the release commit.
+
+The linked qualification commits were verified as ancestors of `df54b0b`; retaining this history preserves their source identities. This requirement does not select a release version or authorize merging.
+
 ## Caller-controlled collection: polling stopped versus enabled
 
 Observed on 2026-11-01 with Node 24.16.0, Darwin arm64, Apple M4 Pro and 14 available logical

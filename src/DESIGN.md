@@ -281,6 +281,10 @@ The open-policy extension is exactly two u32 values; absent means default policy
 additional tail rejects. A future extension needs explicit framing/versioning rather than appending
 an ambiguous optional value.
 
+## Lifecycle state identity
+
+Native status and telemetry share the `src/lifecycle.rs` constants and one atomic state. Numeric codes remain the existing wire contract (`open=0`, `closing=1`, `closed=2`, `poisoned=3`); `telemetry_state_labels_match_native_status_codes` checks initialization, native status bytes and JSON labels together.
+
 ## Telemetry worker banks
 
 Each search completion binds a valid worker bank at most once before first dispatch. The ticket

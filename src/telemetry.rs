@@ -9,6 +9,7 @@ use tantivy::index::SegmentId;
 use tantivy::{Opstamp, Searcher};
 
 use crate::error::ERROR_CODES;
+use crate::lifecycle::{STATE_CLOSED, STATE_CLOSING, STATE_OPEN};
 
 pub(crate) const OP_NAMES: [&str; 8] = [
 	"applyFrame",
@@ -258,7 +259,7 @@ impl Metrics {
 				.collect(),
 			histograms: AtomicBool::new(false),
 			snapshot_bytes: AtomicBool::new(false),
-			state: Arc::new(AtomicU8::new(0)),
+			state: Arc::new(AtomicU8::new(STATE_OPEN)),
 			teardown_started: Mutex::new(None),
 			phases: std::array::from_fn(|_| Latency::default()),
 			phase_succeeded: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -479,9 +480,9 @@ impl Metrics {
 	pub(crate) fn json(&self, queues: &str) -> String {
 		let mut output = String::from("{\"apiVersion\":1,");
 		let state = match self.state.load(Relaxed) {
-			0 => "open",
-			1 => "closing",
-			2 => "closed",
+			STATE_OPEN => "open",
+			STATE_CLOSING => "closing",
+			STATE_CLOSED => "closed",
 			_ => "poisoned",
 		};
 		let _ = write!(
