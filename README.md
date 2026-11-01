@@ -3,9 +3,10 @@
 Native Tantivy full-text indexing for Node.js.
 
 **Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.8.0.** The engine is compiled
-into the native addon; no separate Tantivy installation is required. This source tree has
-version 0.8.0 in its package manifests. The metadata sorting, aggregation, new filter and query-control
-APIs documented here remain unreleased until publication; they are absent from the published 0.7.0 artifacts. See
+into the native addon; no separate Tantivy installation is required. This source tree retains
+version 0.8.0 in its package manifests, but adds unreleased telemetry API 1 and native ABI 14.
+The published 0.8.0 artifacts use ABI 13 and do not include telemetry. Metadata sorting,
+aggregation, new filters and query controls shipped in 0.8.0; they are absent from 0.7.0. See
 [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
 before deploying a build from this tree.
 
@@ -21,6 +22,7 @@ local index files or rebuild them from that authoritative data.
 - [Configure analysis](#analyzer-and-field-configuration), [filters](#structured-filters), and [highlighting](#highlighting-and-snippets).
 - [Manage writes](#mutations-and-backpressure), [recover an index](#lifecycle-and-recovery), or [upgrade from 0.7.x](#upgrading-from-07x) / [0.6.x](#upgrading-from-06x).
 - Reference: [limits and recovery](docs/limits.md), [benchmarks](docs/benchmarks.md), and [backend internals](docs/native-backend-implementation.md).
+- Observe [native operations, queues, latency and snapshot statistics](docs/observability.md), or run the [JSON exporter example](examples/observability.mjs).
 
 ## Capabilities
 
@@ -469,7 +471,7 @@ When constructing `NativeFullTextIndex` directly around a native handle, supply 
 in `searchLimits`; the constructor validates it but cannot inspect the native handle’s policy.
 Search requests cannot raise them. Apply the same policy to every worker serving a logical index;
 changing it requires reopening handles but no index rebuild. The facade and native addon must match
-ABI 13, query API 7, and packed protocol 8. The open frame retains its optional policy extension,
+ABI 14, query API 7, and packed protocol 8. The open frame retains its optional policy extension,
 with defaults when absent.
 
 The clause setting covers compiled text queries, including field multiplication and expansion.
@@ -525,9 +527,10 @@ indexes fail closed and rebuild instead of silently changing recall.
 
 ## Upgrading from 0.7.x
 
-The unreleased metadata and query-control APIs use query API version 7 and native ABI version 13. Deploy the
-JavaScript facade and native addon built from the same revision; the published 0.7.0 addon cannot
-serve these requests. Indexes with a string `filterFields` entry need rebuilding because string
+The metadata and query-control APIs introduced in 0.8.0 use query API version 7. This source tree
+also adds unreleased telemetry, requiring native ABI 14 instead of the published 0.8.0 ABI 13.
+Deploy the JavaScript facade and native addon built from the same revision; the published 0.7.0
+addon cannot serve the metadata and query-control requests. Indexes with a string `filterFields` entry need rebuilding because string
 metadata now also uses raw fast fields. Open and inspection report `E_IDENTITY_MISMATCH` for the
 old schema. Indexes with only numeric/boolean filter fields, or no filter fields, retain their
 existing identity when the rest of the configuration is unchanged.
@@ -802,7 +805,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 13, query API 7, and packed protocol 8. The loader rejects older addon
+This API uses native ABI 14, query API 7, and packed protocol 8. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
 columns. Previously released string-metadata indexes must

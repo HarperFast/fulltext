@@ -9,6 +9,7 @@ interface NativeRuntimeInfo {
 	tantivyVersion: string;
 	nativeAbiVersion: number;
 	queryApiVersion: number;
+	telemetryApiVersion: number;
 	queryClassIsolationMinimumSearchThreads: number;
 	storageBackends: Array<string>;
 	limits: {
@@ -63,6 +64,9 @@ interface NativeAddonApi {
 	__nativeTraceMatches(handle: number, request: Buffer, callback: NativeCallback): void;
 	__nativeClose(handle: number, rollback: boolean, callback: NativeCallback): void;
 	__nativeStatus(handle: number): Buffer;
+	__nativeCreateTelemetry(handle: number): unknown;
+	__nativeTelemetry(token: unknown): string;
+	__nativeConfigureTelemetry(token: unknown, histograms: boolean, snapshotBytes: boolean): void;
 	__testCreateHandle?(): number;
 	__testPanic?(id: number): void;
 	__testCheck?(id: number): boolean;
@@ -79,7 +83,7 @@ interface NativeAddonApi {
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 13;
+const expectedNativeAbiVersion = 14;
 const packageManifest = require('../package.json') as { name: string; version: string };
 let loadedAddon: NativeAddonApi | undefined;
 let runtimeUsesGlibc: boolean | undefined;
@@ -213,6 +217,17 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',
 			`Fulltext query API ${info.queryApiVersion} from ${artifactPath} is not supported`,
+		);
+	}
+	if (
+		info.telemetryApiVersion !== 1 ||
+		typeof addon.__nativeCreateTelemetry !== 'function' ||
+		typeof addon.__nativeTelemetry !== 'function' ||
+		typeof addon.__nativeConfigureTelemetry !== 'function'
+	) {
+		throw new FulltextError(
+			'E_NATIVE_CAPABILITY_MISMATCH',
+			`Fulltext native artifact ${artifactPath} does not provide telemetry API 1`,
 		);
 	}
 	if (typeof addon.__nativeInspect !== 'function') {

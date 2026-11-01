@@ -11,3 +11,7 @@
 - [Query capacity policy](src/DESIGN.md#query-capacity-policy) — immutable operational limits, construction guards, and raised-profile admission.
 
 - [Query controls and source membership](src/DESIGN.md#query-controls-and-source-membership) — native fuzzy policy, source tracing and shared semantic admission.
+
+- [Telemetry worker banks](src/DESIGN.md#telemetry-worker-banks) — ticket ownership, shared fallbacks, and retained scalar-bank memory.
+
+- [Observability comparisons](benchmarks/DESIGN.md#observability-comparisons) — validation-excluded timing windows, staggered collection, and failure evidence.

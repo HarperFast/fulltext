@@ -33,6 +33,15 @@ The engine-facing schema, mutation, commit, search, and lifecycle contracts rema
 the consuming application. The Node package contributes canonical path handling and Tantivy
 `MmapDirectory` construction; the application owns source projection, replay, and readiness.
 
+## Observability ownership
+
+The [telemetry API](observability.md) records wrapper admission, queue, execution and logical-batch
+boundaries. Native reader counts, generation and optional snapshot-byte observations reuse Tantivy's
+public searcher/segment APIs at reader replacement. Scrapes read scalar caches; they do not scan
+files or replace Tantivy's merge scheduler. A telemetry token strongly owns only metrics, so final
+observations remain readable after close without retaining mappings or preventing reset. Histogram
+and byte observations are opt-in. Their overhead is qualification evidence, not assumed free work.
+
 ## Verified constraints
 
 - The package exports one hand-written `@harperfast/fulltext/native` facade for runtime information,
