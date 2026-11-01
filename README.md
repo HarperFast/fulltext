@@ -649,10 +649,10 @@ Search and tracing share a maximum 30-second queue-plus-execution budget. Applic
 shorter remaining request budget through the second method argument; larger values are clamped to
 30 seconds. The budget determines whether queued or completed work is accepted; it is not a
 callback timer. If every eligible worker is already executing non-interruptible work, an expired
-queued request is rejected when a worker next examines it. Ordinary ranked-hit collection and
-individual synchronous Tantivy operations are not interruptible; expired results are discarded
-after control returns. Exact-count, metadata and traversal collectors check deadlines during
-collection. Match tracing checks its deadline while tokenizing and matching. With at least two search threads, one worker is
+queued request is rejected when a worker next examines it. Ordinary stable-score collection, filtered/candidate ranked-hit collection, exact-count, metadata
+and traversal collectors check deadlines every 1,024 visited matches. Prefix expansion checks
+between segment dictionaries. Other ordinary ranked-hit passes and individual synchronous Tantivy
+operations remain non-interruptible; expired results are discarded after control returns. Match tracing checks its deadline while tokenizing and matching. With at least two search threads, one worker is
 reserved for ordinary bounded `any`/`all` BM25. The remaining workers prioritize phrase, prefix,
 fuzzy, unanchored-negation, exact-total, and trace work, then steal ordinary work when that queue is
 idle. A negation intersected with a positive ordinary clause stays in the ordinary lane. A

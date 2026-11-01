@@ -14,6 +14,43 @@ npm run benchmark:native -- --documents 100000 --concurrency 4 --commit-every 25
 npm run benchmark:inspect -- --indexes 1,10,100,1000 --commits 64 --warm-rounds 10
 ```
 
+## Query scoring and restricted collection
+
+After building optimized artifacts, run the same driver against each compared artifact:
+
+```bash
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/query-scoring.mjs --documents 10000 --segments 4 --rounds 100 --limit 20 --varied-scores --restricted
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/query-scoring.mjs --documents 10000 --density 1 --segments 4 --rounds 100 --limit 1000 --varied-scores --restricted --deadline-ms 1,2,5 --deadline-rounds 20
+```
+
+`--documents` accepts 100–100,000 (default 10,000), `--segments` accepts 1–4 (default 4),
+`--limit` accepts 20–1,000 (default 20), and `--rounds` defaults to 100. The driver verifies the
+observed segment count; automatic merging that changes it fails the workload. Without `--density`,
+the original four document families remain unchanged. An explicit density greater than zero and
+at most one controls the All/AND matching fraction through deterministic document assignment.
+`--routing-shapes` selects the existing prefix, fuzzy, phrase and Boolean routing controls.
+`--restricted` adds All4/OR metadata-filter and candidate-ID cases; the JSON records the candidate
+stride/count and the filter's 50% source density. Candidate sets stay within the 1,024-ID limit.
+
+Before timing, complete retrieval checks independently derived matching IDs and exact totals,
+paired native/root boost score equality, and optional bonuses. Every measured request checks exact
+score/ID/order parity with its complete result, plus the bounded or exact total and relation.
+The report compares the selected window boundary with the next hit and flags tied boundaries,
+including ties in the varied-score corpus. Such rows can include stable-collector fallback work;
+they do not isolate pruning or a single collection pass. The tied-score corpus remains separate. Each exact-total mode warms five rounds, then rotates query order between rounds.
+The report retains all raw samples, nearest-rank p50/p95, driver/addon hashes and observed segments.
+Use identical arguments and the same driver for comparisons; prior recorded 20-sample observations
+in the benchmark design notes retain their original methodology.
+
+The optional deadline sweep requires `--restricted`. It interleaves only the restricted baseline
+rows and requested positive integer millisecond budgets, with `exactTotal: false`; its default is
+20 attempts per row/budget. Each attempt records success or `E_TIMEOUT`, elapsed time and positive
+elapsed-minus-budget overshoot. Successful responses must retain score/ID/total parity, and an
+unbudgeted request checks recovery for each row after the sweep. These are end-to-end public-worker
+request measurements, including JavaScript queue/callback overhead. They establish neither a hard
+deadline nor a native-loop interruption bound. This driver does not count visited or scored
+documents and cannot by itself demonstrate pruning or production latency guarantees.
+
 ## Hydration and trace matching
 
 After an optimized `npm run build`, run the targeted hydration and trace benchmarks:

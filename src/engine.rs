@@ -113,6 +113,7 @@ const MAX_FUZZY_CONSTRUCTION_WORK_UNITS: usize = 256;
 
 #[derive(Default)]
 struct QueryConstructionBudget {
+	deadline: Option<Instant>,
 	phrase_terms: usize,
 	fuzzy_work_units: usize,
 }
@@ -334,7 +335,13 @@ impl Collector for TraversalScoreTieCollector {
 		reader: &SegmentReader,
 	) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
 		let mut collector = self.for_segment(segment_ord, reader)?;
+		if let Err(error) = check_deadline(self.deadline) {
+			return Ok(Err(error));
+		}
 		let mut scorer = weight.scorer(reader, 1.0)?;
+		if let Err(error) = check_deadline(self.deadline) {
+			return Ok(Err(error));
+		}
 		let alive = reader.alive_bitset();
 		let mut visited = 0_u64;
 		let mut doc = scorer.doc();
@@ -840,7 +847,7 @@ impl Engine {
 		} else {
 			None
 		};
-		let query = self.query(searcher, request)?;
+		let query = self.query(searcher, request, deadline)?;
 		check_deadline(deadline)?;
 		self.collect_search(searcher, request, deadline, catalog, snapshot, query)
 	}
@@ -944,12 +951,17 @@ impl Engine {
 			};
 			(hits, total, relation, Some(match_count))
 		} else {
-			let scored_docs = searcher
-				.search(
-					query.query.as_ref(),
-					&TopDocs::with_limit(window_end.saturating_add(1)).order_by_score(),
-				)
-				.map_err(index_error)?;
+			let top_docs = TopDocs::with_limit(window_end.saturating_add(1)).order_by_score();
+			let scored_docs = if request.filter.is_some() || request.candidate_ids.is_some() {
+				searcher
+					.search(
+						query.query.as_ref(),
+						&catalog::DeadlineCollector::new(top_docs, deadline),
+					)
+					.map_err(collection_error)?
+			} else {
+				searcher.search(query.query.as_ref(), &top_docs).map_err(index_error)?
+			};
 			check_deadline(deadline)?;
 			let boundary_tie =
 				scored_docs.len() > window_end && scored_docs[window_end - 1].0 == scored_docs[window_end].0;
@@ -1468,12 +1480,12 @@ impl Engine {
 		Ok(fields)
 	}
 
-	fn query(&self, searcher: &Searcher, request: &SearchRequest) -> Result<BuiltQuery> {
+	fn query(&self, searcher: &Searcher, request: &SearchRequest, deadline: Option<Instant>) -> Result<BuiltQuery> {
 		let BuiltQuery {
 			query,
 			clauses,
 			stable_scores,
-		} = self.expression_query(searcher, &request.expression)?;
+		} = self.expression_query(searcher, &request.expression, deadline)?;
 		let query = self.with_candidates(query, request.candidate_ids.as_deref())?;
 		Ok(BuiltQuery {
 			query: self.with_filter(query, request.filter.as_ref())?,
@@ -1482,7 +1494,12 @@ impl Engine {
 		})
 	}
 
-	fn expression_query(&self, searcher: &Searcher, expression: &SearchExpression) -> Result<BuiltQuery> {
+	fn expression_query(
+		&self,
+		searcher: &Searcher,
+		expression: &SearchExpression,
+		deadline: Option<Instant>,
+	) -> Result<BuiltQuery> {
 		crate::protocol::validate_search_structure(expression, self.max_query_clauses, self.fields.len())?;
 		if let SearchExpression::Boost { boost, clause } = expression {
 			if let SearchExpression::Clause(leaf) = clause.as_ref() {
@@ -1513,7 +1530,14 @@ impl Engine {
 				}
 			}
 		}
-		self.expression_query_inner(searcher, expression, &mut QueryConstructionBudget::default())
+		self.expression_query_inner(
+			searcher,
+			expression,
+			&mut QueryConstructionBudget {
+				deadline,
+				..Default::default()
+			},
+		)
 	}
 
 	fn expression_query_inner(
@@ -1821,6 +1845,7 @@ impl Engine {
 			&surface_prefix,
 			fields,
 			self.max_query_clauses - known_clause_count,
+			|| check_deadline(budget.deadline),
 		)?;
 		if completed_clause_count
 			.saturating_add(prefix_clause_count)
@@ -1958,6 +1983,7 @@ impl Engine {
 		prefix: &str,
 		fields: &[&EngineField],
 		remaining_clauses: usize,
+		mut check: impl FnMut() -> Result<()>,
 	) -> Result<(Box<dyn Query>, usize)> {
 		let mut alternatives = Vec::new();
 		for field in fields {
@@ -1966,6 +1992,7 @@ impl Engine {
 				.ok_or_else(|| FulltextError::invalid("prefix search requires surfaceTerms to be enabled"))?;
 			let mut terms = BTreeSet::new();
 			for segment in searcher.segment_readers() {
+				check()?;
 				let inverted = segment.inverted_index(surface_field).map_err(index_error)?;
 				let dictionary = inverted.terms();
 				let mut range = dictionary.range().ge(prefix.as_bytes());
@@ -1989,6 +2016,7 @@ impl Engine {
 						));
 					}
 				}
+				check()?;
 			}
 			for term in terms {
 				let query: Box<dyn Query> = Box::new(TermQuery::new(
@@ -3615,14 +3643,22 @@ mod tests {
 		let reader = engine.reader().unwrap();
 		assert_eq!(
 			engine
-				.expression_query(&reader.searcher(), &expression(&words(128), SearchMode::Any, vec![]))
+				.expression_query(
+					&reader.searcher(),
+					&expression(&words(128), SearchMode::Any, vec![]),
+					None
+				)
 				.unwrap()
 				.clauses,
 			256
 		);
 		assert_eq!(
 			engine
-				.expression_query(&reader.searcher(), &expression(&words(129), SearchMode::Any, vec![]))
+				.expression_query(
+					&reader.searcher(),
+					&expression(&words(129), SearchMode::Any, vec![]),
+					None
+				)
 				.err()
 				.unwrap()
 				.code,
@@ -3633,7 +3669,11 @@ mod tests {
 		let reader = engine.reader().unwrap();
 		assert_eq!(
 			engine
-				.expression_query(&reader.searcher(), &expression(&words(129), SearchMode::Any, vec![]))
+				.expression_query(
+					&reader.searcher(),
+					&expression(&words(129), SearchMode::Any, vec![]),
+					None
+				)
 				.unwrap()
 				.clauses,
 			258
@@ -3778,16 +3818,16 @@ mod tests {
 			})
 		};
 		engine
-			.expression_query(&searcher, &leaf(16, SearchMode::Fuzzy, 1))
+			.expression_query(&searcher, &leaf(16, SearchMode::Fuzzy, 1), None)
 			.unwrap();
 		assert!(engine
-			.expression_query(&searcher, &leaf(16, SearchMode::Fuzzy, 2))
+			.expression_query(&searcher, &leaf(16, SearchMode::Fuzzy, 2), None)
 			.err()
 			.unwrap()
 			.message
 			.contains("construction work units"));
 		engine
-			.expression_query(&searcher, &leaf(4, SearchMode::Fuzzy, 2))
+			.expression_query(&searcher, &leaf(4, SearchMode::Fuzzy, 2), None)
 			.unwrap();
 		for group in [
 			SearchExpression::And as fn(Vec<SearchExpression>) -> SearchExpression,
@@ -3798,12 +3838,16 @@ mod tests {
 				leaf(1, SearchMode::Fuzzy, 2),
 				leaf(1, SearchMode::FuzzyPrefix, 2),
 			];
-			engine.expression_query(&searcher, &group(leaves.clone())).unwrap();
+			engine
+				.expression_query(&searcher, &group(leaves.clone()), None)
+				.unwrap();
 			leaves.push(leaf(1, SearchMode::Fuzzy, 0));
-			engine.expression_query(&searcher, &group(leaves.clone())).unwrap();
+			engine
+				.expression_query(&searcher, &group(leaves.clone()), None)
+				.unwrap();
 			leaves.push(leaf(1, SearchMode::Fuzzy, 1));
 			assert!(engine
-				.expression_query(&searcher, &group(leaves))
+				.expression_query(&searcher, &group(leaves), None)
 				.err()
 				.unwrap()
 				.message
@@ -4005,6 +4049,7 @@ mod tests {
 							&prefix,
 							&fields,
 							MAX_QUERY_CLAUSES - (completed.len() + 1) * fields.len(),
+							|| Ok(()),
 						)
 						.unwrap();
 					let mut clauses = completed
@@ -4454,7 +4499,7 @@ mod tests {
 		invalid.offset = usize::MAX - 1;
 		invalid.limit = 2;
 		assert_eq!(engine.search(&pinned, &invalid).unwrap_err().code, "E_INVALID_ARGUMENT");
-		let query = engine.query(&pinned, &request).unwrap();
+		let query = engine.query(&pinned, &request, None).unwrap();
 		let expired = TraversalScoreTieCollector {
 			inner: StableScoreTieCollector::new(0..2),
 			after: None,
@@ -4541,7 +4586,7 @@ mod tests {
 				traversal: false,
 				after: None,
 			};
-			let query = engine.expression_query(&snapshot, &request.expression).unwrap();
+			let query = engine.expression_query(&snapshot, &request.expression, None).unwrap();
 			let scored_docs = snapshot
 				.search(query.query.as_ref(), &TopDocs::with_limit(500).order_by_score())
 				.unwrap();
@@ -5703,9 +5748,9 @@ mod tests {
 					clause: Box::new(leaf.clone()),
 				}),
 			};
-			let base = engine.expression_query(&searcher, &leaf).unwrap();
+			let base = engine.expression_query(&searcher, &leaf, None).unwrap();
 			let reference = BoostQuery::new(Box::new(BoostQuery::new(base.query, inner)), outer);
-			let actual = engine.expression_query(&searcher, &query).unwrap();
+			let actual = engine.expression_query(&searcher, &query, None).unwrap();
 			let scores = |query: &dyn Query| {
 				let weight = query
 					.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
@@ -5774,7 +5819,7 @@ mod tests {
 						fields: vec!["title".to_owned()],
 					})),
 				};
-				let built = engine.expression_query(&searcher, &expression).unwrap();
+				let built = engine.expression_query(&searcher, &expression, None).unwrap();
 				assert_eq!(built.clauses, 2);
 				assert!(!built.stable_scores);
 				let topology = format!("{:?}", built.query);
@@ -5789,7 +5834,7 @@ mod tests {
 							fields: vec!["title".to_owned()],
 						})),
 					};
-					let built = engine.expression_query(&searcher, &wide).unwrap();
+					let built = engine.expression_query(&searcher, &wide, None).unwrap();
 					assert_eq!(built.clauses, 4);
 					assert!(built.stable_scores);
 				}
@@ -5840,7 +5885,7 @@ mod tests {
 		writer.commit().unwrap();
 		let searcher = engine.reader().unwrap().searcher();
 		let expression = expression(&terms.join(" "), SearchMode::All, vec!["title".to_owned()]);
-		let built = engine.expression_query(&searcher, &expression).unwrap();
+		let built = engine.expression_query(&searcher, &expression, None).unwrap();
 		let weight = built
 			.query
 			.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
@@ -6011,7 +6056,7 @@ mod tests {
 				false,
 			),
 		] {
-			let built = engine.expression_query(&searcher, &expression).unwrap();
+			let built = engine.expression_query(&searcher, &expression, None).unwrap();
 			assert_eq!(built.clauses, expected_clauses, "{name}");
 			assert_eq!(built.stable_scores, expected_stable, "{name}");
 		}
@@ -6049,7 +6094,7 @@ mod tests {
 			("amber stone quartz ruby", SearchMode::FuzzyPrefix, vec![], false),
 		] {
 			let expression = expression(text, mode, fields);
-			let built = engine.expression_query(&searcher, &expression).unwrap();
+			let built = engine.expression_query(&searcher, &expression, None).unwrap();
 			assert_eq!(built.stable_scores, expected, "{text:?} {mode:?}");
 		}
 		writer.close().unwrap();
@@ -6138,9 +6183,9 @@ mod tests {
 					optional: vec![clause.clone()],
 				},
 			] {
-				let built = engine.expression_query(&searcher, &clause).unwrap();
+				let built = engine.expression_query(&searcher, &clause, None).unwrap();
 				let reference = if let SearchExpression::Boost { boost, clause } = &clause {
-					let child = engine.expression_query(&searcher, clause).unwrap();
+					let child = engine.expression_query(&searcher, clause, None).unwrap();
 					Some(boosted(child.query, *boost))
 				} else {
 					None
@@ -6859,6 +6904,126 @@ mod tests {
 		assert_eq!(error.code, "E_INCOMPLETE_CREATE");
 	}
 	#[test]
+	fn prefix_expansion_checks_between_segments_before_later_errors() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for id in 0..3 {
+			writer
+				.apply(MutationBatch {
+					upserts: vec![crate::protocol::Upsert {
+						id: format!("doc-{id}"),
+						version: None,
+						fields: vec![("title".to_owned(), vec!["waterproof".to_owned()])],
+						filters: Vec::new(),
+					}],
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let searcher = engine.reader().unwrap().searcher();
+		assert_eq!(searcher.segment_readers().len(), 3);
+		let fields = engine.selected_fields(&["title".to_owned()]).unwrap();
+		let mut checks = 0;
+		let error = engine
+			.expanded_prefix_group(&searcher, "water", &fields, 1, || {
+				checks += 1;
+				if checks == 3 {
+					Err(FulltextError::new("E_TIMEOUT", "injected prefix deadline"))
+				} else {
+					Ok(())
+				}
+			})
+			.unwrap_err();
+		assert_eq!(checks, 3);
+		assert_eq!(error.code, "E_TIMEOUT");
+		assert_eq!(error.message, "injected prefix deadline");
+		let mut capacity_checks = 0;
+		let error = engine
+			.expanded_prefix_group(&searcher, "water", &fields, 0, || {
+				capacity_checks += 1;
+				if capacity_checks > 1 {
+					Err(FulltextError::new("E_TIMEOUT", "later checkpoint"))
+				} else {
+					Ok(())
+				}
+			})
+			.unwrap_err();
+		assert_eq!(capacity_checks, 1);
+		assert_eq!(error.code, "E_PREFIX_TOO_BROAD");
+
+		assert_eq!(
+			engine
+				.expanded_prefix_group(&searcher, "water", &fields, 0, || Ok(()))
+				.unwrap_err()
+				.code,
+			"E_PREFIX_TOO_BROAD"
+		);
+		assert_eq!(
+			engine
+				.expanded_prefix_group(&searcher, "water", &fields, 1, || Ok(()))
+				.unwrap()
+				.1,
+			1
+		);
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn traversal_rejects_expired_empty_scorer_startup() {
+		use tantivy::query::{EmptyScorer, Explanation, Scorer, Weight};
+		struct StartingWeight {
+			deadline: Instant,
+		}
+		impl Weight for StartingWeight {
+			fn scorer(&self, _reader: &SegmentReader, _boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+				while Instant::now() < self.deadline {
+					std::thread::yield_now();
+				}
+				Ok(Box::new(EmptyScorer))
+			}
+			fn explain(&self, _reader: &SegmentReader, _doc: DocId) -> tantivy::Result<Explanation> {
+				Err(tantivy::TantivyError::InvalidArgument(
+					"no matching document".to_owned(),
+				))
+			}
+		}
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "one".to_owned(),
+					version: None,
+					fields: vec![("title".to_owned(), vec!["amber".to_owned()])],
+					filters: Vec::new(),
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let deadline = Instant::now() + std::time::Duration::from_millis(50);
+		let collector = TraversalScoreTieCollector {
+			inner: StableScoreTieCollector::new(0..1),
+			after: None,
+			deadline: Some(deadline),
+		};
+		let error = collector
+			.collect_segment(&StartingWeight { deadline }, 0, &searcher.segment_readers()[0])
+			.unwrap()
+			.unwrap_err();
+		assert_eq!(error.code, "E_TIMEOUT");
+		writer.close().unwrap();
+	}
+
+	#[test]
 	fn ordinary_stable_collection_aborts_before_visiting_all_matches() {
 		use std::sync::atomic::{AtomicUsize, Ordering};
 		use tantivy::query::{EnableScoring, Explanation, Scorer, Weight};
@@ -6931,84 +7096,102 @@ mod tests {
 				self.inner.score()
 			}
 		}
-		let config = config();
+		let mut config = config();
+		config.identity.filter_fields = vec![FilterFieldConfig {
+			name: "visible".to_owned(),
+			field_type: FilterFieldType::Boolean,
+		}];
 		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
 		let mut writer = engine.writer(&config).unwrap();
 		writer
 			.inner
 			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
-		writer
-			.apply(MutationBatch {
-				upserts: (0..4096)
-					.map(|id| crate::protocol::Upsert {
-						id: format!("doc-{id}"),
-						version: None,
-						fields: vec![("title".to_owned(), vec!["amber stone quartz ruby".to_owned()])],
-						filters: Vec::new(),
-					})
-					.collect(),
-				deletes: Vec::new(),
-			})
-			.unwrap();
-		writer.commit().unwrap();
+		for batch in 0..2 {
+			writer
+				.apply(MutationBatch {
+					upserts: (batch * 2048..(batch + 1) * 2048)
+						.map(|id| crate::protocol::Upsert {
+							id: format!("doc-{id}"),
+							version: None,
+							fields: vec![("title".to_owned(), vec!["amber stone quartz ruby".to_owned()])],
+							filters: vec![("visible".to_owned(), vec![FilterValue::Boolean(true)])],
+						})
+						.collect(),
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
 		let searcher = engine.reader().unwrap().searcher();
-		let mut request = admission_request(SearchMode::All);
-		request.expression = expression("amber stone quartz ruby", SearchMode::All, vec!["title".to_owned()]);
-		let mut query = engine.query(&searcher, &request).unwrap();
-		assert!(query.stable_scores);
-		let visited = Arc::new(AtomicUsize::new(0));
-		let deadline = Instant::now() + std::time::Duration::from_secs(1);
-		query.query = Box::new(ObservedQuery {
-			inner: query.query,
-			visited: visited.clone(),
-			deadline,
-		});
-		let error = engine
-			.collect_search(&searcher, &request, Some(deadline), None, None, query)
-			.unwrap_err();
-		assert_eq!(error.code, "E_TIMEOUT");
-		assert!(visited.load(Ordering::Relaxed) > 0);
-		assert!(
-			visited.load(Ordering::Relaxed) <= 1024,
-			"collection must abort before a full scan"
-		);
-		assert_eq!(engine.search(&searcher, &request).unwrap().hits.len(), request.limit);
-		writer
-			.apply(MutationBatch {
-				upserts: Vec::new(),
-				deletes: vec!["doc-0".to_owned()],
-			})
-			.unwrap();
-		writer.commit().unwrap();
-		let searcher = engine.reader().unwrap().searcher();
-		assert!(searcher
-			.segment_readers()
-			.iter()
-			.any(|segment| segment.alive_bitset().is_some()));
-		let query = engine.query(&searcher, &request).unwrap();
-		let (_, count, expected) = searcher
-			.search(query.query.as_ref(), &StableScoreTieCollector::new(0..request.limit))
-			.unwrap()
-			.unwrap();
-		assert_eq!(count, 4095);
-		let expected = search_hits(&searcher, expected).unwrap();
-		request.exact_total = true;
-		let actual = engine
-			.search_with_deadline(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
-			.unwrap();
-		assert_eq!(actual.total, 4095);
-		assert_eq!(
-			actual
-				.hits
+		for mode in 0..3 {
+			let mut request = admission_request(SearchMode::All);
+			request.expression = expression("amber stone quartz ruby", SearchMode::All, vec!["title".to_owned()]);
+			if mode == 1 {
+				request.filter = Some(FilterExpression::Clause {
+					field: "visible".to_owned(),
+					comparator: FilterComparator::Equals,
+					values: vec![FilterValue::Boolean(true)],
+				});
+			}
+			if mode == 2 {
+				request.candidate_ids = Some((0..1024).map(|id| format!("doc-{id}")).collect());
+			}
+			let mut query = engine.query(&searcher, &request, None).unwrap();
+			assert!(query.stable_scores);
+			let visited = Arc::new(AtomicUsize::new(0));
+			let deadline = Instant::now() + std::time::Duration::from_secs(1);
+			query.query = Box::new(ObservedQuery {
+				inner: query.query,
+				visited: visited.clone(),
+				deadline,
+			});
+			let error = engine
+				.collect_search(&searcher, &request, Some(deadline), None, None, query)
+				.unwrap_err();
+			assert_eq!(error.code, "E_TIMEOUT");
+			assert!(visited.load(Ordering::Relaxed) > 0);
+			assert!(
+				visited.load(Ordering::Relaxed) <= 1024,
+				"collection must abort before a full scan"
+			);
+			assert_eq!(engine.search(&searcher, &request).unwrap().hits.len(), request.limit);
+			writer
+				.apply(MutationBatch {
+					upserts: Vec::new(),
+					deletes: vec!["doc-0".to_owned()],
+				})
+				.unwrap();
+			writer.commit().unwrap();
+			let searcher = engine.reader().unwrap().searcher();
+			assert!(searcher
+				.segment_readers()
 				.iter()
-				.map(|hit| (&hit.id, hit.score.to_bits()))
-				.collect::<Vec<_>>(),
-			expected
-				.iter()
-				.map(|hit| (&hit.id, hit.score.to_bits()))
-				.collect::<Vec<_>>()
-		);
-		assert!(!actual.hits.iter().any(|hit| hit.id == "doc-0"));
+				.any(|segment| segment.alive_bitset().is_some()));
+			let query = engine.query(&searcher, &request, None).unwrap();
+			let (_, count, expected) = searcher
+				.search(query.query.as_ref(), &StableScoreTieCollector::new(0..request.limit))
+				.unwrap()
+				.unwrap();
+			assert_eq!(count, if mode == 2 { 1023 } else { 4095 });
+			let expected = search_hits(&searcher, expected).unwrap();
+			request.exact_total = true;
+			let actual = engine
+				.search_with_deadline(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
+				.unwrap();
+			assert_eq!(actual.total, if mode == 2 { 1023 } else { 4095 });
+			assert_eq!(
+				actual
+					.hits
+					.iter()
+					.map(|hit| (&hit.id, hit.score.to_bits()))
+					.collect::<Vec<_>>(),
+				expected
+					.iter()
+					.map(|hit| (&hit.id, hit.score.to_bits()))
+					.collect::<Vec<_>>()
+			);
+			assert!(!actual.hits.iter().any(|hit| hit.id == "doc-0"));
+		}
 		writer.close().unwrap();
 	}
 
@@ -7077,7 +7260,7 @@ mod tests {
 			traversal: false,
 			after: None,
 		};
-		let real = engine.query(&searcher, &request).unwrap();
+		let real = engine.query(&searcher, &request, None).unwrap();
 		let scores = searcher
 			.search(real.query.as_ref(), &TopDocs::with_limit(2).order_by_score())
 			.unwrap();
@@ -7183,7 +7366,7 @@ mod tests {
 			traversal: false,
 			after: None,
 		};
-		let query = engine.query(&searcher, &request).unwrap();
+		let query = engine.query(&searcher, &request, None).unwrap();
 		let scores = searcher
 			.search(query.query.as_ref(), &TopDocs::with_limit(2).order_by_score())
 			.unwrap();
@@ -7227,7 +7410,7 @@ mod tests {
 		);
 		let control_weights = Arc::new(AtomicUsize::new(0));
 		let control = CountingQuery {
-			inner: engine.query(&searcher, &request).unwrap().query,
+			inner: engine.query(&searcher, &request, None).unwrap().query,
 			weights: control_weights.clone(),
 		};
 		searcher
