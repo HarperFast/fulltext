@@ -1,5 +1,80 @@
 # Observability qualification
 
+## Caller-controlled collection: polling stopped versus enabled
+
+Observed on 2026-11-01 with Node 24.16.0, Darwin arm64, Apple M4 Pro and 14 available logical
+CPUs, using immutable production facade/addon copies from
+[`e63301c`](https://github.com/HarperFast/fulltext/commit/e63301c8825019f12fbb002ba0761b2366c36019).
+**Stopping scheduled `telemetry()` calls avoids snapshot collection cost; basic operation counters
+and timing totals remain active.** This comparison adds no collection switch and does not measure
+the always-on accounting overhead against a build without telemetry.
+
+Seven alternating fresh-process pairs at each of four/sixteen indexes used four concurrent
+callers, 2,000 documents per index and 1,000,000 single-hit ordinary searches per child.
+Histograms and snapshot-byte observation were disabled in both profiles. The polling profile
+scheduled one handle per timer turn (250/62 ms respectively), targeting roughly one call per
+second per handle; timers are not a real-time cadence guarantee. Every handle received 11–12
+calls, exceeding the predeclared minimum of ten. The off profile made zero scheduled calls in
+the measured phase; both profiles still used audit/initialization/final snapshots outside it.
+
+All 28 children completed with clean close/removal and **28,000,000 validated timed searches**.
+Final native counters conserved every search outcome, contained no expensive-search attempts
+and matched timed searches plus 100 warmups and one final validation search per index. Polling
+callbacks reported no thrown error; individual callback return snapshots were not inspected.
+Final snapshots were available with both optional flags disabled.
+
+The table reports median paired changes when polling is **enabled**, relative to no scheduled
+polling; parentheses show all seven pair minima/maxima. Positive values mean more cost.
+
+| Indexes | Throughput loss (%)  | Search p99 increase (%) | Query-window process CPU increase (%) | Mixed-phase process CPU increase (%) |
+| ------- | -------------------- | ----------------------- | ------------------------------------- | ------------------------------------ |
+| 4       | 0.82 (-3.48 to 2.77) | 0.55 (-2.57 to 2.64)    | 0.36 (-1.70 to 1.55)                  | 0.42 (-1.69 to 1.66)                 |
+| 16      | 1.24 (-1.17 to 5.75) | 1.36 (0.22 to 3.92)     | 0.39 (-1.07 to 4.24)                  | 0.43 (-1.01 to 4.30)                 |
+
+Throughput and query CPU sum fully drained 1,024-result windows with validation outside the
+windows. Search latency ends before correctness validation. Mixed-phase CPU includes queries,
+validation and twenty mutation/publication cycles. Process CPU includes native threads; neither
+CPU column isolates telemetry alone. Negative paired values expose run variation rather than a
+claim that polling improves performance. Median individual-run search p99s were 53.33/53.04 µs
+(off/polling) at four indexes and 55.21/55.92 µs at sixteen; these are not median paired ratios.
+
+| Indexes | Total measured calls | Caller-thread call p50 / p99 / max (ms) | Median call wall time / mixed elapsed (%) |
+| ------- | -------------------- | --------------------------------------- | ----------------------------------------- |
+| 4       | 329                  | 0.385 / 1.345 / 1.644                   | 0.195                                     |
+| 16      | 1,298                | 0.350 / 1.265 / 2.307                   | 0.684                                     |
+
+Call-duration percentiles pool the seven polling runs per topology. The last column is the
+median per-run sum of synchronous call durations divided by mixed elapsed time, **not CPU
+utilization**. It excludes timer bookkeeping, exporter encoding and network delivery. There was
+no synchronous all-index scrape burst. This finite synthetic local fixture supports Harper
+starting/stopping staggered polling on existing handles; it does not qualify an actual Harper
+exporter, production Linux, sustained memory, other workloads or a universal overhead bound.
+Basic recording overhead and the earlier variable banked-recorder comparison below remain
+separate considerations. No performance gate was loosened or retroactively declared passed.
+
+Reproduce each child with the same immutable module and alternate off/polling order across seven
+pairs per topology; alternate topology order too. Retain stdout/stderr and require every child
+to exit successfully. Set `TMPDIR` to an empty fixture directory:
+
+```sh
+FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/observability.mjs --child=1 --module=/absolute/package/dist/native.js --profile=off --operation=ordinary-cheap --queries=1000000 --documents=2000 --callers=4 --indexes=4 --validation-window=1024 --poll-interval-ms=1000 --minimum-polls-per-handle=10
+```
+
+Repeat with `--profile=polling` and `--indexes=16` for the other cells. The private artifact set
+`fulltext-telemetry-polling-20261101` retains `manifest.json`, `run.py`, all 28 raw reports/stderr,
+`analyze.py` and `analysis.json`. The analysis independently verifies counters/settings and
+contains each paired result and raw-report SHA-256. Identities:
+
+| Artifact                  | SHA-256                                                            |
+| ------------------------- | ------------------------------------------------------------------ |
+| Manifest                  | `68a76bc5922d0976b95841521727af681e2c568e5f7073671f80085a60f51ed0` |
+| Analysis                  | `0ccd486142ba114fcbb7c4a968cfeea13f28abaa5b59fe632f377a69247bd430` |
+| Analyzer                  | `087216eb86162944cdce41b9879d737104cdfe90f1b841f5ce207102bfd513dc` |
+| Existing benchmark driver | `d4ae8982c992afd636d92b8b3631a448fa1ebcc23a83346ef30720a72232e07e` |
+| Production addon          | `83c599a75ed0a1bd9b1f928d674fce40e8f7cb31cc9e24bd3b9b9c71549e30eb` |
+| `dist/native.js`          | `8564ec55234328c3af21b3293f84d7fc21f15f8f02e193ca8b18a0298b395e15` |
+| `dist/telemetry.js`       | `8dbd16bdde3778f9f47b130fe9d3e0676d0beaca044155454b4f7a48ea78a985` |
+
 ## Deferred-finding measurements and worker errors
 
 Observed on 2026-11-01 with Node 24.16.0, Darwin arm64, Apple M4 Pro and 14 available logical CPUs.
