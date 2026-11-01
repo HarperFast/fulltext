@@ -17,6 +17,38 @@ Metric names and error-code labels are fixed. Requests, document IDs, field valu
 messages are not metric labels. Use a bounded application-owned index label when exporting many
 handles; avoid creating a monitoring series for every transient generation.
 
+## Opt-in collection and dynamic control
+
+The wrapper starts no polling timer and exports nothing automatically. Harper integration should
+leave collection disabled unless an operator or registered metrics consumer enables it. Keep that
+choice in Harper's existing metrics/configuration lifecycle, rather than adding a wrapper-wide
+telemetry switch. A compatible wrapper release and Harper binding/capability adoption are required;
+this PR does not enable collection in Harper.
+
+Start or stop invoking `telemetry()` on the same open handles as demand changes. No handle reopen,
+index rebuild or query-policy change is needed. Stopping collection preserves cumulative counters;
+a later snapshot includes operations performed while polling was stopped. Exporters must account
+for that longer observation interval when calculating rates and must represent missing samples as
+unavailable rather than zero. Already exported data is unaffected.
+
+Collection control is separate from recording configuration. Basic counters and timing totals
+always accumulate. Histograms and snapshot-byte observations are independently opt-in and start
+disabled. Stopping polling alone does not disable either option if it was previously enabled;
+explicitly configure it off when that extra recording/observation work is no longer wanted. Enabling
+collection need not enable either option. Construction and partial configuration can still read
+an initial/current native snapshot; no scheduled collection does not mean no initialization cost.
+
+The [executable example](../examples/observability.mjs) starts with application-owned collection
+disabled, enables it, pauses it while searching, and resumes on the same handle. It verifies that
+the resumed cumulative counters include the uncollected interval. It uses explicit calls, with no
+monitoring SDK or wrapper-owned timer. A Harper collector should stagger calls across eligible
+handles, avoid duplicate owner/reader exports and stop scheduling them on disable or shutdown.
+An already executing synchronous call completes before the caller can process a disable event.
+
+The [same-build polling comparison](observability-qualification.md#caller-controlled-collection-polling-stopped-versus-enabled)
+measures the avoidable collection cost with basic recording active in both profiles. These local
+results do not establish production overhead or choose Harper's collection interval.
+
 ## Operations and admission
 
 `native.operations` separates `applyFrame`, `commit`, `publish`, `reload`, `close`, `search`,

@@ -93,6 +93,53 @@ test('telemetry reports native operations separately from facade logical batches
 	assert.strictEqual(snapshot(index).logicalBatches.attempted, 1n);
 });
 
+for (const kind of ['writer', 'reader']) {
+	test(`caller-controlled ${kind} collection resumes cumulative counters without reopening`, async (context) => {
+		const { index: writer, config } = await fixture(context);
+		await writer.applyMutationBatch({ upserts: [{ id: 'a', fields: { text: 'hello' } }] });
+		await writer.publish('one');
+		const index = kind === 'writer' ? writer : await openNativeFullTextReader(config);
+		try {
+			let enabled = false;
+			const collected = [];
+			const collect = () => {
+				if (enabled) collected.push(snapshot(index));
+			};
+			const search = async () => {
+				const result = await index.search({ text: 'hello' });
+				assert.strictEqual(result.total, 1);
+				assert.strictEqual(result.hits[0]?.id, 'a');
+				collect();
+			};
+			await search();
+			assert.strictEqual(collected.length, 0);
+			enabled = true;
+			await search();
+			assert.strictEqual(collected.length, 1);
+			assert.strictEqual(collected[0].native.operations.search.succeeded, 2n);
+			enabled = false;
+			await search();
+			assert.strictEqual(collected.length, 1);
+			enabled = true;
+			collect();
+			assert.strictEqual(collected.length, 2);
+			assert.strictEqual(collected[1].native.operations.search.succeeded, 3n);
+			assert.strictEqual(collected[0].native.operations.search.succeeded, 2n);
+			for (const value of collected) {
+				assert.strictEqual(value.native.histogramsEnabled, false);
+				assert.strictEqual(value.native.snapshotBytesEnabled, false);
+				assert.strictEqual(value.native.operations.search.execution.histogram.count, 0n);
+				conservedAtQuiescence(value.native.operations.search);
+			}
+		} finally {
+			if (kind === 'reader') {
+				const closed = await index.close();
+				assert.strictEqual(closed.cleanupError, undefined);
+			}
+		}
+	});
+}
+
 test('telemetry configuration is strict, histogram samples freeze when disabled and omitted flags persist', async (context) => {
 	const { index } = await fixture(context);
 	for (const invalid of [null, [], true, { histograms: 1 }, { snapshotBytes: 'yes' }, { surprise: true }]) {

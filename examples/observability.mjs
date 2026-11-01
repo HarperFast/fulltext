@@ -6,13 +6,20 @@ import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
 
 const root = await mkdtemp(path.join(tmpdir(), 'fulltext-observability-example-'));
 let index;
+let collectionEnabled = false;
+const exportedSnapshots = [];
 let primaryError;
 let failed = false;
 let closeAttempted = false;
 const cleanupErrors = [];
 
-function exportSnapshot(snapshot) {
-	return JSON.stringify(snapshot, (_key, value) => (typeof value === 'bigint' ? value.toString() : value));
+function collectSnapshot() {
+	if (!collectionEnabled) return;
+	const snapshot = index.telemetry();
+	assert(snapshot.available, 'The installed native addon should support telemetry');
+	exportedSnapshots.push(snapshot);
+	console.log(JSON.stringify(snapshot, (_key, value) => (typeof value === 'bigint' ? value.toString() : value)));
+	return snapshot;
 }
 
 try {
@@ -31,23 +38,34 @@ try {
 			maxBatchBytes: 1 << 20,
 		},
 	});
-	index.configureTelemetry({ histograms: true });
 	await index.applyMutationBatch({ upserts: [{ id: 'shoe-1', fields: { title: 'waterproof running shoe' } }] });
 	await index.publish('catalog-1');
 	const result = await index.search({ text: 'waterproof', limit: 10 });
 	assert.strictEqual(result.hits[0]?.id, 'shoe-1');
-	const snapshot = index.telemetry();
-	assert(snapshot.available, 'The installed native addon should support telemetry');
+	assert.strictEqual(collectSnapshot(), undefined);
+	assert.strictEqual(exportedSnapshots.length, 0);
+	collectionEnabled = true;
+	const snapshot = collectSnapshot();
 	assert.strictEqual(snapshot.logicalBatches.succeeded, 1n);
 	assert.strictEqual(snapshot.native.reader.documents, 1n);
-	console.log(exportSnapshot(snapshot));
+	assert.strictEqual(snapshot.native.operations.search.succeeded, 1n);
+	assert.strictEqual(snapshot.native.histogramsEnabled, false);
+	assert.strictEqual(snapshot.native.snapshotBytesEnabled, false);
+	collectionEnabled = false;
+	assert.strictEqual((await index.search({ text: 'waterproof', limit: 10 })).hits[0]?.id, 'shoe-1');
+	assert.strictEqual(collectSnapshot(), undefined);
+	assert.strictEqual(exportedSnapshots.length, 1);
+	collectionEnabled = true;
+	assert.strictEqual(collectSnapshot().native.operations.search.succeeded, 2n);
+	assert.strictEqual(exportedSnapshots.length, 2);
 	closeAttempted = true;
 	const closed = await index.close();
 	if (closed.cleanupError) throw closed.cleanupError;
-	const finalSnapshot = index.telemetry();
-	assert(finalSnapshot.available);
+	const finalSnapshot = collectSnapshot();
 	assert.strictEqual(finalSnapshot.native.state, 'closed');
-	console.log(exportSnapshot(finalSnapshot));
+	collectionEnabled = false;
+	assert.strictEqual(collectSnapshot(), undefined);
+	assert.strictEqual(exportedSnapshots.length, 3);
 } catch (error) {
 	failed = true;
 	primaryError = error;
