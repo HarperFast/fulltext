@@ -2,7 +2,7 @@
 
 ## Deferred-finding measurements and worker errors
 
-Observed on Node 24.16.0, Darwin arm64, Apple M4 Pro with 14 available logical CPUs.
+Observed on 2026-11-01 with Node 24.16.0, Darwin arm64, Apple M4 Pro and 14 available logical CPUs.
 The baseline is production-equivalent to
 [`e85899a`](https://github.com/HarperFast/fulltext/commit/e85899a), and the banked runtime is
 [`f4f51dd`](https://github.com/HarperFast/fulltext/commit/f4f51dd). Immutable local facade/addon
@@ -204,7 +204,8 @@ performance pass, production capacity or sustained-memory qualification is claim
 retaining always-on counters and timing totals. Overhead uncertainty is no longer a merge blocker
 for this PR. This acceptance does not establish the tight bound, change the 1%/3%/5% targets,
 relabel inconclusive measurements, or qualify production capacity or sustained memory.
-Histograms and snapshot-byte observations remain opt-in.
+Histograms and snapshot-byte observations remain opt-in. This decision covers runtime `077dffc`;
+the later banked-error runtime has separate measurements and uncertainty recorded above.
 
 | Callers | Indexes | Histograms | Throughput loss      | API p99 increase     |
 | ------- | ------- | ---------- | -------------------- | -------------------- |

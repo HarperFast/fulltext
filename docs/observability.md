@@ -179,8 +179,8 @@ for single-hit ordinary and expensive-prefix searches. Its 10 ms stress interval
 cost and is not an export-interval recommendation. Byte-cost timings do not await the final
 post-settlement observer tail; successful final byte values are not a full-drain timing bound.
 
-Search completion counters use three atomic worker banks per configured search worker, plus a
-shared fallback for unbound work. Recording still uses atomic increments; this reduces sharing
+Search completion counters and worker failure-error buckets use three atomic worker banks per
+configured search worker. Admission rejection errors and unbound drains use a shared fallback. Recording still uses atomic increments; this reduces sharing
 without assuming that only one thread can ever settle a ticket. On the measured arm64 build,
 bank payload is 1,920 bytes per worker (7.5 KiB at four workers, 120 KiB at 64), plus a fixed
 1 KiB alignment increase and container overhead. These scalar banks remain with a retained
