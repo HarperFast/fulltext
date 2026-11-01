@@ -138,7 +138,7 @@ test('polling with too few observed scrapes is explicitly insufficient', () => {
 	}
 });
 
-for (const topology of ['4x4', '64x1'])
+for (const topology of ['4x4', '16x1', '64x1'])
 	test(`idle scrape driver measures exact bounded per-handle samples at ${topology}`, () => {
 		const result = spawnSync(
 			process.execPath,

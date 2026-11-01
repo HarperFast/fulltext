@@ -118,6 +118,12 @@ function observe(distribution: BatchSizeDistribution, value: bigint): void {
 	}
 }
 
+function nativeSnapshot(token: unknown): NativeTelemetry {
+	return JSON.parse(loadAddon().__nativeTelemetry(token), (_key, value) =>
+		typeof value === 'string' && /^\d+$/.test(value) ? BigInt(value) : value,
+	) as NativeTelemetry;
+}
+
 export class FacadeTelemetry {
 	readonly #token: unknown;
 	readonly #batches = {
@@ -138,10 +144,11 @@ export class FacadeTelemetry {
 		trace: { total: 0n, errors: {} as Record<string, bigint> },
 	};
 	#histograms = false;
-	#snapshotBytes = false;
 	constructor(handle: number) {
 		try {
-			this.#token = loadAddon().__nativeCreateTelemetry(handle);
+			const token = loadAddon().__nativeCreateTelemetry(handle);
+			this.#histograms = nativeSnapshot(token).histogramsEnabled;
+			this.#token = token;
 		} catch {}
 	}
 	configure(options: ConfigureTelemetryOptions): void {
@@ -161,15 +168,14 @@ export class FacadeTelemetry {
 		}
 		if (this.#token === undefined)
 			throw new FulltextError('E_NATIVE_CAPABILITY_MISMATCH', 'telemetry token unavailable');
-		const nextHistograms = histograms ?? this.#histograms;
-		const nextBytes = snapshotBytes ?? this.#snapshotBytes;
 		try {
-			loadAddon().__nativeConfigureTelemetry(this.#token, nextHistograms, nextBytes);
+			const native = nativeSnapshot(this.#token);
+			const nextHistograms = histograms ?? native.histogramsEnabled;
+			loadAddon().__nativeConfigureTelemetry(this.#token, nextHistograms, snapshotBytes ?? native.snapshotBytesEnabled);
+			this.#histograms = nextHistograms;
 		} catch (error) {
 			throw normalizeNativeError(error);
 		}
-		this.#histograms = nextHistograms;
-		this.#snapshotBytes = nextBytes;
 	}
 	batchAttempt(): void {
 		this.#batches.attempted++;
@@ -213,9 +219,8 @@ export class FacadeTelemetry {
 		};
 		if (this.#token === undefined) return { ...facade, available: false, reason: 'token-unavailable' };
 		try {
-			const native = JSON.parse(loadAddon().__nativeTelemetry(this.#token), (_key, value) =>
-				typeof value === 'string' && /^\d+$/.test(value) ? BigInt(value) : value,
-			) as NativeTelemetry;
+			const native = nativeSnapshot(this.#token);
+			this.#histograms = native.histogramsEnabled;
 			return { ...facade, available: true, native };
 		} catch {
 			return { ...facade, available: false, reason: 'snapshot-unavailable' };

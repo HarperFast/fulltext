@@ -3962,15 +3962,49 @@ mod tests {
 
 	#[test]
 	fn telemetry_classifier_panic_records_one_unaccepted_attempt() {
-		let metrics = Metrics::new();
-		let error = classify_search(&metrics, || Ok(()), || Ok(()), || panic!("classifier fault")).unwrap_err();
-		assert_eq!(error.status, "E_NATIVE_PANIC");
-		assert_eq!(metrics.test_counts(5), [1, 0, 1, 0, 0, 0, 0]);
-		assert_eq!(metrics.test_counts(6), [0, 0, 0, 0, 0, 0, 0]);
-		assert!(classify_search(&metrics, || Ok(()), || Ok(()), || Ok(true))
-			.unwrap()
-			.unwrap());
-		assert_eq!(metrics.test_counts(5), [1, 0, 1, 0, 0, 0, 0]);
+		for panic_stage in 0..3 {
+			let metrics = Metrics::new();
+			let visited = AtomicU64::new(0);
+			let stage = |current| {
+				visited.fetch_or(1u64 << current, Ordering::Relaxed);
+				assert_ne!(current, panic_stage, "classification stage fault");
+				Ok(())
+			};
+			let error = classify_search(&metrics, || stage(0), || stage(1), || stage(2).map(|()| true)).unwrap_err();
+			assert_eq!(error.status, "E_NATIVE_PANIC");
+			assert_eq!(visited.load(Ordering::Relaxed), (1 << (panic_stage + 1)) - 1);
+			assert_eq!(metrics.test_counts(5), [1, 0, 1, 0, 0, 0, 0]);
+			assert_eq!(metrics.test_counts(6), [0, 0, 0, 0, 0, 0, 0]);
+			assert!(classify_search(&metrics, || Ok(()), || Ok(()), || Ok(true))
+				.unwrap()
+				.unwrap());
+			assert_eq!(metrics.test_counts(5), [1, 0, 1, 0, 0, 0, 0]);
+			assert_eq!(metrics.test_counts(6), [0, 0, 0, 0, 0, 0, 0]);
+		}
+	}
+
+	#[test]
+	fn telemetry_known_search_class_preserves_panic_attribution() {
+		for expensive in [false, true] {
+			let metrics = Metrics::new();
+			let classification = classify_search(&metrics, || Ok(()), || Ok(()), || Ok(expensive)).unwrap();
+			let operation = if classification.as_ref().copied().unwrap_or(false) {
+				6
+			} else {
+				5
+			};
+			let error = observe_operation(&metrics, operation, || {
+				assert_eq!(classification.map_err(fulltext_napi_error)?, expensive);
+				panic!("post-classification admission fault");
+			})
+			.unwrap_err();
+			assert_eq!(error.status, "E_NATIVE_PANIC");
+			assert_eq!(metrics.test_counts(operation), [1, 0, 1, 0, 0, 0, 0]);
+			assert_eq!(
+				metrics.test_counts(if expensive { 5 } else { 6 }),
+				[0, 0, 0, 0, 0, 0, 0]
+			);
+		}
 	}
 
 	#[test]

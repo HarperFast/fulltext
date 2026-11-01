@@ -23,7 +23,7 @@ const integer = (name, fallback, maximum) => {
 };
 const warmupRounds = integer('warmup-rounds', 25, 1_000);
 const sampleRounds = integer('sample-rounds', 120, 10_000);
-const supportedTopologies = ['1x1', '4x1', '64x1', '4x4', '4x16'];
+const supportedTopologies = ['1x1', '4x1', '16x1', '64x1', '4x4', '4x16'];
 const percentile = (values, fraction) => values.toSorted((a, b) => a - b)[Math.ceil(values.length * fraction) - 1];
 
 if (options.child) {

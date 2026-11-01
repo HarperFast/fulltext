@@ -900,35 +900,184 @@ mod tests {
 		}
 		assert!(Metrics::new().search_workers.is_empty());
 	}
+	struct RecordingMeasurement {
+		scope: &'static str,
+		elapsed_ns: u128,
+		thread_spans_ns: Vec<(u128, u128)>,
+	}
+	impl RecordingMeasurement {
+		fn json(&self, threads: usize, iterations: usize, shared: bool, histograms: bool, repetition: usize) -> String {
+			let available = std::thread::available_parallelism().unwrap().get();
+			let spans = self
+				.thread_spans_ns
+				.iter()
+				.map(|(start, end)| format!("[{start},{end}]"))
+				.collect::<Vec<_>>()
+				.join(",");
+			format!("{{\"scope\":\"{}\",\"threads\":{threads},\"availableParallelism\":{available},\"oversubscribed\":{},\"iterationsPerThread\":{iterations},\"shared\":{shared},\"histograms\":{histograms},\"repetition\":{repetition},\"elapsedNanoseconds\":{},\"threadSpansNanoseconds\":[{spans}]}}", self.scope, threads > available, self.elapsed_ns)
+		}
+	}
+
+	fn measure_recording(
+		threads: usize,
+		iterations: usize,
+		shared: bool,
+		histograms: bool,
+		outcome: &'static str,
+	) -> RecordingMeasurement {
+		assert!(matches!(outcome, "success" | "failure" | "rejection"));
+		let rejection = outcome == "rejection";
+		let shared_metrics = Metrics::with_search_workers(threads);
+		let metrics = (0..threads)
+			.map(|_| {
+				if shared {
+					shared_metrics.clone()
+				} else {
+					Metrics::with_search_workers(1)
+				}
+			})
+			.collect::<Vec<_>>();
+		for metrics in &metrics {
+			metrics.histograms.store(histograms, Relaxed);
+		}
+		let barrier = std::sync::Barrier::new(threads);
+		let origin = Instant::now();
+		let results = std::thread::scope(|scope| {
+			let mut handles = Vec::new();
+			for (worker, metrics) in metrics.iter().enumerate() {
+				let barrier = &barrier;
+				handles.push(scope.spawn(move || {
+					let mut tickets = Vec::new();
+					if !rejection {
+						tickets.reserve(iterations);
+						for _ in 0..iterations {
+							metrics.attempt(5);
+							let mut ticket = metrics.ticket(5, 64);
+							ticket.bind_worker(if shared { worker } else { 0 });
+							ticket.arm_at(origin);
+							ticket.start_at(origin + Duration::from_nanos(1));
+							ticket.finish_at(origin + Duration::from_nanos(2));
+							tickets.push(ticket);
+						}
+					}
+					barrier.wait();
+					let start = Instant::now();
+					if rejection {
+						for _ in 0..iterations {
+							metrics.attempt(5);
+							metrics.reject(5, "E_QUEUE_FULL");
+						}
+					} else {
+						for ticket in &mut tickets {
+							ticket.settle(if outcome == "failure" { Some("E_TIMEOUT") } else { None });
+						}
+					}
+					let end = Instant::now();
+					(start, end, tickets)
+				}));
+			}
+			handles
+				.into_iter()
+				.map(|handle| handle.join().unwrap())
+				.collect::<Vec<_>>()
+		});
+		let first = results.iter().map(|(start, _, _)| *start).min().unwrap();
+		let last = results.iter().map(|(_, end, _)| *end).max().unwrap();
+		for metrics in metrics.iter().take(if shared { 1 } else { threads }) {
+			let count = (iterations * if shared { threads } else { 1 }) as u64;
+			assert_eq!(
+				metrics.test_counts(5),
+				if rejection {
+					[count, 0, count, 0, 0, 0, 0]
+				} else if outcome == "failure" {
+					[count, count, 0, 0, count, 0, count]
+				} else {
+					[count, count, 0, 0, count, count, 0]
+				}
+			);
+			let actor = metrics.actor_values(5);
+			assert_eq!(actor.execution.count, if rejection { 0 } else { count });
+			assert_eq!(actor.queue.count, if rejection { 0 } else { count });
+			assert_eq!(
+				actor.execution.histogram_count,
+				if histograms && !rejection { count } else { 0 }
+			);
+			assert_eq!(
+				actor.queue.histogram_count,
+				if histograms && !rejection { count } else { 0 }
+			);
+			for (index, error) in metrics.operations[5].actor.errors.iter().enumerate() {
+				let expected = if (rejection && ERROR_CODES.get(index) == Some(&"E_QUEUE_FULL"))
+					|| (outcome == "failure" && ERROR_CODES.get(index) == Some(&"E_TIMEOUT"))
+				{
+					count
+				} else {
+					0
+				};
+				assert_eq!(load(error), expected);
+			}
+		}
+		RecordingMeasurement {
+			scope: if rejection {
+				"native-rejection-parallel-stress-not-public-owner-thread-admission"
+			} else if outcome == "failure" {
+				"worker-failure-settlement-only"
+			} else {
+				"worker-success-settlement-only"
+			},
+			elapsed_ns: last.duration_since(first).as_nanos(),
+			thread_spans_ns: results
+				.iter()
+				.map(|(start, end, _)| {
+					(
+						start.duration_since(origin).as_nanos(),
+						end.duration_since(origin).as_nanos(),
+					)
+				})
+				.collect(),
+		}
+	}
+	#[test]
+	fn recording_measurement_conserves_shared_and_isolated_outcomes() {
+		for outcome in ["success", "failure", "rejection"] {
+			for shared in [false, true] {
+				for histograms in [false, true] {
+					let measurement = measure_recording(2, 7, shared, histograms, outcome);
+					assert_eq!(measurement.thread_spans_ns.len(), 2);
+					assert!(measurement.thread_spans_ns.iter().all(|(start, end)| start <= end));
+					assert!(measurement
+						.json(2, 7, shared, histograms, 0)
+						.contains(measurement.scope));
+				}
+			}
+		}
+	}
 	#[test]
 	#[ignore]
 	fn metrics_recording_microbenchmark() {
-		for threads in [1, 4] {
-			for banked in [false, true] {
-				for enabled in [false, true] {
-					let m = Metrics::with_search_workers(if banked { threads } else { 0 });
-					m.histograms.store(enabled, Relaxed);
-					let started = Instant::now();
-					std::thread::scope(|scope| {
-						for worker in 0..threads {
-							let m = &m;
-							scope.spawn(move || {
-								for _ in 0..100_000 {
-									m.attempt(5);
-									let mut t = m.ticket(5, 64);
-									t.bind_worker(worker);
-									t.arm();
-									t.start();
-									t.settle(None);
-								}
-							});
+		for threads in [1, 4, 16, 64] {
+			for outcome in ["success", "failure", "rejection"] {
+				for histograms in [false, true] {
+					if outcome == "rejection" && histograms {
+						continue;
+					}
+					for shared in [false, true] {
+						measure_recording(threads, 256, shared, histograms, outcome);
+					}
+					for repetition in 0..7 {
+						let order = if repetition % 2 == 0 {
+							[false, true]
+						} else {
+							[true, false]
+						};
+						for shared in order {
+							let measurement = measure_recording(threads, 8192, shared, histograms, outcome);
+							eprintln!(
+								"telemetry_recording_measurement {}",
+								measurement.json(threads, 8192, shared, histograms, repetition)
+							);
 						}
-					});
-					eprintln!(
-						"threads={threads} banked={banked} histograms={enabled} operations={} elapsed_ns={}",
-						threads * 100_000,
-						started.elapsed().as_nanos()
-					);
+					}
 				}
 			}
 		}

@@ -121,8 +121,8 @@ Use the same immutable package copies identified above; source/artifact identity
 The new launcher controls were smoke-tested separately with one pair and 100 queries, without
 replacing or adding to the measured qualification tables.
 
-The committed [idle scrape driver](../benchmarks/observability-scrape-cost.mjs) reproduces the five
-selected worker/handle topologies using `--baseline` and `--candidate` absolute module paths.
+The committed [idle scrape driver](../benchmarks/observability-scrape-cost.mjs) supports six
+selected worker/handle topologies, including `16x1`, using `--baseline` and `--candidate` absolute module paths.
 Defaults are 25 warmup rounds and 120 sample rounds, histograms off/on, one handle per event-loop
 turn and explicit process budgets. Both round counts are bounded. Its correctness smoke is
 separate from the original measurements; no export-duration gate is inferred from either run.

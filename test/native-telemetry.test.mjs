@@ -125,6 +125,72 @@ test('telemetry configuration is strict, histogram samples freeze when disabled 
 	);
 });
 
+test('partial telemetry configuration preserves native-handle settings across facade tokens', async (context) => {
+	const { index, handle } = await rawFixture(context);
+	index.configureTelemetry({ histograms: true });
+	const alias = new NativeFullTextIndex({ handle, fieldNames: ['text'], maxBatchBytes: 8 << 20 });
+	alias.configureTelemetry({ snapshotBytes: true });
+	assert.strictEqual(snapshot(index).native.histogramsEnabled, true);
+	assert.strictEqual(snapshot(alias).native.snapshotBytesEnabled, true);
+	await index.applyMutationBatch({ upserts: [{ id: 'a', fields: { text: 'hello' } }] });
+	await alias.applyMutationBatch({ upserts: [{ id: 'b', fields: { text: 'hello' } }] });
+	alias.configureTelemetry({ histograms: false });
+	assert.strictEqual(snapshot(index).native.histogramsEnabled, false);
+	await index.applyMutationBatch({ upserts: [{ id: 'c', fields: { text: 'hello' } }] });
+	assert.strictEqual(snapshot(index).logicalBatches.requestedMutationsDistribution.count, 1n);
+	assert.strictEqual(snapshot(index).logicalBatches.frameBytesDistribution.count, 1n);
+	assert.strictEqual(snapshot(index).native.snapshotBytesEnabled, true);
+	index.configureTelemetry({ histograms: true });
+	assert.strictEqual(snapshot(alias).native.histogramsEnabled, true);
+	await alias.applyMutationBatch({ upserts: [{ id: 'd', fields: { text: 'hello' } }] });
+	alias.configureTelemetry({});
+	assert.strictEqual(snapshot(alias).logicalBatches.requestedMutationsDistribution.count, 2n);
+	assert.strictEqual(snapshot(alias).logicalBatches.frameBytesDistribution.count, 2n);
+	assert.strictEqual(snapshot(index).logicalBatches.attempted, 2n);
+	assert.strictEqual(snapshot(alias).logicalBatches.attempted, 2n);
+	assert.strictEqual(snapshot(index).native.operations.applyFrame.succeeded, 4n);
+	assert.strictEqual(snapshot(alias).native.histogramsEnabled, true);
+	assert.strictEqual(snapshot(alias).native.snapshotBytesEnabled, true);
+	const late = new FacadeTelemetry(handle);
+	late.configure({ snapshotBytes: false });
+	assert.strictEqual(snapshot(index).native.histogramsEnabled, true);
+	index.configureTelemetry({ histograms: false });
+	assert.strictEqual(snapshot(alias).native.snapshotBytesEnabled, false);
+	const { index: separate } = await fixture(context);
+	separate.configureTelemetry({ histograms: true });
+	assert.strictEqual(snapshot(index).native.histogramsEnabled, false);
+	assert.strictEqual(snapshot(index).native.snapshotBytesEnabled, false);
+});
+
+test('the first facade initializes omitted settings from the native handle', async (context) => {
+	const directory = mkdtempSync(path.join(tmpdir(), 'fulltext-telemetry-config-'));
+	const config = options(directory);
+	const addon = loadAddon();
+	const opened = await invoke((callback) => addon.__nativeOpen(encodeOpen(config), callback));
+	const handle = opened.u32();
+	assert.strictEqual(opened.u8(), 0);
+	opened.finish();
+	let index;
+	context.after(async () => {
+		if (index) {
+			const result = await index.close({ mode: 'rollback' });
+			assert.strictEqual(result.cleanupError, undefined);
+		} else {
+			await invoke((callback) => addon.__nativeClose(handle, true, callback));
+		}
+		rmSync(directory, { recursive: true, force: true });
+	});
+	const token = addon.__nativeCreateTelemetry(handle);
+	addon.__nativeConfigureTelemetry(token, true, true);
+	index = new NativeFullTextIndex({ handle, fieldNames: ['text'], maxBatchBytes: config.limits.maxBatchBytes });
+	await index.applyMutationBatch({ upserts: [{ id: 'a', fields: { text: 'hello' } }] });
+	assert.strictEqual(snapshot(index).logicalBatches.requestedMutationsDistribution.count, 1n);
+	assert.strictEqual(snapshot(index).logicalBatches.frameBytesDistribution.count, 1n);
+	index.configureTelemetry({});
+	assert.strictEqual(snapshot(index).native.histogramsEnabled, true);
+	assert.strictEqual(snapshot(index).native.snapshotBytesEnabled, true);
+});
+
 test('facade distributions include exact bounds, zero and overflow and return independent bigint snapshots', async (context) => {
 	const { handle } = await rawFixture(context);
 	const telemetry = new FacadeTelemetry(handle);
