@@ -6,7 +6,6 @@ own the export interval and monitoring backend. See the executable
 [vendor-neutral JSON exporter](../examples/observability.mjs).
 
 ```js
-index.configureTelemetry({ histograms: true });
 const snapshot = index.telemetry();
 console.log(JSON.stringify(snapshot, (_key, value) => (typeof value === 'bigint' ? value.toString() : value)));
 ```
@@ -23,7 +22,7 @@ The wrapper starts no polling timer and exports nothing automatically. Harper in
 leave collection disabled unless an operator or registered metrics consumer enables it. Keep that
 choice in Harper's existing metrics/configuration lifecycle, rather than adding a wrapper-wide
 telemetry switch. A compatible wrapper release and Harper binding/capability adoption are required;
-this PR does not enable collection in Harper.
+this wrapper API does not enable collection in Harper.
 
 Start or stop invoking `telemetry()` on the same open handles as demand changes. No handle reopen,
 index rebuild or query-policy change is needed. Stopping collection preserves cumulative counters;
@@ -42,7 +41,8 @@ The [executable example](../examples/observability.mjs) starts with application-
 disabled, enables it, pauses it while searching, and resumes on the same handle. It verifies that
 the resumed cumulative counters include the uncollected interval. It uses explicit calls, with no
 monitoring SDK or wrapper-owned timer. A Harper collector should stagger calls across eligible
-handles, avoid duplicate owner/reader exports and stop scheduling them on disable or shutdown.
+handles, export each handle once while retaining distinct writer/reader observations, and stop
+scheduling calls on disable or shutdown.
 An already executing synchronous call completes before the caller can process a disable event.
 
 The [same-build polling comparison](observability-qualification.md#caller-controlled-collection-polling-stopped-versus-enabled)
