@@ -28,7 +28,17 @@ machine and include scheduler effects.
 At four workers, the original shared-failure recorder was 4.77–4.89 times its isolated control;
 the banked version removes that observed contention. Single-worker failure recording was slower
 in this series; this is not a universal speedup or end-to-end failure-latency measurement.
-Successful-settlement controls remain separate. New mixed controls combine one rejecting
+The matched successful-settlement rows from the same two series are:
+
+| Workers | Histograms | Success before (ns/op) | Success after (ns/op) |
+| ------- | ---------- | ---------------------- | --------------------- |
+| 1       | off / on   | 6.79 / 9.00            | 7.33 / 11.20          |
+| 4       | off / on   | 1.34 / 1.66            | 1.16 / 1.58           |
+| 16      | off / on   | 0.75 / 0.97            | 0.80 / 0.96           |
+| 64      | off / on   | 0.71 / 0.85            | 0.69 / 0.80           |
+
+These controls exclude engine/query work and ticket destruction; they cannot alone explain the
+variable public-API cell below. New mixed controls combine one rejecting
 producer with failing workers, using same/different error codes, and conserve every counter.
 Parallel-rejection-only stress is explicitly labeled unreachable through ordinary public
 owner-thread admission; it does not justify sharding that serialized path.
