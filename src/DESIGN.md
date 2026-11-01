@@ -291,9 +291,9 @@ Every update remains a relaxed atomic RMW, so accidental duplicate worker assign
 lose updates. Snapshots sum wrapping scalar values before JSON serialization. This preserves
 existing nontransactional snapshot semantics, exact-once settlement and histogram-toggle behavior.
 
-Only dispatched/succeeded/failed and queue/execution latency storage are banked. Rare errors
-and mutation totals remain shared. Three 384-byte banks per worker add 1,152 bytes per configured
-search worker on the measured arm64 target, plus a fixed 1,024-byte shared-Actor alignment increase
+Dispatched/succeeded/failed, queue/execution latency and worker error buckets are banked.
+Admission rejection errors and unbound drains use the shared fallback; mutation totals remain
+shared. Three 640-byte banks per worker add 1,920 bytes per configured search worker on the measured arm64 target, plus a fixed 1,024-byte shared-Actor alignment increase
 and container overhead. Retained tokens retain these scalar banks after close; scrape work grows
 with configured workers. The ownership tests cover rebinding/migration, shared drains, duplicate
 bank writers, wrapping sums and disabled/enabled histogram histories.

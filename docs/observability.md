@@ -58,9 +58,11 @@ an index, searcher, mapping or execution permit, so keeping it cannot keep an in
 
 Operation counters and timing totals are always collected. Histograms start disabled. Enable them
 with `configureTelemetry({ histograms: true })`; omitted settings retain their current native-handle values.
-Construction and configuration read the existing native snapshot to initialize or refresh the facade's
+Construction and partial configuration read the existing native snapshot to initialize or refresh the facade's
 local histogram gate. This adds collection cost at those cold boundaries; search and batch paths
-do not read a native snapshot. Reading telemetry also refreshes that local gate.
+do not read a native snapshot. Reading telemetry also refreshes that local gate. Supplying both configuration options avoids
+the preliminary snapshot read. A new facade around a previously used raw handle inherits native
+settings and starts fresh logical counters; concurrent facade owners remain unsupported.
 Configure through the owning writer/reader facade; directly configuring internal native handles or constructing duplicate facade owners is unsupported. Disabling freezes accumulated histogram data; re-enabling continues it. There is no reset API.
 Histogram `count` and `sumNanoseconds` describe only enabled samples, independently of always-on
 timing totals. Buckets are **noncumulative**; each `upperBoundsNanoseconds` entry is an inclusive

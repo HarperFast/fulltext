@@ -119,9 +119,13 @@ function observe(distribution: BatchSizeDistribution, value: bigint): void {
 }
 
 function nativeSnapshot(token: unknown): NativeTelemetry {
-	return JSON.parse(loadAddon().__nativeTelemetry(token), (_key, value) =>
+	const native = JSON.parse(loadAddon().__nativeTelemetry(token), (_key, value) =>
 		typeof value === 'string' && /^\d+$/.test(value) ? BigInt(value) : value,
 	) as NativeTelemetry;
+	if (!native || typeof native.histogramsEnabled !== 'boolean' || typeof native.snapshotBytesEnabled !== 'boolean') {
+		throw new FulltextError('E_NATIVE_FAILURE', 'native telemetry settings must be booleans');
+	}
+	return native;
 }
 
 export class FacadeTelemetry {
@@ -169,9 +173,14 @@ export class FacadeTelemetry {
 		if (this.#token === undefined)
 			throw new FulltextError('E_NATIVE_CAPABILITY_MISMATCH', 'telemetry token unavailable');
 		try {
-			const native = nativeSnapshot(this.#token);
-			const nextHistograms = histograms ?? native.histogramsEnabled;
-			loadAddon().__nativeConfigureTelemetry(this.#token, nextHistograms, snapshotBytes ?? native.snapshotBytesEnabled);
+			let nextHistograms = histograms;
+			let nextBytes = snapshotBytes;
+			if (nextHistograms === undefined || nextBytes === undefined) {
+				const native = nativeSnapshot(this.#token);
+				nextHistograms ??= native.histogramsEnabled;
+				nextBytes ??= native.snapshotBytesEnabled;
+			}
+			loadAddon().__nativeConfigureTelemetry(this.#token, nextHistograms, nextBytes);
 			this.#histograms = nextHistograms;
 		} catch (error) {
 			throw normalizeNativeError(error);

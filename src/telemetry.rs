@@ -85,27 +85,30 @@ struct Admission {
 	request_bytes: AtomicU64,
 }
 #[repr(align(128))]
-#[derive(Default)]
 struct ActorCounters {
 	dispatched: AtomicU64,
 	succeeded: AtomicU64,
 	failed: AtomicU64,
 	queue: Latency,
 	execution: Latency,
-}
-struct Actor {
-	counters: ActorCounters,
-	mutations: AtomicU64,
 	errors: [AtomicU64; ERROR_CODES.len() + 1],
 }
-impl Default for Actor {
+impl Default for ActorCounters {
 	fn default() -> Self {
 		Self {
-			counters: ActorCounters::default(),
-			mutations: AtomicU64::new(0),
+			dispatched: AtomicU64::new(0),
+			succeeded: AtomicU64::new(0),
+			failed: AtomicU64::new(0),
+			queue: Latency::default(),
+			execution: Latency::default(),
 			errors: std::array::from_fn(|_| AtomicU64::new(0)),
 		}
 	}
+}
+#[derive(Default)]
+struct Actor {
+	counters: ActorCounters,
+	mutations: AtomicU64,
 }
 #[derive(Default)]
 struct LatencyValues {
@@ -147,13 +150,25 @@ impl LatencyValues {
 		format!("{{\"count\":\"{}\",\"sumNanoseconds\":\"{}\",\"histogram\":{{\"count\":\"{}\",\"sumNanoseconds\":\"{}\",\"buckets\":[{buckets}],\"upperBoundsNanoseconds\":[{bounds}]}}}}", self.count,self.sum,self.histogram_count,self.histogram_sum)
 	}
 }
-#[derive(Default)]
 struct ActorValues {
 	dispatched: u64,
 	succeeded: u64,
 	failed: u64,
 	queue: LatencyValues,
 	execution: LatencyValues,
+	errors: [u64; ERROR_CODES.len() + 1],
+}
+impl Default for ActorValues {
+	fn default() -> Self {
+		Self {
+			dispatched: 0,
+			succeeded: 0,
+			failed: 0,
+			queue: LatencyValues::default(),
+			execution: LatencyValues::default(),
+			errors: [0; ERROR_CODES.len() + 1],
+		}
+	}
 }
 impl ActorValues {
 	fn include(&mut self, source: &ActorCounters) {
@@ -162,6 +177,9 @@ impl ActorValues {
 		self.failed = self.failed.wrapping_add(load(&source.failed));
 		self.queue.include(&source.queue);
 		self.execution.include(&source.execution);
+		for (value, source) in self.errors.iter_mut().zip(&source.errors) {
+			*value = value.wrapping_add(load(source));
+		}
 	}
 }
 #[derive(Default)]
@@ -258,7 +276,7 @@ impl Metrics {
 			.iter()
 			.position(|v| *v == error)
 			.unwrap_or(ERROR_CODES.len());
-		add(&op.actor.errors[i], 1);
+		add(&op.actor.counters.errors[i], 1);
 	}
 	fn actor_values(&self, operation: usize) -> ActorValues {
 		let mut values = ActorValues::default();
@@ -486,7 +504,7 @@ impl Metrics {
 				if j > 0 {
 					output.push(',');
 				}
-				let _ = write!(output, "\"{error}\":\"{}\"", load(&op.actor.errors[j]));
+				let _ = write!(output, "\"{error}\":\"{}\"", b.errors[j]);
 			}
 			output.push_str("}}");
 		}
@@ -606,7 +624,6 @@ impl Ticket {
 			return;
 		}
 		self.settled = true;
-		let op = &self.metrics.operations[self.operation];
 		let actor = self.actor();
 		if !self.accepted {
 			return;
@@ -635,7 +652,7 @@ impl Ticket {
 				.iter()
 				.position(|v| *v == error)
 				.unwrap_or(ERROR_CODES.len());
-			add(&op.actor.errors[index], 1);
+			add(&actor.errors[index], 1);
 		}
 	}
 }
@@ -757,7 +774,7 @@ mod tests {
 			t.settle(None);
 		}
 		assert_eq!(load(&m.operations[1].admission.accepted), ERROR_CODES.len() as u64);
-		for error in &m.operations[1].actor.errors[..ERROR_CODES.len()] {
+		for error in &m.operations[1].actor.counters.errors[..ERROR_CODES.len()] {
 			assert_eq!(load(error), 1);
 		}
 	}
@@ -790,10 +807,55 @@ mod tests {
 			let values = metrics.actor_values(operation);
 			assert_eq!(values.queue.count, 5);
 			assert_eq!(values.execution.count, 4);
-			assert_eq!(load(&metrics.operations[operation].actor.errors[0]), 1);
+			assert_eq!(load(&metrics.operations[operation].actor.counters.errors[0]), 1);
 		}
 		let json = metrics.json("{}");
 		assert!(json.contains("\"completed\":\"5\""));
+	}
+	#[test]
+	fn worker_errors_stay_local_and_aggregate_with_shared_rejection_and_drain() {
+		let metrics = Metrics::with_search_workers(2);
+		let timeout = ERROR_CODES.iter().position(|code| *code == "E_TIMEOUT").unwrap();
+		let closed = ERROR_CODES.iter().position(|code| *code == "E_CLOSED").unwrap();
+		let rejected = ERROR_CODES.iter().position(|code| *code == "E_QUEUE_FULL").unwrap();
+		for operation in 5..8 {
+			for (worker, code) in [(0, "E_TIMEOUT"), (1, "unrecognized native error")] {
+				metrics.attempt(operation);
+				let mut ticket = metrics.ticket(operation, 0);
+				ticket.bind_worker(worker);
+				ticket.arm();
+				ticket.start();
+				ticket.settle(Some(code));
+				ticket.settle(Some(code));
+			}
+			assert_eq!(load(&metrics.operations[operation].actor.counters.errors[timeout]), 0);
+			assert_eq!(
+				load(&metrics.operations[operation].actor.counters.errors[ERROR_CODES.len()]),
+				0
+			);
+			metrics.attempt(operation);
+			metrics.reject(operation, "E_QUEUE_FULL");
+			metrics.attempt(operation);
+			let mut drain = metrics.ticket(operation, 0);
+			drain.arm();
+			drop(drain);
+			assert_eq!(metrics.test_counts(operation), [4, 3, 1, 0, 3, 0, 3]);
+			let values = metrics.actor_values(operation);
+			assert_eq!(values.errors[timeout], 1);
+			assert_eq!(values.errors[closed], 1);
+			assert_eq!(values.errors[rejected], 1);
+			assert_eq!(values.errors[ERROR_CODES.len()], 1);
+			assert_eq!(values.errors.iter().sum::<u64>(), 4);
+			metrics.operations[operation].actor.counters.errors[timeout].store(u64::MAX, Relaxed);
+			metrics.operations[operation].actor.counters.errors[ERROR_CODES.len()].store(u64::MAX, Relaxed);
+			let wrapped = metrics.actor_values(operation);
+			assert_eq!(wrapped.errors[timeout], 0);
+			assert_eq!(wrapped.errors[ERROR_CODES.len()], 0);
+		}
+		let json = metrics.json("{}");
+		assert_eq!(json.matches("\"E_QUEUE_FULL\":\"1\"").count(), 3);
+		assert_eq!(json.matches("\"E_CLOSED\":\"1\"").count(), 3);
+		assert!(!json.contains("\"E_TIMEOUT\":\"1\""));
 	}
 	#[test]
 	fn worker_binding_is_stable_across_invalid_rebinding_and_thread_migration() {
@@ -851,6 +913,9 @@ mod tests {
 			counters.dispatched.store(u64::MAX, Relaxed);
 			counters.succeeded.store(u64::MAX, Relaxed);
 			counters.failed.store(u64::MAX, Relaxed);
+			for error in &counters.errors {
+				error.store(u64::MAX, Relaxed);
+			}
 			for latency in [&counters.queue, &counters.execution] {
 				latency.count.store(u64::MAX, Relaxed);
 				latency.sum.store(u64::MAX, Relaxed);
@@ -865,6 +930,7 @@ mod tests {
 		assert_eq!(values.dispatched, u64::MAX - 1);
 		assert_eq!(values.succeeded, u64::MAX - 1);
 		assert_eq!(values.failed, u64::MAX - 1);
+		assert!(values.errors.iter().all(|value| *value == u64::MAX - 1));
 		for latency in [values.queue, values.execution] {
 			assert_eq!(latency.count, u64::MAX - 1);
 			assert_eq!(latency.sum, u64::MAX - 1);
@@ -893,8 +959,8 @@ mod tests {
 	}
 	#[test]
 	fn compact_bank_storage_is_bounded_by_configured_workers() {
-		assert_eq!(std::mem::size_of::<ActorCounters>(), 384);
-		for (workers, bytes) in [(1, 1152), (4, 4608), (64, 73728)] {
+		assert_eq!(std::mem::size_of::<ActorCounters>(), 640);
+		for (workers, bytes) in [(1, 1920), (4, 7680), (64, 122880)] {
 			let metrics = Metrics::with_search_workers(workers);
 			assert_eq!(std::mem::size_of_val(&*metrics.search_workers), bytes);
 		}
@@ -925,10 +991,20 @@ mod tests {
 		histograms: bool,
 		outcome: &'static str,
 	) -> RecordingMeasurement {
-		assert!(matches!(outcome, "success" | "failure" | "rejection"));
+		assert!(matches!(
+			outcome,
+			"success" | "failure" | "rejection" | "mixed-same" | "mixed-other"
+		));
+		let mixed = outcome.starts_with("mixed-");
+		let failed = outcome != "success";
+		let rejection_error = if outcome == "mixed-same" {
+			"E_TIMEOUT"
+		} else {
+			"E_QUEUE_FULL"
+		};
 		let rejection = outcome == "rejection";
 		let shared_metrics = Metrics::with_search_workers(threads);
-		let metrics = (0..threads)
+		let metrics = (0..threads + usize::from(mixed))
 			.map(|_| {
 				if shared {
 					shared_metrics.clone()
@@ -940,11 +1016,12 @@ mod tests {
 		for metrics in &metrics {
 			metrics.histograms.store(histograms, Relaxed);
 		}
-		let barrier = std::sync::Barrier::new(threads);
+		let barrier = std::sync::Barrier::new(metrics.len());
 		let origin = Instant::now();
 		let results = std::thread::scope(|scope| {
 			let mut handles = Vec::new();
 			for (worker, metrics) in metrics.iter().enumerate() {
+				let rejection = rejection || worker == threads;
 				let barrier = &barrier;
 				handles.push(scope.spawn(move || {
 					let mut tickets = Vec::new();
@@ -965,11 +1042,11 @@ mod tests {
 					if rejection {
 						for _ in 0..iterations {
 							metrics.attempt(5);
-							metrics.reject(5, "E_QUEUE_FULL");
+							metrics.reject(5, rejection_error);
 						}
 					} else {
 						for ticket in &mut tickets {
-							ticket.settle(if outcome == "failure" { Some("E_TIMEOUT") } else { None });
+							ticket.settle(if failed { Some("E_TIMEOUT") } else { None });
 						}
 					}
 					let end = Instant::now();
@@ -983,42 +1060,55 @@ mod tests {
 		});
 		let first = results.iter().map(|(start, _, _)| *start).min().unwrap();
 		let last = results.iter().map(|(_, end, _)| *end).max().unwrap();
-		for metrics in metrics.iter().take(if shared { 1 } else { threads }) {
-			let count = (iterations * if shared { threads } else { 1 }) as u64;
+		for (index, metrics) in metrics.iter().enumerate().take(if shared { 1 } else { metrics.len() }) {
+			let count = if rejection || (!shared && index == threads) {
+				0
+			} else {
+				(iterations * if shared { threads } else { 1 }) as u64
+			};
+			let rejections = if rejection {
+				(iterations * if shared { threads } else { 1 }) as u64
+			} else if mixed && (shared || index == threads) {
+				iterations as u64
+			} else {
+				0
+			};
 			assert_eq!(
 				metrics.test_counts(5),
-				if rejection {
-					[count, 0, count, 0, 0, 0, 0]
-				} else if outcome == "failure" {
-					[count, count, 0, 0, count, 0, count]
-				} else {
-					[count, count, 0, 0, count, count, 0]
-				}
+				[
+					count + rejections,
+					count,
+					rejections,
+					0,
+					count,
+					if failed { 0 } else { count },
+					if failed { count } else { 0 }
+				]
 			);
 			let actor = metrics.actor_values(5);
-			assert_eq!(actor.execution.count, if rejection { 0 } else { count });
-			assert_eq!(actor.queue.count, if rejection { 0 } else { count });
-			assert_eq!(
-				actor.execution.histogram_count,
-				if histograms && !rejection { count } else { 0 }
-			);
-			assert_eq!(
-				actor.queue.histogram_count,
-				if histograms && !rejection { count } else { 0 }
-			);
-			for (index, error) in metrics.operations[5].actor.errors.iter().enumerate() {
-				let expected = if (rejection && ERROR_CODES.get(index) == Some(&"E_QUEUE_FULL"))
-					|| (outcome == "failure" && ERROR_CODES.get(index) == Some(&"E_TIMEOUT"))
-				{
+			assert_eq!(actor.execution.count, count);
+			assert_eq!(actor.queue.count, count);
+			assert_eq!(actor.execution.histogram_count, if histograms { count } else { 0 });
+			assert_eq!(actor.queue.histogram_count, if histograms { count } else { 0 });
+			for (index, error) in actor.errors.iter().enumerate() {
+				let expected = if ERROR_CODES.get(index) == Some(&rejection_error) {
+					rejections
+				} else {
+					0
+				} + if failed && ERROR_CODES.get(index) == Some(&"E_TIMEOUT") {
 					count
 				} else {
 					0
 				};
-				assert_eq!(load(error), expected);
+				assert_eq!(*error, expected);
 			}
 		}
 		RecordingMeasurement {
-			scope: if rejection {
+			scope: if outcome == "mixed-same" {
+				"worker-failure-plus-one-rejection-producer-same-code"
+			} else if outcome == "mixed-other" {
+				"worker-failure-plus-one-rejection-producer-different-code"
+			} else if rejection {
 				"native-rejection-parallel-stress-not-public-owner-thread-admission"
 			} else if outcome == "failure" {
 				"worker-failure-settlement-only"
@@ -1039,11 +1129,14 @@ mod tests {
 	}
 	#[test]
 	fn recording_measurement_conserves_shared_and_isolated_outcomes() {
-		for outcome in ["success", "failure", "rejection"] {
+		for outcome in ["success", "failure", "rejection", "mixed-same", "mixed-other"] {
 			for shared in [false, true] {
 				for histograms in [false, true] {
 					let measurement = measure_recording(2, 7, shared, histograms, outcome);
-					assert_eq!(measurement.thread_spans_ns.len(), 2);
+					assert_eq!(
+						measurement.thread_spans_ns.len(),
+						if outcome.starts_with("mixed-") { 3 } else { 2 }
+					);
 					assert!(measurement.thread_spans_ns.iter().all(|(start, end)| start <= end));
 					assert!(measurement
 						.json(2, 7, shared, histograms, 0)
@@ -1056,7 +1149,7 @@ mod tests {
 	#[ignore]
 	fn metrics_recording_microbenchmark() {
 		for threads in [1, 4, 16, 64] {
-			for outcome in ["success", "failure", "rejection"] {
+			for outcome in ["success", "failure", "rejection", "mixed-same", "mixed-other"] {
 				for histograms in [false, true] {
 					if outcome == "rejection" && histograms {
 						continue;
@@ -1079,6 +1172,44 @@ mod tests {
 						}
 					}
 				}
+			}
+		}
+	}
+	#[test]
+	#[ignore]
+	fn metrics_native_snapshot_microbenchmark() {
+		for workers in [1, 4, 16, 64] {
+			let metrics = Metrics::with_search_workers(workers);
+			for worker in 0..workers {
+				for operation in 5..8 {
+					metrics.attempt(operation);
+					let mut ticket = metrics.ticket(operation, 64);
+					ticket.bind_worker(worker);
+					ticket.arm();
+					ticket.start();
+					ticket.settle(Some("E_TIMEOUT"));
+				}
+			}
+			for _ in 0..100 {
+				std::hint::black_box(metrics.json("{}"));
+			}
+			for repetition in 0..7 {
+				let mut samples = Vec::with_capacity(2000);
+				let mut bytes = 0;
+				for _ in 0..2000 {
+					let started = Instant::now();
+					let json = metrics.json("{}");
+					samples.push(started.elapsed().as_nanos());
+					bytes = std::hint::black_box(&json).len();
+				}
+				for operation in 5..8 {
+					assert_eq!(
+						metrics.test_counts(operation),
+						[workers as u64, workers as u64, 0, 0, workers as u64, 0, workers as u64]
+					);
+				}
+				let raw = samples.iter().map(u128::to_string).collect::<Vec<_>>().join(",");
+				eprintln!("telemetry_native_snapshot_measurement {{\"scope\":\"native-aggregation-and-json-no-js-parse-no-concurrent-writers\",\"workers\":{workers},\"repetition\":{repetition},\"samplesNanoseconds\":[{raw}],\"jsonBytes\":{bytes}}}");
 			}
 		}
 	}

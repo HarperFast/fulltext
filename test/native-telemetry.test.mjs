@@ -162,6 +162,36 @@ test('partial telemetry configuration preserves native-handle settings across fa
 	assert.strictEqual(snapshot(index).native.snapshotBytesEnabled, false);
 });
 
+test('native snapshots stay on telemetry cold paths and complete configuration avoids reading them', async (context) => {
+	const { index, handle, addon } = await rawFixture(context);
+	const nativeTelemetry = addon.__nativeTelemetry;
+	let reads = 0;
+	try {
+		addon.__nativeTelemetry = (...arguments_) => {
+			reads++;
+			return nativeTelemetry(...arguments_);
+		};
+		const telemetry = new FacadeTelemetry(handle);
+		assert.strictEqual(reads, 1);
+		reads = 0;
+		telemetry.configure({ histograms: true, snapshotBytes: false });
+		assert.strictEqual(reads, 0);
+		await index.applyMutationBatch({ upserts: [{ id: 'a', fields: { text: 'hello' } }] });
+		await index.publish('one');
+		assert.strictEqual((await index.search({ text: 'hello' })).total, 1);
+		await index.traceMatches({ text: 'hello' }, [{ id: 'a', fields: { text: 'hello' } }]);
+		assert.strictEqual(reads, 0);
+		telemetry.configure({ snapshotBytes: true });
+		assert.strictEqual(reads, 1);
+		assert.strictEqual(telemetry.snapshot().available, true);
+		assert.strictEqual(reads, 2);
+		telemetry.configure({ histograms: false, snapshotBytes: false });
+		assert.strictEqual(reads, 2);
+	} finally {
+		addon.__nativeTelemetry = nativeTelemetry;
+	}
+});
+
 test('the first facade initializes omitted settings from the native handle', async (context) => {
 	const directory = mkdtempSync(path.join(tmpdir(), 'fulltext-telemetry-config-'));
 	const config = options(directory);
