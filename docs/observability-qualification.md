@@ -87,6 +87,13 @@ thresholds in every pair; the other seven cells were inconclusive. No cell was o
 in every pair. Keep the 1% off / 3% on throughput and 5% on p99 targets unchanged; no general
 performance pass, production capacity or sustained-memory qualification is claimed.
 
+**Decision:** Kyle accepted the measured overhead for
+[Expose fulltext operation telemetry and latency histograms #81](https://github.com/HarperFast/fulltext/pull/81),
+retaining always-on counters and timing totals. Overhead uncertainty is no longer a merge blocker
+for this PR. This acceptance does not establish the tight bound, change the 1%/3%/5% targets,
+relabel inconclusive measurements, or qualify production capacity or sustained memory.
+Histograms and snapshot-byte observations remain opt-in.
+
 | Callers | Indexes | Histograms | Throughput loss      | API p99 increase     |
 | ------- | ------- | ---------- | -------------------- | -------------------- |
 | 1       | 1       | off        | -0.24 [-28.87, 3.29] | -0.33 [-5.86, 2.47]  |
