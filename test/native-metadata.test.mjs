@@ -375,6 +375,42 @@ test('catalog errors are explicit and leave the handle usable', async (context) 
 	assert.strictEqual((await index.search({ text: 'shoe', exactTotal: true })).total, 6);
 });
 
+test('sorted scored histograms reject only live matching unsafe values', async (context) => {
+	const index = await openNativeFullTextIndex(config(context));
+	context.after(() => index.close({ mode: 'rollback' }));
+	await index.applyMutationBatch({
+		upserts: [
+			{ id: 'safe', fields: { title: 'shoe' }, filters: { price: 10 } },
+			{ id: 'unmatched', fields: { title: 'hat' }, filters: { price: Number.MAX_VALUE } },
+			{ id: 'unsafe', fields: { title: 'shoe' }, filters: { price: Number.MAX_VALUE } },
+		],
+	});
+	await index.commit();
+	await index.reload();
+	const request = {
+		text: 'shoe',
+		sort: sort('price'),
+		exactTotal: true,
+		limit: 10,
+		aggregations: [{ name: 'prices', type: 'histogram', field: 'price', interval: 10 }],
+	};
+	await assert.rejects(index.search(request), (error) => {
+		assert.strictEqual(error.code, 'E_RESOURCE_LIMIT');
+		assert.match(error.message, /representable bucket positions/);
+		return true;
+	});
+	await index.applyMutationBatch({ deletes: ['unsafe'] });
+	await index.commit();
+	await index.reload();
+	const result = await index.search(request);
+	assert.deepStrictEqual(ids(result), ['safe']);
+	assert.strictEqual(result.total, 1);
+	assert.strictEqual(result.totalRelation, 'exact');
+	assert.deepStrictEqual(result.aggregations, [
+		{ name: 'prices', type: 'histogram', buckets: [{ key: 10, count: 1 }] },
+	]);
+});
+
 test('sort key memory rejection preserves smaller sorted windows and ordinary searches', async (context) => {
 	const options = config(context, [{ name: 'brand', type: 'string' }]);
 	const index = await openNativeFullTextIndex(options);
