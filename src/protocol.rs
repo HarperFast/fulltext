@@ -208,6 +208,15 @@ impl SearchStructureBudget {
 		self.charge(count)
 	}
 
+	fn optional_children(&mut self, count: usize) -> Result<()> {
+		if count == 0 {
+			return Err(FulltextError::invalid(
+				"optional scoring requires at least one optional clause",
+			));
+		}
+		self.charge(count)
+	}
+
 	pub(crate) fn leaf(&mut self, text_bytes: usize, fields: usize) -> Result<()> {
 		self.text_bytes = self.text_bytes.saturating_add(text_bytes);
 		if self.text_bytes > MAX_QUERY_TEXT_BYTES {
@@ -250,7 +259,7 @@ pub(crate) fn validate_search_structure(expression: &SearchExpression, clauses: 
 				visit(clause, depth + 1, budget)
 			}
 			SearchExpression::Optional { required, optional } => {
-				budget.children(optional.len())?;
+				budget.optional_children(optional.len())?;
 				budget.charge(1)?;
 				visit(required, depth + 1, budget)?;
 				for child in optional {
@@ -855,7 +864,7 @@ fn scan_search_expression(
 		}
 		5 => {
 			let count = cursor.u16()? as usize;
-			structure.children(count)?;
+			structure.optional_children(count)?;
 			structure.charge(1)?;
 			let required = scan_search_expression(cursor, depth + 1, structure, raised_profile_fields)?;
 			let mut cost = SearchCost {
@@ -1310,7 +1319,7 @@ fn decode_search_expression(
 		}
 		5 => {
 			let count = cursor.u16()? as usize;
-			structure.children(count)?;
+			structure.optional_children(count)?;
 			structure.charge(1)?;
 			let required = Box::new(decode_search_expression(cursor, depth + 1, structure)?);
 			let mut optional = Vec::with_capacity(count);
@@ -1679,6 +1688,56 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn empty_optional_uses_its_own_diagnostic_at_every_native_entry() {
+		for (kind, expression, message) in [
+			(
+				5,
+				SearchExpression::Optional {
+					required: Box::new(SearchExpression::And(Vec::new())),
+					optional: Vec::new(),
+				},
+				"optional scoring requires at least one optional clause",
+			),
+			(
+				1,
+				SearchExpression::And(Vec::new()),
+				"boolean search expressions require at least one child",
+			),
+			(
+				2,
+				SearchExpression::Or(Vec::new()),
+				"boolean search expressions require at least one child",
+			),
+		] {
+			let bytes = [kind, 0, 0];
+			let mut cursor = Cursor {
+				bytes: &bytes,
+				offset: 0,
+			};
+			let scanned = scan_search_expression(
+				&mut cursor,
+				0,
+				&mut SearchStructureBudget::new(256, MAX_FIELDS).unwrap(),
+				None,
+			)
+			.err()
+			.unwrap();
+			cursor.offset = 0;
+			let decoded = decode_search_expression(
+				&mut cursor,
+				0,
+				&mut SearchStructureBudget::new(256, MAX_FIELDS).unwrap(),
+			)
+			.unwrap_err();
+			let typed = validate_search_structure(&expression, 256, MAX_FIELDS).unwrap_err();
+			for error in [scanned, decoded, typed] {
+				assert_eq!(error.code, "E_INVALID_ARGUMENT");
+				assert_eq!(error.message, message);
+			}
+		}
+	}
 
 	#[test]
 	fn scoring_nodes_share_validation_and_preserve_cost_anchors() {
