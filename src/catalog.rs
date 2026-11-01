@@ -1876,19 +1876,38 @@ mod tests {
 		}
 		let mut schema = Schema::builder();
 		let id = schema.add_u64_field("id", FAST);
+		let matched = schema.add_text_field("matched", STRING);
+		let price = schema.add_f64_field("price", FAST);
 		let index = Index::create_in_ram(schema.build());
 		let mut writer = index.writer::<TantivyDocument>(20_000_000).unwrap();
 		for value in 0..2048u64 {
-			writer.add_document(doc!(id=>value)).unwrap();
+			writer
+				.add_document(doc!(id=>value, matched=>"yes", price=>1.0))
+				.unwrap();
 		}
+		writer
+			.add_document(doc!(id=>2048u64, matched=>"no", price=>f64::MAX))
+			.unwrap();
 		writer.commit().unwrap();
 		drop(writer);
 		let searcher = index.reader().unwrap().searcher();
-		for scoring in [false, true] {
+		let query = tantivy::query::TermQuery::new(
+			Term::from_field_text(matched, "yes"),
+			tantivy::schema::IndexRecordOption::Basic,
+		);
+		for (scoring, populated) in [(false, false), (true, false), (true, true)] {
 			let calls = Arc::new(AtomicUsize::new(0));
 			let deadline = Instant::now() + std::time::Duration::from_secs(1);
 			let collector = DeadlineCollector {
-				histograms: vec![],
+				histograms: if populated {
+					vec![HistogramCheck {
+						field: "price".into(),
+						interval: 1.0,
+						ancestors: Vec::new(),
+					}]
+				} else {
+					vec![]
+				},
 				inner: Probe {
 					scoring,
 					calls: calls.clone(),
@@ -1896,13 +1915,61 @@ mod tests {
 				},
 				deadline: Some(deadline),
 			};
-			let error = searcher.search(&AllQuery, &collector).unwrap_err();
+			let error = searcher.search(&query, &collector).unwrap_err();
 			assert_eq!(native_error(error).code, "E_TIMEOUT");
 			assert!(calls.load(Ordering::Relaxed) > 0);
 			assert!(calls.load(Ordering::Relaxed) <= 1024);
-			assert_eq!(count_matches(&searcher, &AllQuery, None).unwrap(), 2048);
+			assert_eq!(count_matches(&searcher, &query, None).unwrap(), 2048);
 		}
 	}
+	#[test]
+	fn scored_histogram_validates_only_alive_matches() {
+		use tantivy::query::TermQuery;
+		use tantivy::schema::IndexRecordOption;
+		let mut schema = Schema::builder();
+		let id = schema.add_text_field("__fulltext_id", STRING | FAST);
+		let price = schema.add_f64_field("__fulltext_filter_1", INDEXED | FAST);
+		let index = Index::create_in_ram(schema.build());
+		let mut writer = index.writer::<TantivyDocument>(20_000_000).unwrap();
+		writer.add_document(doc!(id=>"match",price=>1.0)).unwrap();
+		writer.add_document(doc!(id=>"outlier",price=>f64::MAX)).unwrap();
+		writer.commit().unwrap();
+		let sort = SortRequest {
+			field: "price".into(),
+			direction: SortDirection::Asc,
+			missing: MissingOrder::Last,
+		};
+		let requests = [AggregationRequest {
+			name: "hist".into(),
+			field: "price".into(),
+			kind: AggregationKind::Histogram { interval: 1.0 },
+			aggregations: Vec::new(),
+		}];
+		let run = |query: &dyn Query| {
+			sorted_catalog(
+				&index.reader().unwrap().searcher(),
+				query,
+				SortedCatalogRequest {
+					sort: &sort,
+					aggregations: &requests,
+					offset: 0,
+					limit: 10,
+				},
+				&fields(),
+				index.tokenizers().clone(),
+				Some(Instant::now() + std::time::Duration::from_secs(30)),
+			)
+		};
+		let error = run(&AllQuery).err().unwrap();
+		assert_eq!(error.code, "E_RESOURCE_LIMIT");
+		assert!(error.message.contains("representable bucket positions"));
+		let query = TermQuery::new(Term::from_field_text(id, "match"), IndexRecordOption::Basic);
+		assert_eq!(run(&query).unwrap().total, 1);
+		writer.delete_term(Term::from_field_text(id, "outlier"));
+		writer.commit().unwrap();
+		assert_eq!(run(&AllQuery).unwrap().total, 1);
+	}
+
 	#[test]
 	fn missing_metadata_segments_and_empty_indexes_are_supported() {
 		let mut schema = Schema::builder();
