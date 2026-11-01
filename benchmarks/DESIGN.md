@@ -92,7 +92,7 @@ The composite root boost and required-All optional paths cost more in this corpu
 
 ### Varied-score collector boundary
 
-The earlier varied-score sample kept the same membership distribution while varying term frequency and document length. It checked that ranks 20 and 21 differed for each OR/AND pair before timing; the historical driver later extended that assertion to every non-optional row. The current configurable driver reports `distinctBoundary` and `boundaryTie` without requiring distinct scores; tied rows can include the stable fallback. With these unfiltered Boolean queries, that check rules out the stable-collector boundary-tie rerun in `Engine::collect_search`. Output records the corpus and `distinctBoundary` for each row. This does not measure how many blocks Tantivy prunes.
+The earlier varied-score sample kept the same membership distribution while varying term frequency and document length. It checked that ranks 20 and 21 differed for each OR/AND pair before timing; the historical driver later extended that assertion to every non-optional row. The current configurable driver reports `distinctBoundary` and `boundaryTie` without requiring distinct scores; tied rows can include the stable fallback. Historically, that distinct-boundary check ruled out the stable-collector boundary-tie rerun for those unfiltered Boolean queries in `Engine::collect_search`. Output records the corpus and `distinctBoundary` for each row. This does not measure how many blocks Tantivy prunes.
 
 After the nested-boost multiplication-order fix, an optimized run on the same machine/runtime produced these p50 milliseconds (10,000 documents, 20 warm sequential samples, limit 20):
 
@@ -172,3 +172,47 @@ On the same unchanged optimized artifact `652d1aaafd045641c1880a6c08e1a52099df5a
 The default driver also measured its original OR pair on this artifact: tied baseline/root boost p50 was 0.126/0.172 ms with exact totals off and 0.123/0.175 ms on; varied was 0.156/0.108 ms off and 0.158/0.118 ms on. The routing-mode OR rows use the augmented corpus, so they are not matched before/after comparisons with those default rows.
 
 These samples measure total requests, including JavaScript/native calls, query construction, stable ID-ordinal resolution and possible separate exact counts. Wrapped controls add AST nodes and double scores; tied cutoffs can trigger a stable rerun. None of these pairs isolates pruning or compiler overhead, and timing differences change with totals and corpus. The added families make the small-workload costs visible; they establish no general speedup, strict deadline bound, catalog-scale throughput or memory qualification.
+
+### Restricted collection measurements, 2026-11-01
+
+Three matched 100,000-document varied-score configurations used Node 24.16.0/macOS arm64.
+Both artifacts used optimized builds with test-panic features enabled and hooks inactive, without
+per-hit instrumentation. These are not timings of the separately qualified production binary.
+The identical driver SHA-256 was `bb14a9c81f725f46bc4170d11e1a9ff79117c098998e4ad62711beb8286c1453`;
+loaded baseline/candidate addon SHA-256 values were
+`81cde7067bf8b56e1e3dffb112f076912a189fe64524cb06449bd6ed8041d66d` /
+`e226d3f7439d8a636ccc80f7dfdae3201bd6411758b80c3358861fab6b3e596e`.
+The candidate corresponds to `697fde4` production code; the subsequent test-arm correction did
+not change that code. The separate production artifact was
+`84974a6e1e1262ccba866e2d01021a038c63c15553e9531671b8887126efb41a`, qualified with two packed
+and six production-worker checks.
+
+Each configuration retained 56 rows, with 100 raw warmed samples per row, exact totals off/on
+separate and query rows interleaved within each process. Baseline and candidate were separate
+build/process runs, not interleaved artifact pairs. Raw local reports are
+`~/WebstormProjects/tmp/query-execution-{baseline,candidate}-final3-{100k-4seg-50pct,100k-4seg-1pct,100k-1seg-50pct-window1000}.json`.
+Every warmed timing request passed score/ID/order and total/relation checks. Selected exact-total-off
+metadata-filter baseline rows, milliseconds (p50 / p95):
+
+| Segments / All density / limit | Query |      Baseline |     Candidate |
+| ------------------------------ | ----- | ------------: | ------------: |
+| 4 / 50% / 20                   | All4  | 0.779 / 0.799 | 0.815 / 0.838 |
+| 4 / 50% / 20                   | OR    | 0.723 / 0.748 | 0.781 / 0.799 |
+| 4 / 1% / 20                    | All4  | 0.170 / 0.183 | 0.170 / 0.182 |
+| 4 / 1% / 20                    | OR    | 0.488 / 0.500 | 0.528 / 0.544 |
+| 1 / 50% / 1,000                | All4  | 1.429 / 1.465 | 1.407 / 1.491 |
+| 1 / 50% / 1,000                | OR    | 2.292 / 2.329 | 2.237 / 2.346 |
+
+The four-segment runs used 30 MiB writer memory; the one-segment run needed 128 MiB to prevent
+an automatic flush. All observed segment counts matched. Candidate-ID All4/OR baseline-row
+p50 ranged from 0.999–1.797 ms before and 1.011–1.840 ms after. The one-segment OR filter
+row had a boundary tie in both builds, so its cost includes stable fallback. Other displayed
+filter rows had distinct boundaries. Candidate rows with too few hits have no boundary to check.
+
+The public-worker 1/2/5 ms sweep recorded outcomes and recovery, not native-loop work. Several
+filter medians were below the minimum one-millisecond budget, so success or observed overshoot
+cannot prove mid-loop cancellation. Separate deterministic Rust test-only work counters showed
+candidate collection stopping at 512 rather than 1,024 visits and generic boosted collection at
+1,024 rather than 4,096. Those are cancellation canaries, not native block-WAND/pruning counters.
+Synchronous native operations between cooperative checks remain unchecked. These local observations
+establish neither a causal speedup, a hard deadline, nor clearance of the separate pruning gate.

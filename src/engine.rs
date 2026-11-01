@@ -7234,6 +7234,8 @@ mod tests {
 			);
 			assert_eq!(error.code, "E_TIMEOUT");
 			assert!(visited.load(Ordering::Relaxed) > 0);
+			assert!(scores.load(Ordering::Relaxed) > 0);
+			assert!(scores.load(Ordering::Relaxed) <= visited.load(Ordering::Relaxed) + 1);
 			assert!(
 				visited.load(Ordering::Relaxed) <= if mode == 2 { 512 } else { 1024 },
 				"collection must abort before a full scan"
@@ -7424,7 +7426,7 @@ mod tests {
 				}
 				4 => request.expression = expression("amber stone", SearchMode::Phrase, vec!["title".to_owned()]),
 				5 => request.expression = expression("amber", SearchMode::Fuzzy, vec!["title".to_owned()]),
-				_ => {
+				6 => {
 					request.expression =
 						SearchExpression::And(vec![leaf("amber"), SearchExpression::Not(Box::new(leaf("absent")))])
 				}

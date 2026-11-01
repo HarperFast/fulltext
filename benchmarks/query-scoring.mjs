@@ -76,6 +76,19 @@ const defaultQueries = [
 	{ name: 'single/baseline', query: term('amber'), baseline: 'single/baseline' },
 	{ name: 'single/lowered-root', query: boosted(term('amber')), baseline: 'single/baseline', scale: 2 },
 	{
+		name: 'single-all/baseline',
+		query: { ...term('amber'), mode: 'all' },
+		baseline: 'single/baseline',
+		equivalent: 'single/baseline',
+	},
+	{
+		name: 'single-all/lowered-root',
+		query: boosted({ ...term('amber'), mode: 'all' }),
+		baseline: 'single/baseline',
+		scale: 2,
+		equivalent: 'single/lowered-root',
+	},
+	{
 		name: 'single/native-wrapped',
 		query: wrapped(term('amber')),
 		baseline: 'single/baseline',
