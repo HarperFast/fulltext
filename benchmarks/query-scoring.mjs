@@ -14,6 +14,7 @@ const { values } = parseArgs({
 		documents: { type: 'string', default: '10000' },
 		density: { type: 'string' },
 		segments: { type: 'string', default: '4' },
+		'writer-memory-mib': { type: 'string', default: '30' },
 		rounds: { type: 'string', default: '100' },
 		limit: { type: 'string', default: '20' },
 		'deadline-ms': { type: 'string' },
@@ -33,6 +34,8 @@ function integerOption(name, minimum, maximum) {
 }
 const documents = integerOption('documents', 100, 100000);
 const requestedSegments = integerOption('segments', 1, Math.min(4, documents));
+const writerMemoryMiB = integerOption('writer-memory-mib', 30, 1024);
+const writerMemoryBytes = writerMemoryMiB * 1024 * 1024;
 const rounds = integerOption('rounds', 1, 10000);
 const limit = integerOption('limit', 20, 1000);
 const deadlineRounds = integerOption('deadline-rounds', 1, 10000);
@@ -51,6 +54,7 @@ assert(Number.isFinite(density) && density > 0 && density <= 1, '--density: numb
 const warmupRounds = 5;
 const variedScores = values['varied-scores'];
 const routingShapes = values['routing-shapes'];
+assert(!routingShapes || limit <= 100, '--routing-shapes requires --limit <= 100: ordinary prefix search limit');
 const corpus = variedScores ? 'varied-scores' : 'tied-scores';
 const require = createRequire(import.meta.url);
 const root = await mkdtemp(path.join(tmpdir(), 'fulltext-query-scoring-'));
@@ -230,7 +234,7 @@ try {
 		limits: {
 			indexingThreads: 1,
 			searchThreads: 2,
-			writerMemoryBytes: 30_000_000,
+			writerMemoryBytes,
 			maxQueuedCommands: 32,
 			maxQueuedBytes: 4 << 20,
 			maxBatchBytes: 1 << 20,
@@ -397,6 +401,8 @@ try {
 				limit,
 				density,
 				requestedSegments,
+				writerMemoryMiB,
+				writerMemoryBytes,
 				...(values.restricted ? { candidateCount: candidateIds.length, candidateStride, filterDensity: 0.5 } : {}),
 				rounds,
 				warmupRounds,

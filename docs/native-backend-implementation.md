@@ -428,8 +428,10 @@ preview capability until the catalog-scale benchmark qualifies it. Request budge
 queue wait plus execution, are clamped to 30 seconds, and are checked during match tracing.
 Traversal also charges preparation against that budget and checks its deadline every 1,024 scorer
 advances. Exact-count and metadata collectors also check deadlines during collection, including
-within a segment. Ordinary ranked-hit collection, query construction, and individual synchronous
-Tantivy operations remain uninterruptible; an expired result is discarded after control returns.
+within a segment. Stable-score and compiler-identified generic ordinary ranked-hit passes (including filtered/candidate
+searches) also use the deadline collector. Prefix expansion checks between segment dictionaries. Other ordinary ranked-hit
+passes and individual synchronous Tantivy operations remain uninterruptible; an expired result is
+discarded after control returns.
 See the [collector deadline policy](limits.md#metadata-collectors) for checkpoint granularity and
 synchronous work between checks. If all eligible workers are
 executing, an expired queued request is rejected

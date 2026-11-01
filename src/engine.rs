@@ -106,6 +106,7 @@ struct BuiltQuery {
 	query: Box<dyn Query>,
 	clauses: usize,
 	stable_scores: bool,
+	generic_root: bool,
 }
 
 const MAX_PHRASE_CONSTRUCTION_TERMS: usize = 64 * 256;
@@ -952,7 +953,7 @@ impl Engine {
 			(hits, total, relation, Some(match_count))
 		} else {
 			let top_docs = TopDocs::with_limit(window_end.saturating_add(1)).order_by_score();
-			let scored_docs = if request.filter.is_some() || request.candidate_ids.is_some() {
+			let scored_docs = if request.filter.is_some() || request.candidate_ids.is_some() || query.generic_root {
 				searcher
 					.search(
 						query.query.as_ref(),
@@ -1485,12 +1486,14 @@ impl Engine {
 			query,
 			clauses,
 			stable_scores,
+			generic_root,
 		} = self.expression_query(searcher, &request.expression, deadline)?;
 		let query = self.with_candidates(query, request.candidate_ids.as_deref())?;
 		Ok(BuiltQuery {
 			query: self.with_filter(query, request.filter.as_ref())?,
 			clauses,
 			stable_scores,
+			generic_root,
 		})
 	}
 
@@ -1522,10 +1525,12 @@ impl Engine {
 					};
 					let (query, clauses, stable_scores) = self.term_query(&leaf.text, &fields, occur)?;
 					self.check_total_clause_count(clauses, 1)?;
+					let generic_root = generic_query_root(query.as_ref());
 					return Ok(BuiltQuery {
 						query,
 						clauses: clauses + 1,
 						stable_scores,
+						generic_root,
 					});
 				}
 			}
@@ -1555,6 +1560,7 @@ impl Engine {
 				self.check_total_clause_count(child.clauses, 1)?;
 				child.query = boosted(child.query, *boost);
 				child.stable_scores &= *boost == 1.0;
+				child.generic_root |= *boost != 1.0;
 				child.clauses += 1;
 				Ok(child)
 			}
@@ -1575,6 +1581,7 @@ impl Engine {
 					query: Box::new(BooleanQuery::new(queries)),
 					clauses,
 					stable_scores: false,
+					generic_root: true,
 				})
 			}
 			SearchExpression::Not(child) => {
@@ -1590,6 +1597,7 @@ impl Engine {
 					)),
 					clauses: child.clauses + 2,
 					stable_scores: false,
+					generic_root: true,
 				})
 			}
 		}
@@ -1610,10 +1618,13 @@ impl Engine {
 			clauses += child.clauses;
 			queries.push((occur, child.query));
 		}
+		let query: Box<dyn Query> = Box::new(BooleanQuery::new(queries));
+		let generic_root = generic_query_root(query.as_ref());
 		Ok(BuiltQuery {
-			query: Box::new(BooleanQuery::new(queries)),
+			query,
 			clauses,
 			stable_scores: children.len() > if occur == Occur::Must { 2 } else { 1 },
+			generic_root,
 		})
 	}
 
@@ -1624,20 +1635,35 @@ impl Engine {
 		budget: &mut QueryConstructionBudget,
 	) -> Result<BuiltQuery> {
 		let fields = self.selected_fields(&clause.fields)?;
+		let mut generic_root = false;
 		let (query, clauses, stable_scores) = match clause.mode {
 			SearchMode::Any => self.term_query(&clause.text, &fields, Occur::Should)?,
 			SearchMode::All => self.term_query(&clause.text, &fields, Occur::Must)?,
-			SearchMode::Phrase => self.phrase_query(&clause.text, &fields, budget)?,
+			SearchMode::Phrase => self.phrase_query(&clause.text, &fields, budget, &mut generic_root)?,
 			SearchMode::Prefix => self.prefix_query(searcher, &clause.text, &fields, false, clause.options, budget)?,
 			SearchMode::Fuzzy => self.fuzzy_query(&clause.text, &fields, clause.options, budget)?,
 			SearchMode::FuzzyPrefix => {
 				self.prefix_query(searcher, &clause.text, &fields, true, clause.options, budget)?
 			}
 		};
+		generic_root |= generic_query_root(query.as_ref())
+			|| query.downcast_ref::<BooleanQuery>().is_some_and(|boolean| {
+				clause.mode == SearchMode::Fuzzy
+					&& boolean.clauses().iter().all(|(_, child)| {
+						child.is::<DisjunctionMaxQuery>()
+							|| child.downcast_ref::<BooleanQuery>().is_some_and(|inner| {
+								inner
+									.clauses()
+									.iter()
+									.any(|(occur, child)| *occur == Occur::Must && child.is::<ConstScoreQuery>())
+							})
+					})
+			});
 		Ok(BuiltQuery {
 			query,
 			clauses,
 			stable_scores,
+			generic_root,
 		})
 	}
 
@@ -1720,6 +1746,7 @@ impl Engine {
 		text: &str,
 		fields: &[&EngineField],
 		budget: &mut QueryConstructionBudget,
+		generic_root: &mut bool,
 	) -> Result<(Box<dyn Query>, usize, bool)> {
 		if !self.positions {
 			return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
@@ -1733,6 +1760,7 @@ impl Engine {
 		if terms.len() == 1 {
 			return Ok((self.term_group(&terms[0].1, fields), fields.len(), fields.len() > 1));
 		}
+		*generic_root = true;
 		let alternatives = fields
 			.iter()
 			.map(|field| {
@@ -2414,6 +2442,20 @@ fn resolve_string_ordinals(
 		return Err(FulltextError::new("E_NATIVE_FAILURE", missing_message));
 	}
 	Ok(values)
+}
+
+fn generic_query_root(query: &dyn Query) -> bool {
+	query.is::<BoostQuery>()
+		|| query.is::<ConstScoreQuery>()
+		|| query.is::<EmptyQuery>()
+		|| query.is::<DisjunctionMaxQuery>()
+		|| query.is::<PhraseQuery>()
+		|| query.is::<FuzzyTermQuery>()
+		|| query.downcast_ref::<BooleanQuery>().is_some_and(|boolean| {
+			let clauses = boolean.clauses();
+			clauses.iter().all(|(occur, _)| *occur == Occur::Must)
+				&& (clauses.len() == 1 || clauses.iter().any(|(_, child)| child.is::<ConstScoreQuery>()))
+		})
 }
 
 fn boosted(query: Box<dyn Query>, weight: f32) -> Box<dyn Query> {
@@ -4699,7 +4741,7 @@ mod tests {
 		let fields = engine.fields.iter().collect::<Vec<_>>();
 		assert_eq!(
 			engine
-				.phrase_query("shoe", &fields, &mut QueryConstructionBudget::default())
+				.phrase_query("shoe", &fields, &mut QueryConstructionBudget::default(), &mut false)
 				.unwrap_err()
 				.code,
 			"E_INVALID_ARGUMENT"
@@ -7030,6 +7072,7 @@ mod tests {
 		use tantivy::DocSet;
 		#[derive(Debug)]
 		struct ObservedQuery {
+			scores: Arc<AtomicUsize>,
 			inner: Box<dyn Query>,
 			visited: Arc<AtomicUsize>,
 			deadline: Instant,
@@ -7039,16 +7082,19 @@ mod tests {
 				Self {
 					inner: self.inner.box_clone(),
 					visited: self.visited.clone(),
+					scores: self.scores.clone(),
 					deadline: self.deadline,
 				}
 			}
 		}
 		struct ObservedWeight {
+			scores: Arc<AtomicUsize>,
 			inner: Box<dyn Weight>,
 			visited: Arc<AtomicUsize>,
 			deadline: Instant,
 		}
 		struct ObservedScorer {
+			scores: Arc<AtomicUsize>,
 			inner: Box<dyn Scorer>,
 			visited: Arc<AtomicUsize>,
 			deadline: Instant,
@@ -7058,6 +7104,7 @@ mod tests {
 				Ok(Box::new(ObservedWeight {
 					inner: self.inner.weight(scoring)?,
 					visited: self.visited.clone(),
+					scores: self.scores.clone(),
 					deadline: self.deadline,
 				}))
 			}
@@ -7067,6 +7114,7 @@ mod tests {
 				Ok(Box::new(ObservedScorer {
 					inner: self.inner.scorer(reader, boost)?,
 					visited: self.visited.clone(),
+					scores: self.scores.clone(),
 					deadline: self.deadline,
 				}))
 			}
@@ -7088,6 +7136,7 @@ mod tests {
 		}
 		impl Scorer for ObservedScorer {
 			fn score(&mut self) -> Score {
+				self.scores.fetch_add(1, Ordering::Relaxed);
 				if self.visited.load(Ordering::Relaxed) == 0 {
 					while Instant::now() < self.deadline {
 						std::thread::yield_now();
@@ -7123,7 +7172,7 @@ mod tests {
 			writer.commit().unwrap();
 		}
 		let searcher = engine.reader().unwrap().searcher();
-		for mode in 0..3 {
+		for mode in 0..9 {
 			let mut request = admission_request(SearchMode::All);
 			request.expression = expression("amber stone quartz ruby", SearchMode::All, vec!["title".to_owned()]);
 			if mode == 1 {
@@ -7134,31 +7183,66 @@ mod tests {
 				});
 			}
 			if mode == 2 {
-				request.candidate_ids = Some((0..1024).map(|id| format!("doc-{id}")).collect());
+				request.candidate_ids = Some((1536..2560).map(|id| format!("doc-{id}")).collect());
+			}
+
+			let leaf = |text: &str| expression(text, SearchMode::Any, vec!["title".to_owned()]);
+			match mode {
+				3 => {
+					request.expression = SearchExpression::Boost {
+						boost: 2.0,
+						clause: Box::new(SearchExpression::And(vec![leaf("amber"), leaf("stone")])),
+					}
+				}
+				4 => request.expression = SearchExpression::Not(Box::new(leaf("absent"))),
+				5 => {
+					request.expression = SearchExpression::Optional {
+						required: Box::new(leaf("amber")),
+						optional: vec![leaf("stone")],
+					}
+				}
+				6 => request.expression = expression("amber stone", SearchMode::Phrase, vec!["title".to_owned()]),
+				7 => request.expression = expression("amber", SearchMode::Fuzzy, vec!["title".to_owned()]),
+				8 => {
+					request.expression =
+						SearchExpression::And(vec![leaf("amber"), SearchExpression::Not(Box::new(leaf("absent")))])
+				}
+				_ => {}
 			}
 			let mut query = engine.query(&searcher, &request, None).unwrap();
-			assert!(query.stable_scores);
+			assert!(if mode < 3 {
+				query.stable_scores
+			} else {
+				query.generic_root
+			});
 			let visited = Arc::new(AtomicUsize::new(0));
+			let scores = Arc::new(AtomicUsize::new(0));
 			let deadline = Instant::now() + std::time::Duration::from_secs(1);
 			query.query = Box::new(ObservedQuery {
 				inner: query.query,
 				visited: visited.clone(),
+				scores: scores.clone(),
 				deadline,
 			});
 			let error = engine
 				.collect_search(&searcher, &request, Some(deadline), None, None, query)
 				.unwrap_err();
+			println!(
+				"mode={mode} advances={} scores={}",
+				visited.load(Ordering::Relaxed),
+				scores.load(Ordering::Relaxed)
+			);
 			assert_eq!(error.code, "E_TIMEOUT");
 			assert!(visited.load(Ordering::Relaxed) > 0);
 			assert!(
-				visited.load(Ordering::Relaxed) <= 1024,
+				visited.load(Ordering::Relaxed) <= if mode == 2 { 512 } else { 1024 },
 				"collection must abort before a full scan"
 			);
 			assert_eq!(engine.search(&searcher, &request).unwrap().hits.len(), request.limit);
 			writer
 				.apply(MutationBatch {
 					upserts: Vec::new(),
-					deletes: vec!["doc-0".to_owned()],
+					deletes: vec!["doc-0".to_owned(), "doc-1536".to_owned()],
 				})
 				.unwrap();
 			writer.commit().unwrap();
@@ -7172,13 +7256,13 @@ mod tests {
 				.search(query.query.as_ref(), &StableScoreTieCollector::new(0..request.limit))
 				.unwrap()
 				.unwrap();
-			assert_eq!(count, if mode == 2 { 1023 } else { 4095 });
+			assert_eq!(count, if mode == 2 { 1023 } else { 4094 });
 			let expected = search_hits(&searcher, expected).unwrap();
 			request.exact_total = true;
 			let actual = engine
 				.search_with_deadline(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
 				.unwrap();
-			assert_eq!(actual.total, if mode == 2 { 1023 } else { 4095 });
+			assert_eq!(actual.total, if mode == 2 { 1023 } else { 4094 });
 			assert_eq!(
 				actual
 					.hits
@@ -7191,6 +7275,191 @@ mod tests {
 					.collect::<Vec<_>>()
 			);
 			assert!(!actual.hits.iter().any(|hit| hit.id == "doc-0"));
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn compiler_generic_root_facts_preserve_term_pruning() {
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let leaf = |text: &str, mode| expression(text, mode, vec!["title".to_owned()]);
+		let boost = |clause| SearchExpression::Boost {
+			boost: 2.0,
+			clause: Box::new(clause),
+		};
+		for (expression, expected) in [
+			(leaf("amber", SearchMode::Any), false),
+			(leaf("amber stone", SearchMode::Any), false),
+			(leaf("amber stone", SearchMode::All), false),
+			(leaf("amber", SearchMode::All), true),
+			(leaf("amber", SearchMode::Phrase), false),
+			(expression("amber", SearchMode::Phrase, vec![]), false),
+			(leaf("amber stone", SearchMode::Phrase), true),
+			(leaf("amber", SearchMode::Fuzzy), true),
+			(leaf("cat", SearchMode::Fuzzy), false),
+			(boost(leaf("amber", SearchMode::Any)), false),
+			(
+				boost(SearchExpression::And(vec![
+					leaf("amber", SearchMode::Any),
+					leaf("stone", SearchMode::Any),
+				])),
+				true,
+			),
+			(
+				SearchExpression::And(vec![
+					boost(leaf("amber", SearchMode::Any)),
+					leaf("stone", SearchMode::Any),
+				]),
+				false,
+			),
+			(SearchExpression::Not(Box::new(leaf("absent", SearchMode::Any))), true),
+			(
+				SearchExpression::Optional {
+					required: Box::new(leaf("amber", SearchMode::Any)),
+					optional: vec![leaf("stone", SearchMode::Any)],
+				},
+				true,
+			),
+			(
+				SearchExpression::And(vec![
+					leaf("amber", SearchMode::Any),
+					SearchExpression::Not(Box::new(leaf("absent", SearchMode::Any))),
+				]),
+				true,
+			),
+		] {
+			assert_eq!(
+				engine
+					.expression_query(&searcher, &expression, None)
+					.unwrap()
+					.generic_root,
+				expected,
+				"{expression:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn generic_topdocs_non_tie_pages_preserve_deleted_multisegment_scores() {
+		let mut config = config();
+		config.identity.filter_fields = vec![FilterFieldConfig {
+			name: "visible".to_owned(),
+			field_type: FilterFieldType::Boolean,
+		}];
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for segment in 0..2 {
+			writer
+				.apply(MutationBatch {
+					upserts: (segment * 64..(segment + 1) * 64)
+						.map(|id| crate::protocol::Upsert {
+							id: format!("doc-{id:03}"),
+							version: None,
+							fields: vec![("title".to_owned(), vec!["amber stone ".repeat(id + 1)])],
+							filters: vec![("visible".to_owned(), vec![FilterValue::Boolean(true)])],
+						})
+						.collect(),
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		writer
+			.apply(MutationBatch {
+				upserts: ["amber", "stone", "quartz"]
+					.iter()
+					.map(|text| crate::protocol::Upsert {
+						id: format!("isolated-{text}"),
+						version: None,
+						fields: vec![("title".to_owned(), vec![(*text).to_owned()])],
+						filters: vec![("visible".to_owned(), vec![FilterValue::Boolean(true)])],
+					})
+					.collect(),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: Vec::new(),
+				deletes: vec!["doc-127".to_owned()],
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		assert!(searcher.segment_readers().len() >= 2);
+		assert!(searcher
+			.segment_readers()
+			.iter()
+			.any(|segment| segment.alive_bitset().is_some()));
+		let leaf = |text: &str| expression(text, SearchMode::Any, vec!["title".to_owned()]);
+		for mode in 0..8 {
+			let mut request = admission_request(SearchMode::Any);
+			request.expression = leaf("amber");
+			match mode {
+				0 => {
+					request.filter = Some(FilterExpression::Clause {
+						field: "visible".to_owned(),
+						comparator: FilterComparator::Equals,
+						values: vec![FilterValue::Boolean(true)],
+					})
+				}
+				1 => request.candidate_ids = Some((0..128).map(|id| format!("doc-{id:03}")).collect()),
+				2 => {
+					request.expression = SearchExpression::Boost {
+						boost: 2.0,
+						clause: Box::new(SearchExpression::And(vec![leaf("amber"), leaf("stone")])),
+					}
+				}
+				3 => {
+					request.expression = SearchExpression::Optional {
+						required: Box::new(leaf("amber")),
+						optional: vec![leaf("stone")],
+					}
+				}
+				4 => request.expression = expression("amber stone", SearchMode::Phrase, vec!["title".to_owned()]),
+				5 => request.expression = expression("amber", SearchMode::Fuzzy, vec!["title".to_owned()]),
+				_ => {
+					request.expression =
+						SearchExpression::And(vec![leaf("amber"), SearchExpression::Not(Box::new(leaf("absent")))])
+				}
+				_ => request.expression = expression("amber", SearchMode::All, vec!["title".to_owned()]),
+			}
+			let query = engine.query(&searcher, &request, None).unwrap();
+			assert!(!query.stable_scores);
+			assert!(mode < 2 || query.generic_root);
+			let (_, _, oracle) = searcher
+				.search(query.query.as_ref(), &StableScoreTieCollector::new(0..128))
+				.unwrap()
+				.unwrap();
+			let oracle = search_hits(&searcher, oracle).unwrap();
+			let boundary = oracle
+				.windows(2)
+				.position(|pair| pair[0].score.to_bits() != pair[1].score.to_bits())
+				.unwrap() + 1;
+			request.limit = boundary;
+			assert_ne!(oracle[boundary - 1].score.to_bits(), oracle[boundary].score.to_bits());
+			let result = engine
+				.search_with_deadline(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
+				.unwrap();
+			assert_eq!(
+				result
+					.hits
+					.iter()
+					.map(|hit| (&hit.id, hit.score.to_bits()))
+					.collect::<Vec<_>>(),
+				oracle[..boundary]
+					.iter()
+					.map(|hit| (&hit.id, hit.score.to_bits()))
+					.collect::<Vec<_>>(),
+				"mode={mode}"
+			);
+			assert!(!result.hits.iter().any(|hit| hit.id == "doc-127"));
 		}
 		writer.close().unwrap();
 	}
@@ -7283,6 +7552,7 @@ mod tests {
 					}),
 					clauses: real.clauses,
 					stable_scores: real.stable_scores,
+					generic_root: false,
 				},
 			);
 			assert_eq!(result.unwrap_err().code, expected);
@@ -7379,6 +7649,7 @@ mod tests {
 			}),
 			clauses: query.clauses,
 			stable_scores: query.stable_scores,
+			generic_root: false,
 		};
 		let result = engine
 			.collect_search(

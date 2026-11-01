@@ -25,10 +25,14 @@ FULLTEXT_PREFER_LOCAL_BUILD=1 node benchmarks/query-scoring.mjs --documents 1000
 
 `--documents` accepts 100–100,000 (default 10,000), `--segments` accepts 1–4 (default 4),
 `--limit` accepts 20–1,000 (default 20), and `--rounds` defaults to 100. The driver verifies the
-observed segment count; automatic merging that changes it fails the workload. Without `--density`,
+observed segment count; automatic flushing or merging that changes it fails the workload.
+`--writer-memory-mib` accepts 30–1,024 (default 30); increase it when larger corpora flush
+additional segments before a requested commit. The report records its configured bytes and MiB. Without `--density`,
 the original four document families remain unchanged. An explicit density greater than zero and
 at most one controls the All/AND matching fraction through deterministic document assignment.
-`--routing-shapes` selects the existing prefix, fuzzy, phrase and Boolean routing controls.
+`--routing-shapes` selects the existing prefix, fuzzy, phrase and Boolean routing controls and
+requires `--limit` at most 100 for ordinary prefix searches; invalid combinations fail before
+index creation. Complete routing retrieval uses 1,000-hit traversal pages.
 `--restricted` adds All4/OR metadata-filter and candidate-ID cases; the JSON records the candidate
 stride/count and the filter's 50% source density. Candidate sets stay within the 1,024-ID limit.
 
@@ -48,7 +52,10 @@ rows and requested positive integer millisecond budgets, with `exactTotal: false
 elapsed-minus-budget overshoot. Successful responses must retain score/ID/total parity, and an
 unbudgeted request checks recovery for each row after the sweep. These are end-to-end public-worker
 request measurements, including JavaScript queue/callback overhead. They establish neither a hard
-deadline nor a native-loop interruption bound. This driver does not count visited or scored
+deadline nor a native-loop interruption bound. Budgets have a one-millisecond floor; submillisecond
+collection medians cannot demonstrate mid-loop cancellation at that budget. Deterministic Rust
+work-counter tests provide the separate loop-interruption evidence. Cancellation observations
+do not establish that cancellation caused any measured latency change. This driver does not count visited or scored
 documents and cannot by itself demonstrate pruning or production latency guarantees.
 
 ## Hydration and trace matching
