@@ -150,9 +150,8 @@ export class FacadeTelemetry {
 	#histograms = false;
 	constructor(handle: number) {
 		try {
-			const token = loadAddon().__nativeCreateTelemetry(handle);
-			this.#histograms = nativeSnapshot(token).histogramsEnabled;
-			this.#token = token;
+			this.#token = loadAddon().__nativeCreateTelemetry(handle);
+			this.#histograms = nativeSnapshot(this.#token).histogramsEnabled;
 		} catch {}
 	}
 	configure(options: ConfigureTelemetryOptions): void {

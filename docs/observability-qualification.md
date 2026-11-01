@@ -1,5 +1,117 @@
 # Observability qualification
 
+## Deferred-finding measurements and worker errors
+
+Observed on Node 24.16.0, Darwin arm64, Apple M4 Pro with 14 available logical CPUs.
+The baseline is production-equivalent to
+[`e85899a`](https://github.com/HarperFast/fulltext/commit/e85899a), and the banked runtime is
+[`f4f51dd`](https://github.com/HarperFast/fulltext/commit/f4f51dd). Immutable local facade/addon
+copies and SHA-256 identities were retained with the private raw reports.
+
+### Failure-counter contention
+
+The optimized Rust recorder control uses real tickets bound to worker banks. Setup, admission,
+queue timing, thread creation and ticket/Arc destruction are outside the settlement timer.
+Seven alternating shared/isolated pairs use 8,192 settlements per worker, with exact post-join
+outcome, error and histogram assertions. Values below are median wall nanoseconds divided by
+aggregate settlements, **not individual request latency**. The two runtime series ran separately;
+shared/isolated controls alternate within each series. The 16/64-worker cells oversubscribe this
+machine and include scheduler effects.
+
+| Workers | Histograms | Shared failures before (ns/op) | Banked failures (ns/op) |
+| ------- | ---------- | ------------------------------ | ----------------------- |
+| 1       | off / on   | 23.71 / 21.97                  | 30.18 / 26.01           |
+| 4       | off / on   | 22.49 / 23.35                  | 4.53 / 4.92             |
+| 16      | off / on   | 60.03 / 62.48                  | 2.21 / 2.32             |
+| 64      | off / on   | 64.94 / 65.67                  | 1.71 / 1.79             |
+
+At four workers, the original shared-failure recorder was 4.77–4.89 times its isolated control;
+the banked version removes that observed contention. Single-worker failure recording was slower
+in this series; this is not a universal speedup or end-to-end failure-latency measurement.
+Successful-settlement controls remain separate. New mixed controls combine one rejecting
+producer with failing workers, using same/different error codes, and conserve every counter.
+Parallel-rejection-only stress is explicitly labeled unreachable through ordinary public
+owner-thread admission; it does not justify sharding that serialized path.
+
+Worker error labels now use the existing stable worker selection. Shared admission rejection
+and unbound drain accounting remain available. All increments stay atomic. Banks grow from
+384 to 640 bytes each: 7.5 KiB at four workers and 120 KiB at 64, increases of 3/48 KiB respectively.
+The scalar storage survives close only while a telemetry token retains it.
+
+Reproduce the isolated primitives, including mixed controls, with:
+
+```sh
+cargo test --release --locked --all-features metrics_recording_microbenchmark -- --ignored --exact telemetry::tests::metrics_recording_microbenchmark --nocapture
+```
+
+### Collection scaling
+
+Three fresh-process repetitions per version/topology/histogram mode used 100 warmups and 2,000
+samples per cell: **96,000 public telemetry calls**. The table shows the median of three p50s and
+the largest candidate p99. Histograms off/on retain the same collection shape; this axis records
+configuration continuity rather than an expected idle-cost difference.
+
+| Workers | Histograms | Baseline p50 (ms) | Banked p50 (ms) | Largest banked p99 (ms) |
+| ------- | ---------- | ----------------- | --------------- | ----------------------- |
+| 1       | off / on   | 0.2823 / 0.2837   | 0.2840 / 0.2849 | 0.3470 / 0.3241         |
+| 4       | off / on   | 0.2824 / 0.2808   | 0.2804 / 0.2855 | 0.3180 / 0.3420         |
+| 16      | off / on   | 0.2852 / 0.2836   | 0.2862 / 0.2834 | 0.3320 / 0.3161         |
+| 64      | off / on   | 0.2844 / 0.2890   | 0.2833 / 0.2869 | 0.3263 / 0.3799         |
+
+The native-only control populates all three worker classes, then times aggregation and JSON
+serialization without JavaScript parsing, runtime queue sampling or concurrent writers. Seven
+2,000-sample windows per topology yielded 56,000 samples. Combined p50/p99 microseconds were
+32.21/37.29 at one worker, 32.21/36.54 at four, 32.71/36.33 at sixteen and 34.79/40.21 at sixty-four.
+Native work grows with worker count even when the public-call figures obscure that small cost.
+These observations do not establish a loaded-handle pause bound; stagger exporter calls.
+
+```sh
+node benchmarks/observability-scrape-cost.mjs --baseline=/absolute/baseline/dist/native.js --candidate=/absolute/candidate/dist/native.js --output=/absolute/scrape.json --topologies=1x1,4x1,16x1,64x1 --warmup-rounds=100 --sample-rounds=2000
+cargo test --release --locked --all-features metrics_native_snapshot_microbenchmark -- --ignored --exact telemetry::tests::metrics_native_snapshot_microbenchmark --nocapture
+```
+
+### Ordinary-search regression comparison
+
+Seven alternating fresh-process pairs in eight cells (one/four callers, one/two indexes,
+histograms off/on) validated **4,480,000 timed queries**. Matching profiles, 2,000 documents/index,
+40,000 queries/child and validation-excluded 1,024-result windows compare this optimization only.
+Construction and configuration run outside the query windows. This comparison does not measure
+their native-read cost; those reads are cold boundary costs, not part of the previously accepted
+steady-state overhead measurement.
+
+| Callers | Indexes | Histograms | Median throughput loss (%) | Median p99 increase (%) |
+| ------- | ------- | ---------- | -------------------------- | ----------------------- |
+| 1       | 1       | off / on   | 0.33 / 0.14                | 1.22 / 0.77             |
+| 1       | 2       | off / on   | 0.09 / 0.09                | -0.33 / 1.01            |
+| 4       | 1       | off / on   | 0.20 / -0.10               | 0.09 / -2.58            |
+| 4       | 2       | off / on   | -1.06 / 2.58               | -2.32 / 0.05            |
+
+The four-caller/two-index/histogram-on cell had throughput-loss range -1.61% to 9.63% and p99
+increase range -6.41% to 80.04%. A single predefined seven-pair repeat, with reversed initial
+version order and another **560,000 correct timed queries**, yielded median throughput loss 1.25%
+(range -5.98% to 5.24%) and median p99 change -0.74% (range -5.69% to 5.47%). Preserve both series:
+the spread leaves a small normal-workload cost unresolved. This is not a general no-regression
+claim, a replacement feature-cost acceptance, production-capacity qualification or sustained-memory
+qualification. No gates or workload settings were relaxed.
+
+Reproduce the original eight-cell comparison using `benchmarks/observability.mjs` with
+`--baseline-profile=match --operations=ordinary-cheap --profiles=off,on --pairs=7 --queries=40000
+--documents=2000 --validation-window=1024`, plus immutable baseline/candidate module paths and an
+output path. The targeted repeat uses its child mode at four callers/two indexes/profile `on`.
+
+Private raw-report SHA-256 identities:
+
+| Report                   | SHA-256                                                            |
+| ------------------------ | ------------------------------------------------------------------ |
+| Original recorder        | `b73c29c776fad6fb608a2374eacd0eb18c9acc21579ed3d313bea5c3cb77c420` |
+| Banked recorder          | `11121217562131cf14bfa566bb6062c96b815f4d141cabced252351bbe3953e1` |
+| Native snapshot          | `9f13df6efdaa3e8f9ffc3c4cca995aecf5d676d517dd2efdc33e5828826c0771` |
+| Ordinary comparison      | `342e76662d84a3ada12ab82187299eaafaf0ac00054929fdf1ad67e97d951bde` |
+| Targeted ordinary repeat | `42442a4c4810af9edd8cf1e95d4850f9be4f8110af94625a5e04af96bb73cc15` |
+| Scrape repetition 1      | `1c32ab5ebe06bd7ebbda836ccc4502e320e2bb60e46c0abfb816d68dca4df188` |
+| Scrape repetition 2      | `8a37b54ea6ccaabf56829053319cf04e998a8a602cdd5d875666eae50d554d65` |
+| Scrape repetition 3      | `5db09858c6be88894d2245e0dd5fef89b8508cf2a4487b71405fded5d438ac73` |
+
 ## Short-soak publication completion control
 
 At [`0cd0bb5`](https://github.com/HarperFast/fulltext/commit/0cd0bb5788b73d77614e6fbf30828cff07be91d7),

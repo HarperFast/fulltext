@@ -125,41 +125,125 @@ test('telemetry configuration is strict, histogram samples freeze when disabled 
 	);
 });
 
-test('partial telemetry configuration preserves native-handle settings across facade tokens', async (context) => {
+test('sequential facade rewrapping preserves native settings and separate logical counters', async (context) => {
 	const { index, handle } = await rawFixture(context);
 	index.configureTelemetry({ histograms: true });
-	const alias = new NativeFullTextIndex({ handle, fieldNames: ['text'], maxBatchBytes: 8 << 20 });
-	alias.configureTelemetry({ snapshotBytes: true });
-	assert.strictEqual(snapshot(index).native.histogramsEnabled, true);
-	assert.strictEqual(snapshot(alias).native.snapshotBytesEnabled, true);
 	await index.applyMutationBatch({ upserts: [{ id: 'a', fields: { text: 'hello' } }] });
-	await alias.applyMutationBatch({ upserts: [{ id: 'b', fields: { text: 'hello' } }] });
-	alias.configureTelemetry({ histograms: false });
-	assert.strictEqual(snapshot(index).native.histogramsEnabled, false);
-	await index.applyMutationBatch({ upserts: [{ id: 'c', fields: { text: 'hello' } }] });
-	assert.strictEqual(snapshot(index).logicalBatches.requestedMutationsDistribution.count, 1n);
-	assert.strictEqual(snapshot(index).logicalBatches.frameBytesDistribution.count, 1n);
-	assert.strictEqual(snapshot(index).native.snapshotBytesEnabled, true);
-	index.configureTelemetry({ histograms: true });
-	assert.strictEqual(snapshot(alias).native.histogramsEnabled, true);
-	await alias.applyMutationBatch({ upserts: [{ id: 'd', fields: { text: 'hello' } }] });
-	alias.configureTelemetry({});
-	assert.strictEqual(snapshot(alias).logicalBatches.requestedMutationsDistribution.count, 2n);
-	assert.strictEqual(snapshot(alias).logicalBatches.frameBytesDistribution.count, 2n);
-	assert.strictEqual(snapshot(index).logicalBatches.attempted, 2n);
-	assert.strictEqual(snapshot(alias).logicalBatches.attempted, 2n);
-	assert.strictEqual(snapshot(index).native.operations.applyFrame.succeeded, 4n);
-	assert.strictEqual(snapshot(alias).native.histogramsEnabled, true);
-	assert.strictEqual(snapshot(alias).native.snapshotBytesEnabled, true);
-	const late = new FacadeTelemetry(handle);
-	late.configure({ snapshotBytes: false });
-	assert.strictEqual(snapshot(index).native.histogramsEnabled, true);
-	index.configureTelemetry({ histograms: false });
-	assert.strictEqual(snapshot(alias).native.snapshotBytesEnabled, false);
+	const replacement = new NativeFullTextIndex({ handle, fieldNames: ['text'], maxBatchBytes: 8 << 20 });
+	replacement.configureTelemetry({ snapshotBytes: true });
+	assert.strictEqual(snapshot(replacement).native.histogramsEnabled, true);
+	assert.strictEqual(snapshot(replacement).native.snapshotBytesEnabled, true);
+	await replacement.applyMutationBatch({ upserts: [{ id: 'b', fields: { text: 'hello' } }] });
+	replacement.configureTelemetry({ histograms: false });
+	await replacement.applyMutationBatch({ upserts: [{ id: 'c', fields: { text: 'hello' } }] });
+	assert.strictEqual(snapshot(replacement).logicalBatches.requestedMutationsDistribution.count, 1n);
+	assert.strictEqual(snapshot(replacement).logicalBatches.frameBytesDistribution.count, 1n);
+	assert.strictEqual(snapshot(replacement).native.snapshotBytesEnabled, true);
+	replacement.configureTelemetry({ histograms: true });
+	await replacement.applyMutationBatch({ upserts: [{ id: 'd', fields: { text: 'hello' } }] });
+	replacement.configureTelemetry({});
+	assert.strictEqual(snapshot(replacement).logicalBatches.requestedMutationsDistribution.count, 2n);
+	assert.strictEqual(snapshot(replacement).logicalBatches.frameBytesDistribution.count, 2n);
+	assert.strictEqual(snapshot(index).logicalBatches.attempted, 1n);
+	assert.strictEqual(snapshot(replacement).logicalBatches.attempted, 3n);
+	assert.strictEqual(snapshot(replacement).native.operations.applyFrame.succeeded, 4n);
+	assert.strictEqual(snapshot(replacement).native.histogramsEnabled, true);
+	assert.strictEqual(snapshot(replacement).native.snapshotBytesEnabled, true);
+	const telemetry = new FacadeTelemetry(handle);
+	telemetry.configure({ snapshotBytes: false });
+	assert.strictEqual(telemetry.snapshot().native.histogramsEnabled, true);
+	replacement.configureTelemetry({ histograms: false });
+	assert.strictEqual(snapshot(replacement).native.snapshotBytesEnabled, false);
 	const { index: separate } = await fixture(context);
 	separate.configureTelemetry({ histograms: true });
+	assert.strictEqual(snapshot(replacement).native.histogramsEnabled, false);
+	assert.strictEqual(snapshot(replacement).native.snapshotBytesEnabled, false);
+});
+
+for (const kind of ['writer', 'reader']) {
+	test(`a failed initial ${kind} telemetry read preserves the token for recovery`, async (context) => {
+		const directory = mkdtempSync(path.join(tmpdir(), 'fulltext-telemetry-read-'));
+		const config = options(directory);
+		let writer;
+		let reader;
+		context.after(async () => {
+			if (reader) {
+				const result = await reader.close();
+				assert.strictEqual(result.cleanupError, undefined);
+			}
+			if (writer) {
+				const result = await writer.close({ mode: 'rollback' });
+				assert.strictEqual(result.cleanupError, undefined);
+			}
+			rmSync(directory, { recursive: true, force: true });
+		});
+		if (kind === 'reader') {
+			writer = await openNativeFullTextIndex(config);
+			await writer.applyMutationBatch({ upserts: [{ id: 'a', fields: { text: 'hello' } }] });
+			await writer.publish('one');
+		}
+		const addon = loadAddon();
+		const nativeTelemetry = addon.__nativeTelemetry;
+		let reads = 0;
+		try {
+			addon.__nativeTelemetry = (...arguments_) => {
+				const result = nativeTelemetry(...arguments_);
+				if (++reads === 1) throw new Error('injected initial telemetry read failure');
+				return result;
+			};
+			if (kind === 'writer') writer = await openNativeFullTextIndex(config);
+			else reader = await openNativeFullTextReader(config);
+		} finally {
+			addon.__nativeTelemetry = nativeTelemetry;
+		}
+		assert.strictEqual(reads, 1);
+		const index = kind === 'writer' ? writer : reader;
+		if (kind === 'writer') {
+			await index.applyMutationBatch({ upserts: [{ id: 'a', fields: { text: 'hello' } }] });
+			await index.publish('one');
+		}
+		assert.strictEqual((await index.search({ text: 'hello' })).total, 1);
+		assert.strictEqual(snapshot(index).native.state, 'open');
+		index.configureTelemetry({ histograms: true, snapshotBytes: false });
+		assert.strictEqual(snapshot(index).native.histogramsEnabled, true);
+		const result = await index.close({ mode: 'rollback' });
+		assert.strictEqual(result.cleanupError, undefined);
+		assert.strictEqual(snapshot(index).native.state, 'closed');
+	});
+}
+
+test('partial configuration read failures preserve flags and complete configuration can recover', async (context) => {
+	const { index } = await fixture(context);
+	index.configureTelemetry({ histograms: true, snapshotBytes: false });
+	const addon = loadAddon();
+	const nativeTelemetry = addon.__nativeTelemetry;
+	const failure = new Error('injected partial configuration read failure');
+	let reads = 0;
+	let rejectRead = true;
+	try {
+		addon.__nativeTelemetry = (...arguments_) => {
+			reads++;
+			const result = nativeTelemetry(...arguments_);
+			if (rejectRead) throw failure;
+			return result;
+		};
+		assert.throws(
+			() => index.configureTelemetry({ snapshotBytes: true }),
+			(error) => error.code === 'E_NATIVE_FAILURE' && error.cause === failure,
+		);
+		rejectRead = false;
+		const unchanged = snapshot(index);
+		assert.strictEqual(unchanged.native.histogramsEnabled, true);
+		assert.strictEqual(unchanged.native.snapshotBytesEnabled, false);
+		assert.strictEqual(reads, 2);
+		rejectRead = true;
+		index.configureTelemetry({ histograms: false, snapshotBytes: true });
+		assert.strictEqual(reads, 2);
+	} finally {
+		addon.__nativeTelemetry = nativeTelemetry;
+	}
 	assert.strictEqual(snapshot(index).native.histogramsEnabled, false);
-	assert.strictEqual(snapshot(index).native.snapshotBytesEnabled, false);
+	assert.strictEqual(snapshot(index).native.snapshotBytesEnabled, true);
 });
 
 test('native snapshots stay on telemetry cold paths and complete configuration avoids reading them', async (context) => {

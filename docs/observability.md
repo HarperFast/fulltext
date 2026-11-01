@@ -63,7 +63,9 @@ local histogram gate. This adds collection cost at those cold boundaries; search
 do not read a native snapshot. Reading telemetry also refreshes that local gate. Supplying both configuration options avoids
 the preliminary snapshot read. A new facade around a previously used raw handle inherits native
 settings and starts fresh logical counters; concurrent facade owners remain unsupported.
-Configure through the owning writer/reader facade; directly configuring internal native handles or constructing duplicate facade owners is unsupported. Disabling freezes accumulated histogram data; re-enabling continues it. There is no reset API.
+Configure through the owning writer/reader facade. Directly configuring internal native handles
+is unsupported. Disabling freezes accumulated histogram data; re-enabling continues it. There is
+no reset API.
 Histogram `count` and `sumNanoseconds` describe only enabled samples, independently of always-on
 timing totals. Buckets are **noncumulative**; each `upperBoundsNanoseconds` entry is an inclusive
 upper bound, with `null` for infinity. Convert to cumulative buckets when required by an exporter.
@@ -110,7 +112,9 @@ statistics, per-index RSS and native cancellation. Process CPU/RSS belongs to OS
 Harper owns request latency, authorization, record hydration, replication and source-log lag;
 this API makes no changes to Harper's public surfaces. If telemetry token acquisition fails,
 opening the index still succeeds and `telemetry()` returns `available: false` with a bounded
-reason. Operations continue; telemetry configuration then reports capability failure.
+reason. Operations continue; telemetry configuration then reports capability failure. A failed
+initial snapshot retains a successfully acquired token, allowing later collection or configuration
+to recover. A partial-configuration read failure leaves both native settings and the local gate unchanged.
 
 ## Qualifying overhead
 
@@ -178,7 +182,7 @@ post-settlement observer tail; successful final byte values are not a full-drain
 Search completion counters use three atomic worker banks per configured search worker, plus a
 shared fallback for unbound work. Recording still uses atomic increments; this reduces sharing
 without assuming that only one thread can ever settle a ticket. On the measured arm64 build,
-bank payload is 1,152 bytes per worker (4.5 KiB at four workers, 72 KiB at 64), plus a fixed
+bank payload is 1,920 bytes per worker (7.5 KiB at four workers, 120 KiB at 64), plus a fixed
 1 KiB alignment increase and container overhead. These scalar banks remain with a retained
 telemetry token after close. Scrapes sum all configured banks, so scrape work grows with worker
 count even when workers are idle. No engine, searcher or native mapping is retained by those banks.

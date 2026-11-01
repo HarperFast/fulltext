@@ -575,6 +575,13 @@ fn classify_search(
 		}
 	}
 }
+fn search_metric_operation(classification: &Result<bool>) -> usize {
+	if classification.as_ref().copied().unwrap_or(false) {
+		6
+	} else {
+		5
+	}
+}
 fn observe_operation(
 	metrics: &Metrics,
 	operation: usize,
@@ -709,11 +716,7 @@ pub fn native_search(
 			|| validate_search_header(&packed_request),
 			|| search_is_expensive_for_config(&packed_request, &runtime.config),
 		)?;
-		let metric_op = if classification.as_ref().copied().unwrap_or(false) {
-			6
-		} else {
-			5
-		};
+		let metric_op = search_metric_operation(&classification);
 		observe_operation(&runtime.metrics, metric_op, || {
 			let expensive = classification.map_err(fulltext_napi_error)?;
 			let queue = runtime.search_queue(expensive);
@@ -3947,7 +3950,8 @@ mod tests {
 				},
 			)
 			.unwrap();
-			let error = observe_operation(&metrics, 5, || {
+			let operation = search_metric_operation(&classification);
+			let error = observe_operation(&metrics, operation, || {
 				classification.map_err(fulltext_napi_error)?;
 				Ok(())
 			})
@@ -3988,11 +3992,8 @@ mod tests {
 		for expensive in [false, true] {
 			let metrics = Metrics::new();
 			let classification = classify_search(&metrics, || Ok(()), || Ok(()), || Ok(expensive)).unwrap();
-			let operation = if classification.as_ref().copied().unwrap_or(false) {
-				6
-			} else {
-				5
-			};
+			let operation = search_metric_operation(&classification);
+			assert_eq!(operation, if expensive { 6 } else { 5 });
 			let error = observe_operation(&metrics, operation, || {
 				assert_eq!(classification.map_err(fulltext_napi_error)?, expensive);
 				panic!("post-classification admission fault");
