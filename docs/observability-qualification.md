@@ -2,9 +2,9 @@
 
 ## Preserve qualification source history
 
-Merge this PR with a merge commit so the measured source commits below remain reachable. Do not squash, rebase or force-push the measured history without first preserving those commits under durable refs and recording the old-to-new source mapping. A later source revision does not retroactively qualify an earlier measurement, and source labels must not be retargeted to the release commit.
+Keep measured source commits reachable when integrating qualification changes. Merge commits retain the measured ancestry. Do not squash, rebase or force-push the measured history without first preserving those commits under durable refs and recording the old-to-new source mapping. A later source revision does not retroactively qualify an earlier measurement, and source labels must not be retargeted to the release commit.
 
-The linked qualification commits were verified as ancestors of `df54b0b`; retaining this history preserves their source identities. This requirement does not select a release version or authorize merging.
+The linked qualification commits were verified as ancestors of `df54b0b`; retaining this history preserves their source identities.
 
 ## Caller-controlled collection: polling stopped versus enabled
 
