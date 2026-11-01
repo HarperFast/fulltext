@@ -132,6 +132,22 @@ These are total-request comparisons. The wrapper control adds an AST node, stabl
 
 Correctness evidence is separate: the old installed addon fails the permanent 300-document, two-commit four-term All/AND/empty-body regressions with a distinct cutoff; the three-term control passes on that addon. The native canary independently compares raw TopDocs with scorer iteration at four terms. The new route passes both. Three-term routing is a conservative mitigation, not a demonstrated three-term failure or a claim of universal safety for smaller native queries. Ordinary stable collection cooperatively checks deadlines every 1,024 visited documents; these measurements do not establish strict latency bounds, customer-distribution throughput, or catalog-scale memory limits.
 
+### Pre-deadline baseline retained for comparison
+
+The [complete pre-deadline tables](https://github.com/HarperFast/fulltext/blob/89c55246a74b34141b3a188977eed29f6211b16c/benchmarks/DESIGN.md#L109-L162) retain artifact `ce875b5a` measurements. The deadline-aware artifact is `652d1aaa`. Both used the same driver/corpora, Node 24.16.0/macOS arm64 and 20 warm sequential samples. Selected stable baseline p50 milliseconds, varied scores and exact totals off:
+
+| Query                        | Before deadlines | Deadline-aware |
+| ---------------------------- | ---------------: | -------------: |
+| Three-term All               |            0.157 |          0.163 |
+| Four-term All                |            0.168 |          0.177 |
+| OR, routing corpus           |            0.137 |          0.152 |
+| Exact singleton prefix       |            0.142 |          0.159 |
+| Two short Fuzzy terms        |            0.129 |          0.156 |
+| One-token Phrase, two fields |            0.131 |          0.156 |
+| Three-term All, two fields   |            0.240 |          0.251 |
+
+The deadline-aware run was slower in these stable baseline rows. These are separate warm runs, not a controlled isolation of deadline-check overhead; generic wrapped controls also varied. Preserve both artifacts' tables when assessing the cost of cooperative cancellation. The diagnostic-only `5394ecf` changes validation errors, not collection, and was not re-benchmarked.
+
 ### Additional compiler routing shapes
 
 Use `node scripts/run-local.mjs benchmarks/query-scoring.mjs --routing-shapes` and add `--varied-scores` for the corresponding varied run. This opt-in mode leaves the default 20 shapes and corpus unchanged. It reuses the 10,000-document, four 2,500-document commit boundaries, 20 warm samples and limit 20. Only this mode adds short `xy`/`zz` tokens correlated with amber/stone membership, copies title into a second body field, enables positions/surface terms, and uses 125-document mutation batches. Both runs observed four committed segments.
