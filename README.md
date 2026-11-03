@@ -20,7 +20,7 @@ local index files or rebuild them from that authoritative data.
 - [Install](#installation) and [create your first index](#quick-start).
 - [Choose an API](#choose-an-api) and [understand search results](#reading-search-results).
 - [Configure analysis](#analyzer-and-field-configuration), [filters](#structured-filters), and [highlighting](#highlighting-and-snippets).
-- [Manage writes](#mutations-and-backpressure), [recover an index](#lifecycle-and-recovery), or [upgrade from 0.7.x](#upgrading-from-07x) / [0.6.x](#upgrading-from-06x).
+- [Manage writes](#mutations-and-backpressure), [recover an index](#lifecycle-and-recovery), or [upgrade from 0.8.x](#upgrading-from-08x) / [0.7.x](#upgrading-from-07x) / [0.6.x](#upgrading-from-06x).
 - Reference: [limits and recovery](docs/limits.md), [benchmarks](docs/benchmarks.md), and [backend internals](docs/native-backend-implementation.md).
 - Observe [native operations, queues, latency and snapshot statistics](docs/observability.md), or run the [JSON exporter example](examples/observability.mjs).
 
@@ -900,9 +900,9 @@ versions in the installed native addon:
 ```js
 import { runtimeInfo } from '@harperfast/fulltext/native';
 
-const { packageVersion, nativeAbiVersion, queryApiVersion, telemetryApiVersion } = await runtimeInfo();
-console.log({ packageVersion, nativeAbiVersion, queryApiVersion, telemetryApiVersion });
-// { packageVersion: '0.9.0', nativeAbiVersion: 14, queryApiVersion: 8, telemetryApiVersion: 1 }
+const { packageVersion, tantivyVersion, nativeAbiVersion, queryApiVersion, telemetryApiVersion } = await runtimeInfo();
+console.log({ packageVersion, tantivyVersion, nativeAbiVersion, queryApiVersion, telemetryApiVersion });
+// { packageVersion: '0.9.0', tantivyVersion: '0.27.0', nativeAbiVersion: 14, queryApiVersion: 8, telemetryApiVersion: 1 }
 ```
 
 The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an
