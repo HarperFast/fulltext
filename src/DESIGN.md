@@ -341,3 +341,30 @@ truncation, positive-branch selection, and analyzed-only fuzzy evidence under ne
 `trace_expression` owns shared per-record source tokens and bounds aggregate matching work;
 negative membership never spends highlight spans. Simple leaves retain the FTTM layout and
 existing evaluator; Boolean trees use FTBT, guarded by query API 9 / ABI 16.
+
+### Tantivy and application ownership
+
+Verified against pinned Tantivy 0.27.0 source: search uses the production `Engine::query`
+compiler, native queries/weights/scorers, postings and reader statistics. Tracing reuses the
+same tokenizer configuration, query normalization, synonym expansion and fuzzy matching
+predicates/automata. It does not establish indexed membership or calculate relevance scores.
+
+Tantivy's `SnippetGenerator::create` collects a flat `Query::query_terms` set, restricted by
+indexed document frequency. It loses occurrence polarity and matching-branch structure;
+`snippet_from_doc` joins field values. `SnippetGenerator::new` allows caller-supplied terms but
+still does not evaluate Boolean membership. Neither entry point implements this API's current-source
+fuzzy fallback, per-value UTF-16 spans or unknown evidence under truncated negation. An ephemeral
+in-memory index would require native indexing, commit and reader setup for each request and would
+still require source-offset projection. Do not add that lifecycle to highlighting.
+
+`TracePlan::needs_surface` identifies the analyzer streams each leaf actually reads. Full fuzzy
+membership under negation consumes analyzed tokens directly; it neither retains an unused
+surface copy nor builds a source-position map. Positive fuzzy tracing keeps the existing surface
+fallback and shares its matching predicates with the analyzed-only path. Regression tests
+prove that 300,000 analyzed tokens across values fit and unrelated prefix truncation cannot
+change the known membership of an analyzed-only negative leaf.
+
+Harper owns source loading/version checks, visibility/expiry, table/attribute authorization and
+product projection. Adoption is tracked in [Adopt Boolean-aware full-text highlights and snippets](https://github.com/HarperFast/harper/issues/3965).
+Harper must authorize membership-only fields even when those fields are not highlightable;
+removing their clauses before tracing would change Boolean truth.

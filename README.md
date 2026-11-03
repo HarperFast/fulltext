@@ -675,6 +675,20 @@ cannot satisfy NOT. A known matching OR branch can still provide spans. Membersh
 before positive spans consume the shared response/span budgets. Existing simple-clause trace
 frames and limits remain supported.
 
+### Engine and application boundary
+
+Tantivy owns indexed query execution, scoring, reader snapshots and analysis. Fulltext's source
+adapter reuses that analysis and matching machinery to return branch-aware spans from values
+supplied by the caller. Tantivy's snippet generator accepts a flat term set and does not preserve
+this API's Boolean branch truth, negative suppression, value indices or UTF-16 offsets. Fulltext
+therefore keeps bounded source membership and snippet projection separate from indexed search.
+
+Applications must authorize every field affecting membership, load/version-check current source,
+and enforce row visibility before projection. A matching trace does not establish that a row is
+still authorized, unexpired or present in the indexed snapshot. Harper adoption is tracked in
+[Adopt Boolean-aware full-text highlights and snippets](https://github.com/HarperFast/harper/issues/3965).
+These library changes do not expose a new Harper API by themselves.
+
 ## Deadlines and query isolation
 
 Search and tracing share a maximum 30-second queue-plus-execution budget. Applications can pass a

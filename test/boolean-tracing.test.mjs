@@ -17,7 +17,7 @@ const or = (...clauses) => ({ operator: 'or', clauses });
 const not = (clause) => ({ operator: 'not', clause });
 const boost = (clause) => ({ operator: 'boost', boost: 2, clause });
 const optional = (required, ...optional) => ({ operator: 'optional', required, optional });
-async function fixture(context) {
+async function fixture(context, overrides = {}) {
 	const directory = await mkdtemp(path.join(tmpdir(), 'fulltext-boolean-trace-'));
 	const index = await openNativeFullTextIndex({
 		path: directory,
@@ -26,6 +26,7 @@ async function fixture(context) {
 		analyzer: 'english@2',
 		fields: [{ name: 'title' }, { name: 'body' }],
 		surfaceTerms: true,
+		...overrides,
 		limits: {
 			indexingThreads: 1,
 			searchThreads: 2,
@@ -192,4 +193,49 @@ test('Boolean cached-value capacity bounds zero-token metadata and preserves unk
 	const result = await index.traceMatches({ query: and(leaf('oak'), not(leaf('forbidden'))) }, source);
 	assert.strictEqual(result.complete, false);
 	assert.deepStrictEqual(result.records, []);
+});
+
+test('negated full fuzzy retains only analyzed evidence across values', async (context) => {
+	const index = await fixture(context);
+	const source = [{ id: 'large', fields: { title: ['ox '.repeat(150_000), 'ox '.repeat(150_000)] } }];
+	const query = not(leaf('forbidden', ['title'], 'fuzzy'));
+	const result = await index.traceMatches({ query }, source);
+	assert.strictEqual(result.complete, true);
+	assert.deepStrictEqual(result.records, [{ id: 'large', values: [] }]);
+});
+
+test('surface truncation in another branch cannot hide analyzed-only fuzzy negation', async (context) => {
+	const index = await fixture(context);
+	const source = [{ id: 'large', fields: { title: ['ox '.repeat(150_000), 'ox '.repeat(150_000)] } }];
+	const query = or(not(leaf('forbidden', ['title'], 'fuzzy')), leaf('missing', ['title'], 'prefix'));
+	const result = await index.traceMatches({ query }, source);
+	assert.strictEqual(result.complete, false);
+	assert.deepStrictEqual(result.records, [{ id: 'large', values: [] }]);
+});
+
+test('Boolean tracing preserves synonym matches, value indices and UTF-16 offsets together', async (context) => {
+	const index = await fixture(context, { synonyms: [{ source: 'tv', replacements: ['television'] }] });
+	const source = [{ id: 'unicode', fields: { title: ['😀 tv', 'blocked tv'], body: 'amber' } }];
+	await index.applyMutationBatch({ upserts: source });
+	await index.commit();
+	await index.reload();
+	const query = and(leaf('television'), not(leaf('absent', ['body'])));
+	const result = await index.traceMatches({ query }, source, { snippets: true });
+	assert.strictEqual(result.complete, true);
+	assert.deepStrictEqual(
+		result.records.map(({ id }) => id),
+		(await index.search({ query })).hits.map(({ id }) => id),
+	);
+	assert.deepStrictEqual(
+		result.records[0].values.map(({ field, valueIndex, spans }) => ({ field, valueIndex, spans })),
+		[
+			{ field: 'title', valueIndex: 0, spans: [{ start: 3, end: 5 }] },
+			{ field: 'title', valueIndex: 1, spans: [{ start: 8, end: 10 }] },
+		],
+	);
+	for (const value of result.records[0].values) {
+		const text = source[0].fields.title[value.valueIndex];
+		assert.strictEqual(text.slice(value.spans[0].start, value.spans[0].end), 'tv');
+		assert(value.fragments.length > 0);
+	}
 });
