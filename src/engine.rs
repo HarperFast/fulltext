@@ -436,12 +436,12 @@ struct TraceSource<'a> {
 struct TraceLeaf<'a> {
 	plan: TracePlan,
 	fields: HashSet<&'a str>,
-	indexed_fuzzy: bool,
+	analyzed_fuzzy: bool,
 }
 
 impl TraceLeaf<'_> {
 	fn needs_surface(&self) -> bool {
-		self.plan.needs_surface(self.indexed_fuzzy)
+		self.plan.needs_surface(self.analyzed_fuzzy)
 	}
 }
 
@@ -680,8 +680,8 @@ impl FuzzyTraceTerm {
 }
 
 impl TracePlan {
-	fn needs_surface(&self, indexed_fuzzy: bool) -> bool {
-		matches!(self, Self::Prefix { .. }) || (!indexed_fuzzy && matches!(self, Self::Fuzzy { .. }))
+	fn needs_surface(&self, analyzed_fuzzy: bool) -> bool {
+		matches!(self, Self::Prefix { .. }) || (!analyzed_fuzzy && matches!(self, Self::Fuzzy { .. }))
 	}
 
 	fn record_matches(&self, found: &HashSet<String>) -> bool {
@@ -1315,7 +1315,7 @@ impl Engine {
 				leaves.push(TraceLeaf {
 					plan,
 					fields: fields.iter().map(|field| field.name.as_str()).collect(),
-					indexed_fuzzy: negative,
+					analyzed_fuzzy: negative,
 				});
 				TraceExpression::Leaf(index)
 			}
@@ -1448,7 +1448,7 @@ impl Engine {
 					}
 					work -= cost;
 					let (_, terms, _, truncated) =
-						self.trace_tokens(&leaf.plan, source, 0, deadline, leaf.indexed_fuzzy)?;
+						self.trace_tokens(&leaf.plan, source, 0, deadline, leaf.analyzed_fuzzy)?;
 					found.extend(terms);
 					unknown |= truncated;
 				}
@@ -1637,12 +1637,12 @@ impl Engine {
 		source: &TraceSource<'_>,
 		max_spans: usize,
 		deadline: Option<Instant>,
-		indexed_fuzzy: bool,
+		analyzed_fuzzy: bool,
 	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool, bool)> {
 		let analyzed = &source.analyzed;
 		let surface = &source.surface;
 		let utf16_offsets = &source.utf16;
-		let needs_surface = plan.needs_surface(indexed_fuzzy);
+		let needs_surface = plan.needs_surface(analyzed_fuzzy);
 		let analysis_truncated = source.analyzed_truncated || (needs_surface && source.surface_truncated);
 		let mut spans = Vec::new();
 		let mut seen_spans = HashSet::new();
@@ -1760,7 +1760,7 @@ impl Engine {
 			}
 			TracePlan::Fuzzy { exact, fuzzy } => {
 				let mut analyzed_by_position = HashMap::<usize, Vec<&str>>::new();
-				if !indexed_fuzzy {
+				if !analyzed_fuzzy {
 					for token in analyzed {
 						analyzed_by_position
 							.entry(token.position)
@@ -1768,13 +1768,13 @@ impl Engine {
 							.push(token.text.as_str());
 					}
 				}
-				let tokens = if indexed_fuzzy { analyzed } else { surface };
+				let tokens = if analyzed_fuzzy { analyzed } else { surface };
 				for (index, token) in tokens.iter().enumerate() {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
 					let analyzed_term = [token.text.as_str()];
-					let source_terms = if indexed_fuzzy {
+					let source_terms = if analyzed_fuzzy {
 						Some(analyzed_term.as_slice())
 					} else {
 						analyzed_by_position.get(&token.position).map(Vec::as_slice)
@@ -1784,7 +1784,7 @@ impl Engine {
 					let mut fuzzy_match = None;
 					if exact_match.is_none() {
 						for alternative in fuzzy {
-							if if indexed_fuzzy {
+							if if analyzed_fuzzy {
 								alternative.matches_analyzed(source_terms)?
 							} else {
 								alternative.matches(source_terms, &token.text)?
