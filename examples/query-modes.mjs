@@ -40,8 +40,21 @@ try {
 		{ text: 'waterprof', mode: 'fuzzy' },
 		{ text: 'waterproof tral', mode: 'fuzzy-prefix' },
 		{ text: 'waterproof', mode: 'any', candidateIds: ['boot-1'] },
+		{
+			query: {
+				operator: 'optional',
+				required: { text: 'waterproof' },
+				optional: [
+					{
+						operator: 'boost',
+						boost: 3,
+						clause: { text: 'trail running', mode: 'phrase', fields: ['title'] },
+					},
+				],
+			},
+		},
 	]) {
-		console.log(request.mode, await index.search({ ...request, limit: 10 }));
+		console.log(request.mode ?? 'optional', await index.search({ ...request, limit: 10 }));
 	}
 } finally {
 	await index?.close({ mode: 'rollback' });

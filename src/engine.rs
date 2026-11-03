@@ -105,6 +105,7 @@ struct EngineFilterField {
 struct BuiltQuery {
 	query: Box<dyn Query>,
 	clauses: usize,
+	stable_scores: bool,
 }
 
 const MAX_PHRASE_CONSTRUCTION_TERMS: usize = 64 * 256;
@@ -922,17 +923,17 @@ impl Engine {
 			});
 		}
 		let window_end = request.offset + request.limit;
-		let stable_any = request.candidate_ids.is_none()
-			&& request.filter.is_none()
-			&& query.clauses > 1
-			&& matches!(&request.expression, SearchExpression::Clause(clause) if clause.mode == SearchMode::Any);
-		let (hits, bounded_total, bounded_total_relation, collected_total) = if stable_any {
+		let stable_scores = request.candidate_ids.is_none() && request.filter.is_none() && query.stable_scores;
+		let (hits, bounded_total, bounded_total_relation, collected_total) = if stable_scores {
 			let (retained, match_count, mut scored_docs) = searcher
 				.search(
 					query.query.as_ref(),
-					&StableScoreTieCollector::new(request.offset..window_end.saturating_add(1)),
+					&catalog::DeadlineCollector::new(
+						StableScoreTieCollector::new(request.offset..window_end.saturating_add(1)),
+						deadline,
+					),
 				)
-				.map_err(index_error)??;
+				.map_err(collection_error)??;
 			check_deadline(deadline)?;
 			scored_docs.truncate(request.limit);
 			let hits = search_hits(searcher, scored_docs)?;
@@ -956,9 +957,12 @@ impl Engine {
 				let (_, match_count, scored_docs) = searcher
 					.search(
 						query.query.as_ref(),
-						&StableScoreTieCollector::new(request.offset..window_end),
+						&catalog::DeadlineCollector::new(
+							StableScoreTieCollector::new(request.offset..window_end),
+							deadline,
+						),
 					)
-					.map_err(index_error)??;
+					.map_err(collection_error)??;
 				let hits = search_hits(searcher, scored_docs)?;
 				(hits, Some(match_count))
 			} else {
@@ -1023,7 +1027,7 @@ impl Engine {
 				None => {
 					check_deadline(deadline)?;
 					(
-						catalog::count_matches(searcher, query.query.as_ref(), deadline).map_err(count_error)?,
+						catalog::count_matches(searcher, query.query.as_ref(), deadline).map_err(collection_error)?,
 						TotalRelation::Exact,
 					)
 				}
@@ -1465,16 +1469,50 @@ impl Engine {
 	}
 
 	fn query(&self, searcher: &Searcher, request: &SearchRequest) -> Result<BuiltQuery> {
-		let BuiltQuery { query, clauses } = self.expression_query(searcher, &request.expression)?;
+		let BuiltQuery {
+			query,
+			clauses,
+			stable_scores,
+		} = self.expression_query(searcher, &request.expression)?;
 		let query = self.with_candidates(query, request.candidate_ids.as_deref())?;
 		Ok(BuiltQuery {
 			query: self.with_filter(query, request.filter.as_ref())?,
 			clauses,
+			stable_scores,
 		})
 	}
 
 	fn expression_query(&self, searcher: &Searcher, expression: &SearchExpression) -> Result<BuiltQuery> {
 		crate::protocol::validate_search_structure(expression, self.max_query_clauses, self.fields.len())?;
+		if let SearchExpression::Boost { boost, clause } = expression {
+			if let SearchExpression::Clause(leaf) = clause.as_ref() {
+				if matches!(leaf.mode, SearchMode::Any | SearchMode::All) {
+					// Only the root has no inherited boost whose multiplication order must be preserved.
+					let fields: Vec<_> = self
+						.selected_fields(&leaf.fields)?
+						.into_iter()
+						.cloned()
+						.map(|mut field| {
+							field.weight *= *boost;
+							field
+						})
+						.collect();
+					let fields: Vec<_> = fields.iter().collect();
+					let occur = if leaf.mode == SearchMode::Any {
+						Occur::Should
+					} else {
+						Occur::Must
+					};
+					let (query, clauses, stable_scores) = self.term_query(&leaf.text, &fields, occur)?;
+					self.check_total_clause_count(clauses, 1)?;
+					return Ok(BuiltQuery {
+						query,
+						clauses: clauses + 1,
+						stable_scores,
+					});
+				}
+			}
+		}
 		self.expression_query_inner(searcher, expression, &mut QueryConstructionBudget::default())
 	}
 
@@ -1488,6 +1526,33 @@ impl Engine {
 			SearchExpression::Clause(clause) => self.clause_query(searcher, clause, budget),
 			SearchExpression::And(children) => self.boolean_query(searcher, children, Occur::Must, budget),
 			SearchExpression::Or(children) => self.boolean_query(searcher, children, Occur::Should, budget),
+			SearchExpression::Boost { boost, clause } => {
+				let mut child = self.expression_query_inner(searcher, clause, budget)?;
+				self.check_total_clause_count(child.clauses, 1)?;
+				child.query = boosted(child.query, *boost);
+				child.stable_scores &= *boost == 1.0;
+				child.clauses += 1;
+				Ok(child)
+			}
+			SearchExpression::Optional { required, optional } => {
+				let mut clauses = optional.len() + 1;
+				let required = self.expression_query_inner(searcher, required, budget)?;
+				self.check_total_clause_count(clauses, required.clauses)?;
+				clauses += required.clauses;
+				let mut queries = Vec::with_capacity(optional.len() + 1);
+				queries.push((Occur::Must, required.query));
+				for child in optional {
+					let child = self.expression_query_inner(searcher, child, budget)?;
+					self.check_total_clause_count(clauses, child.clauses)?;
+					clauses += child.clauses;
+					queries.push((Occur::Should, child.query));
+				}
+				Ok(BuiltQuery {
+					query: Box::new(BooleanQuery::new(queries)),
+					clauses,
+					stable_scores: false,
+				})
+			}
 			SearchExpression::Not(child) => {
 				let child = self.expression_query_inner(searcher, child, budget)?;
 				self.check_total_clause_count(child.clauses, 2)?;
@@ -1500,6 +1565,7 @@ impl Engine {
 						0.0,
 					)),
 					clauses: child.clauses + 2,
+					stable_scores: false,
 				})
 			}
 		}
@@ -1523,6 +1589,7 @@ impl Engine {
 		Ok(BuiltQuery {
 			query: Box::new(BooleanQuery::new(queries)),
 			clauses,
+			stable_scores: children.len() > if occur == Occur::Must { 2 } else { 1 },
 		})
 	}
 
@@ -1533,7 +1600,7 @@ impl Engine {
 		budget: &mut QueryConstructionBudget,
 	) -> Result<BuiltQuery> {
 		let fields = self.selected_fields(&clause.fields)?;
-		let (query, clauses) = match clause.mode {
+		let (query, clauses, stable_scores) = match clause.mode {
 			SearchMode::Any => self.term_query(&clause.text, &fields, Occur::Should)?,
 			SearchMode::All => self.term_query(&clause.text, &fields, Occur::Must)?,
 			SearchMode::Phrase => self.phrase_query(&clause.text, &fields, budget)?,
@@ -1543,7 +1610,11 @@ impl Engine {
 				self.prefix_query(searcher, &clause.text, &fields, true, clause.options, budget)?
 			}
 		};
-		Ok(BuiltQuery { query, clauses })
+		Ok(BuiltQuery {
+			query,
+			clauses,
+			stable_scores,
+		})
 	}
 
 	fn analyze(&self, text: &str, surface: bool, deduplicate: bool) -> Result<Vec<String>> {
@@ -1587,10 +1658,10 @@ impl Engine {
 		Ok(terms)
 	}
 
-	fn term_query(&self, text: &str, fields: &[&EngineField], occur: Occur) -> Result<(Box<dyn Query>, usize)> {
+	fn term_query(&self, text: &str, fields: &[&EngineField], occur: Occur) -> Result<(Box<dyn Query>, usize, bool)> {
 		let terms = self.analyze(text, false, true)?;
 		if terms.is_empty() {
-			return Ok((Box::new(EmptyQuery), 0));
+			return Ok((Box::new(EmptyQuery), 0, false));
 		}
 		self.check_clause_count(terms.len(), fields.len())?;
 		let clauses = terms.len().saturating_mul(fields.len());
@@ -1605,8 +1676,9 @@ impl Engine {
 					alternatives.push((Occur::Should, boosted(query, field.weight)));
 				}
 			}
-			return Ok((Box::new(BooleanQuery::new(alternatives)), clauses));
+			return Ok((Box::new(BooleanQuery::new(alternatives)), clauses, clauses > 1));
 		}
+		let stable_scores = terms.len() > 2 && clauses > 0;
 		Ok((
 			Box::new(BooleanQuery::new(
 				terms
@@ -1615,6 +1687,7 @@ impl Engine {
 					.collect(),
 			)),
 			clauses,
+			stable_scores,
 		))
 	}
 
@@ -1623,18 +1696,18 @@ impl Engine {
 		text: &str,
 		fields: &[&EngineField],
 		budget: &mut QueryConstructionBudget,
-	) -> Result<(Box<dyn Query>, usize)> {
+	) -> Result<(Box<dyn Query>, usize, bool)> {
 		if !self.positions {
 			return Err(FulltextError::invalid("phrase search requires positions to be enabled"));
 		}
 		let terms = self.analyze_positioned(text)?;
 		if terms.is_empty() {
-			return Ok((Box::new(EmptyQuery), 0));
+			return Ok((Box::new(EmptyQuery), 0, false));
 		}
 		self.check_clause_count(1, fields.len())?;
 		budget.phrase(terms.len(), fields.len())?;
 		if terms.len() == 1 {
-			return Ok((self.term_group(&terms[0].1, fields), fields.len()));
+			return Ok((self.term_group(&terms[0].1, fields), fields.len(), fields.len() > 1));
 		}
 		let alternatives = fields
 			.iter()
@@ -1649,7 +1722,7 @@ impl Engine {
 				(Occur::Should, boosted(query, field.weight))
 			})
 			.collect();
-		Ok((Box::new(BooleanQuery::new(alternatives)), fields.len()))
+		Ok((Box::new(BooleanQuery::new(alternatives)), fields.len(), false))
 	}
 
 	fn fuzzy_query(
@@ -1658,7 +1731,7 @@ impl Engine {
 		fields: &[&EngineField],
 		options: QueryOptions,
 		budget: &mut QueryConstructionBudget,
-	) -> Result<(Box<dyn Query>, usize)> {
+	) -> Result<(Box<dyn Query>, usize, bool)> {
 		let surface = self.analyze(text, true, true)?;
 		let mut pairs = Vec::new();
 		for surface_term in surface {
@@ -1668,7 +1741,7 @@ impl Engine {
 			}
 		}
 		if pairs.is_empty() {
-			return Ok((Box::new(EmptyQuery), 0));
+			return Ok((Box::new(EmptyQuery), 0, false));
 		}
 		let fuzzy_terms = pairs.iter().filter(|(_, term)| fuzzy_eligible(term)).count();
 		if fuzzy_terms > MAX_FUZZY_TERMS {
@@ -1678,6 +1751,7 @@ impl Engine {
 		}
 		self.check_clause_count(pairs.len(), fields.len().saturating_mul(3))?;
 		budget.fuzzy(fuzzy_terms, fields.len(), options.fuzzy_distance)?;
+		let stable_scores = pairs.len() - fuzzy_terms >= 2;
 		let exact_bonus = fields.iter().map(|field| field.weight).fold(0.0f32, f32::max) * 0.25 + 1.0;
 		let clause_count = pairs.len().saturating_mul(fields.len().saturating_mul(3));
 		let clauses = pairs
@@ -1701,7 +1775,7 @@ impl Engine {
 				))
 			})
 			.collect::<Result<Vec<_>>>()?;
-		Ok((Box::new(BooleanQuery::new(clauses)), clause_count))
+		Ok((Box::new(BooleanQuery::new(clauses)), clause_count, stable_scores))
 	}
 
 	fn prefix_query(
@@ -1712,14 +1786,14 @@ impl Engine {
 		fuzzy: bool,
 		options: QueryOptions,
 		budget: &mut QueryConstructionBudget,
-	) -> Result<(Box<dyn Query>, usize)> {
+	) -> Result<(Box<dyn Query>, usize, bool)> {
 		self.require_surface_fields(fields)?;
 		if text.chars().last().is_some_and(char::is_whitespace) {
 			return self.term_query(text, fields, Occur::Must);
 		}
 		let (completed, surface_prefix) = self.final_surface_term(text)?;
 		let Some(surface_prefix) = surface_prefix else {
-			return Ok((Box::new(EmptyQuery), 0));
+			return Ok((Box::new(EmptyQuery), 0, false));
 		};
 		let minimum = if fuzzy { 4 } else { 3 };
 		if surface_prefix.chars().count() < minimum {
@@ -1737,6 +1811,7 @@ impl Engine {
 				format!("prefix query exceeds {} clauses", self.max_query_clauses),
 			));
 		}
+		let stable_scores = completed.len() + 1 > 2 && !(fuzzy && fuzzy_eligible(&surface_prefix));
 		let mut clauses = Vec::with_capacity(completed.len() + 1);
 		for term in completed {
 			clauses.push((Occur::Must, self.term_group(&term, fields)));
@@ -1787,6 +1862,7 @@ impl Engine {
 		Ok((
 			Box::new(BooleanQuery::new(clauses)),
 			completed_clause_count + prefix_clause_count + fuzzy_clause_count,
+			stable_scores,
 		))
 	}
 
@@ -3326,7 +3402,7 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 	FulltextError::new("E_STORAGE", error.to_string())
 }
 
-fn count_error(error: tantivy::TantivyError) -> FulltextError {
+fn collection_error(error: tantivy::TantivyError) -> FulltextError {
 	match &error {
 		tantivy::TantivyError::InvalidArgument(message) if message == crate::error::SEARCH_TIMEOUT_MESSAGE => {
 			FulltextError::new("E_TIMEOUT", crate::error::SEARCH_TIMEOUT_MESSAGE)
@@ -3779,7 +3855,7 @@ mod tests {
 					} else {
 						FuzzyTermQuery::new(term, distance, transpositions)
 					};
-					let (query, _) = if prefix {
+					let (query, _, _) = if prefix {
 						engine
 							.prefix_query(
 								&searcher,
@@ -3913,7 +3989,7 @@ mod tests {
 				(true, "trail waterpro"),
 			] {
 				let mut budget = QueryConstructionBudget::default();
-				let (current, _) = if prefix {
+				let (current, _, _) = if prefix {
 					engine
 						.prefix_query(&searcher, text, &fields, true, options, &mut budget)
 						.unwrap()
@@ -4591,10 +4667,10 @@ mod tests {
 		config.identity.surface_terms = true;
 		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
 		let fields = engine.fields.iter().collect::<Vec<_>>();
-		let (flat_query, clauses) = engine.term_query("waterproof trail", &fields, Occur::Should).unwrap();
+		let (flat_query, clauses, _) = engine.term_query("waterproof trail", &fields, Occur::Should).unwrap();
 		assert_eq!(clauses, 4);
 		assert_eq!(format!("{flat_query:?}").matches("BooleanQuery").count(), 1);
-		let (grouped_query, _) = engine.term_query("waterproof trail", &fields, Occur::Must).unwrap();
+		let (grouped_query, _, _) = engine.term_query("waterproof trail", &fields, Occur::Must).unwrap();
 		assert_eq!(format!("{grouped_query:?}").matches("BooleanQuery").count(), 3);
 
 		let mut writer = engine.writer(&config).unwrap();
@@ -5600,6 +5676,385 @@ mod tests {
 		writer.close().unwrap();
 	}
 
+	fn assert_nested_boost_reference_scores(field_weight: f32, outer: f32, inner: f32) {
+		let mut config = config();
+		config.identity.fields[0].weight = field_weight;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "matched".to_owned(),
+					version: None,
+					fields: vec![("title".to_owned(), vec!["amber stone".to_owned()])],
+					filters: Vec::new(),
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		for mode in [SearchMode::Any, SearchMode::All] {
+			let leaf = expression("amber", mode, vec!["title".to_owned()]);
+			let query = SearchExpression::Boost {
+				boost: outer,
+				clause: Box::new(SearchExpression::Boost {
+					boost: inner,
+					clause: Box::new(leaf.clone()),
+				}),
+			};
+			let base = engine.expression_query(&searcher, &leaf).unwrap();
+			let reference = BoostQuery::new(Box::new(BoostQuery::new(base.query, inner)), outer);
+			let actual = engine.expression_query(&searcher, &query).unwrap();
+			let scores = |query: &dyn Query| {
+				let weight = query
+					.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
+					.unwrap();
+				searcher
+					.segment_readers()
+					.iter()
+					.flat_map(|reader| {
+						let mut scorer = weight.scorer(reader, 1.0).unwrap();
+						let mut scores = Vec::new();
+						while scorer.doc() != tantivy::TERMINATED {
+							scores.push((scorer.doc(), scorer.score().to_bits()));
+							scorer.advance();
+						}
+						scores
+					})
+					.collect::<Vec<_>>()
+			};
+			let expected = scores(&reference);
+			assert!(!expected.is_empty());
+			assert_eq!(
+				scores(actual.query.as_ref()),
+				expected,
+				"native boost order changed for {field_weight} * {inner} * {outer}"
+			);
+			let mut request = admission_request(mode);
+			request.expression = query;
+			request.exact_total = true;
+			let result = engine.search(&searcher, &request).unwrap();
+			assert_eq!(result.total, 1);
+			assert_eq!(result.hits[0].id, "matched");
+			if outer == 0.0 {
+				assert_eq!(result.hits[0].score, 0.0);
+			}
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn nested_boost_zero_preserves_native_order_without_intermediate_overflow() {
+		assert_nested_boost_reference_scores(3e38, 0.0, 2.0);
+	}
+
+	#[test]
+	fn nested_boost_fractional_weights_preserve_native_score_bits() {
+		for weight in [0.1, 0.3, 0.7, 1.3] {
+			for (outer, inner) in [(0.7, 0.3), (0.1, 0.7), (1.3, 2.7)] {
+				assert_nested_boost_reference_scores(weight, outer, inner);
+			}
+		}
+	}
+
+	#[test]
+	fn simple_boosts_preserve_term_query_topology_and_collector_route() {
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		for mode in [SearchMode::Any, SearchMode::All] {
+			for boost in [0.0, 1.0, 2.5] {
+				let expression = SearchExpression::Boost {
+					boost,
+					clause: Box::new(SearchExpression::Clause(SearchClause {
+						text: "trail".to_owned(),
+						mode,
+						options: QueryOptions::default(),
+						fields: vec!["title".to_owned()],
+					})),
+				};
+				let built = engine.expression_query(&searcher, &expression).unwrap();
+				assert_eq!(built.clauses, 2);
+				assert!(!built.stable_scores);
+				let topology = format!("{:?}", built.query);
+				assert!(topology.starts_with("BooleanQuery"), "{topology}");
+				if mode == SearchMode::Any {
+					let wide = SearchExpression::Boost {
+						boost,
+						clause: Box::new(SearchExpression::Clause(SearchClause {
+							text: "trail waterproof shoe".to_owned(),
+							mode: SearchMode::Any,
+							options: QueryOptions::default(),
+							fields: vec!["title".to_owned()],
+						})),
+					};
+					let built = engine.expression_query(&searcher, &wide).unwrap();
+					assert_eq!(built.clauses, 4);
+					assert!(built.stable_scores);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn four_term_intersection_pruning_differs_from_scorer_but_search_preserves_bits() {
+		let mut configuration = config();
+		configuration.identity.fields = vec![FieldConfig {
+			name: "title".to_owned(),
+			weight: 0.7f32 * 0.3f32,
+		}];
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let mut writer = engine.writer(&configuration).unwrap();
+		let terms = ["amber", "stone", "quartz", "ruby"];
+		let mut upserts = (0..127)
+			.map(|id| {
+				let mut words = Vec::new();
+				for (position, term) in terms.iter().enumerate() {
+					words.extend(std::iter::repeat_n(
+						*term,
+						1 + ((id * (7 + position * 4)) % (11 + position * 6)),
+					));
+				}
+				words.extend(std::iter::repeat_n("filler", 1 + ((id * 37) % 173)));
+				crate::protocol::Upsert {
+					id: format!("all-{id}"),
+					version: None,
+					fields: vec![("title".to_owned(), vec![words.join(" ")])],
+					filters: Vec::new(),
+				}
+			})
+			.collect::<Vec<_>>();
+		upserts.push(crate::protocol::Upsert {
+			id: "distractor".to_owned(),
+			version: None,
+			fields: vec![("title".to_owned(), vec!["amber stone quartz".to_owned()])],
+			filters: Vec::new(),
+		});
+		writer
+			.apply(MutationBatch {
+				upserts,
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let expression = expression(&terms.join(" "), SearchMode::All, vec!["title".to_owned()]);
+		let built = engine.expression_query(&searcher, &expression).unwrap();
+		let weight = built
+			.query
+			.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
+			.unwrap();
+		let mut iterated = Vec::new();
+		for (segment, reader) in searcher.segment_readers().iter().enumerate() {
+			let mut scorer = weight.scorer(reader, 1.0).unwrap();
+			while scorer.doc() != tantivy::TERMINATED {
+				iterated.push((scorer.score(), DocAddress::new(segment as u32, scorer.doc())));
+				scorer.advance();
+			}
+		}
+		let ids = search_hit_ids(&searcher, &iterated).unwrap();
+		let mut expected = iterated
+			.into_iter()
+			.zip(ids)
+			.map(|((score, _), id)| (id, score))
+			.collect::<Vec<_>>();
+		expected
+			.sort_by(|(left_id, left), (right_id, right)| right.total_cmp(left).then_with(|| left_id.cmp(right_id)));
+		assert_ne!(expected[4].1, expected[5].1, "fixture cutoff must avoid tie fallback");
+		let raw = searcher
+			.search(built.query.as_ref(), &TopDocs::with_limit(6).order_by_score())
+			.unwrap();
+		let raw_ids = search_hit_ids(&searcher, &raw).unwrap();
+		let raw_bits = raw
+			.iter()
+			.zip(raw_ids)
+			.take(5)
+			.map(|((score, _), id)| (id, score.to_bits()))
+			.collect::<Vec<_>>();
+		let expected_bits = expected
+			.into_iter()
+			.take(5)
+			.map(|(id, score)| (id, score.to_bits()))
+			.collect::<Vec<_>>();
+		assert_ne!(
+			raw_bits, expected_bits,
+			"pinned Tantivy intersection canary no longer diverges; reassess stable routing"
+		);
+		assert_eq!(
+			raw_bits.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+			expected_bits.iter().map(|(id, _)| id).collect::<Vec<_>>()
+		);
+		let mut request = admission_request(SearchMode::All);
+		request.expression = expression;
+		request.limit = 5;
+		let result = engine.search(&searcher, &request).unwrap();
+		let actual = result
+			.hits
+			.into_iter()
+			.map(|hit| (hit.id, hit.score.to_bits()))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			actual, expected_bits,
+			"ordinary search must preserve native scorer bits"
+		);
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn empty_direct_rust_schema_has_no_score_sum_to_stabilize() {
+		let mut configuration = config();
+		configuration.identity.fields.clear();
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let result = engine.search(&searcher, &admission_request(SearchMode::All)).unwrap();
+		assert!(result.hits.is_empty());
+		assert_eq!(result.total, 0);
+	}
+
+	#[test]
+	fn stable_score_routes_preserve_safe_small_queries_and_cover_term_sums() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let mut writer = engine.writer(&config()).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "populated-fields".to_owned(),
+					version: None,
+					fields: vec![
+						("title".to_owned(), vec!["amber stone quartz".to_owned()]),
+						("description".to_owned(), vec!["amber stone quartz".to_owned()]),
+					],
+					filters: Vec::new(),
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let leaf = |text, mode| expression(text, mode, vec!["title".to_owned()]);
+		let all_two = leaf("amber stone", SearchMode::All);
+		let all_three = leaf("amber stone quartz", SearchMode::All);
+		let two_leaves = vec![leaf("amber", SearchMode::Any), leaf("stone", SearchMode::Any)];
+		let three_leaves = vec![
+			leaf("amber", SearchMode::Any),
+			leaf("stone", SearchMode::Any),
+			leaf("quartz", SearchMode::Any),
+		];
+		let boost = |clause| SearchExpression::Boost {
+			boost: 0.3,
+			clause: Box::new(clause),
+		};
+		for (name, expression, expected_clauses, expected_stable) in [
+			("single Any", leaf("amber", SearchMode::Any), 1, false),
+			("two-term Any", leaf("amber stone", SearchMode::Any), 2, true),
+			("two-term All", all_two.clone(), 2, false),
+			("three-term All", all_three.clone(), 3, true),
+			("two-leaf AND", SearchExpression::And(two_leaves.clone()), 4, false),
+			("three-leaf AND", SearchExpression::And(three_leaves.clone()), 6, true),
+			(
+				"single-leaf OR",
+				SearchExpression::Or(vec![leaf("amber", SearchMode::Any)]),
+				2,
+				false,
+			),
+			("two-leaf OR", SearchExpression::Or(two_leaves), 4, true),
+			("boosted two-term All", boost(all_two), 3, false),
+			("boosted three-term All", boost(all_three.clone()), 4, true),
+			("nested boosted All", boost(boost(all_three)), 5, false),
+			(
+				"boosted AND",
+				boost(SearchExpression::And(three_leaves.clone())),
+				7,
+				false,
+			),
+			(
+				"identity boosted AND",
+				SearchExpression::Boost {
+					boost: 1.0,
+					clause: Box::new(SearchExpression::And(three_leaves)),
+				},
+				7,
+				true,
+			),
+			(
+				"two-term multi-field All",
+				expression("amber stone", SearchMode::All, vec![]),
+				4,
+				false,
+			),
+			(
+				"three-term multi-field All",
+				expression("amber stone quartz", SearchMode::All, vec![]),
+				6,
+				true,
+			),
+			(
+				"single-term multi-field All",
+				expression("amber", SearchMode::All, vec![]),
+				2,
+				false,
+			),
+			(
+				"optional root",
+				SearchExpression::Optional {
+					required: Box::new(leaf("amber", SearchMode::Any)),
+					optional: vec![leaf("stone", SearchMode::Any)],
+				},
+				4,
+				false,
+			),
+			(
+				"not root",
+				SearchExpression::Not(Box::new(leaf("amber stone quartz", SearchMode::All))),
+				5,
+				false,
+			),
+		] {
+			let built = engine.expression_query(&searcher, &expression).unwrap();
+			assert_eq!(built.clauses, expected_clauses, "{name}");
+			assert_eq!(built.stable_scores, expected_stable, "{name}");
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn query_builders_report_stable_collection_for_collapsible_term_scores() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "terms".to_owned(),
+					version: None,
+					fields: vec![("title".to_owned(), vec!["amber stone quartz ruby".to_owned()])],
+					filters: Vec::new(),
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		for (text, mode, fields, expected) in [
+			("amber", SearchMode::Phrase, vec![], true),
+			("amber", SearchMode::Phrase, vec!["title".to_owned()], false),
+			("amber stone", SearchMode::Phrase, vec![], false),
+			("xy zz", SearchMode::Fuzzy, vec![], true),
+			("amber stone", SearchMode::Fuzzy, vec![], false),
+			("amber stone quartz ruby ", SearchMode::Prefix, vec![], true),
+			("amber stone quartz ruby ", SearchMode::FuzzyPrefix, vec![], true),
+			("amber stone quartz ruby", SearchMode::Prefix, vec![], true),
+			("amber stone quartz ruby", SearchMode::FuzzyPrefix, vec![], false),
+		] {
+			let expression = expression(text, mode, fields);
+			let built = engine.expression_query(&searcher, &expression).unwrap();
+			assert_eq!(built.stable_scores, expected, "{text:?} {mode:?}");
+		}
+		writer.close().unwrap();
+	}
+
 	#[test]
 	fn scorer_and_for_each_preserve_score_bits() {
 		let mut config = config();
@@ -5668,26 +6123,60 @@ mod tests {
 				},
 				fields: Vec::new(),
 			});
-			let built = engine.expression_query(&searcher, &clause).unwrap();
-			let weight = built
-				.query
-				.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
-				.unwrap();
-			for reader in searcher.segment_readers() {
-				let mut scorer = weight.scorer(reader, 1.0).unwrap();
-				let mut scored = Vec::new();
-				while scorer.doc() != tantivy::TERMINATED {
-					scored.push((scorer.doc(), scorer.score().to_bits()));
-					scorer.advance();
-				}
-				let mut enumerated = Vec::new();
-				weight
-					.for_each(reader, &mut |doc, score| enumerated.push((doc, score.to_bits())))
+			for clause in [
+				clause.clone(),
+				SearchExpression::Boost {
+					boost: 0.0,
+					clause: Box::new(clause.clone()),
+				},
+				SearchExpression::Boost {
+					boost: 2.5,
+					clause: Box::new(clause.clone()),
+				},
+				SearchExpression::Optional {
+					required: Box::new(clause.clone()),
+					optional: vec![clause.clone()],
+				},
+			] {
+				let built = engine.expression_query(&searcher, &clause).unwrap();
+				let reference = if let SearchExpression::Boost { boost, clause } = &clause {
+					let child = engine.expression_query(&searcher, clause).unwrap();
+					Some(boosted(child.query, *boost))
+				} else {
+					None
+				};
+				let weight = built
+					.query
+					.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
 					.unwrap();
-				assert!(!scored.is_empty(), "fixture must match {text}");
-				scored.sort_unstable();
-				enumerated.sort_unstable();
-				assert_eq!(scored, enumerated, "scoring topology changed for {text}");
+				for reader in searcher.segment_readers() {
+					let mut scorer = weight.scorer(reader, 1.0).unwrap();
+					let mut scored = Vec::new();
+					while scorer.doc() != tantivy::TERMINATED {
+						scored.push((scorer.doc(), scorer.score().to_bits()));
+						scorer.advance();
+					}
+					let mut enumerated = Vec::new();
+					weight
+						.for_each(reader, &mut |doc, score| enumerated.push((doc, score.to_bits())))
+						.unwrap();
+					assert!(!scored.is_empty(), "fixture must match {text}");
+					if let Some(reference) = &reference {
+						let reference_weight = reference
+							.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
+							.unwrap();
+						let mut reference_scorer = reference_weight.scorer(reader, 1.0).unwrap();
+						let mut expected = Vec::new();
+						while reference_scorer.doc() != tantivy::TERMINATED {
+							expected.push((reference_scorer.doc(), reference_scorer.score().to_bits()));
+							reference_scorer.advance();
+						}
+						assert_eq!(scored, expected, "lowered boost changed score bits for {text}");
+					}
+					scored.sort_unstable();
+					enumerated.sort_unstable();
+					assert_eq!(scored, enumerated, "scoring topology changed for {text}");
+				}
 			}
 		}
 		writer.close().unwrap();
@@ -6370,6 +6859,160 @@ mod tests {
 		assert_eq!(error.code, "E_INCOMPLETE_CREATE");
 	}
 	#[test]
+	fn ordinary_stable_collection_aborts_before_visiting_all_matches() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		use tantivy::query::{EnableScoring, Explanation, Scorer, Weight};
+		use tantivy::DocSet;
+		#[derive(Debug)]
+		struct ObservedQuery {
+			inner: Box<dyn Query>,
+			visited: Arc<AtomicUsize>,
+			deadline: Instant,
+		}
+		impl Clone for ObservedQuery {
+			fn clone(&self) -> Self {
+				Self {
+					inner: self.inner.box_clone(),
+					visited: self.visited.clone(),
+					deadline: self.deadline,
+				}
+			}
+		}
+		struct ObservedWeight {
+			inner: Box<dyn Weight>,
+			visited: Arc<AtomicUsize>,
+			deadline: Instant,
+		}
+		struct ObservedScorer {
+			inner: Box<dyn Scorer>,
+			visited: Arc<AtomicUsize>,
+			deadline: Instant,
+		}
+		impl Query for ObservedQuery {
+			fn weight(&self, scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+				Ok(Box::new(ObservedWeight {
+					inner: self.inner.weight(scoring)?,
+					visited: self.visited.clone(),
+					deadline: self.deadline,
+				}))
+			}
+		}
+		impl Weight for ObservedWeight {
+			fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+				Ok(Box::new(ObservedScorer {
+					inner: self.inner.scorer(reader, boost)?,
+					visited: self.visited.clone(),
+					deadline: self.deadline,
+				}))
+			}
+			fn explain(&self, reader: &SegmentReader, doc: DocId) -> tantivy::Result<Explanation> {
+				self.inner.explain(reader, doc)
+			}
+		}
+		impl DocSet for ObservedScorer {
+			fn advance(&mut self) -> DocId {
+				self.visited.fetch_add(1, Ordering::Relaxed);
+				self.inner.advance()
+			}
+			fn doc(&self) -> DocId {
+				self.inner.doc()
+			}
+			fn size_hint(&self) -> u32 {
+				self.inner.size_hint()
+			}
+		}
+		impl Scorer for ObservedScorer {
+			fn score(&mut self) -> Score {
+				if self.visited.load(Ordering::Relaxed) == 0 {
+					while Instant::now() < self.deadline {
+						std::thread::yield_now();
+					}
+				}
+				self.inner.score()
+			}
+		}
+		let config = config();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut writer = engine.writer(&config).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		writer
+			.apply(MutationBatch {
+				upserts: (0..4096)
+					.map(|id| crate::protocol::Upsert {
+						id: format!("doc-{id}"),
+						version: None,
+						fields: vec![("title".to_owned(), vec!["amber stone quartz ruby".to_owned()])],
+						filters: Vec::new(),
+					})
+					.collect(),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let mut request = admission_request(SearchMode::All);
+		request.expression = expression("amber stone quartz ruby", SearchMode::All, vec!["title".to_owned()]);
+		let mut query = engine.query(&searcher, &request).unwrap();
+		assert!(query.stable_scores);
+		let visited = Arc::new(AtomicUsize::new(0));
+		let deadline = Instant::now() + std::time::Duration::from_secs(1);
+		query.query = Box::new(ObservedQuery {
+			inner: query.query,
+			visited: visited.clone(),
+			deadline,
+		});
+		let error = engine
+			.collect_search(&searcher, &request, Some(deadline), None, None, query)
+			.unwrap_err();
+		assert_eq!(error.code, "E_TIMEOUT");
+		assert!(visited.load(Ordering::Relaxed) > 0);
+		assert!(
+			visited.load(Ordering::Relaxed) <= 1024,
+			"collection must abort before a full scan"
+		);
+		assert_eq!(engine.search(&searcher, &request).unwrap().hits.len(), request.limit);
+		writer
+			.apply(MutationBatch {
+				upserts: Vec::new(),
+				deletes: vec!["doc-0".to_owned()],
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		assert!(searcher
+			.segment_readers()
+			.iter()
+			.any(|segment| segment.alive_bitset().is_some()));
+		let query = engine.query(&searcher, &request).unwrap();
+		let (_, count, expected) = searcher
+			.search(query.query.as_ref(), &StableScoreTieCollector::new(0..request.limit))
+			.unwrap()
+			.unwrap();
+		assert_eq!(count, 4095);
+		let expected = search_hits(&searcher, expected).unwrap();
+		request.exact_total = true;
+		let actual = engine
+			.search_with_deadline(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
+			.unwrap();
+		assert_eq!(actual.total, 4095);
+		assert_eq!(
+			actual
+				.hits
+				.iter()
+				.map(|hit| (&hit.id, hit.score.to_bits()))
+				.collect::<Vec<_>>(),
+			expected
+				.iter()
+				.map(|hit| (&hit.id, hit.score.to_bits()))
+				.collect::<Vec<_>>()
+		);
+		assert!(!actual.hits.iter().any(|hit| hit.id == "doc-0"));
+		writer.close().unwrap();
+	}
+
+	#[test]
 	fn ordinary_exact_count_preserves_native_error_classification() {
 		use tantivy::query::{EnableScoring, Weight};
 		#[derive(Clone, Copy, Debug)]
@@ -6456,6 +7099,7 @@ mod tests {
 						kind,
 					}),
 					clauses: real.clauses,
+					stable_scores: real.stable_scores,
 				},
 			);
 			assert_eq!(result.unwrap_err().code, expected);
@@ -6551,6 +7195,7 @@ mod tests {
 				weights: weights.clone(),
 			}),
 			clauses: query.clauses,
+			stable_scores: query.stable_scores,
 		};
 		let result = engine
 			.collect_search(

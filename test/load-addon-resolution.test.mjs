@@ -88,7 +88,7 @@ function createFixture(context, options) {
 				? "throw new Error('fixture load failure');\n"
 				: `module.exports = {
 					source: 'platform',
-						runtimeInfo() { return { packageVersion: ${JSON.stringify(options.nativeVersion)}, nativeAbiVersion: 14, telemetryApiVersion: ${options.telemetryVersion ?? 1}, queryApiVersion: 7, storageBackends: ['native'] }; },
+						runtimeInfo() { return { packageVersion: ${JSON.stringify(options.nativeVersion)}, nativeAbiVersion: 14, telemetryApiVersion: ${options.telemetryVersion ?? 1}, queryApiVersion: ${options.queryVersion ?? 8}, storageBackends: ['native'] }; },
 						${options.omitTelemetrySymbol === '__nativeCreateTelemetry' ? '' : '__nativeCreateTelemetry() {},'} ${options.omitTelemetrySymbol === '__nativeTelemetry' ? '' : '__nativeTelemetry() {},'} ${options.omitTelemetrySymbol === '__nativeConfigureTelemetry' ? '' : '__nativeConfigureTelemetry() {},'} __nativeInspect() {}, __nativeValidateOpen() {}, __nativeConfigureRuntime() {}, __nativeReset() {}, __nativeOpenReader() {}
 				};\n`,
 		);
@@ -122,3 +122,16 @@ test('telemetry capability rejects unknown API versions', (context) => {
 		'E_NATIVE_CAPABILITY_MISMATCH',
 	);
 });
+
+for (const [name, options, message] of [
+	['telemetry-only', { queryVersion: 7 }, 'Fulltext query API 7 from PACKAGE is not supported'],
+	['scoring-only', { telemetryVersion: 0 }, 'Fulltext native artifact PACKAGE does not provide telemetry API 1'],
+]) {
+	test(`combined capabilities reject a ${name} artifact with a matching package version and ABI`, (context) => {
+		const fixture = createFixture(context, { nativeVersion: '0.1.0', ...options });
+		assert.strictEqual(
+			runFixture(fixture.root, 'try { loadAddon(); } catch (error) { console.log(`${error.code}:${error.message}`); }'),
+			`E_NATIVE_CAPABILITY_MISMATCH:${message.replace('PACKAGE', fixture.packageName)}`,
+		);
+	});
+}

@@ -89,7 +89,7 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 		package_version: env!("CARGO_PKG_VERSION").to_owned(),
 		tantivy_version: TANTIVY_VERSION.to_owned(),
 		native_abi_version: NATIVE_ABI_VERSION,
-		query_api_version: 7,
+		query_api_version: 8,
 		telemetry_api_version: 1,
 		query_class_isolation_minimum_search_threads: 2,
 		storage_backends: vec!["native".to_owned()],

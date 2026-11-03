@@ -4,14 +4,21 @@ Status: verified against Tantivy 0.27.0 source and local macOS arm64 tests · Ow
 Engineering · Last verified: 2026-10-28
 
 `TraversalScoreTieCollector` owns its scorer loop so it can return `E_TIMEOUT` between document
-batches. Keep the ordinary `StableScoreTieCollector` independent: traversal-only boundary and
-deadline checks must not enter its per-match path.
+batches. The ordinary `StableScoreTieCollector` stays independent of traversal boundaries. Ordinary stable
+passes reuse the shared `catalog::DeadlineCollector` scorer loop and check deadlines every 1,024
+visited documents, including the boundary-tie rerun. The wrapper respects deletions and returns an
+error instead of partial hits; its timeout sentinel maps to `E_TIMEOUT`.
 
 Traversal must use the same scoring path on every page. In pinned Tantivy 0.27.0,
 `BooleanWeight::for_each` and `BooleanWeight::scorer` both construct `BufferedUnionScorer` for term
 unions; `into_box_scorer` performs that construction for the latter. Preserve this equivalence when
 upgrading Tantivy: a different floating-point summation order can change score ties and continuation
-boundaries.
+boundaries. Pinned `block_wand_intersection` also groups four-term sums differently from
+`Intersection::score`. Ordinary unfiltered search therefore uses the existing stable collector for
+compiler-identified term unions and intersections, including exact prefix fallbacks, All leaves
+with three or more analyzed terms, root AND groups with three or more children, and root OR groups
+with two or more children. The three-term cutoff is conservative; the canary proves
+the four-term divergence, not a universal failure at three terms or universal safety at two.
 
 The test `traversal_retains_a_merged_snapshot_and_stops_collection_on_deadline` enforces
 collection-stage expiry and preservation of an old searcher through a forced merge. Public traversal
@@ -44,7 +51,7 @@ and its UTF-16 spans independently of indexed stems.
 `QueryOptions` resolves fuzzy distance 0–2/default 1 and transpositions default true per leaf.
 The facade rejects supplied fuzzy controls on Boolean groups before reading their children;
 controls belong to text leaves and are never inherited.
-Protocol 8 encodes u8/bool after each mode; ABI 14/query API 7 require a matching facade. Options
+Protocol 8 encodes u8/bool after each mode; ABI 14/query API 8 require a matching facade. Options
 are absent from persisted identity and included in continuation digests. Nondefault fuzzy traces
 lazily use requested native automata on the existing analyzed/surface branches, sharing a matcher
 when query terms are identical. Distance zero uses equality/prefix checks without a DFA. Current-source
@@ -220,7 +227,7 @@ aggregation children map directly to native `sub_aggregation` trees. Resource ad
 for collector construction and possible parent instances before collection. Histogram parents use
 position spans, with native query-scoped probes when conservative admission fails. Histogram safety
 checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
-checks protect each recursive wire/API walker. Current packed protocol 8, query API 7 and ABI 14
+checks protect each recursive wire/API walker. Current packed protocol 8, query API 8 and ABI 14
 include metadata, query-capacity open support and per-leaf matching controls. Neither change alters persisted identity v8.
 
 Sorted snapshot continuation and metadata-derived score adjustment remain outside this
@@ -249,7 +256,7 @@ structured-filter bounds remain fixed. The facade's frozen `queryLimits` getter 
 snapshot, not mutable caller options. Native validation remains authoritative for raw frames and
 direct Rust opens.
 
-`SearchStructureBudget` charges `S = sum(AND/OR child counts) + 2 × NOT count` before descending.
+`SearchStructureBudget` charges `S = sum(AND/OR child counts) + 2 × NOT count + Boost count + sum(Optional child counts)` before descending.
 The compiler charges those same edges plus nonnegative leaf costs, so `S <= compiled clauses`
 and AST nodes are at most `S + 1`. This protects allocation without duplicating Tantivy analysis.
 The Node normalizer charges before visiting children; the native admission scanner uses the actual
@@ -269,7 +276,7 @@ above that. Fuzzy traces compare at most 16 eligible alternatives. Branch-local 
 makes completion checks constant-time. Boundary and construction regressions live in `query-capacity.test.mjs` and the
 engine tests.
 
-Raised-policy admission compares maximum per-leaf term cost and summed compiled-clause cost against the default envelope. Boolean child counts and NOT’s two synthetic clauses are included, matching native query construction; term counts across independent leaves are not added. Protocol boundary tests and the two-handle optimized admission test enforce this distinction.
+Raised-policy admission compares maximum per-leaf term cost and summed compiled-clause cost against the default envelope. Each Boolean child costs one structural clause, NOT costs two, boost costs one, and optional scoring costs one per required or optional child, matching native query construction; term counts across independent leaves are not added. Protocol boundary tests and the two-handle optimized admission test enforce this distinction.
 
 Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
 non-ASCII input conservatively uses the expensive lane because normalization can expand text.
@@ -280,6 +287,24 @@ require a matching facade/addon.
 The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
 additional tail rejects. A future extension needs explicit framing/versioning rather than appending
 an ambiguous optional value.
+
+## Query scoring
+
+Boost preserves its child's membership; Optional requires its required branch and adds scores from matching optional branches through native Must/Should composition. Every walker charges one structural clause per boost and one per required or optional child before descending. Optional-only anchors cannot make a complement-driven required branch cheap. Admission inherits expensive work from all children.
+
+Only a root boost directly over an Any/All leaf multiplies the selected field weights before constructing term queries. This keeps bare term scorers visible to Tantivy's native pruning paths. The reference-score tests check exact float32 bits against BoostQuery: BoostWeight's scorer multiplies the outer boost into the leaf's existing boost, matching this lowering. Query builders record the required collection path in `BuiltQuery::stable_scores`; collection does not reconstruct topology from the input AST. Term unions retain the existing multi-clause Any policy. Term intersections with three or more analyzed terms use stable collection across all selected fields, because empty per-segment fields can collapse unions into bare TermScorers. One/two-term All starts with TopDocs; boundary ties can still trigger a stable rerun.
+
+Completed prefix input delegates to the term builder and inherits this fact. Nontrailing exact prefix queries with three or more conjuncts can also collapse singleton dictionary expansions into term intersections. Eligible fuzzy-prefix bonus branches retain generic scoring. A one-position phrase is a field term union; multi-position phrases retain native phrase scoring. Fuzzy queries conservatively use stable collection when two or more ineligible surface terms could survive as a term union after other branches disappear. AND/OR use immediate child counts, since each child can collapse to one bare term scorer per segment. Candidate/filter wrappers add ConstScorers and already force generic native scoring. Native non-unit boost wrappers clear the fact; identity wrappers inherit it. Root Any/All weight lowering carries the term builder's fact directly.
+
+The stable path scans matches and resolves ID ordinals even for low limits. Like the existing Any path, affected queries fail closed if any matching document lacks an ID ordinal, including matches outside the returned page. Admission policy remains
+unchanged, so broad three-term conjunctions can do this work in the ordinary lane, subject to existing
+term/clause admission bounds. Ordinary stable collection checks deadlines every 1,024 visited documents through the shared collector, plus before and after collection. These cooperative checks do not interrupt a single slow scorer operation and are not a strict latency bound. The added All/AND/OR scan cost is measured only by the small paired workload, not qualified at catalog scale. The four-term raw-TopDocs/scorer canary and public bounded-page
+regressions pin this mitigation for Tantivy upgrades. This is not a repair of every possible native
+block-max rounding bound; the underlying two-term and cross-segment bounds remain upstream concerns.
+
+Every nested boost, including one over an Any/All leaf, remains wrapped in native BoostQuery. This preserves outer-first float32 multiplication: folding an inner boost into a field weight can change rounding or overflow before an enclosing zero boost reaches it. Native-reference regressions cover fractional weights and a finite large field weight with an outer zero boost. Other root modes and composite subtrees also remain wrapped in native BoostQuery. At the root, that wrapper uses Tantivy's generic pruning iterator rather than the specialized Boolean block-WAND paths; optional required-All composition also incurs scoring work beyond the required-only intersection. The paired optimized workload in benchmarks/query-scoring.mjs compares total request costs. Its varied-score mode rules out boundary-tie reruns for the OR/AND pairs; it does not isolate pruning overhead or count skipped blocks. Recheck topology, score bits and these comparisons when upgrading Tantivy; the measurements do not establish a catalog-scale latency guarantee.
+
+Negative-zero boosts reject before execution. Direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts with native ABI 14 and query API 8. Persisted identity is unchanged.
 
 ## Lifecycle state identity
 

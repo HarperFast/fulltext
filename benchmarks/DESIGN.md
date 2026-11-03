@@ -113,3 +113,112 @@ compare unchanged-default controls before attributing a regression to the new op
 ## Writer stall evidence
 
 The opt-in writer-diagnostics helper emits five-second process CPU/RSS and existing native status snapshots. It uses an unref timer, contains sampling/output errors, serializes counters as decimal strings and detaches native status before close while continuing process CPU/RSS sampling until close settles. Native test-addon events use a separate prefix so progress JSON parsers ignore them. Diagnostic overhead and separate wall-clock samples are observations; neither changes workload acceptance or establishes native CPU attribution.
+
+## Query relevance scoring
+
+`npm run benchmark:query-scoring` builds production artifacts and runs the local addon. Direct driver invocation assumes an already-built optimized addon. The original sample indexed 10,000 documents across four commits, with 7,500 Any/OR matches and 5,000 All/AND matches. A subset of required matches also contains the optional term, and optional-only records must stay excluded. Before timing, paired full-result checks verify membership, exact totals, doubled boost scores and positive optional bonuses.
+
+The original sample used twenty warm sequential searches per row, limit 20, with exact totals disabled and enabled separately. The paired root-boost OR/AND rows compare complete request latency with composite wrapping; optional with required All compares native Must/Should composition against its required-only baseline. Repeated score ties can force the unboosted top-docs collector to rerun through stable collection, so these rows dilute specialized-pruning differences and do not isolate the cost of losing block-WAND. These costs remain accepted rather than introducing custom scorer or composite boost distribution semantics.
+
+The original sample's two-term Any baseline and boosted Any rows both used stable collection, so they did not measure the root leaf lowering's specialized pruning. That sample lacked a boosted-All row; the current driver and measurements below add two-, three- and four-term All comparisons.
+
+A same-process optimized run of the original sample on 2026-10-31, macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 produced these local p50 milliseconds:
+
+| Query                      | Exact totals off | Exact totals on |
+| -------------------------- | ---------------: | --------------: |
+| Any baseline               |            0.133 |           0.112 |
+| Boosted Any                |            0.108 |           0.111 |
+| Optional with required Any |            0.250 |           0.238 |
+| OR baseline                |            0.123 |           0.120 |
+| Root boost over OR         |            0.178 |           0.169 |
+| AND baseline               |            0.118 |           0.120 |
+| Root boost over AND        |            0.158 |           0.154 |
+| All baseline               |            0.124 |           0.108 |
+| Optional with required All |            0.217 |           0.204 |
+
+The composite root boost and required-All optional paths cost more in this corpus. Lowering a root boost directly over an Any leaf does not imply zero overhead for other query shapes. Recursive boosts retain native wrappers to preserve outer-first float32 multiplication. This small warm fixture contains repeated terms and ties; timings include the JavaScript/native boundary and are not a throughput or catalog-scale qualification. The varied-score mode below removes the boundary-tie rerun confound for its OR/AND pairs. Re-run paired rows on representative customer distributions before drawing broader performance conclusions.
+
+### Varied-score collector boundary
+
+The earlier varied-score sample kept the same membership distribution while varying term frequency and document length. It checked that ranks 20 and 21 differed for each OR/AND pair before timing; the current driver extends that check to every non-optional row. With these unfiltered Boolean queries, that check rules out the stable-collector boundary-tie rerun in `Engine::collect_search`. Output records the corpus and `distinctBoundary` for each row. This does not measure how many blocks Tantivy prunes.
+
+After the nested-boost multiplication-order fix, an optimized run on the same machine/runtime produced these p50 milliseconds (10,000 documents, 20 warm sequential samples, limit 20):
+
+| Query               | Exact totals off | Exact totals on |
+| ------------------- | ---------------: | --------------: |
+| OR baseline         |            0.132 |           0.158 |
+| Root boost over OR  |            0.108 |           0.133 |
+| AND baseline        |            0.072 |           0.094 |
+| Root boost over AND |            0.101 |           0.126 |
+
+All paired membership, total and boost-score checks passed, as did the four distinct-boundary assertions in both total modes. The OR cost difference changes sign relative to the tied corpus; neither sample establishes a general speedup or slowdown. Generic composite boosting remains an accepted native-library tradeoff. These small warm samples do not qualify throughput, memory at catalog scale, or other document/score distributions.
+
+### Stable routing for wider term sums
+
+The current driver adds a single-term baseline and root-lowered/native-wrapped comparisons, plus two-, three- and four-term All families. `boost(2, boost(1, clause))` is the native-wrapped control: its inner identity boost disappears, while the outer native wrapper remains. Complete membership, scaled scores and native-wrapped score bits must agree before any timing. All 40 rows completed in each of the tied and varied modes (20 query shapes across exact totals off/on). Both runs observed four committed segments; each All term has 5,000 postings spread across the committed batches, beyond one 128-document block. Committed `meta.json` observations are benchmark diagnostics, not a public storage API.
+
+In the varied corpus, ranks 20 and 21 must differ for every non-optional row. The three/four-term All baseline and lowered rows now use stable collection; the native-wrapped controls use generic native TopDocs iteration. Two-term All starts with native pruning, while tied cutoffs can trigger the existing stable rerun. The tied mode deliberately retains that confound.
+
+An optimized 2026-10-31 run after moving the stable-score fact into query construction and adding shared deadline checks to ordinary stable collection, on macOS arm64, Node 24.16.0, Tantivy 0.27.0, native ABI 14 / query API 8 measured these p50 milliseconds (20 warm sequential samples, limit 20). Native artifact SHA256: `652d1aaafd045641c1880a6c08e1a52099df5aa599de91fabf64f1ec6191cd6b`. Both modes passed all 40 correctness rows and observed four committed segments.
+
+| Query                         | Tied, exact off | Tied, exact on | Varied, exact off | Varied, exact on |
+| ----------------------------- | --------------: | -------------: | ----------------: | ---------------: |
+| Single term baseline          |           0.116 |          0.109 |             0.093 |            0.092 |
+| Single term root lowered      |           0.119 |          0.110 |             0.091 |            0.096 |
+| Single term native wrapped    |           0.115 |          0.113 |             0.094 |            0.099 |
+| Two-term All baseline         |           0.135 |          0.131 |             0.077 |            0.104 |
+| Two-term All root lowered     |           0.140 |          0.132 |             0.078 |            0.104 |
+| Two-term All native wrapped   |           0.143 |          0.139 |             0.102 |            0.126 |
+| Three-term All baseline       |           0.119 |          0.119 |             0.163 |            0.153 |
+| Three-term All root lowered   |           0.120 |          0.118 |             0.162 |            0.158 |
+| Three-term All native wrapped |           0.179 |          0.171 |             0.127 |            0.162 |
+| Four-term All baseline        |           0.140 |          0.131 |             0.177 |            0.176 |
+| Four-term All root lowered    |           0.139 |          0.133 |             0.177 |            0.173 |
+| Four-term All native wrapped  |           0.210 |          0.208 |             0.143 |            0.195 |
+
+These are total-request comparisons. The wrapper control adds an AST node, stable collection resolves ID ordinals, exact totals can add a separate native count, and tied TopDocs can rerun collection. Those differences prevent attributing the timing delta solely to pruning or ordinal lookup. The small single-term differences do not establish an optimization benefit; the two-term and wider-All rows expose costs on this corpus only. Historical tables above describe earlier fixtures/builds and are not a matched before/after speedup comparison.
+
+Correctness evidence is separate: the old installed addon fails the permanent 300-document, two-commit four-term All/AND/empty-body regressions with a distinct cutoff; the three-term control passes on that addon. The native canary independently compares raw TopDocs with scorer iteration at four terms. The new route passes both. Three-term routing is a conservative mitigation, not a demonstrated three-term failure or a claim of universal safety for smaller native queries. Ordinary stable collection cooperatively checks deadlines every 1,024 visited documents; these measurements do not establish strict latency bounds, customer-distribution throughput, or catalog-scale memory limits.
+
+### Pre-deadline baseline retained for comparison
+
+The [complete pre-deadline tables](https://github.com/HarperFast/fulltext/blob/89c55246a74b34141b3a188977eed29f6211b16c/benchmarks/DESIGN.md#L109-L162) retain artifact `ce875b5a` measurements. The deadline-aware artifact is `652d1aaa`. Both used the same driver/corpora, Node 24.16.0/macOS arm64 and 20 warm sequential samples. Selected stable baseline p50 milliseconds, varied scores and exact totals off:
+
+| Query                        | Before deadlines | Deadline-aware |
+| ---------------------------- | ---------------: | -------------: |
+| Three-term All               |            0.157 |          0.163 |
+| Four-term All                |            0.168 |          0.177 |
+| OR, routing corpus           |            0.137 |          0.152 |
+| Exact singleton prefix       |            0.142 |          0.159 |
+| Two short Fuzzy terms        |            0.129 |          0.156 |
+| One-token Phrase, two fields |            0.131 |          0.156 |
+| Three-term All, two fields   |            0.240 |          0.251 |
+
+The deadline-aware run was slower in these stable baseline rows. These are separate warm runs, not a controlled isolation of deadline-check overhead; generic wrapped controls also varied. Preserve both artifacts' tables when assessing the cost of cooperative cancellation. The diagnostic-only `5394ecf` changes validation errors, not collection, and was not re-benchmarked.
+
+### Additional compiler routing shapes
+
+Use `node scripts/run-local.mjs benchmarks/query-scoring.mjs --routing-shapes` and add `--varied-scores` for the corresponding varied run. This opt-in mode leaves the default 20 shapes and corpus unchanged. It reuses the 10,000-document, four 2,500-document commit boundaries, 20 warm samples and limit 20. Only this mode adds short `xy`/`zz` tokens correlated with amber/stone membership, copies title into a second body field, enables positions/surface terms, and uses 125-document mutation batches. Both runs observed four committed segments.
+
+Each family has an explicit expected total: OR, short-Fuzzy and one-token two-field Phrase match 7,500 documents; exact prefix and three-term two-field All match 5,000. The exact prefix has two completed terms and a singleton final `ruby` expansion. Complete correctness reads use 100-hit traversal pages because ordinary prefix search rejects limits above 100; timed ordinary requests remain at limit 20. Complete membership, totals and exact doubled baseline scores must agree with `boost(2, boost(1, query))` before timing. The native wrapper retains generic scoring. The varied mode requires distinct ranks 20/21 for all 20 rows; the tied mode deliberately retains boundary ties.
+
+On the same unchanged optimized artifact `652d1aaafd045641c1880a6c08e1a52099df5aa599de91fabf64f1ec6191cd6b`, Node 24.16.0/macOS arm64, all 20 rows passed in each mode. P50 milliseconds:
+
+| Query                                       | Tied, exact off | Tied, exact on | Varied, exact off | Varied, exact on |
+| ------------------------------------------- | --------------: | -------------: | ----------------: | ---------------: |
+| OR baseline                                 |           0.125 |          0.117 |             0.152 |            0.156 |
+| OR native wrapped                           |           0.169 |          0.166 |             0.110 |            0.130 |
+| Exact singleton prefix baseline             |           0.149 |          0.118 |             0.159 |            0.150 |
+| Exact singleton prefix native wrapped       |           0.209 |          0.176 |             0.129 |            0.166 |
+| Two short Fuzzy terms baseline              |           0.189 |          0.117 |             0.156 |            0.145 |
+| Two short Fuzzy terms native wrapped        |           0.235 |          0.160 |             0.112 |            0.131 |
+| One-token Phrase, two fields baseline       |           0.121 |          0.123 |             0.156 |            0.155 |
+| One-token Phrase, two fields native wrapped |           0.180 |          0.177 |             0.114 |            0.146 |
+| Three-term All, two fields baseline         |           0.226 |          0.223 |             0.251 |            0.261 |
+| Three-term All, two fields native wrapped   |           0.372 |          0.413 |             0.227 |            0.349 |
+
+The default driver also measured its original OR pair on this artifact: tied baseline/root boost p50 was 0.126/0.172 ms with exact totals off and 0.123/0.175 ms on; varied was 0.156/0.108 ms off and 0.158/0.118 ms on. The routing-mode OR rows use the augmented corpus, so they are not matched before/after comparisons with those default rows.
+
+These samples measure total requests, including JavaScript/native calls, query construction, stable ID-ordinal resolution and possible separate exact counts. Wrapped controls add AST nodes and double scores; tied cutoffs can trigger a stable rerun. None of these pairs isolates pruning or compiler overhead, and timing differences change with totals and corpus. The added families make the small-workload costs visible; they establish no general speedup, strict deadline bound, catalog-scale throughput or memory qualification.
+
+The query-scoring measurements above describe the pre-telemetry scoring build identified by their retained source and addon hashes. They do not qualify the combined 0.9.0 scoring/telemetry artifact.

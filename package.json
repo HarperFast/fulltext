@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/fulltext",
-	"version": "0.8.0",
+	"version": "0.9.0",
 	"description": "Native Tantivy full-text indexing for Node.js",
 	"type": "module",
 	"exports": {
@@ -43,6 +43,7 @@
 		"benchmark:multi-index": "npm run build && node scripts/run-local.mjs benchmarks/multi-index.mjs",
 		"benchmark:inspect": "npm run build && node scripts/run-local.mjs benchmarks/inspect.mjs",
 		"benchmark:inspect:smoke": "node scripts/run-local.mjs benchmarks/inspect.mjs --smoke",
+		"benchmark:query-scoring": "npm run build && node scripts/run-local.mjs benchmarks/query-scoring.mjs",
 		"benchmark:query-controls": "npm run build && node scripts/run-local.mjs benchmarks/query-controls.mjs",
 		"examples:smoke": "node scripts/run-local.mjs examples/basic.mjs && node scripts/run-local.mjs examples/query-modes.mjs && node scripts/run-local.mjs examples/catalog-search.mjs && node scripts/run-local.mjs examples/metadata-search.mjs && node scripts/run-local.mjs examples/structured-filters.mjs && node scripts/run-local.mjs examples/checkpoint-recovery.mjs && node scripts/run-local.mjs examples/highlighting.mjs && node scripts/run-local.mjs examples/multi-index.mjs && node scripts/run-local.mjs examples/reset-rebuild.mjs && node scripts/run-local.mjs examples/observability.mjs",
 		"benchmark:smoke": "node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver logical && node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver low-level",
@@ -72,10 +73,10 @@
 		"url": "git+https://github.com/HarperFast/fulltext.git"
 	},
 	"optionalDependencies": {
-		"@harperfast/fulltext-darwin-arm64": "0.8.0",
-		"@harperfast/fulltext-linux-arm64-gnu": "0.8.0",
-		"@harperfast/fulltext-linux-x64-gnu": "0.8.0",
-		"@harperfast/fulltext-win32-x64-msvc": "0.8.0"
+		"@harperfast/fulltext-darwin-arm64": "0.9.0",
+		"@harperfast/fulltext-linux-arm64-gnu": "0.9.0",
+		"@harperfast/fulltext-linux-x64-gnu": "0.9.0",
+		"@harperfast/fulltext-win32-x64-msvc": "0.9.0"
 	},
 	"devDependencies": {
 		"@napi-rs/cli": "3.10.5",

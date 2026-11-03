@@ -960,3 +960,47 @@ test('concurrent search callers remain correct while telemetry is repeatedly scr
 		assert.strictEqual(queue.oldestAgeNanoseconds, null);
 	}
 });
+
+test(
+	'combined scoring and telemetry preserve eligibility and settle a queue-expired ordinary search once',
+	{ timeout: 10_000 },
+	async (context) => {
+		const { index, addon, handle } = await rawFixture(context);
+		index.configureTelemetry({ histograms: true });
+		await index.applyMutationBatch({
+			upserts: [
+				{ id: 'required', fields: { text: 'amber stone trail' } },
+				{ id: 'bonus', fields: { text: 'amber quartz trail' } },
+				{ id: 'optional-only', fields: { text: 'quartz' } },
+			],
+		});
+		await index.publish('scoring-telemetry');
+		const query = {
+			operator: 'optional',
+			required: { text: 'amber' },
+			optional: [{ operator: 'boost', boost: 10, clause: { text: 'quartz' } }],
+		};
+		const result = await index.search({ query, limit: 10 });
+		assert.deepStrictEqual(
+			result.hits.map(({ id }) => id),
+			['bonus', 'required'],
+		);
+		const successful = snapshot(index).native.operations.search;
+		assert.strictEqual(successful.attempted, 1n);
+		assert.strictEqual(successful.succeeded, 1n);
+		conservedAtQuiescence(successful);
+		assert.strictEqual(snapshot(index).native.operations.expensiveSearch.attempted, 0n);
+
+		addon.__testDelayNextOrdinarySearch(handle, 20);
+		await assert.rejects(index.search({ text: 'amber stone trail', mode: 'all' }, { remainingBudgetMilliseconds: 1 }), {
+			code: 'E_TIMEOUT',
+		});
+		const final = snapshot(index).native.operations.search;
+		assert.strictEqual(final.attempted, 2n);
+		assert.strictEqual(final.succeeded, 1n);
+		assert.strictEqual(final.failed, 1n);
+		assert.strictEqual(final.errors.E_TIMEOUT, 1n);
+		conservedAtQuiescence(final);
+		assert.strictEqual(snapshot(index).preparationRejections.search.total, 0n);
+	},
+);

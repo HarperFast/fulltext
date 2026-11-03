@@ -70,7 +70,7 @@ test('loads the artifact for the executing platform', async () => {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
 		nativeAbiVersion: 14,
-		queryApiVersion: 7,
+		queryApiVersion: 8,
 		queryClassIsolationMinimumSearchThreads: 2,
 		lifecycleApiVersion: 1,
 		mutationBatchApiVersion: 5,

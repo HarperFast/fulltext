@@ -29,6 +29,7 @@ import {
 	maxExpressionDepth,
 	maxQueryClauses,
 	resolveQueryLimits,
+	normalizeQueryBoost,
 	encodeTrace,
 	MutationBatchFrameCursor,
 } from './codec.js';
@@ -70,7 +71,7 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	queryApiVersion: 7;
+	queryApiVersion: 8;
 	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
 	mutationBatchApiVersion: 5;
@@ -259,7 +260,9 @@ export interface SearchClause extends QueryOptions {
 export type SearchExpression =
 	| SearchClause
 	| { operator: 'and' | 'or'; clauses: SearchExpression[] }
-	| { operator: 'not'; clause: SearchExpression };
+	| { operator: 'not'; clause: SearchExpression }
+	| { operator: 'boost'; boost: number; clause: SearchExpression }
+	| { operator: 'optional'; required: SearchExpression; optional: SearchExpression[] };
 
 export type FilterValue = string | number | boolean;
 
@@ -1395,7 +1398,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			queryApiVersion: info.queryApiVersion as 7,
+			queryApiVersion: info.queryApiVersion as 8,
 			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
 			mutationBatchApiVersion: 5,
@@ -1443,6 +1446,13 @@ function normalizeSearchExpression(
 	if (!request || typeof request !== 'object' || Array.isArray(request)) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'search request must be an object');
 	}
+	if (
+		('boost' in request && request.boost !== undefined) ||
+		('optional' in request && request.optional !== undefined) ||
+		('required' in request && request.required !== undefined) ||
+		('should' in request && request.should !== undefined)
+	)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'scoring controls belong in a query expression');
 	if (request.query !== undefined) {
 		if (
 			request.text !== undefined ||
@@ -1474,8 +1484,32 @@ function normalizeExpression(
 	if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > maxExpressionDepth) {
 		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search expression');
 	}
+	if ('boost' in expression && expression.boost !== undefined && expression.operator !== 'boost')
+		throw new FulltextError('E_INVALID_ARGUMENT', 'boost belongs on a boost expression');
+	if (
+		((('optional' in expression && expression.optional !== undefined) ||
+			('required' in expression && expression.required !== undefined)) &&
+			expression.operator !== 'optional') ||
+		('should' in expression && expression.should !== undefined)
+	)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'optional scoring controls belong on an optional expression');
+	if (
+		(expression.operator !== 'boost' &&
+			expression.operator !== 'not' &&
+			'clause' in expression &&
+			expression.clause !== undefined) ||
+		(expression.operator !== 'and' &&
+			expression.operator !== 'or' &&
+			'clauses' in expression &&
+			expression.clauses !== undefined)
+	)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'conflicting search expression children');
 	if ('text' in expression) {
-		if (typeof expression.text !== 'string' || (expression.mode !== undefined && expression.operator !== undefined)) {
+		if (
+			typeof expression.text !== 'string' ||
+			(expression.operator !== undefined &&
+				(expression.mode !== undefined || (expression.operator !== 'any' && expression.operator !== 'all')))
+		) {
 			throw new FulltextError('E_INVALID_ARGUMENT', 'invalid search clause');
 		}
 		return {
@@ -1485,6 +1519,11 @@ function normalizeExpression(
 		};
 	}
 	if (
+		('mode' in expression && expression.mode !== undefined) ||
+		('fields' in expression && expression.fields !== undefined)
+	)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'text options belong on search clauses');
+	if (
 		('fuzzyDistance' in expression && expression.fuzzyDistance !== undefined) ||
 		('fuzzyTranspositions' in expression && expression.fuzzyTranspositions !== undefined)
 	) {
@@ -1493,6 +1532,25 @@ function normalizeExpression(
 	if (expression.operator === 'not') {
 		chargeSearchStructure(budget, 2);
 		return { operator: 'not', clause: normalizeExpression(expression.clause, depth + 1, budget) };
+	}
+	if (expression.operator === 'boost') {
+		const boost = normalizeQueryBoost(expression.boost);
+		const clause = expression.clause;
+		chargeSearchStructure(budget, 1);
+		return { operator: 'boost', boost, clause: normalizeExpression(clause, depth + 1, budget) };
+	}
+	if (expression.operator === 'optional') {
+		const optional = expression.optional;
+		const required = expression.required;
+		const count = Array.isArray(optional) ? optional.length : 0;
+		if (!Number.isSafeInteger(count) || count < 1)
+			throw new FulltextError('E_INVALID_ARGUMENT', 'optional scoring requires at least one optional clause');
+		chargeSearchStructure(budget, count + 1);
+		return {
+			operator: 'optional',
+			required: normalizeExpression(required, depth + 1, budget),
+			optional: Array.from({ length: count }, (_, i) => normalizeExpression(optional[i], depth + 1, budget)),
+		};
 	}
 	const children = expression.clauses;
 	const count = Array.isArray(children) ? children.length : 0;
