@@ -63,6 +63,10 @@ Failures before the native search class is known, including classifier panic, ar
 preparation rejections. Direct calls with unknown or released native handles remain outside
 attributed per-handle counters; the wrapper does not retain tombstones to infer their owner.
 
+The draft `explain()` command uses `expensiveSearch` native operation and queue counters.
+Facade validation failures use the `search` preparation-rejection bucket. Telemetry API 1
+adds no explanation-specific bucket.
+
 At quiescence, attempted equals accepted plus rejected. Native `completed` is derived from succeeded
 plus failed; attempts remain independently recorded. Accepted work is completed, queued or dispatched. `dispatched` is a current gauge that decreases on settlement, not a cumulative dispatch counter. It includes any wait for
 a permit after dequeue; its wait contributes to queue time, not execution. Scrapes read relaxed
