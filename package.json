@@ -54,7 +54,7 @@
 		"prepack": "npm run build:typescript && npm run verify:package-artifacts",
 		"test": "cargo test --locked --all-features && npm run test:node",
 		"test:rust": "cargo test --locked --all-features",
-		"test:node": "npm run build:test-native && npm run build:typescript && node scripts/run-node-tests.mjs test && npm run build:native && node scripts/run-node-tests.mjs release",
+		"test:node": "node scripts/run-node-suite.mjs",
 		"test:optimized-native": "npm run build:test-native:release && npm run build:typescript && node scripts/run-node-tests.mjs optimized",
 		"verify:package-artifacts": "node scripts/verify-package-artifacts.mjs",
 		"benchmark:observability": "node benchmarks/observability.mjs"

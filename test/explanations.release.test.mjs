@@ -82,29 +82,38 @@ for (const [name, request] of [
 		);
 	});
 }
-test('production explanations preserve a finite zero-boost tree', async (context) => {
-	const index = await fixture(context, [{ name: 'title', weight: 3e38 }]);
-	await index.applyMutationBatch({
-		upserts: Array.from({ length: 10 }, (_, i) => ({
-			id: 'overflow-' + i,
-			fields: { title: i === 0 ? 'amber' : 'quartz' },
-		})),
+for (const outerBoost of [0, 1e-20]) {
+	test(`production explanations preserve a finite tree with outer boost ${outerBoost}`, async (context) => {
+		const index = await fixture(context, [{ name: 'title', weight: 3e38 }]);
+		await index.applyMutationBatch({
+			upserts: Array.from({ length: 10 }, (_, i) => ({
+				id: 'overflow-' + i,
+				fields: { title: i === 0 ? 'amber' : 'quartz' },
+			})),
+		});
+		await index.commit();
+		await index.reload();
+		const request = {
+			query: { operator: 'boost', boost: outerBoost, clause: { operator: 'boost', boost: 2, clause: leaf('amber') } },
+		};
+		const score = (await index.search(request)).hits[0].score;
+		assert(Number.isFinite(score));
+		if (outerBoost === 0) assert.strictEqual(score, 0);
+		else assert(score > 0);
+		let result;
+		let explainError;
+		try {
+			result = await index.explain(request, ['overflow-0']);
+		} catch (error) {
+			explainError = error;
+		}
+		assert.strictEqual((await index.search(request)).hits[0].score, score);
+		if (explainError) throw explainError;
+		assert.strictEqual(result.records[0].score, score);
+		const finite = (node) => {
+			assert(Number.isFinite(node.value));
+			for (const child of node.details ?? []) finite(child);
+		};
+		finite(result.records[0].explanation);
 	});
-	await index.commit();
-	await index.reload();
-	const request = {
-		query: { operator: 'boost', boost: 0, clause: { operator: 'boost', boost: 2, clause: leaf('amber') } },
-	};
-	assert.strictEqual((await index.search(request)).hits[0].score, 0);
-	let result;
-	let explainError;
-	try {
-		result = await index.explain(request, ['overflow-0']);
-	} catch (error) {
-		explainError = error;
-	}
-	assert.strictEqual((await index.search(request)).hits[0].score, 0);
-	if (explainError) throw explainError;
-	assert.strictEqual(result.records[0].score, 0);
-	assert(Number.isFinite(result.records[0].explanation.value));
-});
+}

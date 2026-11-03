@@ -1090,13 +1090,14 @@ impl Engine {
 				"explanation snapshot changed; retry on a retained reader",
 			));
 		}
-		let built = self.query(searcher, &request.search)?;
-		if built.clauses > MAX_QUERY_CLAUSES {
-			return Err(FulltextError::new(
-				"E_RESOURCE_LIMIT",
-				format!("explain supports at most {MAX_QUERY_CLAUSES} compiled clauses"),
-			));
-		}
+		let bounded_engine = (self.max_query_clauses > MAX_QUERY_CLAUSES).then(|| Self {
+			max_query_clauses: MAX_QUERY_CLAUSES,
+			..self.clone()
+		});
+		let built = bounded_engine
+			.as_ref()
+			.unwrap_or(self)
+			.query(searcher, &request.search)?;
 		let weight = built
 			.query
 			.weight(EnableScoring::enabled_from_searcher(searcher))
@@ -4443,6 +4444,60 @@ mod tests {
 	}
 
 	#[test]
+	fn explanation_limits_prefix_expansion_under_raised_policy() {
+		let mut configuration = config();
+		configuration.identity.surface_terms = true;
+		configuration.identity.fields = (0..6)
+			.map(|i| FieldConfig {
+				name: format!("field{i}"),
+				weight: 1.0,
+			})
+			.collect();
+		configuration.limits.max_query_clauses = 1024;
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let mut writer = engine.writer(&configuration).unwrap();
+		let text = (0..50).map(|i| format!("amber{i:03}")).collect::<Vec<_>>().join(" ");
+		writer
+			.apply(MutationBatch {
+				upserts: vec![crate::protocol::Upsert {
+					id: "record".to_owned(),
+					version: None,
+					fields: configuration
+						.identity
+						.fields
+						.iter()
+						.map(|field| (field.name.clone(), vec![text.clone()]))
+						.collect(),
+					filters: Vec::new(),
+				}],
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let mut search = admission_request(SearchMode::Prefix);
+		search.expression = expression("amber", SearchMode::Prefix, Vec::new());
+		assert_eq!(engine.query(&searcher, &search).unwrap().clauses, 300);
+		let request = explanation_request(search, &["record"]);
+		let error = engine
+			.explain(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
+			.err()
+			.unwrap();
+		assert_eq!(error.code, "E_PREFIX_TOO_BROAD");
+		assert!(error.message.contains("256 clauses"));
+		assert_eq!(engine.query(&searcher, &request.search).unwrap().clauses, 300);
+		let mut lower = engine.clone();
+		lower.max_query_clauses = 7;
+		let error = lower
+			.explain(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
+			.err()
+			.unwrap();
+		assert_eq!(error.code, "E_PREFIX_TOO_BROAD");
+		assert!(error.message.contains("7 clauses"));
+		writer.close().unwrap();
+	}
+
+	#[test]
 	fn explanation_native_clause_and_response_limits() {
 		let mut configuration = config();
 		configuration.identity.fields.truncate(1);
@@ -4478,7 +4533,7 @@ mod tests {
 		assert_eq!(engine.query(&searcher, &too_many.search).unwrap().clauses, 257);
 		assert_eq!(
 			engine.explain(&searcher, &too_many, deadline()).err().unwrap().code,
-			"E_RESOURCE_LIMIT"
+			"E_INVALID_ARGUMENT"
 		);
 
 		let native_json = |request: &crate::protocol::ExplainRequest| {

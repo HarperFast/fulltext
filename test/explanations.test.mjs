@@ -28,6 +28,7 @@ async function fixture(context, overrides = {}) {
 			maxQueuedCommands: 32,
 			maxQueuedBytes: 4 * 1024 * 1024,
 			maxBatchBytes: 1024 * 1024,
+			...overrides.limits,
 		},
 	};
 	const index = await openNativeFullTextIndex(options);
@@ -179,26 +180,34 @@ test('explain preserves request order across multiple segments and replacement s
 	}
 });
 
-test('explain preserves finite zero-boost scores when native intermediate explanations overflow', async (context) => {
-	const { index } = await fixture(context, { fields: [{ name: 'title', weight: 3e38 }, { name: 'body' }] });
-	await index.applyMutationBatch({
-		deletes: documents.map(({ id }) => id),
-		upserts: Array.from({ length: 10 }, (_, i) => ({
-			id: `overflow-${i}`,
-			fields: { title: i === 0 ? 'amber' : 'quartz' },
-		})),
+for (const outerBoost of [0, 1e-20]) {
+	test(`explain preserves finite nested boost scores with outer factor ${outerBoost}`, async (context) => {
+		const { index } = await fixture(context, { fields: [{ name: 'title', weight: 3e38 }, { name: 'body' }] });
+		await index.applyMutationBatch({
+			deletes: documents.map(({ id }) => id),
+			upserts: Array.from({ length: 10 }, (_, i) => ({
+				id: `overflow-${i}`,
+				fields: { title: i === 0 ? 'amber' : 'quartz' },
+			})),
+		});
+		await index.commit();
+		await index.reload();
+		const request = {
+			query: { operator: 'boost', boost: outerBoost, clause: { operator: 'boost', boost: 2, clause: leaf('amber') } },
+		};
+		const searched = await index.search(request);
+		assert(Number.isFinite(searched.hits[0].score));
+		if (outerBoost === 0) assert.strictEqual(searched.hits[0].score, 0);
+		else assert(searched.hits[0].score > 0);
+		const explained = await index.explain(request, ['overflow-0']);
+		assert.strictEqual(explained.records[0].score, searched.hits[0].score);
+		const finite = (node) => {
+			assert(Number.isFinite(node.value));
+			for (const child of node.details ?? []) finite(child);
+		};
+		finite(explained.records[0].explanation);
 	});
-	await index.commit();
-	await index.reload();
-	const request = {
-		query: { operator: 'boost', boost: 0, clause: { operator: 'boost', boost: 2, clause: leaf('amber') } },
-	};
-	const searched = await index.search(request);
-	assert.strictEqual(searched.hits[0].score, 0);
-	const explained = await index.explain(request, ['overflow-0']);
-	assert.strictEqual(explained.records[0].score, searched.hits[0].score);
-	assert(Number.isFinite(explained.records[0].explanation.value));
-});
+}
 
 test('explain rejects non-object requests as invalid arguments', async (context) => {
 	const { index } = await fixture(context);
@@ -213,4 +222,27 @@ test('explain rejects malformed options before native admission', async (context
 		await assert.rejects(index.explain({ text: 'amber' }, ['first'], options), { code: 'E_INVALID_ARGUMENT' });
 	}
 	assert.strictEqual((await index.explain({ text: 'amber' }, ['first'])).records[0].matched, true);
+});
+
+test('explain clamps raised structural policy before native admission', async (context) => {
+	const { index } = await fixture(context, { limits: { maxQueryClauses: 4096 } });
+	const request = { query: { operator: 'or', clauses: Array.from({ length: 257 }, () => leaf('amber')) } };
+	assert((await index.search(request)).hits.length > 0);
+	const before = index.telemetry().preparationRejections.search.total;
+	await assert.rejects(index.explain(request, ['first']), {
+		code: 'E_INVALID_ARGUMENT',
+		message: /search structure exceeds 256 compiled clauses/,
+	});
+	assert.strictEqual(index.telemetry().preparationRejections.search.total, before + 1n);
+	const admitted = { text: 'amber', fields: ['title'] };
+	const searched = await index.search(admitted);
+	const explained = await index.explain(
+		admitted,
+		searched.hits.map(({ id }) => id),
+	);
+	assert.deepStrictEqual(
+		explained.records.map(({ id, score }) => ({ id, score })),
+		searched.hits,
+	);
+	assert((await index.search(request)).hits.length > 0);
 });

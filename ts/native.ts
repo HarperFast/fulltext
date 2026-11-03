@@ -934,7 +934,10 @@ export class NativeFullTextIndex {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 			if (!Array.isArray(ids)) throw new FulltextError('E_INVALID_ARGUMENT', 'explanation IDs must be an array');
 			const requestedIds = ids.slice();
-			const expression = normalizeSearchExpression(request, this.#queryLimits.maxQueryClauses);
+			const expression = normalizeSearchExpression(
+				request,
+				Math.min(this.#queryLimits.maxQueryClauses, maxQueryClauses),
+			);
 			for (const key of ['offset', 'limit', 'sort', 'aggregations', 'exactTotal', 'continuation']) {
 				if ((request as Record<string, unknown>)[key] !== undefined)
 					throw new FulltextError('E_INVALID_ARGUMENT', `explain does not support ${key}`);
