@@ -51,7 +51,7 @@ and its UTF-16 spans independently of indexed stems.
 `QueryOptions` resolves fuzzy distance 0–2/default 1 and transpositions default true per leaf.
 The facade rejects supplied fuzzy controls on Boolean groups before reading their children;
 controls belong to text leaves and are never inherited.
-Protocol 8 encodes u8/bool after each mode; ABI 14/query API 8 require a matching facade. Options
+Protocol 8 encodes u8/bool after each mode; ABI 15/query API 8 require a matching facade. Options
 are absent from persisted identity and included in continuation digests. Nondefault fuzzy traces
 lazily use requested native automata on the existing analyzed/surface branches, sharing a matcher
 when query terms are identical. Distance zero uses equality/prefix checks without a DFA. Current-source
@@ -227,7 +227,7 @@ aggregation children map directly to native `sub_aggregation` trees. Resource ad
 for collector construction and possible parent instances before collection. Histogram parents use
 position spans, with native query-scoped probes when conservative admission fails. Histogram safety
 checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
-checks protect each recursive wire/API walker. Current packed protocol 8, query API 8 and ABI 14
+checks protect each recursive wire/API walker. Current packed protocol 8, query API 8 and ABI 15
 include metadata, query-capacity open support and per-leaf matching controls. Neither change alters persisted identity v8.
 
 Sorted snapshot continuation and metadata-derived score adjustment remain outside this
@@ -281,7 +281,7 @@ Raised-policy admission compares maximum per-leaf term cost and summed compiled-
 Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
 non-ASCII input conservatively uses the expensive lane because normalization can expand text.
 Default-policy classification is unchanged. The optimized two-handle regression pins ordinary
-isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 14
+isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 15
 require a matching facade/addon.
 
 The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
@@ -304,7 +304,7 @@ block-max rounding bound; the underlying two-term and cross-segment bounds remai
 
 Every nested boost, including one over an Any/All leaf, remains wrapped in native BoostQuery. This preserves outer-first float32 multiplication: folding an inner boost into a field weight can change rounding or overflow before an enclosing zero boost reaches it. Native-reference regressions cover fractional weights and a finite large field weight with an outer zero boost. Other root modes and composite subtrees also remain wrapped in native BoostQuery. At the root, that wrapper uses Tantivy's generic pruning iterator rather than the specialized Boolean block-WAND paths; optional required-All composition also incurs scoring work beyond the required-only intersection. The paired optimized workload in benchmarks/query-scoring.mjs compares total request costs. Its varied-score mode rules out boundary-tie reruns for the OR/AND pairs; it does not isolate pruning overhead or count skipped blocks. Recheck topology, score bits and these comparisons when upgrading Tantivy; the measurements do not establish a catalog-scale latency guarantee.
 
-Negative-zero boosts reject before execution. Direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts with native ABI 14 and query API 8. Persisted identity is unchanged.
+Negative-zero boosts reject before execution. Direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts with native ABI 15 and query API 8. Persisted identity is unchanged.
 
 ## Lifecycle state identity
 
@@ -332,3 +332,62 @@ The forced-admission helper checks queue availability and changes lifecycle stat
 queue mutex, before enqueueing rollback close. Unavailable queues therefore cannot turn a final
 poisoned state back into closing. The native loop regression inspects bank versus shared-fallback
 outcomes, so deleting production worker binding fails even when aggregate totals still conserve.
+
+## Explanation draft
+
+This explanation section was last verified on 2026-11-03 against the released dependency and a temporary native-source backport; source qualification does not establish release readiness.
+
+`explanations.test.mjs` compares production search and diagnostic scorer bits on a captured
+searcher, including request-order restoration after ascending per-segment seeks. Fuzzy, optional-scoring and missing OR branch
+cases currently reproduce an upstream BooleanWeight explanation panic.
+The production release tests verify those three fixtures retain scorer parity and pending
+writes when native debug assertions are disabled. The nonfinite zero and reducing-positive nested-boost regressions fail in
+both builds. The draft must not ship until all regressions pass against an approved native implementation.
+
+### Explanation engine boundary and qualification
+
+Verified against pinned Tantivy 0.27.0: `Engine::explain` calls the existing `Engine::query`, builds
+one native scoring `Weight` from its captured searcher and reuses one native scorer per addressed
+segment. IDs resolve through native postings and deletion masks. Sorting document addresses before
+seeking preserves the forward-only scorer invariant; output restores requested ID order. The
+multi-segment/replacement test retains a dedicated reader while the writer replaces and deletes IDs.
+
+`Weight::explain` remains upstream-owned. `BooleanWeight` can seek backward into a nonmatching
+child. `BoostWeight::scorer` propagates boosts inward, while `BoostWeight::explain` evaluates inner
+explanations before multiplying the enclosing boost. At extreme finite field weights, zero or reducing positive outer boosts
+can yield finite actual scores but nonfinite explanation descendants, serialized as null. Keep
+both regressions as release blockers and preserve finite-tree validation; do not copy native scoring
+or sanitize away invalid descendants in the wrapper.
+
+The optimized expensive-search admission fixture includes FTEX queue saturation, queued expiry,
+ordinary capacity and close. The packed consumer runs the BM25 explanation example. Direct Rust tests exercise three retained segments, caller order, scorer-bit parity for four sampled IDs in a
+12,288-document index, duplicate live IDs, the 256-clause admission limit and real native JSON crossing
+the 256 KiB tree and 1 MiB response caps. These verify rejection at the configured limits, not
+production capacity. Cooperative deadline checks run around native work; tree construction remains
+uninterruptible. Large-tree depth/node-limit and catalog-scale cost qualification remain open in [Expose score explanations for relevance debugging](https://github.com/HarperFast/fulltext/issues/56).
+
+Harper owns the privileged diagnostic API, source/version/expiry and authorization policy. Its
+adoption is tracked in [Expose authorized snapshot-bound full-text score explanations](https://github.com/HarperFast/harper/issues/3964).
+
+Run blocked-draft production qualification independently with `npm run build:typescript`,
+`npm run build:native`, then `FULLTEXT_PREFER_LOCAL_BUILD=1 node --test test/explanations.release.test.mjs`.
+The Node suite now records debug assertion failures, builds production last, then executes release
+qualification and returns failure if either test phase failed. Setup/build failures, signals and
+abnormal exits abort; a production-build failure cannot report success with a test addon left behind.
+`node-test-phases.test.mjs` verifies this with real npm/subprocess fixtures. The matrix uses this same
+command; the separate coverage job still measures the debug facade only.
+
+### Diagnostic compiler policy
+
+`Engine::explain` conditionally copies the immutable engine configuration only for raised clause
+policies, then calls the unchanged compiler with a 256-clause ceiling. Default/lower policies borrow
+the existing engine. Compiler limits reject rather than truncate, preserving search tree and score
+parity for admitted queries. The prefix regression exercises six fields with 300 expansions: ordinary
+search retains its raised policy, while explain rejects inside dictionary expansion at 256. The
+facade applies the same structural ceiling before queue admission; analysis and dictionary expansion
+remain native compiler responsibilities. Existing term, phrase and fuzzy construction budgets apply.
+
+Native repairs are tracked in [Preserve scorer boost context in explanations](https://github.com/quickwit-oss/tantivy/pull/3239),
+including the existing [backward-seek fix](https://github.com/quickwit-oss/tantivy/pull/3198).
+Local backport qualification against the published source preserves fulltext's Rust 1.90 toolchain;
+Release still requires an approved native dependency and matching published artifacts.

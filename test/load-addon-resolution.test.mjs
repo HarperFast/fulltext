@@ -88,8 +88,8 @@ function createFixture(context, options) {
 				? "throw new Error('fixture load failure');\n"
 				: `module.exports = {
 					source: 'platform',
-						runtimeInfo() { return { packageVersion: ${JSON.stringify(options.nativeVersion)}, nativeAbiVersion: 14, telemetryApiVersion: ${options.telemetryVersion ?? 1}, queryApiVersion: ${options.queryVersion ?? 8}, storageBackends: ['native'] }; },
-						${options.omitTelemetrySymbol === '__nativeCreateTelemetry' ? '' : '__nativeCreateTelemetry() {},'} ${options.omitTelemetrySymbol === '__nativeTelemetry' ? '' : '__nativeTelemetry() {},'} ${options.omitTelemetrySymbol === '__nativeConfigureTelemetry' ? '' : '__nativeConfigureTelemetry() {},'} __nativeInspect() {}, __nativeValidateOpen() {}, __nativeConfigureRuntime() {}, __nativeReset() {}, __nativeOpenReader() {}
+						runtimeInfo() { return { packageVersion: ${JSON.stringify(options.nativeVersion)}, nativeAbiVersion: 15, telemetryApiVersion: ${options.telemetryVersion ?? 1}, queryApiVersion: ${options.queryVersion ?? 8}, storageBackends: ['native'] }; },
+						${options.omitTelemetrySymbol === '__nativeCreateTelemetry' ? '' : '__nativeCreateTelemetry() {},'} ${options.omitTelemetrySymbol === '__nativeTelemetry' ? '' : '__nativeTelemetry() {},'} ${options.omitTelemetrySymbol === '__nativeConfigureTelemetry' ? '' : '__nativeConfigureTelemetry() {},'} ${options.omitExplain ? '' : '__nativeExplain() {},'} __nativeInspect() {}, __nativeValidateOpen() {}, __nativeConfigureRuntime() {}, __nativeReset() {}, __nativeOpenReader() {}
 				};\n`,
 		);
 	}
@@ -135,3 +135,11 @@ for (const [name, options, message] of [
 		);
 	});
 }
+
+test('explanation capability rejects a matching ABI artifact without its entry point', (context) => {
+	const fixture = createFixture(context, { nativeVersion: '0.1.0', omitExplain: true });
+	assert.strictEqual(
+		runFixture(fixture.root, 'try { loadAddon(); } catch (error) { console.log(error.code); }'),
+		'E_NATIVE_CAPABILITY_MISMATCH',
+	);
+});

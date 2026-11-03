@@ -3,8 +3,8 @@
 Native Tantivy full-text indexing for Node.js.
 
 **Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.9.0.** The engine is compiled
-into the native addon; no separate Tantivy installation is required. The matching 0.9.0 facade
-and addon require native ABI 14, query API 8 and telemetry API 1.
+into the native addon; no separate Tantivy installation is required. This draft facade
+and addon require native ABI 15, query API 8 and telemetry API 1. Published 0.9.0 artifacts use ABI 14; this draft requires a new synchronized release before publication.
 Published 0.8.0 artifacts use ABI 13 / query API 7 and do not include scoring controls or telemetry.
 Deploy the facade and native package at the same version. See
 [Upgrading from 0.8.x](#upgrading-from-08x), [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
@@ -510,7 +510,7 @@ optional branch; callers must authorize access to all of those fields. Defined `
 ignore these properties. Nested text leaves now reject legacy `operator` mode aliases other than
 `any` and `all`; use `mode: 'prefix'` instead of `operator: 'prefix'` inside `query`.
 The top-level request's legacy `operator: 'prefix'` alias remains supported. The scoring and structural
-properties listed above treat `undefined` as absent; this does not apply to a present `text` property. These additions require a matching ABI 14 / query API 8 facade and addon.
+properties listed above treat `undefined` as absent; this does not apply to a present `text` property. These additions require a matching ABI 15 / query API 8 facade and addon.
 
 ### Configurable query capacity
 
@@ -525,7 +525,7 @@ When constructing `NativeFullTextIndex` directly around a native handle, supply 
 in `searchLimits`; the constructor validates it but cannot inspect the native handle’s policy.
 Search requests cannot raise them. Apply the same policy to every worker serving a logical index;
 changing it requires reopening handles but no index rebuild. The facade and native addon must match
-ABI 14, query API 8, and packed protocol 8. The open frame retains its optional policy extension,
+ABI 15, query API 8, and packed protocol 8. The open frame retains its optional policy extension,
 with defaults when absent.
 
 The clause setting covers compiled text queries, including field multiplication and expansion.
@@ -618,6 +618,77 @@ coverage only after rebuilding. Reset can retire old identity formats; do not ed
 an index open. Before downgrading to 0.6.x, retire the 0.7 index with the 0.7 reset API, then rebuild
 with 0.6.x; the older reset API reports `E_INDEX_CORRUPT` for the unrecognized identity. Relevance
 scores may differ between engine versions; continuation tokens remain reader-instance scoped.
+
+## Score explanations (draft; upstream blocker)
+
+This implementation is not ready for release. In debug builds, Tantivy 0.27.0
+BooleanWeight explanation recursion seeks backward into a nonmatching child and triggers a native
+assertion for fuzzy, optional-scoring and missing OR branch fixtures. The panic poisons the shared handle
+and rolls back its pending writes. In production builds those assertions are disabled: the same
+three production fixtures return finite trees with exact scorer parity and preserve pending writes.
+That fixture coverage does not establish the complete typed-query contract.
+
+Nested zero and reducing positive boosts can have finite search scores but nonfinite native
+explanation descendants in both debug and production builds. Finite-tree validation rejects it with
+E_NATIVE_FAILURE; a subsequent search remains usable. No dependency patch, replacement scorer or
+tree sanitization is included. Keep this change draft until native correctness and expensive-query
+cost qualification pass.
+
+Native main currently requires Rust 1.91; fulltext uses Rust 1.90. Adoption must select a compatible backport release or separately qualify a toolchain update.
+
+The native repair is a separate draft, [Preserve scorer boost context in explanations](https://github.com/quickwit-oss/tantivy/pull/3239),
+which includes the prerequisite [Do not seek backwards when explaining a document](https://github.com/quickwit-oss/tantivy/pull/3198).
+Local source-backport qualification runs on fulltext's Rust 1.90 toolchain; this repo's dependency
+pin remains unchanged. Source qualification does not establish a released native artifact.
+
+The proposed `explain(request, ids, options)` method runs on the bounded expensive-search lane
+and uses the production compiler. It accepts text/query, fields, fuzzy controls, candidates and
+metadata filters; pagination, sorting, aggregation and exact counts are rejected. Supply one to
+ten distinct IDs. Missing and nonmatching records share `{ id, matched: false }`.
+
+`searchPage()` now returns its captured `snapshot`, including on the final page. Pass that value
+as `explain`'s `options.snapshot`; a changed snapshot rejects with `E_CURSOR_EXPIRED`. Use a dedicated
+reader without reloading to retain an older snapshot while the writer publishes. Explain returns
+the actual snapshot and request-ordered records with the native float32 `score` and an explanation
+tree (`value`, `description`, optional `details` and `context`). `format: 'tantivy-0.27'` identifies
+the upstream representation; descriptions and internal field-number context are diagnostic text,
+not stable application keys. JSON decimal values represent float32 numbers; use the separate
+binary-decoded `score` for exact comparison. Child values need not add to their parent's value.
+
+Explanations are privileged diagnostics. BM25 details reveal index-wide term/document counts,
+field lengths and configured weights even when filters or candidates restrict membership.
+Consumers must authorize access separately before exposing them to users.
+
+The diagnostic compiler applies `min(handle.maxQueryClauses, 256)` before expansion and construction,
+using the same compiler as search. Lower handle limits and configured term limits remain in force.
+The facade also applies this structural limit before native admission. Clause overflow follows the
+compiler errors: `E_INVALID_ARGUMENT`, or `E_PREFIX_TOO_BROAD` during prefix expansion. Each explanation
+is capped at 256 KiB and the response at 1 MiB; overlarge responses reject with `E_RESULT_TOO_LARGE`. Every JSON node must
+have a finite value; validation rejects malformed trees with `E_NATIVE_FAILURE`. Queue plus
+execution share the usual request budget. Upstream explanation work is uninterruptible within
+one call and can rebuild fuzzy/prefix subtrees repeatedly; deadlines are checked between IDs
+and before returning. This has not been qualified for catalog-scale use. Native observations
+are included in `expensiveSearch`; facade preparation rejections are included in `search`.
+
+### Engine and application boundary
+
+`explain()` reuses fulltext's existing typed-query compiler to construct Tantivy queries, then
+uses a captured Tantivy `Searcher`, native `Weight`, per-segment scorer and `Weight::explain`. The separate `score` is the actual native float32 score;
+fulltext does not reconstruct BM25 or rewrite the native explanation tree. Native explanation
+values and descriptions are diagnostic; intermediate arithmetic can differ from scorer arithmetic.
+The finite-tree validator stays enabled even while the upstream overflow case blocks release.
+
+Fulltext owns typed request validation, bounded ID lookup, protocol/lifecycle/admission, snapshot
+checking and response validation. Applications own table/attribute authorization, source visibility,
+expiry/version checks and diagnostic access policy. A filtered query's explanations can still
+reveal index-wide statistics. Harper integration is tracked separately in
+[Expose authorized snapshot-bound full-text score explanations](https://github.com/HarperFast/harper/issues/3964).
+
+[`examples/score-explanations.mjs`](examples/score-explanations.mjs) verifies snapshot and scorer
+parity for a supported BM25 shape, including when run from the packed consumer. This example does
+not qualify the blocked Boolean cases or catalog-scale cost. Direct Rust fixtures separately
+exercise multi-segment scorer parity, duplicate live IDs, clause admission and actual native JSON
+at the per-tree and whole-response byte limits; those rejection tests are not capacity measurements.
 
 ## Highlighting and snippets
 
@@ -864,7 +935,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 14, query API 8, and packed protocol 8. The loader rejects older addon
+This draft source requires native ABI 15, query API 8, and packed protocol 8. Released 0.9.0 uses ABI 14; a new synchronized package version is required before publication. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
 columns. Previously released string-metadata indexes must
@@ -904,7 +975,7 @@ const { packageVersion, tantivyVersion, nativeAbiVersion, queryApiVersion, telem
 console.log({ packageVersion, tantivyVersion });
 // { packageVersion: '0.9.0', tantivyVersion: '0.27.0' }
 console.log({ nativeAbiVersion, queryApiVersion, telemetryApiVersion });
-// { nativeAbiVersion: 14, queryApiVersion: 8, telemetryApiVersion: 1 }
+// { nativeAbiVersion: 15, queryApiVersion: 8, telemetryApiVersion: 1 }
 ```
 
 The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an

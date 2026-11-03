@@ -19,13 +19,15 @@ use tantivy::{IndexReader, Searcher};
 
 use crate::boundary;
 use crate::engine::{
-	persisted_index_id, Engine, InspectionResult, SearchResult, TotalRelation, TraceResult, Writer, IDENTITY_PATH,
+	persisted_index_id, Engine, ExplainRecord, ExplainResult, InspectionResult, SearchResult, TotalRelation,
+	TraceResult, Writer, IDENTITY_PATH,
 };
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
-	decode_batch, decode_inspect, decode_open, decode_reset, decode_runtime_budget, decode_search, decode_trace,
-	search_budget, search_is_expensive_for_config, trace_budget, validate_batch_header, validate_search_header,
-	validate_trace_header, EngineConfig, RuntimeBudgetLimits, PROTOCOL_VERSION,
+	decode_batch, decode_explain, decode_inspect, decode_open, decode_reset, decode_runtime_budget, decode_search,
+	decode_trace, explain_budget, search_budget, search_is_expensive_for_config, trace_budget, validate_batch_header,
+	validate_explain_header, validate_search_header, validate_trace_header, EngineConfig, RuntimeBudgetLimits,
+	PROTOCOL_VERSION,
 };
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -296,6 +298,7 @@ struct SearchCommand {
 enum SearchOperation {
 	Search { bytes: Vec<u8>, expensive: bool },
 	Trace(Vec<u8>),
+	Explain(Vec<u8>),
 }
 
 #[napi(catch_unwind, skip_typescript, js_name = "__nativeConfigureRuntime")]
@@ -764,6 +767,40 @@ pub fn native_trace_matches(
 				.try_push_tracked(
 					SearchCommand {
 						operation: SearchOperation::Trace(request),
+						completion,
+					},
+					packed_request.len(),
+					|| Ok(()),
+					|command, enqueued| command.completion.arm_at(enqueued),
+				)
+				.map_err(fulltext_napi_error)
+		})
+	})?
+}
+
+#[napi(catch_unwind, skip_typescript, js_name = "__nativeExplain")]
+pub fn native_explain(
+	env: Env,
+	handle: u32,
+	packed_request: Buffer,
+	callback: CompletionCallback<'_>,
+) -> boundary::Result<()> {
+	boundary::run_stateless(|| {
+		let runtime = runtime(&env, handle)?;
+		observe_operation(&runtime.metrics, 6, || {
+			runtime.require_open().map_err(fulltext_napi_error)?;
+			validate_explain_header(&packed_request).map_err(fulltext_napi_error)?;
+			let queue = runtime.search_queue(true);
+			queue
+				.check_capacity(packed_request.len())
+				.map_err(fulltext_napi_error)?;
+			let mut completion = completion(callback, &runtime.environment)?;
+			completion.ticket = Some(runtime.metrics.ticket(6, packed_request.len()));
+			let request = packed_request.to_vec();
+			queue
+				.try_push_tracked(
+					SearchCommand {
+						operation: SearchOperation::Explain(request),
 						completion,
 					},
 					packed_request.len(),
@@ -1941,6 +1978,7 @@ impl BoundedQueue<SearchCommand> {
 			let milliseconds = match &queued.value.operation {
 				SearchOperation::Search { bytes, .. } => search_budget(bytes),
 				SearchOperation::Trace(bytes) => trace_budget(bytes),
+				SearchOperation::Explain(bytes) => explain_budget(bytes),
 			}
 			.unwrap_or(0);
 			let remaining = Duration::from_millis(u64::from(milliseconds))
@@ -2680,6 +2718,43 @@ fn execute_search_command(
 					return Err(search_timeout());
 				}
 				let response = success_envelope(trace_body(result));
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				Ok(response)
+			});
+			let finished = Instant::now();
+			completion.finish_at(finished);
+			runtime.search_execution_nanoseconds.fetch_add(
+				duration_ns(finished.saturating_duration_since(started)),
+				Ordering::Relaxed,
+			);
+			result
+		}
+		SearchOperation::Explain(bytes) => {
+			let deadline = operation_deadline(explain_budget(&bytes)?, queued.enqueued.elapsed())?;
+			let _permit = match preacquired_permit {
+				Some(permit) => Some(permit),
+				None => runtime.expensive_search_permit(deadline)?,
+			};
+			let started = Instant::now();
+			completion.start_at(started);
+			#[cfg(feature = "test-panic")]
+			if _permit.is_some() {
+				let milliseconds = runtime.expensive_search_delay_milliseconds.swap(0, Ordering::AcqRel);
+				if milliseconds > 0 {
+					thread::sleep(Duration::from_millis(milliseconds));
+				}
+			}
+			let result = decode_explain(&bytes).and_then(|request| {
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				let result = engine.explain(&reader.searcher(), &request, deadline)?;
+				if Instant::now() >= deadline {
+					return Err(search_timeout());
+				}
+				let response = success_envelope(explain_body(result));
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
 				}
@@ -3586,6 +3661,27 @@ fn reset_body(result: ResetResult) -> Vec<u8> {
 
 fn u64_body(value: u64) -> Vec<u8> {
 	value.to_le_bytes().to_vec()
+}
+
+fn explain_body(result: ExplainResult) -> Vec<u8> {
+	let mut bytes = Vec::new();
+	push_string(&mut bytes, &result.snapshot);
+	bytes.extend_from_slice(&(result.records.len() as u16).to_le_bytes());
+	for record in result.records {
+		match record {
+			ExplainRecord::Unmatched { id } => {
+				push_string(&mut bytes, &id);
+				bytes.push(0);
+			}
+			ExplainRecord::Matched { id, score, json } => {
+				push_string(&mut bytes, &id);
+				bytes.push(1);
+				bytes.extend_from_slice(&score.to_le_bytes());
+				push_string(&mut bytes, &json);
+			}
+		}
+	}
+	bytes
 }
 
 fn search_body(result: SearchResult) -> Vec<u8> {

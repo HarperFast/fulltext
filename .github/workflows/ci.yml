@@ -186,11 +186,17 @@ jobs:
       - name: Run multi-index benchmark smoke
         run: node scripts/run-local.mjs benchmarks/multi-index.mjs --smoke --output benchmark-multi-index.json
       - run: npm run benchmark:inspect:smoke
+      - name: Qualify explanation diagnostic smoke
+        run: node scripts/run-local.mjs benchmarks/explanations.mjs --smoke > benchmark-explanations-default.jsonl
+      - name: Qualify raised-policy explanation smoke
+        run: node scripts/run-local.mjs benchmarks/explanations.mjs --smoke --raised > benchmark-explanations-raised.jsonl
       - name: Store benchmark smoke results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-smoke-${{ matrix.target }}-${{ github.sha }}
-          path: benchmark-*.json
+          path: |
+            benchmark-*.json
+            benchmark-explanations-*.jsonl
           if-no-files-found: warn
           retention-days: 30

@@ -8,6 +8,8 @@ export const maxCommitPayloadBytes = 64 * 1024;
 export const maxSearchRequestBytes = 8 * 1024 * 1024;
 export const maxSearchBudgetMilliseconds = 30_000;
 export const maxTraceRecords = 100;
+export const maxExplainIds = 10;
+export const snapshotHexBytes = 64;
 export const maxExpressionDepth = 8;
 export const maxQueryClauses = 256;
 const maxQueryTerms = 64;
@@ -731,6 +733,34 @@ function encodeBatchHeader(upserts: number, deletes: number): Buffer {
 	offset = header.writeUInt32LE(deletes, offset);
 	if (offset !== header.length) throw new FulltextError('E_NATIVE_FAILURE', 'mutation batch header length mismatch');
 	return header;
+}
+
+export function encodeExplain(search: PackedSearchRequest, ids: string[], snapshot?: string): Buffer {
+	if (!Array.isArray(ids) || ids.length < 1 || ids.length > maxExplainIds)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'explain requires between 1 and ' + maxExplainIds + ' distinct IDs');
+	const copied = ids.slice();
+	if (new Set(copied).size !== copied.length)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'explanation IDs must be distinct');
+	const writer = new ByteWriter(maxSearchRequestBytes, 'E_INVALID_ARGUMENT');
+	writer.header('FTEX');
+	const query = encodeSearch(search);
+	writer.u32(query.length, 'search.length');
+	writer.encodedBytes([query]);
+	writer.u16(copied.length, 'ids.length');
+	for (const id of copied) {
+		if (typeof id !== 'string' || id.length === 0 || Buffer.byteLength(id) > maxRecordIdBytes)
+			throw new FulltextError('E_INVALID_ARGUMENT', 'invalid explanation ID');
+		writer.string(id);
+	}
+	if (
+		snapshot !== undefined &&
+		(typeof snapshot !== 'string' || snapshot.length !== snapshotHexBytes || !/^[0-9a-f]+$/.test(snapshot))
+	)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid explanation snapshot');
+	writer.boolean(snapshot !== undefined);
+	if (snapshot !== undefined) writer.string(snapshot);
+	writer.u32(search.budgetMilliseconds, 'budgetMilliseconds');
+	return writer.finish();
 }
 
 export function encodeSearch(request: PackedSearchRequest): Buffer {

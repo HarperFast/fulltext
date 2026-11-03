@@ -17,3 +17,7 @@
 - [Telemetry worker banks](src/DESIGN.md#telemetry-worker-banks) — ticket ownership, shared fallbacks, and retained scalar-bank memory.
 
 - [Observability comparisons](benchmarks/DESIGN.md#observability-comparisons) — validation-excluded timing windows, staggered collection, and failure evidence.
+
+- [Explanation draft](src/DESIGN.md#explanation-draft) — snapshot/score parity and the upstream release blocker.
+
+- [Explanation qualification](benchmarks/DESIGN.md#explanation-diagnostics) — distributed-ID cost profiles, source provenance and native timeout limits.

@@ -45,7 +45,7 @@
 		"benchmark:inspect:smoke": "node scripts/run-local.mjs benchmarks/inspect.mjs --smoke",
 		"benchmark:query-scoring": "npm run build && node scripts/run-local.mjs benchmarks/query-scoring.mjs",
 		"benchmark:query-controls": "npm run build && node scripts/run-local.mjs benchmarks/query-controls.mjs",
-		"examples:smoke": "node scripts/run-local.mjs examples/basic.mjs && node scripts/run-local.mjs examples/query-modes.mjs && node scripts/run-local.mjs examples/catalog-search.mjs && node scripts/run-local.mjs examples/metadata-search.mjs && node scripts/run-local.mjs examples/structured-filters.mjs && node scripts/run-local.mjs examples/checkpoint-recovery.mjs && node scripts/run-local.mjs examples/highlighting.mjs && node scripts/run-local.mjs examples/multi-index.mjs && node scripts/run-local.mjs examples/reset-rebuild.mjs && node scripts/run-local.mjs examples/observability.mjs",
+		"examples:smoke": "node scripts/run-local.mjs examples/basic.mjs && node scripts/run-local.mjs examples/query-modes.mjs && node scripts/run-local.mjs examples/catalog-search.mjs && node scripts/run-local.mjs examples/metadata-search.mjs && node scripts/run-local.mjs examples/structured-filters.mjs && node scripts/run-local.mjs examples/checkpoint-recovery.mjs && node scripts/run-local.mjs examples/highlighting.mjs && node scripts/run-local.mjs examples/multi-index.mjs && node scripts/run-local.mjs examples/reset-rebuild.mjs && node scripts/run-local.mjs examples/observability.mjs && node scripts/run-local.mjs examples/score-explanations.mjs",
 		"benchmark:smoke": "node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver logical && node scripts/run-local.mjs benchmarks/native.mjs --smoke --mutation-driver low-level",
 		"check": "npm run format:check && npm run lint && npm run test",
 		"format": "prettier --write . && cargo fmt",
@@ -54,10 +54,13 @@
 		"prepack": "npm run build:typescript && npm run verify:package-artifacts",
 		"test": "cargo test --locked --all-features && npm run test:node",
 		"test:rust": "cargo test --locked --all-features",
-		"test:node": "npm run build:test-native && npm run build:typescript && node scripts/run-node-tests.mjs test && npm run build:native && node scripts/run-node-tests.mjs release",
+		"test:node": "node scripts/run-node-tests.mjs all",
 		"test:optimized-native": "npm run build:test-native:release && npm run build:typescript && node scripts/run-node-tests.mjs optimized",
 		"verify:package-artifacts": "node scripts/verify-package-artifacts.mjs",
-		"benchmark:observability": "node benchmarks/observability.mjs"
+		"benchmark:observability": "node benchmarks/observability.mjs",
+		"benchmark:explanations": "npm run build && node scripts/run-local.mjs benchmarks/explanations.mjs",
+		"benchmark:explanations:smoke": "node scripts/run-local.mjs benchmarks/explanations.mjs --smoke",
+		"benchmark:explanations:stress": "node scripts/run-local.mjs benchmarks/explanations.mjs --stress"
 	},
 	"engines": {
 		"node": "^22.18.0 || >=24.0.0"
