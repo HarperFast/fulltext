@@ -962,7 +962,7 @@ test('concurrent search callers remain correct while telemetry is repeatedly scr
 });
 
 test(
-	'combined scoring and telemetry preserve eligibility and settle ordinary timeouts once',
+	'combined scoring and telemetry preserve eligibility and settle a queue-expired ordinary search once',
 	{ timeout: 10_000 },
 	async (context) => {
 		const { index, addon, handle } = await rawFixture(context);

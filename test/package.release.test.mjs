@@ -103,7 +103,7 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 		[
 			'--input-type=module',
 			'--eval',
-			"import { createRequire } from 'node:module'; const addon = createRequire(import.meta.url)(process.argv[1]); if (Object.keys(addon).some(key => key.startsWith('__test') || key.startsWith('__phase0'))) process.exit(1); const info = await import('@harperfast/fulltext/native').then(x => x.runtimeInfo()); if (info.storageBackends.join(',') !== 'native') process.exit(2); console.log(info);",
+			"import { createRequire } from 'node:module'; const addon = createRequire(import.meta.url)(process.argv[1]); if (Object.keys(addon).some(key => key.startsWith('__test') || key.startsWith('__phase0'))) process.exit(1); const info = await import('@harperfast/fulltext/native').then(x => x.runtimeInfo()); if (info.storageBackends.join(',') !== 'native') process.exit(2); console.log(info); console.log({ nativeTelemetryApiVersion: addon.runtimeInfo().telemetryApiVersion });",
 			nativePackageName,
 		],
 		{ cwd: projectDirectory, encoding: 'utf8', env: consumerEnvironment },
@@ -111,7 +111,7 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 	assert.match(output, /tantivyVersion: '0\.27\.0'/);
 	assert.match(output, /nativeAbiVersion: 14/);
 	assert.match(output, /queryApiVersion: 8/);
-	assert.match(output, /telemetryApiVersion: 1/);
+	assert.match(output, /nativeTelemetryApiVersion: 1/);
 	for (const example of examples) {
 		const exampleOutput = execFileSync(
 			process.execPath,

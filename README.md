@@ -7,7 +7,7 @@ into the native addon; no separate Tantivy installation is required. Version 0.9
 published. Its matching facade and addon require native ABI 14, query API 8 and telemetry API 1.
 Published 0.8.0 artifacts use ABI 13 / query API 7 and do not include scoring controls or telemetry.
 Deploy the facade and native package at the same version. See
-[Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
+[Upgrading from 0.8.x](#upgrading-from-08x), [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
 before deploying a build from this tree.
 
 This repository is under active development. The native entry point provides a standalone Tantivy
@@ -580,11 +580,14 @@ The public analyzer name and identity-sidecar version jointly identify persisted
 Any future filter or ordering change must use a new analyzer name or sidecar version so existing
 indexes fail closed and rebuild instead of silently changing recall.
 
-## Upgrading from 0.7.x
+## Upgrading from 0.8.x
 
 Version 0.9.0 combines query scoring and telemetry at native ABI 14, query API 8 and telemetry
 API 1. Deploy the facade and native addon together; published 0.8.0 artifacts use ABI 13 and
 query API 7. Upgrading from 0.8.0 preserves persisted index identity and does not require a rebuild.
+
+## Upgrading from 0.7.x
+
 When upgrading from 0.7.x, indexes with a string
 `filterFields` entry need rebuilding because string
 metadata now also uses raw fast fields. Open and inspection report `E_IDENTITY_MISMATCH` for the

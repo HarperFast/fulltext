@@ -309,7 +309,7 @@ The native many-segment qualification demonstrates this flow. These Rust source/
 accompany the pre-1.0 package change from 0.5 to 0.6; they do not introduce a `searchPage` method on
 `Engine`.
 
-## Direct Rust API compatibility in 0.9.0
+## Direct Rust API compatibility in 0.8.0
 
 Direct Rust `protocol::Limits` literals now also supply `max_query_terms: 64` and
 `max_query_clauses: 256` for default policy, or validated configured values. They are operational
@@ -336,15 +336,8 @@ it: its cached wire representation is crate-private.
 
 Exhaustive matches must handle `FilterExpression::Not(Box<FilterExpression>)` and
 `FilterComparator::{Exists, Missing}`. Presence clauses carry `values: Vec::new()`.
-`SearchResult` and the filter enums are source changes to the pre-1.0 Rust API; the JavaScript
-0.9.0 facade uses packed protocol 8, native ABI 14, query API 8 and telemetry API 1 with its matching addon.
-
-Exhaustive `SearchExpression` matches now also handle `Boost { boost: f32, clause:
-Box<SearchExpression> }` and `Optional { required: Box<SearchExpression>, optional:
-Vec<SearchExpression> }`. The optional list must be nonempty. Boosts must be finite in `0..=100`
-and cannot be negative zero. `SearchExpression` no longer implements `Eq` because it contains
-float32 boosts; use its `PartialEq` implementation for comparisons and remove `Eq` derives from
-containing types that require it.
+`SearchResult` and the filter enums are source changes to the pre-1.0 Rust API. Published 0.8.0
+uses packed protocol 8, native ABI 13 and query API 7.
 
 Direct Rust `SearchClause` literals also supply `options: QueryOptions::default()` or validated
 fuzzy controls. Shared semantic checks cover candidate count/bytes before deduplication,
@@ -356,6 +349,17 @@ packed decoding rejects nonfinite filters during decoding. A valid stale continu
 retains snapshot-before-schema/query ordering, while malformed inputs can have different error
 precedence across entry points. Trace validates its own supported semantics rather than executing
 search pagination, catalog or filter options.
+
+## Direct Rust API compatibility in 0.9.0
+
+Exhaustive `SearchExpression` matches now also handle `Boost { boost: f32, clause:
+Box<SearchExpression> }` and `Optional { required: Box<SearchExpression>, optional:
+Vec<SearchExpression> }`. The optional list must be nonempty. Boosts must be finite in `0..=100`
+and cannot be negative zero. `SearchExpression` no longer implements `Eq` because it contains
+float32 boosts; use its `PartialEq` implementation for comparisons and remove `Eq` derives from
+containing types that require it.
+
+The matching 0.9.0 facade and addon use packed protocol 8, native ABI 14, query API 8 and telemetry API 1.
 
 ## Source reference
 
