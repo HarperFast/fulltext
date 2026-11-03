@@ -975,8 +975,9 @@ export class NativeFullTextIndex {
 			cursor.finish();
 			return { complete, records: matched };
 		} catch (error) {
-			if (!nativeStarted) this.#telemetry.preparationRejected('trace', error);
-			throw error;
+			const normalized = normalizeNativeError(error);
+			if (!nativeStarted) this.#telemetry.preparationRejected('trace', normalized);
+			throw normalized;
 		}
 	}
 

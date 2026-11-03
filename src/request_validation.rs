@@ -78,19 +78,6 @@ fn validate_expression_options(expression: &SearchExpression) -> Result<bool> {
 }
 
 pub(crate) fn validate_trace_admission(request: &SearchRequest, records: &[TraceRecord]) -> Result<()> {
-	if request.filter.is_some()
-		|| request.sort.is_some()
-		|| !request.aggregations.is_empty()
-		|| request.offset != 0
-		|| request.exact_total
-		|| request.traversal
-		|| request.after.is_some()
-	{
-		return Err(FulltextError::invalid(
-			"traceMatches does not support metadata filters, collectors or pagination",
-		));
-	}
-
 	validate_candidates(request.candidate_ids.as_deref())?;
 	validate_expression_options(&request.expression)?;
 	crate::protocol::validate_search_structure(
