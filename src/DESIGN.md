@@ -338,7 +338,9 @@ outcomes, so deleting production worker binding fails even when aggregate totals
 `explanations.test.mjs` compares production search and diagnostic scorer bits on a captured
 searcher, including request-order restoration after ascending per-segment seeks. Fuzzy, optional-scoring and nested OR
 cases currently reproduce an upstream BooleanWeight explanation panic.
-The draft must not ship until those regressions pass against an approved native implementation.
+Production release tests separately verify those three fixtures retain scorer parity and pending
+writes when native debug assertions are disabled. The nonfinite nested-boost regression fails in
+both builds. The draft must not ship until all regressions pass against an approved native implementation.
 
 ### Explanation engine boundary and qualification
 

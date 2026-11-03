@@ -639,6 +639,7 @@ pub fn validate_explain_header(bytes: &[u8]) -> Result<()> {
 	Ok(())
 }
 
+const SNAPSHOT_HEX_BYTES: usize = 64;
 pub const MAX_EXPLAIN_IDS: usize = 10;
 pub const MAX_EXPLAIN_BYTES: usize = 256 * 1024;
 pub const MAX_EXPLAIN_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -648,6 +649,8 @@ fn invalid_explain_id_count() -> FulltextError {
 }
 
 pub struct ExplainRequest {
+	/// Query carrier: use offset 0, limit 1 and no traversal, sort, aggregation or exact total.
+	/// The limit is the FTEX sentinel, not an explanation count; IDs determine the count.
 	pub search: SearchRequest,
 	pub ids: Vec<String>,
 	pub snapshot: Option<String>,
@@ -679,7 +682,7 @@ pub(crate) fn validate_explain(request: &ExplainRequest) -> Result<()> {
 		}
 	}
 	if let Some(snapshot) = &request.snapshot {
-		if snapshot.len() != 64
+		if snapshot.len() != SNAPSHOT_HEX_BYTES
 			|| !snapshot
 				.bytes()
 				.all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -1263,7 +1266,7 @@ fn decode_search_traversal(cursor: &mut Cursor<'_>) -> Result<(bool, Option<Sear
 		let snapshot = cursor.string()?;
 		let score = cursor.f32()?;
 		let id = cursor.record_id()?;
-		if snapshot.len() != 64
+		if snapshot.len() != SNAPSHOT_HEX_BYTES
 			|| !snapshot
 				.bytes()
 				.all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))

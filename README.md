@@ -621,11 +621,18 @@ scores may differ between engine versions; continuation tokens remain reader-ins
 
 ## Score explanations (draft; upstream blocker)
 
-This implementation is not ready for release. Tantivy 0.27.0 `BooleanWeight::explain` seeks
-backward when a requested document precedes a nonmatching child's first match. The new
-real-index tests reproduce debug assertions for fuzzy, optional-scoring and nested OR expressions. Three regression cases reproduce this panic. A separate zero-boost case exposes nonfinite native explanation descendants despite a finite actual score.
-No dependency patch or replacement scorer is included. The draft also rejects a native tree containing nonfinite descendants: `boost(0, boost(2, term))` with a sufficiently large field weight can score zero while native explanation arithmetic overflows. Keep this change draft until the upstream
-behavior is fixed and the full typed-query contract and expensive-query cost have been qualified.
+This implementation is not ready for release. In debug builds, Tantivy 0.27.0
+BooleanWeight explanation recursion seeks backward into a nonmatching child and triggers a native
+assertion for fuzzy, optional-scoring and nested OR fixtures. The panic poisons the shared handle
+and rolls back its pending writes. In production builds those assertions are disabled: the same
+three fixtures return finite trees with exact scorer parity and preserve pending writes, as checked
+by the release tests. That fixture coverage does not establish the complete typed-query contract.
+
+A separate nested zero-boost case has a finite search score but nonfinite native explanation
+descendants in both debug and production builds. Finite-tree validation rejects it with
+E_NATIVE_FAILURE; a subsequent search remains usable. No dependency patch, replacement scorer or
+tree sanitization is included. Keep this change draft until native correctness and expensive-query
+cost qualification pass.
 
 The proposed `explain(request, ids, options)` method runs on the bounded expensive-search lane
 and uses the production compiler. It accepts text/query, fields, fuzzy controls, candidates and
@@ -645,8 +652,9 @@ Explanations are privileged diagnostics. BM25 details reveal index-wide term/doc
 field lengths and configured weights even when filters or candidates restrict membership.
 Consumers must authorize access separately before exposing them to users.
 
-The draft caps text-query construction at 256 compiled clauses, each explanation at 256 KiB and
-the response at 1 MiB. Overlarge responses reject with `E_RESULT_TOO_LARGE`. Every JSON node must
+The draft rejects queries that compile to more than 256 clauses, caps each explanation at 256 KiB and
+the response at 1 MiB. A raised handle policy still controls query construction before the diagnostic
+clause check; this does not bound construction latency. Overlarge responses reject with `E_RESULT_TOO_LARGE`. Every JSON node must
 have a finite value; validation rejects malformed trees with `E_NATIVE_FAILURE`. Queue plus
 execution share the usual request budget. Upstream explanation work is uninterruptible within
 one call and can rebuild fuzzy/prefix subtrees repeatedly; deadlines are checked between IDs

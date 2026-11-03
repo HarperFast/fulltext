@@ -28,6 +28,7 @@ import {
 	maxSearchBudgetMilliseconds,
 	maxTraceRecords,
 	maxExplainIds,
+	snapshotHexBytes,
 	maxExpressionDepth,
 	maxQueryClauses,
 	resolveQueryLimits,
@@ -52,7 +53,6 @@ export type {
 	FacadeTelemetrySnapshot,
 } from './telemetry.js';
 
-const snapshotHexBytes = 64;
 const continuationOffsets = {
 	handle: 1,
 	digest: 5,
@@ -928,6 +928,8 @@ export class NativeFullTextIndex {
 			this.#assertPreparationOpen();
 			if (!request || typeof request !== 'object' || Array.isArray(request))
 				throw new FulltextError('E_INVALID_ARGUMENT', 'explain request must be an object');
+			if (!options || typeof options !== 'object' || Array.isArray(options))
+				throw new FulltextError('E_INVALID_ARGUMENT', 'explain options must be an object');
 			if (request.mode !== undefined && request.operator !== undefined)
 				throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 			if (!Array.isArray(ids)) throw new FulltextError('E_INVALID_ARGUMENT', 'explanation IDs must be an array');
@@ -956,7 +958,8 @@ export class NativeFullTextIndex {
 			nativeStarted = true;
 			const cursor = await invoke((callback) => addon.__nativeExplain(this.#handle, frame, callback));
 			const snapshot = cursor.string();
-			if (!/^[0-9a-f]{64}$/.test(snapshot)) throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation snapshot');
+			if (snapshot.length !== snapshotHexBytes || !/^[0-9a-f]+$/.test(snapshot))
+				throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation snapshot');
 			const count = cursor.u16();
 			if (count !== requestedIds.length || count < 1 || count > maxExplainIds)
 				throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation count');

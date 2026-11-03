@@ -9,6 +9,7 @@ export const maxSearchRequestBytes = 8 * 1024 * 1024;
 export const maxSearchBudgetMilliseconds = 30_000;
 export const maxTraceRecords = 100;
 export const maxExplainIds = 10;
+export const snapshotHexBytes = 64;
 export const maxExpressionDepth = 8;
 export const maxQueryClauses = 256;
 const maxQueryTerms = 64;
@@ -751,7 +752,10 @@ export function encodeExplain(search: PackedSearchRequest, ids: string[], snapsh
 			throw new FulltextError('E_INVALID_ARGUMENT', 'invalid explanation ID');
 		writer.string(id);
 	}
-	if (snapshot !== undefined && (typeof snapshot !== 'string' || !/^[0-9a-f]{64}$/.test(snapshot)))
+	if (
+		snapshot !== undefined &&
+		(typeof snapshot !== 'string' || snapshot.length !== snapshotHexBytes || !/^[0-9a-f]+$/.test(snapshot))
+	)
 		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid explanation snapshot');
 	writer.boolean(snapshot !== undefined);
 	if (snapshot !== undefined) writer.string(snapshot);

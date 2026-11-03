@@ -206,3 +206,11 @@ test('explain rejects non-object requests as invalid arguments', async (context)
 		await assert.rejects(index.explain(request, ['first']), { code: 'E_INVALID_ARGUMENT' });
 	}
 });
+
+test('explain rejects malformed options before native admission', async (context) => {
+	const { index } = await fixture(context);
+	for (const options of [null, 1, true, 'invalid', [], () => {}]) {
+		await assert.rejects(index.explain({ text: 'amber' }, ['first'], options), { code: 'E_INVALID_ARGUMENT' });
+	}
+	assert.strictEqual((await index.explain({ text: 'amber' }, ['first'])).records[0].matched, true);
+});

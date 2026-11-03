@@ -6,6 +6,7 @@ import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
 
 const directory = await mkdtemp(path.join(tmpdir(), 'fulltext-score-explanation-'));
 let index;
+let completed = false;
 try {
 	index = await openNativeFullTextIndex({
 		path: directory,
@@ -48,10 +49,20 @@ try {
 		}
 	}
 	console.log('Snapshot-bound BM25 explanation parity:', result.records);
+	completed = true;
 } finally {
-	if (index) {
-		const closed = await index.close({ mode: 'rollback' });
-		if (closed?.cleanupError) throw closed.cleanupError;
+	let closeError;
+	try {
+		const closed = await index?.close({ mode: 'rollback' });
+		closeError = closed?.cleanupError;
+	} catch (error) {
+		closeError = error;
 	}
-	await rm(directory, { recursive: true, force: true });
+	if (!closeError) {
+		try {
+			await rm(directory, { recursive: true, force: true });
+		} catch (error) {
+			if (completed) throw error;
+		}
+	} else if (completed) throw closeError;
 }
