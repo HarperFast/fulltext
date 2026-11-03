@@ -2,11 +2,11 @@
 
 Native Tantivy full-text indexing for Node.js.
 
-**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.8.0.** The engine is compiled
-into the native addon; no separate Tantivy installation is required. Published 0.8.0 artifacts use
-native ABI 13 / query API 7. This unreleased query-scoring source still carries version 0.8.0 in
-its manifests but requires native ABI 14 / query API 8; it is not interchangeable with the
-published 0.8.0 facade or addon. Deploy matching artifacts built from the same source revision. See
+**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.9.0.** The engine is compiled
+into the native addon; no separate Tantivy installation is required. Version 0.9.0 is not yet
+published. Its matching facade and addon require native ABI 14, query API 8 and telemetry API 1.
+Published 0.8.0 artifacts use ABI 13 / query API 7 and do not include scoring controls or telemetry.
+Deploy the facade and native package at the same version. See
 [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
 before deploying a build from this tree.
 
@@ -22,6 +22,7 @@ local index files or rebuild them from that authoritative data.
 - [Configure analysis](#analyzer-and-field-configuration), [filters](#structured-filters), and [highlighting](#highlighting-and-snippets).
 - [Manage writes](#mutations-and-backpressure), [recover an index](#lifecycle-and-recovery), or [upgrade from 0.7.x](#upgrading-from-07x) / [0.6.x](#upgrading-from-06x).
 - Reference: [limits and recovery](docs/limits.md), [benchmarks](docs/benchmarks.md), and [backend internals](docs/native-backend-implementation.md).
+- Observe [native operations, queues, latency and snapshot statistics](docs/observability.md), or run the [JSON exporter example](examples/observability.mjs).
 
 ## Capabilities
 
@@ -580,11 +581,10 @@ indexes fail closed and rebuild instead of silently changing recall.
 
 ## Upgrading from 0.7.x
 
-Published 0.8.0 metadata and query-control artifacts use query API 7 and native ABI 13. This
-unreleased query-scoring branch requires query API 8 and native ABI 14 despite retaining 0.8.0
-in its source manifests; deploy the JavaScript facade and native addon built from the same revision.
-The scoring change preserves persisted index identity from published 0.8.0 and does not require
-a rebuild. When upgrading from 0.7.x, indexes with a string
+Version 0.9.0 combines query scoring and telemetry at native ABI 14, query API 8 and telemetry
+API 1. Deploy the facade and native addon together; published 0.8.0 artifacts use ABI 13 and
+query API 7. Upgrading from 0.8.0 preserves persisted index identity and does not require a rebuild.
+When upgrading from 0.7.x, indexes with a string
 `filterFields` entry need rebuilding because string
 metadata now also uses raw fast fields. Open and inspection report `E_IDENTITY_MISMATCH` for the
 old schema. Indexes with only numeric/boolean filter fields, or no filter fields, retain their
@@ -898,7 +898,7 @@ import { runtimeInfo } from '@harperfast/fulltext/native';
 
 const { packageVersion, tantivyVersion } = await runtimeInfo();
 console.log({ packageVersion, tantivyVersion });
-// { packageVersion: '0.8.0', tantivyVersion: '0.27.0' }
+// { packageVersion: '0.9.0', tantivyVersion: '0.27.0' }
 ```
 
 The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an

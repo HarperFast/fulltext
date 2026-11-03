@@ -8,6 +8,7 @@ export interface RuntimeInfo {
   tantivyVersion: string
   nativeAbiVersion: number
   queryApiVersion: number
+  telemetryApiVersion: number
   queryClassIsolationMinimumSearchThreads: number
   storageBackends: Array<string>
   limits: RuntimeLimits

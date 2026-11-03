@@ -108,6 +108,11 @@ ownership contract remains separate from this native-handle fix.
 
 The workload heartbeat reuses public status counters: queued commands identify admission waits; commit opstamp, uncommitted mutations and completed execution metrics distinguish native completion from pending JavaScript delivery. Executing work with low process CPU still requires further native stack/file evidence; this is not a deadlock diagnosis. The original Windows failure occurred in the debug test phase before production rebuild. Keep workloads and deadlines unchanged; instrumented observations do not establish production performance or explain a prior failure merely because the next run passes.
 
+Optional snapshot-byte observation runs after command completion settlement and before the current
+`writer-end` diagnostic. Its work is excluded from the recorded operation duration, but included
+in the gap between event timestamps. A missing `writer-end` alone therefore cannot establish that
+the engine operation is still running.
+
 ## Request preparation
 
 Query identities up to 64 KiB hash synchronously; larger ones use WebCrypto. This threshold changes
@@ -300,3 +305,30 @@ block-max rounding bound; the underlying two-term and cross-segment bounds remai
 Every recursive boost, including one over an Any/All leaf, remains wrapped in native BoostQuery. This preserves outer-first float32 multiplication: folding an inner boost into a field weight can change rounding or overflow before an enclosing zero boost reaches it. Native-reference regressions cover fractional weights and a finite large field weight with an outer zero boost. Other root modes and composite subtrees also remain wrapped in native BoostQuery. At the root, that wrapper uses Tantivy's generic pruning iterator rather than the specialized Boolean block-WAND paths; optional required-All composition also incurs scoring work beyond the required-only intersection. The paired optimized workload in benchmarks/query-scoring.mjs compares total request costs. Its varied-score mode rules out boundary-tie reruns for the OR/AND pairs; it does not isolate pruning overhead or count skipped blocks. Recheck topology, score bits and these comparisons when upgrading Tantivy; the measurements do not establish a catalog-scale latency guarantee.
 
 Negative-zero boosts reject before execution. Direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts with native ABI 14 and query API 8. Persisted identity is unchanged.
+
+## Lifecycle state identity
+
+Native status and telemetry share the `src/lifecycle.rs` constants and one atomic state. Numeric codes remain the existing wire contract (`open=0`, `closing=1`, `closed=2`, `poisoned=3`); `telemetry_state_labels_match_native_status_codes` checks initialization, native status bytes and JSON labels together.
+
+## Telemetry worker banks
+
+Each search completion binds a valid worker bank at most once before first dispatch. The ticket
+retains that selection through settlement, panic and Drop, including a future thread migration.
+Ordinary, flexible, expired and closing execution paths pass the stable worker index; test-only
+pre-delay dispatch binds first too. Unbound queued drains/rejections retain the shared fallback.
+Every update remains a relaxed atomic RMW, so accidental duplicate worker assignment cannot
+lose updates. Snapshots sum wrapping scalar values before JSON serialization. This preserves
+existing nontransactional snapshot semantics, exact-once settlement and histogram-toggle behavior.
+
+Dispatched/succeeded/failed, queue/execution latency and worker error buckets are banked.
+Admission rejection errors and unbound drains use the shared fallback; mutation totals remain
+shared. Three 640-byte banks per worker add 1,920 bytes per configured search worker on the measured arm64 target, plus a fixed 1,024-byte shared-Actor alignment increase
+and container overhead. Retained tokens retain these scalar banks after close; scrape work grows
+with configured workers. The ownership tests cover rebinding/migration, shared drains, duplicate
+bank writers, wrapping sums and disabled/enabled histogram histories.
+
+Forced environment cleanup may see a terminal poisoned runtime after its writer queue has closed.
+The forced-admission helper checks queue availability and changes lifecycle state under the same
+queue mutex, before enqueueing rollback close. Unavailable queues therefore cannot turn a final
+poisoned state back into closing. The native loop regression inspects bank versus shared-fallback
+outcomes, so deleting production worker binding fails even when aggregate totals still conserve.

@@ -74,6 +74,7 @@ test('loads the artifact for the executing platform', async () => {
 		queryClassIsolationMinimumSearchThreads: 2,
 		lifecycleApiVersion: 1,
 		mutationBatchApiVersion: 5,
+		telemetryApiVersion: 1,
 		storageBackends: ['native'],
 		limits: {
 			maxAggregationDepth: 32,

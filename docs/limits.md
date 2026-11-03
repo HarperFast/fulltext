@@ -309,7 +309,7 @@ The native many-segment qualification demonstrates this flow. These Rust source/
 accompany the pre-1.0 package change from 0.5 to 0.6; they do not introduce a `searchPage` method on
 `Engine`.
 
-## Direct Rust API compatibility for the unreleased metadata APIs
+## Direct Rust API compatibility in 0.9.0
 
 Direct Rust `protocol::Limits` literals now also supply `max_query_terms: 64` and
 `max_query_clauses: 256` for default policy, or validated configured values. They are operational
@@ -337,7 +337,7 @@ it: its cached wire representation is crate-private.
 Exhaustive matches must handle `FilterExpression::Not(Box<FilterExpression>)` and
 `FilterComparator::{Exists, Missing}`. Presence clauses carry `values: Vec::new()`.
 `SearchResult` and the filter enums are source changes to the pre-1.0 Rust API; the JavaScript
-facade uses packed protocol 8, native ABI 14, and query API 8 with its matching addon.
+0.9.0 facade uses packed protocol 8, native ABI 14, query API 8 and telemetry API 1 with its matching addon.
 
 Exhaustive `SearchExpression` matches now also handle `Boost { boost: f32, clause:
 Box<SearchExpression> }` and `Optional { required: Box<SearchExpression>, optional:

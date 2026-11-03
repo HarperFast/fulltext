@@ -109,6 +109,9 @@ test('the packed package loads without consumer lifecycle scripts', (context) =>
 		{ cwd: projectDirectory, encoding: 'utf8', env: consumerEnvironment },
 	);
 	assert.match(output, /tantivyVersion: '0\.27\.0'/);
+	assert.match(output, /nativeAbiVersion: 14/);
+	assert.match(output, /queryApiVersion: 8/);
+	assert.match(output, /telemetryApiVersion: 1/);
 	for (const example of examples) {
 		const exampleOutput = execFileSync(
 			process.execPath,

@@ -88,8 +88,8 @@ function createFixture(context, options) {
 				? "throw new Error('fixture load failure');\n"
 				: `module.exports = {
 					source: 'platform',
-						runtimeInfo() { return { packageVersion: ${JSON.stringify(options.nativeVersion)}, nativeAbiVersion: 14, queryApiVersion: 8, storageBackends: ['native'] }; },
-						__nativeInspect() {}, __nativeValidateOpen() {}, __nativeConfigureRuntime() {}, __nativeReset() {}, __nativeOpenReader() {}
+						runtimeInfo() { return { packageVersion: ${JSON.stringify(options.nativeVersion)}, nativeAbiVersion: 14, telemetryApiVersion: ${options.telemetryVersion ?? 1}, queryApiVersion: ${options.queryVersion ?? 8}, storageBackends: ['native'] }; },
+						${options.omitTelemetrySymbol === '__nativeCreateTelemetry' ? '' : '__nativeCreateTelemetry() {},'} ${options.omitTelemetrySymbol === '__nativeTelemetry' ? '' : '__nativeTelemetry() {},'} ${options.omitTelemetrySymbol === '__nativeConfigureTelemetry' ? '' : '__nativeConfigureTelemetry() {},'} __nativeInspect() {}, __nativeValidateOpen() {}, __nativeConfigureRuntime() {}, __nativeReset() {}, __nativeOpenReader() {}
 				};\n`,
 		);
 	}
@@ -104,4 +104,34 @@ function runFixture(root, statement) {
 		['--input-type=module', '--eval', `import { loadAddon } from './dist/load-addon.js'; ${statement}`],
 		{ cwd: root, encoding: 'utf8', env: environment },
 	).trim();
+}
+
+for (const missing of ['__nativeCreateTelemetry', '__nativeTelemetry', '__nativeConfigureTelemetry']) {
+	test(`telemetry capability rejects missing ${missing}`, (context) => {
+		const fixture = createFixture(context, { nativeVersion: '0.1.0', omitTelemetrySymbol: missing });
+		assert.strictEqual(
+			runFixture(fixture.root, 'try { loadAddon(); } catch (error) { console.log(error.code); }'),
+			'E_NATIVE_CAPABILITY_MISMATCH',
+		);
+	});
+}
+test('telemetry capability rejects unknown API versions', (context) => {
+	const fixture = createFixture(context, { nativeVersion: '0.1.0', telemetryVersion: 2 });
+	assert.strictEqual(
+		runFixture(fixture.root, 'try { loadAddon(); } catch (error) { console.log(error.code); }'),
+		'E_NATIVE_CAPABILITY_MISMATCH',
+	);
+});
+
+for (const [name, options, message] of [
+	['telemetry-only', { queryVersion: 7 }, 'Fulltext query API 7 from PACKAGE is not supported'],
+	['scoring-only', { telemetryVersion: 0 }, 'Fulltext native artifact PACKAGE does not provide telemetry API 1'],
+]) {
+	test(`combined capabilities reject a ${name} artifact with a matching package version and ABI`, (context) => {
+		const fixture = createFixture(context, { nativeVersion: '0.1.0', ...options });
+		assert.strictEqual(
+			runFixture(fixture.root, 'try { loadAddon(); } catch (error) { console.log(`${error.code}:${error.message}`); }'),
+			`E_NATIVE_CAPABILITY_MISMATCH:${message.replace('PACKAGE', fixture.packageName)}`,
+		);
+	});
 }

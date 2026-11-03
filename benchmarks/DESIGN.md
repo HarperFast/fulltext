@@ -1,11 +1,59 @@
 # Qualification measurement
 
+## Observability comparisons
+
+`observability.mjs` uses fresh child processes and separate baseline/candidate module paths, with
+alternating order inside each pair. It cannot silently swap an addon under an already loaded
+facade. Keep workload/correctness identical across profiles; baseline deliberately makes no
+telemetry API calls. `--baseline-profile=match` instead compares matching telemetry settings;
+that output is explicitly optimization-only and carries no feature-cost budget classification.
+Optional snapshot-byte cost and polling are separate profiles. Preserve raw
+pairs and mark noisy measurements inconclusive instead of treating a rounded median as proof of
+the 1%/3% throughput targets. Finite local CPU/RSS observations are not sustained-memory evidence.
+
+Default scenarios cover tie-heavy ordinary collection, single-hit `ordinary-cheap`, and expensive
+prefix/exact-total work. `--operations` filters distinct known scenario names without changing
+other matrix dimensions. Both ordinary shapes use bounded totals; requesting exact totals routes
+to the expensive queue. Candidate warmup asserts actual native class counters. The catalog tie
+case invokes the stable fallback after TopDocs, so it cannot bound the cheapest ordinary path.
+The unique product7 case requires ID7/total1/exact, and ID0-only publications cannot change it.
+
+Per-query timers stop when the search API resolves, before correctness validation. The report
+labels API latency separately from query-window throughput/time (`measurementVersion: 2`). Each
+bounded window (default 1,024 results) drains every caller before validating every result outside
+its timer. CPU and event-loop utilization are sampled over those same windows; mixed CPU/elapsed
+still include validation and 20 mutation/publication cycles. Polling defaults to 1,000 ms per handle,
+one handle per timer turn, and reports actual counts and synchronous scrape durations. A short
+run with few scrapes cannot qualify that schedule; retain 10 ms only as an explicit stress setting.
+The default ten-poll/handle descriptive floor labels undersampled cells insufficient; it is not
+an acceptance threshold or statistical confidence statement.
+
+`observability-scrape-cost.mjs` retains the separate idle-handle protocol: immutable baseline and
+candidate modules, serial fresh children, 100 searches/handle, default 25 warmup rounds and 120
+measured calls/handle with event-loop turns between them. The five selected topologies cap total
+search workers at 64 and handles at 16. Explicit aggregate queue budget covers writer, ordinary
+and expensive queues. Results pool per-call quantiles per child and retain every per-handle
+sample; they do not bound active workload stalls. Both observability drivers emit a child report
+only after verified close and directory cleanup. The paired driver requires clean close on success
+and rolls back only after measurement failure; preserve a primary measurement failure with any secondary cleanup errors,
+and retain the directory on every failed measurement, including a failed open without an owned
+handle that could prove quiescence. Test fixtures verify configuration, warmup and
+sample counts without treating a fake clock as native performance evidence.
+Historical reports used validation-inclusive percentiles; preserve and label them rather than
+reinterpreting their p99 values as API completion latency.
+
 ## Mixed metadata soak
 
 `metadata-soak.mjs` gives each in-flight query a lease on a reader that is never reloaded. Its
 source oracle is prepared for that reader's published checkpoint. A publication swaps the current
 lease; retirement closes the old reader only after its queries finish. This prevents comparing a
 legitimate old-snapshot result with newer source rows.
+
+The optional `--min-publications` positive safe integer gives short correctness fixtures a
+completion condition: the mixed phase continues until both its duration and publication minimum
+are met, unless an operation fails first. Absence means zero and adds no iterations to the default
+30-minute mixed/10-minute drain workload. Fixture children retain their existing outer deadlines;
+the option does not relax resource gates or qualify a short run as a sustained soak.
 
 Latency histograms have fixed bins. Recent memory samples retain only the final five-minute
 window; the sampling interval is at least 100 ms. Full samples stream to disk. Do not retain every
@@ -172,3 +220,5 @@ On the same unchanged optimized artifact `652d1aaafd045641c1880a6c08e1a52099df5a
 The default driver also measured its original OR pair on this artifact: tied baseline/root boost p50 was 0.126/0.172 ms with exact totals off and 0.123/0.175 ms on; varied was 0.156/0.108 ms off and 0.158/0.118 ms on. The routing-mode OR rows use the augmented corpus, so they are not matched before/after comparisons with those default rows.
 
 These samples measure total requests, including JavaScript/native calls, query construction, stable ID-ordinal resolution and possible separate exact counts. Wrapped controls add AST nodes and double scores; tied cutoffs can trigger a stable rerun. None of these pairs isolates pruning or compiler overhead, and timing differences change with totals and corpus. The added families make the small-workload costs visible; they establish no general speedup, strict deadline bound, catalog-scale throughput or memory qualification.
+
+The query-scoring measurements above describe the pre-telemetry scoring build identified by their retained source and addon hashes. They do not qualify the combined 0.9.0 scoring/telemetry artifact.
