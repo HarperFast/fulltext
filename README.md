@@ -619,6 +619,40 @@ an index open. Before downgrading to 0.6.x, retire the 0.7 index with the 0.7 re
 with 0.6.x; the older reset API reports `E_INDEX_CORRUPT` for the unrecognized identity. Relevance
 scores may differ between engine versions; continuation tokens remain reader-instance scoped.
 
+## Score explanations (draft; upstream blocker)
+
+This implementation is not ready for release. Tantivy 0.27.0 `BooleanWeight::explain` seeks
+backward when a requested document precedes a nonmatching child's first match. The new
+real-index tests reproduce debug assertions for fuzzy and optional-scoring expressions.
+No dependency patch or replacement scorer is included. Keep this change draft until the upstream
+behavior is fixed and the full typed-query contract and expensive-query cost have been qualified.
+
+The proposed `explain(request, ids, options)` method runs on the bounded expensive-search lane
+and uses the production compiler. It accepts text/query, fields, fuzzy controls, candidates and
+metadata filters; pagination, sorting, aggregation and exact counts are rejected. Supply one to
+ten distinct IDs. Missing and nonmatching records share `{ id, matched: false }`.
+
+`searchPage()` now returns its captured `snapshot`, including on the final page. Pass that value
+as `explain`'s `options.snapshot`; a changed snapshot rejects with `E_CURSOR_EXPIRED`. Use a dedicated
+reader without reloading to retain an older snapshot while the writer publishes. Explain returns
+the actual snapshot and request-ordered records with the native float32 `score` and an explanation
+tree (`value`, `description`, optional `details` and `context`). `format: 'tantivy-0.27'` identifies
+the upstream representation; descriptions and internal field-number context are diagnostic text,
+not stable application keys. JSON decimal values represent float32 numbers; use the separate
+binary-decoded `score` for exact comparison. Child values need not add to their parent's value.
+
+Explanations are privileged diagnostics. BM25 details reveal index-wide term/document counts,
+field lengths and configured weights even when filters or candidates restrict membership.
+Consumers must authorize access separately before exposing them to users.
+
+The draft caps text-query construction at 256 compiled clauses, each explanation at 256 KiB and
+the response at 1 MiB. Overlarge responses reject with `E_RESULT_TOO_LARGE`. Every JSON node must
+have a finite value; validation rejects malformed trees with `E_NATIVE_FAILURE`. Queue plus
+execution share the usual request budget. Upstream explanation work is uninterruptible within
+one call and can rebuild fuzzy/prefix subtrees repeatedly; deadlines are checked between IDs
+and before returning. This has not been qualified for catalog-scale use. Native observations
+are included in `expensiveSearch`; facade preparation rejections are included in `search`.
+
 ## Highlighting and snippets
 
 Highlighting is opt-in and operates on caller-supplied current source values, so the library never
@@ -864,7 +898,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 14, query API 8, and packed protocol 8. The loader rejects older addon
+This draft source requires native ABI 15, query API 8, and packed protocol 8. Released 0.9.0 uses ABI 14; a new synchronized package version is required before publication. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
 columns. Previously released string-metadata indexes must
@@ -904,7 +938,7 @@ const { packageVersion, tantivyVersion, nativeAbiVersion, queryApiVersion, telem
 console.log({ packageVersion, tantivyVersion });
 // { packageVersion: '0.9.0', tantivyVersion: '0.27.0' }
 console.log({ nativeAbiVersion, queryApiVersion, telemetryApiVersion });
-// { nativeAbiVersion: 14, queryApiVersion: 8, telemetryApiVersion: 1 }
+// { nativeAbiVersion: 15, queryApiVersion: 8, telemetryApiVersion: 1 }
 ```
 
 The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an

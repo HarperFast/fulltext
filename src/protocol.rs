@@ -627,6 +627,109 @@ pub fn search_budget(bytes: &[u8]) -> Result<u32> {
 	packed_budget(bytes, *b"FTSQ", "search")
 }
 
+pub fn explain_budget(bytes: &[u8]) -> Result<u32> {
+	packed_budget(bytes, *b"FTEX", "explain")
+}
+
+pub fn validate_explain_header(bytes: &[u8]) -> Result<()> {
+	if bytes.len() > MAX_SEARCH_REQUEST_BYTES {
+		return Err(FulltextError::invalid("packed explanation request exceeds 8 MiB"));
+	}
+	let _ = Cursor::new(bytes, *b"FTEX")?;
+	Ok(())
+}
+
+pub struct ExplainRequest {
+	pub search: SearchRequest,
+	pub ids: Vec<String>,
+	pub snapshot: Option<String>,
+}
+
+pub(crate) fn validate_explain(request: &ExplainRequest) -> Result<()> {
+	let search = &request.search;
+	crate::request_validation::validate_search_admission(search)?;
+	if search.offset != 0
+		|| search.limit != 1
+		|| search.exact_total
+		|| search.traversal
+		|| search.sort.is_some()
+		|| !search.aggregations.is_empty()
+		|| search.after.is_some()
+	{
+		return Err(FulltextError::invalid(
+			"explain does not support pagination, sorting or aggregation",
+		));
+	}
+	if request.ids.is_empty() || request.ids.len() > 10 {
+		return Err(FulltextError::invalid("explain requires between 1 and 10 distinct IDs"));
+	}
+	let mut seen = std::collections::HashSet::new();
+	for id in &request.ids {
+		validate_record_id(id)?;
+		if !seen.insert(id) {
+			return Err(FulltextError::invalid("explanation IDs must be distinct"));
+		}
+	}
+	if let Some(snapshot) = &request.snapshot {
+		if snapshot.len() != 64
+			|| !snapshot
+				.bytes()
+				.all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+		{
+			return Err(FulltextError::invalid("invalid explanation snapshot"));
+		}
+	}
+	Ok(())
+}
+
+pub fn decode_explain(bytes: &[u8]) -> Result<ExplainRequest> {
+	validate_explain_header(bytes)?;
+	let mut cursor = Cursor::new(bytes, *b"FTEX")?;
+	let length = cursor.u32()? as usize;
+	let search = decode_search(cursor.take(length)?)?;
+	if search.offset != 0
+		|| search.limit != 1
+		|| search.exact_total
+		|| search.traversal
+		|| search.sort.is_some()
+		|| !search.aggregations.is_empty()
+	{
+		return Err(FulltextError::invalid(
+			"explain does not support pagination, sorting or aggregation",
+		));
+	}
+	let count = cursor.u16()? as usize;
+	if count == 0 || count > 10 {
+		return Err(FulltextError::invalid("explain requires between 1 and 10 distinct IDs"));
+	}
+	let mut ids = Vec::with_capacity(count);
+	let mut seen = std::collections::HashSet::new();
+	for _ in 0..count {
+		let id = cursor.record_id()?;
+		if !seen.insert(id.clone()) {
+			return Err(FulltextError::invalid("explanation IDs must be distinct"));
+		}
+		ids.push(id);
+	}
+	let snapshot = if cursor.boolean()? {
+		let value = cursor.string()?;
+		if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+			return Err(FulltextError::invalid("invalid explanation snapshot"));
+		}
+		Some(value)
+	} else {
+		None
+	};
+	let budget = cursor.u32()?;
+	cursor.finish()?;
+	if budget != search.budget_milliseconds {
+		return Err(FulltextError::invalid("inconsistent explanation budget"));
+	}
+	let request = ExplainRequest { search, ids, snapshot };
+	validate_explain(&request)?;
+	Ok(request)
+}
+
 pub fn trace_budget(bytes: &[u8]) -> Result<u32> {
 	packed_budget(bytes, *b"FTTM", "trace")
 }

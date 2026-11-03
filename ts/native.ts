@@ -20,6 +20,7 @@ import {
 	encodeReset,
 	encodeRuntimeBudget,
 	encodeSearchFrame,
+	encodeExplain,
 	maxRecordIdBytes,
 	maxSearchRequestBytes,
 	maxCommitPayloadBytes,
@@ -297,7 +298,39 @@ export interface SearchPageRequest extends Omit<SearchRequest, 'offset' | 'exact
 	continuation?: string;
 }
 
+export type ExplainRequest = Pick<
+	SearchRequest,
+	| 'text'
+	| 'query'
+	| 'mode'
+	| 'operator'
+	| 'fields'
+	| 'fuzzyDistance'
+	| 'fuzzyTranspositions'
+	| 'candidateIds'
+	| 'filter'
+>;
+
+export interface ScoreExplanation {
+	value: number;
+	description: string;
+	details?: ScoreExplanation[];
+	context?: string[];
+}
+
+export interface ExplainOptions extends SearchExecutionOptions {
+	snapshot?: string;
+}
+export interface ExplainResult {
+	snapshot: string;
+	format: 'tantivy-0.27';
+	records: Array<
+		{ id: string; matched: false } | { id: string; matched: true; score: number; explanation: ScoreExplanation }
+	>;
+}
+
 export interface SearchPageResult extends SearchResult {
+	snapshot?: string;
 	continuation?: string;
 }
 
@@ -839,8 +872,9 @@ export class NativeFullTextIndex {
 			});
 			const aggregations = decodeAggregations(cursor);
 			let continuation: string | undefined;
+			let snapshot: string | undefined;
 			if (traversal) {
-				const snapshot = cursor.string();
+				snapshot = cursor.string();
 				const more = cursor.u8();
 				if (
 					snapshot.length !== snapshotHexBytes ||
@@ -877,7 +911,64 @@ export class NativeFullTextIndex {
 				hits,
 				...(aggregations === undefined ? {} : { aggregations }),
 				...(continuation === undefined ? {} : { continuation }),
+				...(snapshot === undefined ? {} : { snapshot }),
 			};
+		} catch (error) {
+			if (!nativeStarted) this.#telemetry.preparationRejected('search', error);
+			throw error;
+		}
+	}
+
+	async explain(request: ExplainRequest, ids: string[], options: ExplainOptions = {}): Promise<ExplainResult> {
+		let nativeStarted = false;
+		try {
+			this.#assertPreparationOpen();
+			const expression = normalizeSearchExpression(request, this.#queryLimits.maxQueryClauses);
+			for (const key of ['offset', 'limit', 'sort', 'aggregations', 'exactTotal', 'continuation']) {
+				if ((request as Record<string, unknown>)[key] !== undefined)
+					throw new FulltextError('E_INVALID_ARGUMENT', `explain does not support ${key}`);
+			}
+			const frame = encodeExplain(
+				{
+					expression,
+					candidateIds: request.candidateIds,
+					filter:
+						request.filter === undefined ? undefined : normalizeFilterExpression(request.filter, 0, { leaves: 0 }),
+					offset: 0,
+					limit: 1,
+					exactTotal: false,
+					budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
+				},
+				ids,
+				options.snapshot,
+			);
+			this.#assertPreparationOpen();
+			nativeStarted = true;
+			const cursor = await invoke((callback) => loadAddon().__nativeExplain(this.#handle, frame, callback));
+			const snapshot = cursor.string();
+			if (!/^[0-9a-f]{64}$/.test(snapshot)) throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation snapshot');
+			const count = cursor.u16();
+			if (count < 1 || count > 10) throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation count');
+			const records: ExplainResult['records'] = [];
+			for (let i = 0; i < count; i++) {
+				const id = cursor.string();
+				if (cursor.u8() === 0) {
+					records.push({ id, matched: false });
+					continue;
+				}
+				const score = cursor.f32();
+				let explanation: unknown;
+				try {
+					explanation = JSON.parse(cursor.string());
+				} catch {
+					throw new FulltextError('E_NATIVE_FAILURE', 'invalid native explanation JSON');
+				}
+				validateScoreExplanation(explanation);
+				if (!Number.isFinite(score)) throw new FulltextError('E_NATIVE_FAILURE', 'invalid native explanation score');
+				records.push({ id, matched: true, score, explanation: explanation as ScoreExplanation });
+			}
+			cursor.finish();
+			return { snapshot, format: 'tantivy-0.27', records };
 		} catch (error) {
 			if (!nativeStarted) this.#telemetry.preparationRejected('search', error);
 			throw error;
@@ -1115,6 +1206,10 @@ export class NativeFullTextReader {
 
 	searchPage(request: SearchPageRequest, options: SearchExecutionOptions = {}): Promise<SearchPageResult> {
 		return this.#inner.searchPage(request, options);
+	}
+
+	explain(request: ExplainRequest, ids: string[], options: ExplainOptions = {}): Promise<ExplainResult> {
+		return this.#inner.explain(request, ids, options);
 	}
 
 	traceMatches(
@@ -1721,4 +1816,21 @@ function continuationMac(key: Buffer, digest: Buffer, token: Buffer): Buffer {
 		.update(token.subarray(continuationOffsets.snapshot))
 		.update(digest)
 		.digest();
+}
+
+function validateScoreExplanation(input: unknown, depth = 0, budget = { nodes: 8192 }): void {
+	if (!input || typeof input !== 'object' || Array.isArray(input) || depth > 32 || --budget.nodes < 0)
+		throw new FulltextError('E_NATIVE_FAILURE', 'invalid native explanation tree');
+	const node = input as Record<string, unknown>;
+	if (typeof node.value !== 'number' || !Number.isFinite(node.value) || typeof node.description !== 'string')
+		throw new FulltextError('E_NATIVE_FAILURE', 'invalid native explanation value');
+	if (
+		node.context !== undefined &&
+		(!Array.isArray(node.context) || node.context.some((item) => typeof item !== 'string'))
+	)
+		throw new FulltextError('E_NATIVE_FAILURE', 'invalid native explanation context');
+	if (node.details !== undefined) {
+		if (!Array.isArray(node.details)) throw new FulltextError('E_NATIVE_FAILURE', 'invalid native explanation details');
+		for (const child of node.details) validateScoreExplanation(child, depth + 1, budget);
+	}
 }

@@ -1061,6 +1061,127 @@ impl Engine {
 		})
 	}
 
+	pub fn explain(
+		&self,
+		searcher: &Searcher,
+		request: &crate::protocol::ExplainRequest,
+		deadline: Instant,
+	) -> Result<Vec<u8>> {
+		use tantivy::query::EnableScoring;
+		use tantivy::{DocSet, TERMINATED};
+		crate::protocol::validate_explain(request)?;
+		if request.ids.is_empty() || request.ids.len() > 10 {
+			return Err(FulltextError::invalid("explain requires between 1 and 10 distinct IDs"));
+		}
+		let mut seen = HashSet::new();
+		for id in &request.ids {
+			validate_record_id(id)?;
+			if !seen.insert(id) {
+				return Err(FulltextError::invalid("explanation IDs must be distinct"));
+			}
+		}
+		check_deadline(Some(deadline))?;
+		let snapshot = search_snapshot(searcher.generation().segments());
+		if request.snapshot.as_ref().is_some_and(|expected| *expected != snapshot) {
+			return Err(FulltextError::new(
+				"E_CURSOR_EXPIRED",
+				"explanation snapshot changed; retry on a retained reader",
+			));
+		}
+		let built = self.query(searcher, &request.search)?;
+		if built.clauses > 256 {
+			return Err(FulltextError::new(
+				"E_RESOURCE_LIMIT",
+				"explain supports at most 256 compiled clauses",
+			));
+		}
+		let weight = built
+			.query
+			.weight(EnableScoring::enabled_from_searcher(searcher))
+			.map_err(index_error)?;
+		let mut addresses = Vec::new();
+		for (index, id) in request.ids.iter().enumerate() {
+			let term = Term::from_field_text(self.id_field, id);
+			let mut found = false;
+			for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+				check_deadline(Some(deadline))?;
+				let inverted = segment.inverted_index(self.id_field).map_err(index_error)?;
+				if let Some(mut postings) = inverted
+					.read_postings(&term, IndexRecordOption::Basic)
+					.map_err(|error| index_error(error.into()))?
+				{
+					while postings.doc() != TERMINATED {
+						let doc = postings.doc();
+						if !segment.is_deleted(doc) {
+							if found {
+								return Err(FulltextError::native(
+									"multiple live documents have the same explanation ID",
+								));
+							}
+							found = true;
+							addresses.push((segment_ord, doc, index));
+						}
+						postings.advance();
+						check_deadline(Some(deadline))?;
+					}
+				}
+			}
+		}
+		addresses.sort_unstable();
+		let mut results: Vec<Option<(f32, String)>> = vec![None; request.ids.len()];
+		let mut total_bytes = 4 + snapshot.len() + 2 + request.ids.iter().map(|id| 5 + id.len()).sum::<usize>();
+		let mut position = 0;
+		while position < addresses.len() {
+			let segment_ord = addresses[position].0;
+			let segment = &searcher.segment_readers()[segment_ord];
+			check_deadline(Some(deadline))?;
+			let mut scorer = weight.scorer(segment, 1.0).map_err(index_error)?;
+			while position < addresses.len() && addresses[position].0 == segment_ord {
+				let (_, doc, index) = addresses[position];
+				position += 1;
+				check_deadline(Some(deadline))?;
+				if scorer.doc() < doc {
+					scorer.seek(doc);
+				}
+				if scorer.doc() != doc {
+					continue;
+				}
+				let score = scorer.score();
+				if !score.is_finite() {
+					return Err(FulltextError::native("explanation score is not finite"));
+				}
+				let explanation = weight.explain(segment, doc).map_err(index_error)?;
+				let json = explanation.to_pretty_json();
+				check_deadline(Some(deadline))?;
+				total_bytes = total_bytes.saturating_add(8 + json.len());
+				if json.len() > 256 * 1024 || total_bytes > 1024 * 1024 {
+					return Err(FulltextError::new(
+						"E_RESULT_TOO_LARGE",
+						"explanation exceeds its response byte limit",
+					));
+				}
+				results[index] = Some((score, json));
+			}
+		}
+		let mut bytes = Vec::with_capacity(total_bytes);
+		let string = |bytes: &mut Vec<u8>, value: &str| {
+			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+			bytes.extend_from_slice(value.as_bytes());
+		};
+		string(&mut bytes, &snapshot);
+		bytes.extend_from_slice(&(request.ids.len() as u16).to_le_bytes());
+		for (id, result) in request.ids.iter().zip(results) {
+			string(&mut bytes, id);
+			bytes.push(u8::from(result.is_some()));
+			if let Some((score, json)) = result {
+				bytes.extend_from_slice(&score.to_le_bytes());
+				string(&mut bytes, &json);
+			}
+		}
+		check_deadline(Some(deadline))?;
+		Ok(bytes)
+	}
+
 	pub fn trace_matches(
 		&self,
 		request: &SearchRequest,

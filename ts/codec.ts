@@ -733,6 +733,31 @@ function encodeBatchHeader(upserts: number, deletes: number): Buffer {
 	return header;
 }
 
+export function encodeExplain(search: PackedSearchRequest, ids: string[], snapshot?: string): Buffer {
+	if (!Array.isArray(ids) || ids.length < 1 || ids.length > 10)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'explain requires between 1 and 10 distinct IDs');
+	const copied = ids.slice();
+	if (new Set(copied).size !== copied.length)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'explanation IDs must be distinct');
+	const writer = new ByteWriter(maxSearchRequestBytes, 'E_INVALID_ARGUMENT');
+	writer.header('FTEX');
+	const query = encodeSearch(search);
+	writer.u32(query.length, 'search.length');
+	writer.encodedBytes([query]);
+	writer.u16(copied.length, 'ids.length');
+	for (const id of copied) {
+		if (typeof id !== 'string' || id.length === 0 || Buffer.byteLength(id) > maxRecordIdBytes)
+			throw new FulltextError('E_INVALID_ARGUMENT', 'invalid explanation ID');
+		writer.string(id);
+	}
+	if (snapshot !== undefined && (typeof snapshot !== 'string' || !/^[0-9a-f]{64}$/.test(snapshot)))
+		throw new FulltextError('E_INVALID_ARGUMENT', 'invalid explanation snapshot');
+	writer.boolean(snapshot !== undefined);
+	if (snapshot !== undefined) writer.string(snapshot);
+	writer.u32(search.budgetMilliseconds, 'budgetMilliseconds');
+	return writer.finish();
+}
+
 export function encodeSearch(request: PackedSearchRequest): Buffer {
 	return encodeSearchFrame(request).bytes;
 }

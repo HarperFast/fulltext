@@ -61,6 +61,7 @@ interface NativeAddonApi {
 	__nativePublish(handle: number, payload: string, callback: NativeCallback): void;
 	__nativeReload(handle: number, callback: NativeCallback): void;
 	__nativeSearch(handle: number, request: Buffer, callback: NativeCallback): void;
+	__nativeExplain(handle: number, request: Buffer, callback: NativeCallback): void;
 	__nativeTraceMatches(handle: number, request: Buffer, callback: NativeCallback): void;
 	__nativeClose(handle: number, rollback: boolean, callback: NativeCallback): void;
 	__nativeStatus(handle: number): Buffer;
@@ -83,7 +84,7 @@ interface NativeAddonApi {
 export type NativeCallback = (response: Buffer) => void;
 
 const require = createRequire(import.meta.url);
-const expectedNativeAbiVersion = 14;
+const expectedNativeAbiVersion = 15;
 const packageManifest = require('../package.json') as { name: string; version: string };
 let loadedAddon: NativeAddonApi | undefined;
 let runtimeUsesGlibc: boolean | undefined;

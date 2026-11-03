@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "test-panic")]
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const NATIVE_ABI_VERSION: u32 = 14;
+pub const NATIVE_ABI_VERSION: u32 = 15;
 pub const TANTIVY_VERSION: &str = "0.27.0";
 
 #[cfg(feature = "node-api")]

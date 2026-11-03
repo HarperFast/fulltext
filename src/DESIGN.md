@@ -332,3 +332,10 @@ The forced-admission helper checks queue availability and changes lifecycle stat
 queue mutex, before enqueueing rollback close. Unavailable queues therefore cannot turn a final
 poisoned state back into closing. The native loop regression inspects bank versus shared-fallback
 outcomes, so deleting production worker binding fails even when aggregate totals still conserve.
+
+## Explanation draft
+
+`explanations.test.mjs` compares production search and diagnostic scorer bits on a captured
+searcher, including request-order restoration after ascending per-segment seeks. Fuzzy and
+optional-scoring cases currently reproduce an upstream BooleanWeight explanation panic.
+The draft must not ship until those regressions pass against an approved native implementation.
