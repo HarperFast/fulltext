@@ -8,6 +8,7 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { openNativeFullTextIndex, runtimeInfo } from '../dist/native.js';
 import { loadAddon } from '../dist/load-addon.js';
+import { closeIndex } from './metadata-cleanup.mjs';
 
 const gates = { maxSampleMilliseconds: 5000, maxObservedRssGrowthBytes: 256 << 20 };
 const args = process.argv.slice(2);
@@ -180,7 +181,7 @@ try {
 			throw error;
 		} finally {
 			try {
-				await index.close({ mode: 'rollback' });
+				await closeIndex(index, { mode: 'rollback' });
 			} catch (error) {
 				if (!indexFailure) throw error;
 			}

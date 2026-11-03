@@ -623,7 +623,7 @@ scores may differ between engine versions; continuation tokens remain reader-ins
 
 This implementation is not ready for release. In debug builds, Tantivy 0.27.0
 BooleanWeight explanation recursion seeks backward into a nonmatching child and triggers a native
-assertion for fuzzy, optional-scoring and nested OR fixtures. The panic poisons the shared handle
+assertion for fuzzy, optional-scoring and missing OR branch fixtures. The panic poisons the shared handle
 and rolls back its pending writes. In production builds those assertions are disabled: the same
 three production fixtures return finite trees with exact scorer parity and preserve pending writes.
 That fixture coverage does not establish the complete typed-query contract.
@@ -633,6 +633,8 @@ explanation descendants in both debug and production builds. Finite-tree validat
 E_NATIVE_FAILURE; a subsequent search remains usable. No dependency patch, replacement scorer or
 tree sanitization is included. Keep this change draft until native correctness and expensive-query
 cost qualification pass.
+
+Native main currently requires Rust 1.91; fulltext uses Rust 1.90. Adoption must select a compatible backport release or separately qualify a toolchain update.
 
 The native repair is a separate draft, [Preserve scorer boost context in explanations](https://github.com/quickwit-oss/tantivy/pull/3239),
 which includes the prerequisite [Do not seek backwards when explaining a document](https://github.com/quickwit-oss/tantivy/pull/3198).

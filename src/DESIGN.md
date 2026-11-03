@@ -335,8 +335,10 @@ outcomes, so deleting production worker binding fails even when aggregate totals
 
 ## Explanation draft
 
+This explanation section was last verified on 2026-11-03 against the released dependency and a temporary native-source backport; source qualification does not establish release readiness.
+
 `explanations.test.mjs` compares production search and diagnostic scorer bits on a captured
-searcher, including request-order restoration after ascending per-segment seeks. Fuzzy, optional-scoring and nested OR
+searcher, including request-order restoration after ascending per-segment seeks. Fuzzy, optional-scoring and missing OR branch
 cases currently reproduce an upstream BooleanWeight explanation panic.
 The production release tests verify those three fixtures retain scorer parity and pending
 writes when native debug assertions are disabled. The nonfinite zero and reducing-positive nested-boost regressions fail in

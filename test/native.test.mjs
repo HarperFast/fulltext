@@ -29,6 +29,7 @@ import {
 } from '../dist/codec.js';
 import { normalizeNativeError } from '../dist/errors.js';
 import { loadAddon, platformTriple } from '../dist/load-addon.js';
+import { closeIndex } from '../benchmarks/metadata-cleanup.mjs';
 
 const packageManifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const cargoManifest = readFileSync(new URL('../Cargo.toml', import.meta.url), 'utf8');
@@ -197,6 +198,7 @@ test('a close failure after resource release remains resettable', async (context
 	assert.strictEqual(index.status().state, 'closed');
 	await assert.rejects(index.commit(), (error) => error.code === 'E_CLOSED');
 	assert.strictEqual((await index.close()).cleanupError?.code, 'E_CLOSE_FAILED');
+	await assert.rejects(closeIndex(index, { mode: 'rollback' }), (error) => error.code === 'E_CLOSE_FAILED');
 	assert.strictEqual((await resetNativeFullTextIndex({ path: indexPath, indexId: 'close-failed' })).state, 'reset');
 });
 
