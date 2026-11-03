@@ -901,8 +901,10 @@ versions in the installed native addon:
 import { runtimeInfo } from '@harperfast/fulltext/native';
 
 const { packageVersion, tantivyVersion, nativeAbiVersion, queryApiVersion, telemetryApiVersion } = await runtimeInfo();
-console.log({ packageVersion, tantivyVersion, nativeAbiVersion, queryApiVersion, telemetryApiVersion });
-// { packageVersion: '0.9.0', tantivyVersion: '0.27.0', nativeAbiVersion: 14, queryApiVersion: 8, telemetryApiVersion: 1 }
+console.log({ packageVersion, tantivyVersion });
+// { packageVersion: '0.9.0', tantivyVersion: '0.27.0' }
+console.log({ nativeAbiVersion, queryApiVersion, telemetryApiVersion });
+// { nativeAbiVersion: 14, queryApiVersion: 8, telemetryApiVersion: 1 }
 ```
 
 The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an
