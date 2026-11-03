@@ -332,3 +332,12 @@ The forced-admission helper checks queue availability and changes lifecycle stat
 queue mutex, before enqueueing rollback close. Unavailable queues therefore cannot turn a final
 poisoned state back into closing. The native loop regression inspects bank versus shared-fallback
 outcomes, so deleting production worker binding fails even when aggregate totals still conserve.
+
+## Boolean source tracing
+
+`TraceExpression::evaluate` uses three-valued membership: OR(true, unknown) is true,
+AND(false, unknown) is false, and NOT(unknown) is unknown. `boolean-tracing.test.mjs` pins
+truncation, positive-branch selection, and analyzed-only fuzzy evidence under negation.
+`trace_expression` owns shared per-record source tokens and bounds aggregate matching work;
+negative membership never spends highlight spans. Simple leaves retain the FTTM layout and
+existing evaluator; Boolean trees use FTBT, guarded by query API 9 / ABI 16.

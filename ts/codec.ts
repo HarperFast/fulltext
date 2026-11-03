@@ -437,12 +437,11 @@ export interface PackedSearchRequest {
 	traversal?: { after?: { snapshot: string; score: number; id: string } };
 }
 
-export interface PackedTraceRequest extends PackedSearchClause {
-	fields: string[];
+export type PackedTraceRequest = (PackedSearchClause | { expression: PackedSearchExpression }) & {
 	candidateIds?: string[];
 	records: Array<{ id: string; fields: Array<{ name: string; values: string[] }> }>;
 	budgetMilliseconds: number;
-}
+};
 
 export function encodeOpen(config: PackedOpenConfig): Buffer {
 	const writer = new ByteWriter(Number.MAX_SAFE_INTEGER, 'E_INVALID_ARGUMENT');
@@ -913,12 +912,18 @@ export function encodeTrace(request: PackedTraceRequest): Buffer {
 	validateCandidateIds(request.candidateIds);
 	for (const record of request.records) validateRecordId(record.id);
 	const writer = new ByteWriter(maxSearchRequestBytes, 'E_INVALID_ARGUMENT');
-	writer.header('FTTM');
-	writer.string(request.text);
-	writer.u8(['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'].indexOf(request.mode), 'mode');
-	encodeQueryOptions(writer, request);
-	writer.u16(request.fields.length, 'fields.length');
-	for (const field of request.fields) writer.string(field);
+	const expression = 'expression' in request ? request.expression : request;
+	if ('operator' in expression) {
+		writer.header('FTBT');
+		encodeSearchExpression(writer, expression, 0);
+	} else {
+		writer.header('FTTM');
+		writer.string(expression.text);
+		writer.u8(['any', 'all', 'phrase', 'prefix', 'fuzzy', 'fuzzy-prefix'].indexOf(expression.mode), 'mode');
+		encodeQueryOptions(writer, expression);
+		writer.u16(expression.fields.length, 'fields.length');
+		for (const field of expression.fields) writer.string(field);
+	}
 	writer.boolean(request.candidateIds !== undefined);
 	if (request.candidateIds !== undefined) {
 		writer.u16(request.candidateIds.length, 'candidateIds.length');

@@ -71,7 +71,7 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	queryApiVersion: 8;
+	queryApiVersion: 9;
 	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
 	mutationBatchApiVersion: 5;
@@ -302,7 +302,8 @@ export interface SearchPageResult extends SearchResult {
 }
 
 export interface TraceSearchRequest extends QueryOptions {
-	text: string;
+	text?: string;
+	query?: SearchExpression;
 	mode?: SearchMode;
 	operator?: 'any' | 'all';
 	fields?: string[];
@@ -892,11 +893,10 @@ export class NativeFullTextIndex {
 		let nativeStarted = false;
 		try {
 			this.#assertPreparationOpen();
-			if (typeof request.text !== 'string') throw new FulltextError('E_INVALID_ARGUMENT', 'traceMatches requires text');
-			const text = request.text;
-			const queryOptions = normalizeQueryOptions(request);
-			if (request.mode !== undefined && request.operator !== undefined) {
-				throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
+			const expression = normalizeSearchExpression(request, this.#queryLimits.maxQueryClauses);
+			for (const key of ['filter', 'offset', 'limit', 'sort', 'aggregations', 'exactTotal', 'continuation']) {
+				if ((request as Record<string, unknown>)[key] !== undefined)
+					throw new FulltextError('E_INVALID_ARGUMENT', `traceMatches does not support ${key}`);
 			}
 			if (!Array.isArray(records) || records.length > maxTraceRecords) {
 				throw new FulltextError(
@@ -941,9 +941,7 @@ export class NativeFullTextIndex {
 			}
 			const cursor = await invoke((callback) => {
 				const frame = encodeTrace({
-					text,
-					...queryOptions,
-					fields: request.fields ?? [],
+					expression,
 					candidateIds: request.candidateIds,
 					records: packedRecords,
 					budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
@@ -1398,7 +1396,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			queryApiVersion: info.queryApiVersion as 8,
+			queryApiVersion: info.queryApiVersion as 9,
 			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
 			mutationBatchApiVersion: 5,

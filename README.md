@@ -499,8 +499,8 @@ only from the required branch and inherits expensive work from any branch. Exist
 term, compiled-clause and deadline limits apply to every subtree. Each boost costs one structural
 clause; an optional node with `n` optional children costs `n + 1`, plus its child costs.
 
-`traceMatches()` remains a simple-clause source-tracing API. Consumers may trace the positive
-required and optional clauses against their current source values; boosts do not alter spans.
+`traceMatches()` accepts Boolean text expressions and returns spans from matching positive
+branches; boosts do not alter spans. See [Boolean highlighting](#boolean-highlighting).
 Authorize every referenced field before indexed search, including fields used only for optional
 ranking. A leaf that omits `fields` searches every configured text field, including inside an
 optional branch; callers must authorize access to all of those fields. Defined `boost`, `optional`,
@@ -646,6 +646,34 @@ can overrun the cooperative budget.
 Analysis is limited to 262,144 emitted tokens per value after synonym expansion. When that token
 ceiling, a span ceiling, or the response ceiling is reached, `complete` is false and later matches
 may be omitted.
+
+### Boolean highlighting
+
+`traceMatches()` accepts the same typed `query` expression as search, including AND, OR, NOT,
+boosts and required clauses with optional scoring clauses. See
+[`examples/boolean-highlighting.mjs`](examples/boolean-highlighting.mjs) for a complete indexed-search
+and current-source highlighting route.
+
+Only matching positive branches contribute spans. Every AND child must match; an OR includes
+spans from its matching branches. Boosts preserve source membership and spans. Optional clauses
+contribute spans only when the required expression matches. Clauses inside NOT never contribute
+spans, including nested negation. A matching negation-only expression can return a record with an
+empty `values` array. Candidates restrict the supplied source records. Metadata filters, sort,
+aggregation, pagination and exact counts are unsupported and rejected; omit those search-only
+properties when reusing a request for tracing.
+
+Tracing evaluates caller-supplied current values, not live indexed metadata or source versions.
+Full-fuzzy positive traces retain the existing surface-term fallback. Beneath NOT they use only
+analyzed-token evidence, so a surface-only resemblance cannot incorrectly exclude a record.
+Prefix tracing still does not expand the live index dictionary.
+
+Boolean traces tokenize each selected value once per analyzer. In addition to the existing
+per-value ceiling, retained source analysis is limited to 524,288 emitted tokens per record,
+combined across analyzers; matching visits are limited to 8,388,608 tokens per request, including
+span collection. Exhaustion makes evidence unknown and sets `complete: false`. Unknown absence
+cannot satisfy NOT. A known matching OR branch can still provide spans. Membership is evaluated
+before positive spans consume the shared response/span budgets. Existing simple-clause trace
+frames and limits remain supported.
 
 ## Deadlines and query isolation
 
@@ -864,7 +892,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This API uses native ABI 14, query API 8, and packed protocol 8. The loader rejects older addon
+This unreleased source requires native ABI 16, query API 9, and packed protocol 8. Released 0.9.0 uses ABI 14/query API 8; select an unused synchronized package version before publishing this source. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
 columns. Previously released string-metadata indexes must
@@ -904,7 +932,7 @@ const { packageVersion, tantivyVersion, nativeAbiVersion, queryApiVersion, telem
 console.log({ packageVersion, tantivyVersion });
 // { packageVersion: '0.9.0', tantivyVersion: '0.27.0' }
 console.log({ nativeAbiVersion, queryApiVersion, telemetryApiVersion });
-// { nativeAbiVersion: 14, queryApiVersion: 8, telemetryApiVersion: 1 }
+// { nativeAbiVersion: 16, queryApiVersion: 9, telemetryApiVersion: 1 }
 ```
 
 The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an
