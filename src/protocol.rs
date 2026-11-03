@@ -639,6 +639,10 @@ pub fn validate_explain_header(bytes: &[u8]) -> Result<()> {
 	Ok(())
 }
 
+pub const MAX_EXPLAIN_IDS: usize = 10;
+pub const MAX_EXPLAIN_BYTES: usize = 256 * 1024;
+pub const MAX_EXPLAIN_RESPONSE_BYTES: usize = 1024 * 1024;
+
 pub struct ExplainRequest {
 	pub search: SearchRequest,
 	pub ids: Vec<String>,
@@ -660,7 +664,7 @@ pub(crate) fn validate_explain(request: &ExplainRequest) -> Result<()> {
 			"explain does not support pagination, sorting or aggregation",
 		));
 	}
-	if request.ids.is_empty() || request.ids.len() > 10 {
+	if request.ids.is_empty() || request.ids.len() > MAX_EXPLAIN_IDS {
 		return Err(FulltextError::invalid("explain requires between 1 and 10 distinct IDs"));
 	}
 	let mut seen = std::collections::HashSet::new();
@@ -699,23 +703,16 @@ pub fn decode_explain(bytes: &[u8]) -> Result<ExplainRequest> {
 		));
 	}
 	let count = cursor.u16()? as usize;
-	if count == 0 || count > 10 {
+	if count == 0 || count > MAX_EXPLAIN_IDS {
 		return Err(FulltextError::invalid("explain requires between 1 and 10 distinct IDs"));
 	}
 	let mut ids = Vec::with_capacity(count);
-	let mut seen = std::collections::HashSet::new();
 	for _ in 0..count {
-		let id = cursor.record_id()?;
-		if !seen.insert(id.clone()) {
-			return Err(FulltextError::invalid("explanation IDs must be distinct"));
-		}
-		ids.push(id);
+		ids.push(cursor.record_id()?);
 	}
 	let snapshot = if cursor.boolean()? {
 		let value = cursor.string()?;
-		if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-			return Err(FulltextError::invalid("invalid explanation snapshot"));
-		}
+
 		Some(value)
 	} else {
 		None
@@ -2138,6 +2135,62 @@ mod tests {
 
 		bytes.push(0);
 		assert_eq!(decode_reset(&bytes).unwrap_err().code, "E_INVALID_ARGUMENT");
+	}
+
+	#[test]
+	fn explanation_frames_fail_closed_on_truncation_and_invalid_controls() {
+		fn frame(ids: &[&str], snapshot: Option<&str>, budget: u32, limit: u32) -> Vec<u8> {
+			let mut search = b"FTSQ\x08\x00".to_vec();
+			search.push(0);
+			search.extend_from_slice(&5u32.to_le_bytes());
+			search.extend_from_slice(b"alpha");
+			search.extend_from_slice(&[0, 1, 1, 0, 0]);
+			search.extend_from_slice(&[0; 10]);
+			search.extend_from_slice(&0u32.to_le_bytes());
+			search.extend_from_slice(&limit.to_le_bytes());
+			search.push(0);
+			search.extend_from_slice(&100u32.to_le_bytes());
+			let mut bytes = b"FTEX\x08\x00".to_vec();
+			bytes.extend_from_slice(&(search.len() as u32).to_le_bytes());
+			bytes.extend(search);
+			bytes.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+			for id in ids {
+				bytes.extend_from_slice(&(id.len() as u32).to_le_bytes());
+				bytes.extend_from_slice(id.as_bytes());
+			}
+			bytes.push(u8::from(snapshot.is_some()));
+			if let Some(snapshot) = snapshot {
+				bytes.extend_from_slice(&(snapshot.len() as u32).to_le_bytes());
+				bytes.extend_from_slice(snapshot.as_bytes());
+			}
+			bytes.extend_from_slice(&budget.to_le_bytes());
+			bytes
+		}
+		let snapshot = "a".repeat(64);
+		let valid = frame(&["b", "a"], Some(&snapshot), 100, 1);
+		let decoded = decode_explain(&valid).unwrap();
+		assert_eq!(decoded.ids, vec!["b", "a"]);
+		assert_eq!(decoded.snapshot.as_deref(), Some(snapshot.as_str()));
+		assert_eq!(explain_budget(&valid).unwrap(), 100);
+		for length in 0..valid.len() {
+			assert!(decode_explain(&valid[..length]).is_err());
+		}
+		for invalid in [
+			frame(&[], None, 100, 1),
+			frame(&["a", "a"], None, 100, 1),
+			frame(&["a"], Some("bad"), 100, 1),
+			frame(&["a"], None, 101, 1),
+			frame(&["a"], None, 100, 2),
+			frame(&["a"; 11], None, 100, 1),
+		] {
+			assert_eq!(decode_explain(&invalid).err().unwrap().code, "E_INVALID_ARGUMENT");
+		}
+		let mut trailing = valid.clone();
+		trailing.push(0);
+		assert!(decode_explain(&trailing).is_err());
+		let mut header = valid;
+		header[0] = b'X';
+		assert!(decode_explain(&header).is_err());
 	}
 
 	#[test]

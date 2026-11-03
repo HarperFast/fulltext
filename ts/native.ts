@@ -330,7 +330,7 @@ export interface ExplainResult {
 }
 
 export interface SearchPageResult extends SearchResult {
-	snapshot?: string;
+	snapshot: string;
 	continuation?: string;
 }
 
@@ -755,15 +755,17 @@ export class NativeFullTextIndex {
 		return this.#search(request, options, false);
 	}
 
-	searchPage(request: SearchPageRequest, options: SearchExecutionOptions = {}): Promise<SearchPageResult> {
-		return this.#search(request, options, true);
+	async searchPage(request: SearchPageRequest, options: SearchExecutionOptions = {}): Promise<SearchPageResult> {
+		const result = await this.#search(request, options, true);
+		if (result.snapshot === undefined) throw new FulltextError('E_NATIVE_FAILURE', 'missing search-page snapshot');
+		return { ...result, snapshot: result.snapshot };
 	}
 
 	async #search(
 		request: SearchPageRequest,
 		options: SearchExecutionOptions,
 		traversal: boolean,
-	): Promise<SearchPageResult> {
+	): Promise<SearchResult & Partial<SearchPageResult>> {
 		let nativeStarted = false;
 		try {
 			this.#assertPreparationOpen();
@@ -923,6 +925,10 @@ export class NativeFullTextIndex {
 		let nativeStarted = false;
 		try {
 			this.#assertPreparationOpen();
+			if (request.mode !== undefined && request.operator !== undefined)
+				throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
+			if (!Array.isArray(ids)) throw new FulltextError('E_INVALID_ARGUMENT', 'explanation IDs must be an array');
+			const requestedIds = ids.slice();
 			const expression = normalizeSearchExpression(request, this.#queryLimits.maxQueryClauses);
 			for (const key of ['offset', 'limit', 'sort', 'aggregations', 'exactTotal', 'continuation']) {
 				if ((request as Record<string, unknown>)[key] !== undefined)
@@ -939,7 +945,7 @@ export class NativeFullTextIndex {
 					exactTotal: false,
 					budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
 				},
-				ids,
+				requestedIds,
 				options.snapshot,
 			);
 			this.#assertPreparationOpen();
@@ -948,11 +954,15 @@ export class NativeFullTextIndex {
 			const snapshot = cursor.string();
 			if (!/^[0-9a-f]{64}$/.test(snapshot)) throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation snapshot');
 			const count = cursor.u16();
-			if (count < 1 || count > 10) throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation count');
+			if (count !== requestedIds.length || count < 1 || count > 10)
+				throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation count');
 			const records: ExplainResult['records'] = [];
 			for (let i = 0; i < count; i++) {
 				const id = cursor.string();
-				if (cursor.u8() === 0) {
+				const matched = cursor.u8();
+				if (id !== requestedIds[i] || matched > 1)
+					throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation record');
+				if (matched === 0) {
 					records.push({ id, matched: false });
 					continue;
 				}
@@ -970,8 +980,9 @@ export class NativeFullTextIndex {
 			cursor.finish();
 			return { snapshot, format: 'tantivy-0.27', records };
 		} catch (error) {
-			if (!nativeStarted) this.#telemetry.preparationRejected('search', error);
-			throw error;
+			const normalized = normalizeNativeError(error);
+			if (!nativeStarted) this.#telemetry.preparationRejected('search', normalized);
+			throw normalized;
 		}
 	}
 

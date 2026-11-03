@@ -4,7 +4,7 @@ Native Tantivy full-text indexing for Node.js.
 
 **Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.9.0.** The engine is compiled
 into the native addon; no separate Tantivy installation is required. The matching 0.9.0 facade
-and addon require native ABI 14, query API 8 and telemetry API 1.
+and addon require native ABI 15, query API 8 and telemetry API 1. Published 0.9.0 artifacts use ABI 14; this draft requires a new synchronized release before publication.
 Published 0.8.0 artifacts use ABI 13 / query API 7 and do not include scoring controls or telemetry.
 Deploy the facade and native package at the same version. See
 [Upgrading from 0.8.x](#upgrading-from-08x), [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
@@ -510,7 +510,7 @@ optional branch; callers must authorize access to all of those fields. Defined `
 ignore these properties. Nested text leaves now reject legacy `operator` mode aliases other than
 `any` and `all`; use `mode: 'prefix'` instead of `operator: 'prefix'` inside `query`.
 The top-level request's legacy `operator: 'prefix'` alias remains supported. The scoring and structural
-properties listed above treat `undefined` as absent; this does not apply to a present `text` property. These additions require a matching ABI 14 / query API 8 facade and addon.
+properties listed above treat `undefined` as absent; this does not apply to a present `text` property. These additions require a matching ABI 15 / query API 8 facade and addon.
 
 ### Configurable query capacity
 
@@ -525,7 +525,7 @@ When constructing `NativeFullTextIndex` directly around a native handle, supply 
 in `searchLimits`; the constructor validates it but cannot inspect the native handle’s policy.
 Search requests cannot raise them. Apply the same policy to every worker serving a logical index;
 changing it requires reopening handles but no index rebuild. The facade and native addon must match
-ABI 14, query API 8, and packed protocol 8. The open frame retains its optional policy extension,
+ABI 15, query API 8, and packed protocol 8. The open frame retains its optional policy extension,
 with defaults when absent.
 
 The clause setting covers compiled text queries, including field multiplication and expansion.
@@ -623,7 +623,7 @@ scores may differ between engine versions; continuation tokens remain reader-ins
 
 This implementation is not ready for release. Tantivy 0.27.0 `BooleanWeight::explain` seeks
 backward when a requested document precedes a nonmatching child's first match. The new
-real-index tests reproduce debug assertions for fuzzy and optional-scoring expressions.
+real-index tests reproduce debug assertions for fuzzy, optional-scoring and nested OR expressions. The current regression run passes 12 of 15 cases; the other three reproduce this panic.
 No dependency patch or replacement scorer is included. Keep this change draft until the upstream
 behavior is fixed and the full typed-query contract and expensive-query cost have been qualified.
 

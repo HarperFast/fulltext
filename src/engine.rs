@@ -395,6 +395,16 @@ pub struct SearchResult {
 	pub traversal: Option<(String, bool)>,
 }
 
+pub struct ExplainResult {
+	pub snapshot: String,
+	pub records: Vec<ExplainRecord>,
+}
+
+pub enum ExplainRecord {
+	Unmatched { id: String },
+	Matched { id: String, score: Score, json: String },
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct TraceSpan {
 	pub start: u32,
@@ -1066,20 +1076,11 @@ impl Engine {
 		searcher: &Searcher,
 		request: &crate::protocol::ExplainRequest,
 		deadline: Instant,
-	) -> Result<Vec<u8>> {
+	) -> Result<ExplainResult> {
 		use tantivy::query::EnableScoring;
 		use tantivy::{DocSet, TERMINATED};
 		crate::protocol::validate_explain(request)?;
-		if request.ids.is_empty() || request.ids.len() > 10 {
-			return Err(FulltextError::invalid("explain requires between 1 and 10 distinct IDs"));
-		}
-		let mut seen = HashSet::new();
-		for id in &request.ids {
-			validate_record_id(id)?;
-			if !seen.insert(id) {
-				return Err(FulltextError::invalid("explanation IDs must be distinct"));
-			}
-		}
+
 		check_deadline(Some(deadline))?;
 		let snapshot = search_snapshot(searcher.generation().segments());
 		if request.snapshot.as_ref().is_some_and(|expected| *expected != snapshot) {
@@ -1089,7 +1090,7 @@ impl Engine {
 			));
 		}
 		let built = self.query(searcher, &request.search)?;
-		if built.clauses > 256 {
+		if built.clauses > MAX_QUERY_CLAUSES {
 			return Err(FulltextError::new(
 				"E_RESOURCE_LIMIT",
 				"explain supports at most 256 compiled clauses",
@@ -1148,13 +1149,17 @@ impl Engine {
 				}
 				let score = scorer.score();
 				if !score.is_finite() {
-					return Err(FulltextError::native("explanation score is not finite"));
+					return Err(FulltextError::invalid(
+						"search score is not finite; lower field weights or query boosts",
+					));
 				}
 				let explanation = weight.explain(segment, doc).map_err(index_error)?;
 				let json = explanation.to_pretty_json();
 				check_deadline(Some(deadline))?;
 				total_bytes = total_bytes.saturating_add(8 + json.len());
-				if json.len() > 256 * 1024 || total_bytes > 1024 * 1024 {
+				if json.len() > crate::protocol::MAX_EXPLAIN_BYTES
+					|| total_bytes > crate::protocol::MAX_EXPLAIN_RESPONSE_BYTES
+				{
 					return Err(FulltextError::new(
 						"E_RESULT_TOO_LARGE",
 						"explanation exceeds its response byte limit",
@@ -1163,23 +1168,21 @@ impl Engine {
 				results[index] = Some((score, json));
 			}
 		}
-		let mut bytes = Vec::with_capacity(total_bytes);
-		let string = |bytes: &mut Vec<u8>, value: &str| {
-			bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
-			bytes.extend_from_slice(value.as_bytes());
-		};
-		string(&mut bytes, &snapshot);
-		bytes.extend_from_slice(&(request.ids.len() as u16).to_le_bytes());
-		for (id, result) in request.ids.iter().zip(results) {
-			string(&mut bytes, id);
-			bytes.push(u8::from(result.is_some()));
-			if let Some((score, json)) = result {
-				bytes.extend_from_slice(&score.to_le_bytes());
-				string(&mut bytes, &json);
-			}
-		}
+		let records = request
+			.ids
+			.iter()
+			.zip(results)
+			.map(|(id, result)| match result {
+				Some((score, json)) => ExplainRecord::Matched {
+					id: id.clone(),
+					score,
+					json,
+				},
+				None => ExplainRecord::Unmatched { id: id.clone() },
+			})
+			.collect();
 		check_deadline(Some(deadline))?;
-		Ok(bytes)
+		Ok(ExplainResult { snapshot, records })
 	}
 
 	pub fn trace_matches(

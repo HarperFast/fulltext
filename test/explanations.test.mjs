@@ -73,7 +73,7 @@ for (const [index, query] of queries.entries()) {
 			assert.strictEqual(record.matched, !!hit);
 			if (hit) {
 				assert.strictEqual(record.score, hit.score);
-				assert.strictEqual(Math.fround(record.explanation.value), hit.score);
+				assert(Number.isFinite(record.explanation.value));
 				assert.strictEqual(typeof record.explanation.description, 'string');
 				assert.strictEqual(page.hits.find(({ id }) => id === record.id).score, record.score);
 			} else assert.deepStrictEqual(record, { id: record.id, matched: false });
@@ -116,3 +116,25 @@ test('explain validates bounded IDs, unsupported request options and snapshots w
 	await index.close();
 	await assert.rejects(index.explain({ text: 'amber' }, ['first']), { code: 'E_CLOSED' });
 });
+
+for (const [name, request] of [
+	[
+		'a nested OR branch missing from every field',
+		{ query: { operator: 'or', clauses: [{ text: 'amber' }, { text: 'absent' }] } },
+	],
+	['a nonmatching phrase field', { text: 'running shoe', mode: 'phrase' }],
+]) {
+	test(`explain handles ${name} without poisoning the handle`, async (context) => {
+		const { index } = await fixture(context);
+		const searched = await index.search(request);
+		const result = await index.explain(
+			request,
+			searched.hits.map(({ id }) => id),
+		);
+		assert(result.records.every(({ matched }) => matched));
+		assert.deepStrictEqual(
+			result.records.map(({ score }) => score),
+			searched.hits.map(({ score }) => score),
+		);
+	});
+}

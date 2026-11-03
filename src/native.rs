@@ -19,7 +19,8 @@ use tantivy::{IndexReader, Searcher};
 
 use crate::boundary;
 use crate::engine::{
-	persisted_index_id, Engine, InspectionResult, SearchResult, TotalRelation, TraceResult, Writer, IDENTITY_PATH,
+	persisted_index_id, Engine, ExplainRecord, ExplainResult, InspectionResult, SearchResult, TotalRelation,
+	TraceResult, Writer, IDENTITY_PATH,
 };
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
@@ -2753,7 +2754,7 @@ fn execute_search_command(
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
 				}
-				let response = success_envelope(result);
+				let response = success_envelope(explain_body(result));
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
 				}
@@ -3660,6 +3661,27 @@ fn reset_body(result: ResetResult) -> Vec<u8> {
 
 fn u64_body(value: u64) -> Vec<u8> {
 	value.to_le_bytes().to_vec()
+}
+
+fn explain_body(result: ExplainResult) -> Vec<u8> {
+	let mut bytes = Vec::new();
+	push_string(&mut bytes, &result.snapshot);
+	bytes.extend_from_slice(&(result.records.len() as u16).to_le_bytes());
+	for record in result.records {
+		match record {
+			ExplainRecord::Unmatched { id } => {
+				push_string(&mut bytes, &id);
+				bytes.push(0);
+			}
+			ExplainRecord::Matched { id, score, json } => {
+				push_string(&mut bytes, &id);
+				bytes.push(1);
+				bytes.extend_from_slice(&score.to_le_bytes());
+				push_string(&mut bytes, &json);
+			}
+		}
+	}
+	bytes
 }
 
 fn search_body(result: SearchResult) -> Vec<u8> {
