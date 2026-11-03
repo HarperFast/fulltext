@@ -338,8 +338,8 @@ outcomes, so deleting production worker binding fails even when aggregate totals
 `explanations.test.mjs` compares production search and diagnostic scorer bits on a captured
 searcher, including request-order restoration after ascending per-segment seeks. Fuzzy, optional-scoring and nested OR
 cases currently reproduce an upstream BooleanWeight explanation panic.
-Local manual production runs of the release tests separately verify those three fixtures retain scorer parity and pending
-writes when native debug assertions are disabled. The nonfinite nested-boost regression fails in
+The production release tests verify those three fixtures retain scorer parity and pending
+writes when native debug assertions are disabled. The nonfinite zero and reducing-positive nested-boost regressions fail in
 both builds. The draft must not ship until all regressions pass against an approved native implementation.
 
 ### Explanation engine boundary and qualification
@@ -352,8 +352,8 @@ multi-segment/replacement test retains a dedicated reader while the writer repla
 
 `Weight::explain` remains upstream-owned. `BooleanWeight` can seek backward into a nonmatching
 child. `BoostWeight::scorer` propagates boosts inward, while `BoostWeight::explain` evaluates inner
-explanations before multiplying the enclosing boost. At extreme finite field weights an outer zero
-can yield an actual score of zero but nonfinite explanation descendants, serialized as null. Keep
+explanations before multiplying the enclosing boost. At extreme finite field weights, zero or reducing positive outer boosts
+can yield finite actual scores but nonfinite explanation descendants, serialized as null. Keep
 both regressions as release blockers and preserve finite-tree validation; do not copy native scoring
 or sanitize away invalid descendants in the wrapper.
 
@@ -369,5 +369,23 @@ adoption is tracked in [Expose authorized snapshot-bound full-text score explana
 
 Run blocked-draft production qualification independently with `npm run build:typescript`,
 `npm run build:native`, then `FULLTEXT_PREFER_LOCAL_BUILD=1 node --test test/explanations.release.test.mjs`.
-The existing combined Node command stops after a failed debug phase, so these observed production
-results are local evidence until the native debug blockers clear and CI reaches its release phase.
+The Node suite now records debug assertion failures, builds production last, then executes release
+qualification and returns failure if either test phase failed. Setup/build failures, signals and
+abnormal exits abort; a production-build failure cannot report success with a test addon left behind.
+`node-test-phases.test.mjs` verifies this with real npm/subprocess fixtures. The matrix uses this same
+command; the separate coverage job still measures the debug facade only.
+
+### Diagnostic compiler policy
+
+`Engine::explain` conditionally copies the immutable engine configuration only for raised clause
+policies, then calls the unchanged compiler with a 256-clause ceiling. Default/lower policies borrow
+the existing engine. Compiler limits reject rather than truncate, preserving search tree and score
+parity for admitted queries. The prefix regression exercises six fields with 300 expansions: ordinary
+search retains its raised policy, while explain rejects inside dictionary expansion at 256. The
+facade applies the same structural ceiling before queue admission; analysis and dictionary expansion
+remain native compiler responsibilities. Existing term, phrase and fuzzy construction budgets apply.
+
+Native repairs are tracked in [Preserve scorer boost context in explanations](https://github.com/quickwit-oss/tantivy/pull/3239),
+including the existing [backward-seek fix](https://github.com/quickwit-oss/tantivy/pull/3198).
+Local backport qualification against the published source preserves fulltext's Rust 1.90 toolchain;
+Release still requires an approved native dependency and matching published artifacts.

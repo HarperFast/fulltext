@@ -625,14 +625,19 @@ This implementation is not ready for release. In debug builds, Tantivy 0.27.0
 BooleanWeight explanation recursion seeks backward into a nonmatching child and triggers a native
 assertion for fuzzy, optional-scoring and nested OR fixtures. The panic poisons the shared handle
 and rolls back its pending writes. In production builds those assertions are disabled: the same
-three fixtures return finite trees with exact scorer parity and preserve pending writes, as checked
-by local manual production runs of the release tests. That fixture coverage does not establish the complete typed-query contract.
+three production fixtures return finite trees with exact scorer parity and preserve pending writes.
+That fixture coverage does not establish the complete typed-query contract.
 
-A separate nested zero-boost case has a finite search score but nonfinite native explanation
-descendants in both debug and production builds. Finite-tree validation rejects it with
+Nested zero and reducing positive boosts can have finite search scores but nonfinite native
+explanation descendants in both debug and production builds. Finite-tree validation rejects it with
 E_NATIVE_FAILURE; a subsequent search remains usable. No dependency patch, replacement scorer or
 tree sanitization is included. Keep this change draft until native correctness and expensive-query
 cost qualification pass.
+
+The native repair is a separate draft, [Preserve scorer boost context in explanations](https://github.com/quickwit-oss/tantivy/pull/3239),
+which includes the prerequisite [Do not seek backwards when explaining a document](https://github.com/quickwit-oss/tantivy/pull/3198).
+Local source-backport qualification runs on fulltext's Rust 1.90 toolchain; this repo's dependency
+pin remains unchanged. Source qualification does not establish a released native artifact.
 
 The proposed `explain(request, ids, options)` method runs on the bounded expensive-search lane
 and uses the production compiler. It accepts text/query, fields, fuzzy controls, candidates and
@@ -652,9 +657,11 @@ Explanations are privileged diagnostics. BM25 details reveal index-wide term/doc
 field lengths and configured weights even when filters or candidates restrict membership.
 Consumers must authorize access separately before exposing them to users.
 
-The draft rejects queries that compile to more than 256 clauses, caps each explanation at 256 KiB and
-the response at 1 MiB. A raised handle policy still controls query construction before the diagnostic
-clause check; this does not bound construction latency. Overlarge responses reject with `E_RESULT_TOO_LARGE`. Every JSON node must
+The diagnostic compiler applies `min(handle.maxQueryClauses, 256)` before expansion and construction,
+using the same compiler as search. Lower handle limits and configured term limits remain in force.
+The facade also applies this structural limit before native admission. Clause overflow follows the
+compiler errors: `E_INVALID_ARGUMENT`, or `E_PREFIX_TOO_BROAD` during prefix expansion. Each explanation
+is capped at 256 KiB and the response at 1 MiB; overlarge responses reject with `E_RESULT_TOO_LARGE`. Every JSON node must
 have a finite value; validation rejects malformed trees with `E_NATIVE_FAILURE`. Queue plus
 execution share the usual request budget. Upstream explanation work is uninterruptible within
 one call and can rebuild fuzzy/prefix subtrees repeatedly; deadlines are checked between IDs

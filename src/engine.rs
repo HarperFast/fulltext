@@ -4567,18 +4567,19 @@ mod tests {
 		let mut bounded_trees = request(96);
 		let json_bytes = native_json(&bounded_trees).len();
 		assert!(json_bytes < crate::protocol::MAX_EXPLAIN_BYTES);
-		assert!(json_bytes * 6 < crate::protocol::MAX_EXPLAIN_RESPONSE_BYTES);
-		assert!(json_bytes * 7 > crate::protocol::MAX_EXPLAIN_RESPONSE_BYTES);
-		bounded_trees.ids = (0..6).map(|i| format!("record{i}")).collect();
+		let fitting_records = crate::protocol::MAX_EXPLAIN_RESPONSE_BYTES / json_bytes;
+		assert!((1..crate::protocol::MAX_EXPLAIN_IDS).contains(&fitting_records));
+		assert!(json_bytes * (fitting_records + 1) > crate::protocol::MAX_EXPLAIN_RESPONSE_BYTES);
+		bounded_trees.ids = (0..fitting_records).map(|i| format!("record{i}")).collect();
 		assert_eq!(
 			engine
 				.explain(&searcher, &bounded_trees, deadline())
 				.unwrap()
 				.records
 				.len(),
-			6
+			fitting_records
 		);
-		bounded_trees.ids.push("record6".to_owned());
+		bounded_trees.ids.push(format!("record{fitting_records}"));
 		assert_eq!(
 			engine
 				.explain(&searcher, &bounded_trees, deadline())

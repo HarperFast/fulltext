@@ -9,15 +9,21 @@ import { fileURLToPath } from 'node:url';
 import { openNativeFullTextIndex, runtimeInfo } from '../dist/native.js';
 import { loadAddon } from '../dist/load-addon.js';
 
+const gates = { maxSampleMilliseconds: 5000, maxObservedRssGrowthBytes: 256 << 20 };
 const args = process.argv.slice(2);
-assert(args.length <= 1 && args.every((arg) => ['--smoke', '--stress'].includes(arg)));
+assert(args.length <= 3 && args.every((arg) => ['--smoke', '--stress', '--raised', '--wide-schema'].includes(arg)));
+assert(!(args.includes('--smoke') && args.includes('--stress')));
+const raised = args.includes('--raised');
+const wideSchema = args.includes('--wide-schema');
+assert(!wideSchema || (raised && args.includes('--smoke')));
 assert.strictEqual(process.env.FULLTEXT_PREFER_LOCAL_BUILD, '1', 'run through scripts/run-local.mjs');
 assert.strictEqual(loadAddon().__testDelayNextExpensiveSearch, undefined, 'use a production native build');
 const documents = args.includes('--smoke') ? 1024 : args.includes('--stress') ? 131_072 : 16_384;
 const rounds = args.includes('--smoke') ? 3 : 20;
+const writerMemoryBytes = wideSchema ? 128_000_000 : 15_000_000;
 const root = await mkdtemp(path.join(tmpdir(), 'fulltext-explanations-'));
 const leaf = (text, extra = {}) => ({ text, fields: ['title'], ...extra });
-const fields = ['title', 'empty1', 'empty2', 'empty3'];
+const fields = ['title', ...Array.from({ length: wideSchema ? 1023 : 3 }, (_, i) => `empty${i + 1}`)];
 const queries = [
 	['term', leaf('amber')],
 	['fuzzy', leaf('ambr', { mode: 'fuzzy' })],
@@ -33,7 +39,7 @@ const queries = [
 					text: 'ambr' + String.fromCharCode(97 + i),
 					mode: 'fuzzy',
 					fuzzyDistance: 2,
-					fields,
+					fields: fields.slice(0, 4),
 				})),
 			},
 		},
@@ -50,14 +56,20 @@ const telemetry = {
 		platform: process.platform,
 		architecture: process.arch,
 		node: process.version,
+		nativeSource: process.env.FULLTEXT_BENCH_NATIVE_SOURCE ?? 'repository Cargo.lock',
 		runtime: await runtimeInfo(),
 	},
 	documents,
+	gates,
+	queryPolicy: raised ? 'raised-4096' : 'default-256',
+	declaredFields: fields.length,
+	writerMemoryBytes,
 	populatedFields: ['title'],
-	emptyFields: fields.slice(1),
+	emptyFieldCount: fields.length - 1,
 	fingerprints: await Promise.all([
 		fingerprint(new URL(import.meta.url)),
 		fingerprint(new URL('../dist/native.js', import.meta.url)),
+		fingerprint(new URL('../Cargo.lock', import.meta.url)),
 		fingerprint(
 			new URL(
 				`../fulltext.${process.platform}-${process.arch}${process.platform === 'linux' ? '-gnu' : process.platform === 'win32' ? '-msvc' : ''}.node`,
@@ -81,10 +93,11 @@ try {
 			limits: {
 				indexingThreads: 1,
 				searchThreads: 2,
-				writerMemoryBytes: 15_000_000,
+				writerMemoryBytes,
 				maxQueuedCommands: 32,
 				maxQueuedBytes: 4 << 20,
 				maxBatchBytes: 1 << 20,
+				maxQueryClauses: raised ? 4096 : 256,
 			},
 		});
 		let indexFailure;
@@ -153,6 +166,11 @@ try {
 						rssStart,
 						peakRss,
 					};
+					assert(row.maxMs <= gates.maxSampleMilliseconds, `${name}: observed sample exceeded latency gate`);
+					assert(
+						row.peakRss - row.rssStart <= gates.maxObservedRssGrowthBytes,
+						`${name}: observed RSS growth exceeded gate`,
+					);
 					telemetry.rows.push(row);
 					console.log(JSON.stringify(row));
 				}

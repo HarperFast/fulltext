@@ -222,3 +222,42 @@ The default driver also measured its original OR pair on this artifact: tied bas
 These samples measure total requests, including JavaScript/native calls, query construction, stable ID-ordinal resolution and possible separate exact counts. Wrapped controls add AST nodes and double scores; tied cutoffs can trigger a stable rerun. None of these pairs isolates pruning or compiler overhead, and timing differences change with totals and corpus. The added families make the small-workload costs visible; they establish no general speedup, strict deadline bound, catalog-scale throughput or memory qualification.
 
 The query-scoring measurements above describe the pre-telemetry scoring build identified by their retained source and addon hashes. They do not qualify the combined 0.9.0 scoring/telemetry artifact.
+
+## Explanation diagnostics
+
+Observed on 2026-11-03, macOS arm64/Node 24.16, using the exact published Tantivy 0.27 source with
+the native explanation fixes locally backported. The committed dependency remains unchanged.
+The [upstream repair](https://github.com/quickwit-oss/tantivy/pull/3239) includes the
+[backward-seek prerequisite](https://github.com/quickwit-oss/tantivy/pull/3198). Fulltext compiler,
+scorer-bit comparisons and request ordering ran through the public Node API. See the
+[driver and measurement contract](../docs/benchmarks.md#score-explanation-qualification).
+
+| Profile                                                                       | Documents | Fields | Observed segments | Samples per row | Largest p95, ms | Largest observed row RSS increase, MiB |
+| ----------------------------------------------------------------------------- | --------: | -----: | ----------------- | --------------: | --------------: | -------------------------------------: |
+| [default](../docs/explanation-qualification-2026-11-03-default.jsonl)         |    16,384 |      4 | 9/17              |              20 |          27.082 |                                  10.75 |
+| [stress](../docs/explanation-qualification-2026-11-03-stress.jsonl)           |   131,072 |      4 | 13/23             |              20 |          54.967 |                                   4.38 |
+| [raised](../docs/explanation-qualification-2026-11-03-raised.jsonl)           |    16,384 |      4 | 9/17              |              20 |          24.310 |                                   6.34 |
+| [wide-schema](../docs/explanation-qualification-2026-11-03-wide-schema.jsonl) |     1,024 |  1,024 | 1/16              |               3 |           8.668 |                                   4.41 |
+
+All 96 rows passed native-score parity and observed-sample gates (5,000 ms and 256 MiB within-row
+RSS increase). These are local regression observations, not hard latency/allocation bounds. Each
+profile samples one/ten IDs distributed across the corpus, in reverse request order, over six query
+shapes. One shape reaches the existing 256 fuzzy construction-work-unit cap. Only title contains
+text; three empty fields participate in that cap shape. The schema smoke declares 1,024 fields,
+uses 1,024 documents/three measured samples and a 128 MB writer; it is not catalog qualification.
+
+Default and raised profiles use the same fixture and 15 MB writer; raised changes the handle's
+clause policy to 4,096. The observed distributions do not isolate cloning from native execution,
+allocator state or segment differences. The wide-schema fixture with a 15 MB writer was interrupted
+during prolonged segment/garbage-collection setup, before diagnostic timing; no result from it is
+claimed. The 128 MB schema smoke does not qualify that minimum-memory configuration.
+
+Native explanation construction remains uninterruptible within a call and may rebuild child
+scorers per ID. Fulltext checks deadlines between native operations and bounds admission/response
+sizes; this is not a strict per-tree timeout. Keep that residual risk tracked in
+[Expose score explanations for relevance debugging](https://github.com/HarperFast/fulltext/issues/56).
+
+Sources: the linked JSONL files include driver/facade/Cargo graph/addon fingerprints and explicit
+source-only native provenance. CI runs smoke profiles in the existing Linux jobs; stress and wide
+schema remain manual. Source qualification does not replace approved dependency adoption or
+synchronized published artifacts.

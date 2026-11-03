@@ -591,3 +591,26 @@ terms over twenty source tokens measured 0.041375 → 0.042959 ms; the 10,000-to
 measured 4.987292 → 5.038625 ms. These are finite default-policy controls, not new-policy speedup claims.
 One separate distance-two/transpositions-off trace measured p50 0.474709 ms for the sixteen-term,
 twenty-token case, including native DFA preparation for the requested nondefault policy.
+
+## Score-explanation qualification
+
+Run a production build, then `node scripts/run-local.mjs benchmarks/explanations.mjs`. Use `--smoke`
+for a wiring check or `--stress` for 131,072 documents. Add `--raised` for the same fixture on a
+4,096-clause handle, exercising the bounded-copy compiler path. Use `--smoke --raised --wide-schema`
+for a separate 1,024-field/1,024-document smoke with a 128 MB writer. Only title is populated; the
+construction-cap query selects four fields, including three empty ones. This does not qualify four
+populated fuzzy fields or a large catalog with 1,024 fields.
+
+The driver samples one or ten IDs distributed across the corpus, restores reversed request order,
+and compares each score with an independent candidate-restricted public search. It records actual
+reader segment counts after reload, rather than assuming commit count equals segment count. The
+fuzzy cap shape has sixteen distance-two leaves across four fields (256 construction work units).
+Latency excludes correctness assertions and two warmups. CPU includes those warmups and checks;
+process RSS observations include shared caches and can miss brief allocation peaks. Fingerprints
+identify the driver, facade and locally loaded production artifact. These synthetic observations do
+not establish a strict timeout bound, per-request allocations or a customer-distribution capacity
+limit. Observed samples must stay under five seconds and observed within-row RSS growth under
+256 MiB. These are regression tripwires, not hard native-work or allocation bounds. The existing
+Linux x64/arm64 benchmark jobs run default/raised smoke profiles and retain their JSONL output;
+manual stress and wide-schema profiles stay outside per-push CI. Keep explanation correctness and
+released-dependency adoption as separate gates.
