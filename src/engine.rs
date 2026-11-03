@@ -437,7 +437,6 @@ struct TraceLeaf<'a> {
 	plan: TracePlan,
 	fields: HashSet<&'a str>,
 	indexed_fuzzy: bool,
-	positive: bool,
 }
 
 impl TraceLeaf<'_> {
@@ -1317,7 +1316,6 @@ impl Engine {
 					plan,
 					fields: fields.iter().map(|field| field.name.as_str()).collect(),
 					indexed_fuzzy: negative,
-					positive: !negative,
 				});
 				TraceExpression::Leaf(index)
 			}
@@ -1471,9 +1469,6 @@ impl Engine {
 			let mut pending_spans = remaining_spans;
 			for index in decision.leaves {
 				let leaf = &leaves[index];
-				if !leaf.positive {
-					continue;
-				}
 				for source in &sources {
 					if !leaf.fields.contains(source.field) {
 						continue;
@@ -1484,10 +1479,11 @@ impl Engine {
 						continue;
 					}
 					work -= cost;
-					let (spans, _, truncated, _) =
-						self.trace_tokens(&leaf.plan, source, pending_spans, deadline, false)?;
-					result.complete &= !truncated;
 					let entry = values.entry((source.field, source.value_index)).or_default();
+					let candidate_spans = pending_spans + entry.len();
+					let (spans, _, truncated, _) =
+						self.trace_tokens(&leaf.plan, source, candidate_spans, deadline, false)?;
+					result.complete &= !truncated;
 					for span in spans {
 						if entry.contains(&(span.start, span.end)) {
 							continue;

@@ -246,3 +246,78 @@ test('trace request shape errors retain invalid-argument classification', async 
 		await assert.rejects(index.traceMatches(request, []), { code: 'E_INVALID_ARGUMENT' });
 	}
 });
+
+for (const { count, suffix, complete } of [
+	{ count: 1020, suffix: 'stone', complete: true },
+	{ count: 1023, suffix: 'stone', complete: true },
+	{ count: 1024, suffix: '', complete: true },
+	{ count: 1024, suffix: 'stone', complete: false },
+]) {
+	test(`overlapping Boolean leaves retain unique spans at ${count} tokens and suffix ${suffix || 'none'}`, async (context) => {
+		const index = await fixture(context);
+		const text = 'amber '.repeat(count) + suffix;
+		const result = await index.traceMatches({ query: or(leaf('amber'), leaf('amber stone')) }, [
+			{ id: 'one', fields: { title: text } },
+		]);
+		assert.strictEqual(result.complete, complete);
+		const spans = Array.from({ length: count }, (_, i) => ({ start: i * 6, end: i * 6 + 5 }));
+		if (suffix && count < 1024) spans.push({ start: count * 6, end: count * 6 + suffix.length });
+		assert.deepStrictEqual(result.records, [{ id: 'one', values: [{ field: 'title', valueIndex: 0, spans }] }]);
+	});
+}
+
+test('overlapping Boolean leaves keep independent span budgets for each source field and value', async (context) => {
+	const index = await fixture(context);
+	const text = 'amber '.repeat(254) + 'stone';
+	const fields = ['title', 'body'];
+	const result = await index.traceMatches({ query: or(leaf('amber', fields), leaf('amber stone', fields)) }, [
+		{ id: 'one', fields: { title: [text, text], body: [text, text] } },
+	]);
+	assert.strictEqual(result.complete, true);
+	const spans = Array.from({ length: 254 }, (_, i) => ({ start: i * 6, end: i * 6 + 5 }));
+	spans.push({ start: 1524, end: 1529 });
+	const values = ['body', 'title'].flatMap((field) => [0, 1].map((valueIndex) => ({ field, valueIndex, spans })));
+	assert.deepStrictEqual(result.records, [{ id: 'one', values }]);
+});
+
+test('trace caller exceptions preserve identity before native submission', async (context) => {
+	const index = await fixture(context);
+	const queryFailure = new RangeError('caller query getter');
+	await assert.rejects(
+		index.traceMatches(
+			{
+				get query() {
+					throw queryFailure;
+				},
+			},
+			[],
+		),
+		(error) => error === queryFailure,
+	);
+	const sourceFailure = new TypeError('caller source getter');
+	await assert.rejects(
+		index.traceMatches({ query: boost(leaf('amber')) }, [
+			{
+				id: 'one',
+				get fields() {
+					throw sourceFailure;
+				},
+			},
+		]),
+		(error) => error === sourceFailure,
+	);
+	await assert.rejects(index.traceMatches({ query: boost(leaf('amber', ['unknown'])) }, records), {
+		code: 'E_INVALID_ARGUMENT',
+	});
+	assert.strictEqual((await index.traceMatches({ query: boost(leaf('amber')) }, records)).complete, true);
+});
+
+test('nested negated clauses retain membership without producing spans', async (context) => {
+	const index = await fixture(context);
+	const result = await index.traceMatches({ query: not(not(leaf('amber'))) }, records);
+	assert.strictEqual(result.complete, true);
+	assert.deepStrictEqual(result.records, [
+		{ id: 'a', values: [] },
+		{ id: 'b', values: [] },
+	]);
+});

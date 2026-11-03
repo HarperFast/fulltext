@@ -653,7 +653,7 @@ boosts and required clauses with optional scoring clauses. See
 and current-source highlighting route.
 
 Only matching positive branches contribute spans. Every AND child must match; an OR includes
-spans from its matching branches. Boosts preserve source membership and spans. Optional clauses
+spans from its matching branches. Exact duplicate spans across those branches share capacity; overlapping clauses cannot consume the limit twice for the same span. Boosts preserve source membership and spans. Optional clauses
 contribute spans only when the required expression matches. Clauses inside NOT never contribute
 spans, including nested negation. A matching negation-only expression can return a record with an
 empty `values` array. Candidates restrict the supplied source records. Metadata filters, sort,

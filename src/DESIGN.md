@@ -381,3 +381,9 @@ limits are validated, but search windows, filters and collectors are not execute
 The public Node `TraceSearchRequest` is narrower and rejects supplied search-only controls. Do
 not turn the Rust compatibility behavior into a claim that trace applies indexed filters; callers
 must select complete source records themselves.
+
+### Unique Boolean span admission
+
+Cross-leaf duplicates must not spend the shared span budget. Each value's leaf allowance includes its already retained spans before existing cross-leaf deduplication charges new spans. That sum stays within the 1,024-span ceiling. The overlapping-leaf regressions in `boolean-tracing.test.mjs` exercise exact capacity, over-cap unions and independent values. Clauses beneath NOT still contribute no spans, including nested NOT; the evaluator determines that without a redundant leaf flag.
+
+Facade caller exceptions retain their identity until native submission; native/response failures are normalized afterward. Empty-candidate requests retain query preparation validation rather than bypassing invalid fields or analyzer-dependent constraints.
