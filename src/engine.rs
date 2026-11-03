@@ -40,6 +40,7 @@ use crate::protocol::{
 	TraceRecord, MAX_FUZZY_TERMS, MAX_PREFIX_EXPANSIONS, MAX_QUERY_CLAUSES, MAX_SEARCH_RESPONSE_BYTES, MAX_TRACE_SPANS,
 };
 
+const SCORE_OVERFLOW_MESSAGE: &str = "search score overflow; reopen with lower field weights";
 const ID_FIELD_NAME: &str = "__fulltext_id";
 const VERSION_FIELD_NAME: &str = "__fulltext_version";
 pub(crate) const IDENTITY_PATH: &str = ".harper-fulltext-identity";
@@ -1093,7 +1094,7 @@ impl Engine {
 		if built.clauses > MAX_QUERY_CLAUSES {
 			return Err(FulltextError::new(
 				"E_RESOURCE_LIMIT",
-				"explain supports at most 256 compiled clauses",
+				format!("explain supports at most {MAX_QUERY_CLAUSES} compiled clauses"),
 			));
 		}
 		let weight = built
@@ -1149,9 +1150,7 @@ impl Engine {
 				}
 				let score = scorer.score();
 				if !score.is_finite() {
-					return Err(FulltextError::invalid(
-						"search score is not finite; lower field weights or query boosts",
-					));
+					return Err(FulltextError::invalid(SCORE_OVERFLOW_MESSAGE));
 				}
 				let explanation = weight.explain(segment, doc).map_err(index_error)?;
 				let json = explanation.to_pretty_json();
@@ -2376,9 +2375,7 @@ fn search_snapshot(segments: &BTreeMap<SegmentId, Option<Opstamp>>) -> String {
 fn search_response_bytes(hits: &[SearchHit], header_bytes: usize) -> Result<usize> {
 	hits.iter().try_fold(header_bytes, |bytes, hit| {
 		if !hit.score.is_finite() {
-			return Err(FulltextError::invalid(
-				"search score overflow; reopen with lower field weights",
-			));
+			return Err(FulltextError::invalid(SCORE_OVERFLOW_MESSAGE));
 		}
 		bytes
 			.checked_add(9 + hit.id.len() + hit.version.as_ref().map_or(0, |version| 4 + version.len()))
@@ -4242,6 +4239,281 @@ mod tests {
 			traversal: false,
 			after: None,
 		}
+	}
+
+	fn explanation_request(search: SearchRequest, ids: &[&str]) -> crate::protocol::ExplainRequest {
+		crate::protocol::ExplainRequest {
+			search: SearchRequest { limit: 1, ..search },
+			ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+			snapshot: None,
+		}
+	}
+
+	#[test]
+	fn explanation_native_scores_order_snapshot_and_deadline() {
+		let configuration = config();
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let mut writer = engine.writer(&configuration).unwrap();
+		writer
+			.inner
+			.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for entries in [
+			vec![("a", "amber stone"), ("b", "amber amber stone")],
+			vec![("c", "quartz"), ("d", "stone amber")],
+			vec![("e", "amber stone stone")],
+		] {
+			writer
+				.apply(MutationBatch {
+					upserts: entries
+						.into_iter()
+						.map(|(id, text)| crate::protocol::Upsert {
+							id: id.to_owned(),
+							version: None,
+							fields: vec![("title".to_owned(), vec![text.to_owned()])],
+							filters: Vec::new(),
+						})
+						.collect(),
+					deletes: Vec::new(),
+				})
+				.unwrap();
+			writer.commit().unwrap();
+		}
+		let reader = engine.reader().unwrap();
+		let pinned = reader.searcher();
+		assert_eq!(pinned.segment_readers().len(), 3);
+		let mut search = admission_request(SearchMode::Any);
+		search.expression = expression("amber stone", SearchMode::Any, vec!["title".to_owned()]);
+		let hits = engine.search(&pinned, &search).unwrap().hits;
+		let mut request = explanation_request(search, &["e", "b", "missing", "a", "c", "d"]);
+		let deadline = || Instant::now() + std::time::Duration::from_secs(10);
+		let result = engine.explain(&pinned, &request, deadline()).unwrap();
+		assert_eq!(result.snapshot, search_snapshot(pinned.generation().segments()));
+		let ordered = result
+			.records
+			.into_iter()
+			.map(|record| match record {
+				ExplainRecord::Matched { id, score, json } => {
+					let hit = hits.iter().find(|hit| hit.id == id).unwrap();
+					assert_eq!(score.to_bits(), hit.score.to_bits());
+					assert!(json.contains("description"));
+					(id, true)
+				}
+				ExplainRecord::Unmatched { id } => {
+					assert!(!hits.iter().any(|hit| hit.id == id));
+					(id, false)
+				}
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			ordered,
+			vec![
+				("e".to_owned(), true),
+				("b".to_owned(), true),
+				("missing".to_owned(), false),
+				("a".to_owned(), true),
+				("c".to_owned(), false),
+				("d".to_owned(), true)
+			]
+		);
+		request.snapshot = Some(result.snapshot);
+		writer
+			.apply(MutationBatch {
+				upserts: Vec::new(),
+				deletes: vec!["a".to_owned()],
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		reader.reload().unwrap();
+		assert!(engine.explain(&pinned, &request, deadline()).is_ok());
+		assert_eq!(
+			engine
+				.explain(&reader.searcher(), &request, deadline())
+				.err()
+				.unwrap()
+				.code,
+			"E_CURSOR_EXPIRED"
+		);
+		assert_eq!(
+			engine
+				.explain(&pinned, &request, Instant::now() - std::time::Duration::from_millis(1))
+				.err()
+				.unwrap()
+				.code,
+			"E_TIMEOUT"
+		);
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn explanation_native_seek_preserves_score_bits_across_buffer_windows() {
+		let mut configuration = config();
+		configuration.identity.fields.truncate(1);
+		configuration.identity.fields[0].weight = 0.7;
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let mut writer = engine.writer(&configuration).unwrap();
+		writer
+			.apply(MutationBatch {
+				upserts: (0..4096)
+					.map(|i| crate::protocol::Upsert {
+						id: format!("{i:04}"),
+						version: None,
+						fields: vec![(
+							"title".to_owned(),
+							vec![match i {
+								0..=31 => "alpha bravo charlie delta",
+								32..=511 => "alpha charlie delta",
+								512..=2047 => "alpha delta",
+								_ => "alpha",
+							}
+							.to_owned()],
+						)],
+						filters: Vec::new(),
+					})
+					.collect(),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		assert_eq!(searcher.segment_readers().len(), 1);
+		let mut search = admission_request(SearchMode::Any);
+		search.expression = expression("alpha bravo charlie delta", SearchMode::Any, vec!["title".to_owned()]);
+		let query = engine.query(&searcher, &search).unwrap();
+		let expected = searcher
+			.search(query.query.as_ref(), &TopDocs::with_limit(4096).order_by_score())
+			.unwrap()
+			.into_iter()
+			.map(|(score, address)| (address.doc_id, score.to_bits()))
+			.collect::<HashMap<_, _>>();
+		let request = explanation_request(search, &["4095", "0999", "0000", "2048"]);
+		let actual = engine
+			.explain(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
+			.unwrap();
+		for record in actual.records {
+			match record {
+				ExplainRecord::Matched { id, score, .. } => {
+					assert_eq!(score.to_bits(), expected[&id.parse::<u32>().unwrap()])
+				}
+				ExplainRecord::Unmatched { id } => panic!("missing indexed match {id}"),
+			}
+		}
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn explanation_rejects_duplicate_live_ids_from_native_postings() {
+		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
+		let mut writer = engine.index.writer_with_num_threads(1, 15_000_000).unwrap();
+		writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+		for _ in 0..2 {
+			let mut document = TantivyDocument::default();
+			document.add_text(engine.id_field, "duplicate");
+			document.add_text(engine.fields[0].field, "alpha");
+			writer.add_document(document).unwrap();
+			writer.commit().unwrap();
+		}
+		let searcher = engine.reader().unwrap().searcher();
+		assert_eq!(searcher.segment_readers().len(), 2);
+		let request = explanation_request(admission_request(SearchMode::Any), &["duplicate"]);
+		let error = engine
+			.explain(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
+			.err()
+			.unwrap();
+		assert_eq!(error.code, "E_NATIVE_FAILURE");
+		assert!(error.message.contains("multiple live documents"));
+	}
+
+	#[test]
+	fn explanation_native_clause_and_response_limits() {
+		let mut configuration = config();
+		configuration.identity.fields.truncate(1);
+		configuration.identity.stop_words = false;
+		configuration.limits.max_query_terms = 512;
+		configuration.limits.max_query_clauses = 1024;
+		let engine = Engine::open(RamDirectory::create(), &configuration).unwrap();
+		let mut writer = engine.writer(&configuration).unwrap();
+		let terms = (0..257).map(|i| format!("term{i:03}")).collect::<Vec<_>>();
+		writer
+			.apply(MutationBatch {
+				upserts: (0..10)
+					.map(|i| crate::protocol::Upsert {
+						id: format!("record{i}"),
+						version: None,
+						fields: vec![("title".to_owned(), vec![terms.join(" ")])],
+						filters: Vec::new(),
+					})
+					.collect(),
+				deletes: Vec::new(),
+			})
+			.unwrap();
+		writer.commit().unwrap();
+		let searcher = engine.reader().unwrap().searcher();
+		let request = |count| {
+			let mut search = admission_request(SearchMode::Any);
+			search.expression = expression(&terms[..count].join(" "), SearchMode::Any, vec!["title".to_owned()]);
+			explanation_request(search, &["record0"])
+		};
+		let deadline = || Instant::now() + std::time::Duration::from_secs(10);
+		let too_many = request(257);
+		assert!(engine.search(&searcher, &too_many.search).is_ok());
+		assert_eq!(engine.query(&searcher, &too_many.search).unwrap().clauses, 257);
+		assert_eq!(
+			engine.explain(&searcher, &too_many, deadline()).err().unwrap().code,
+			"E_RESOURCE_LIMIT"
+		);
+
+		let native_json = |request: &crate::protocol::ExplainRequest| {
+			let query = engine.query(&searcher, &request.search).unwrap();
+			let weight = query
+				.query
+				.weight(tantivy::query::EnableScoring::enabled_from_searcher(&searcher))
+				.unwrap();
+			weight
+				.explain(&searcher.segment_readers()[0], 0)
+				.unwrap()
+				.to_pretty_json()
+		};
+		let maximum = request(256);
+		assert_eq!(engine.query(&searcher, &maximum.search).unwrap().clauses, 256);
+		assert!(native_json(&maximum).len() > crate::protocol::MAX_EXPLAIN_BYTES);
+		assert_eq!(
+			engine.explain(&searcher, &maximum, deadline()).err().unwrap().code,
+			"E_RESULT_TOO_LARGE"
+		);
+		let oversized_tree = request(192);
+		assert!(native_json(&oversized_tree).len() > crate::protocol::MAX_EXPLAIN_BYTES);
+		assert_eq!(
+			engine
+				.explain(&searcher, &oversized_tree, deadline())
+				.err()
+				.unwrap()
+				.code,
+			"E_RESULT_TOO_LARGE"
+		);
+		let mut bounded_trees = request(96);
+		let json_bytes = native_json(&bounded_trees).len();
+		assert!(json_bytes < crate::protocol::MAX_EXPLAIN_BYTES);
+		assert!(json_bytes * 6 < crate::protocol::MAX_EXPLAIN_RESPONSE_BYTES);
+		assert!(json_bytes * 7 > crate::protocol::MAX_EXPLAIN_RESPONSE_BYTES);
+		bounded_trees.ids = (0..6).map(|i| format!("record{i}")).collect();
+		assert_eq!(
+			engine
+				.explain(&searcher, &bounded_trees, deadline())
+				.unwrap()
+				.records
+				.len(),
+			6
+		);
+		bounded_trees.ids.push("record6".to_owned());
+		assert_eq!(
+			engine
+				.explain(&searcher, &bounded_trees, deadline())
+				.err()
+				.unwrap()
+				.code,
+			"E_RESULT_TOO_LARGE"
+		);
+		writer.close().unwrap();
 	}
 
 	#[test]

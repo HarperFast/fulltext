@@ -336,8 +336,8 @@ outcomes, so deleting production worker binding fails even when aggregate totals
 ## Explanation draft
 
 `explanations.test.mjs` compares production search and diagnostic scorer bits on a captured
-searcher, including request-order restoration after ascending per-segment seeks. Fuzzy and
-optional-scoring cases currently reproduce an upstream BooleanWeight explanation panic.
+searcher, including request-order restoration after ascending per-segment seeks. Fuzzy, optional-scoring and nested OR
+cases currently reproduce an upstream BooleanWeight explanation panic.
 The draft must not ship until those regressions pass against an approved native implementation.
 
 ### Explanation engine boundary and qualification
@@ -356,10 +356,11 @@ both regressions as release blockers and preserve finite-tree validation; do not
 or sanitize away invalid descendants in the wrapper.
 
 The optimized expensive-search admission fixture includes FTEX queue saturation, queued expiry,
-ordinary capacity and close. The packed consumer runs the BM25 explanation example. Response-byte
-limits and cooperative deadline checks are enforced in the native result path, but native tree
-construction remains uninterruptible, and large-tree byte/depth/node-limit and catalog-scale cost
-qualification remain open in [Expose score explanations for relevance debugging](https://github.com/HarperFast/fulltext/issues/56).
+ordinary capacity and close. The packed consumer runs the BM25 explanation example. Direct Rust tests exercise three retained segments, caller order, scorer-bit parity across
+4,096 documents, duplicate live IDs, the 256-clause admission limit and real native JSON crossing
+the 256 KiB tree and 1 MiB response caps. These verify rejection at the configured limits, not
+production capacity. Cooperative deadline checks run around native work; tree construction remains
+uninterruptible. Large-tree depth/node-limit and catalog-scale cost qualification remain open in [Expose score explanations for relevance debugging](https://github.com/HarperFast/fulltext/issues/56).
 
 Harper owns the privileged diagnostic API, source/version/expiry and authorization policy. Its
 adoption is tracked in [Expose authorized snapshot-bound full-text score explanations](https://github.com/HarperFast/harper/issues/3964).

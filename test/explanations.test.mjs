@@ -199,3 +199,10 @@ test('explain preserves finite zero-boost scores when native intermediate explan
 	assert.strictEqual(explained.records[0].score, searched.hits[0].score);
 	assert(Number.isFinite(explained.records[0].explanation.value));
 });
+
+test('explain rejects non-object requests as invalid arguments', async (context) => {
+	const { index } = await fixture(context);
+	for (const request of [null, undefined, 1, 'amber', []]) {
+		await assert.rejects(index.explain(request, ['first']), { code: 'E_INVALID_ARGUMENT' });
+	}
+});

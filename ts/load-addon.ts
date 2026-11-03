@@ -231,6 +231,12 @@ function validateAddon(addon: NativeAddonApi, artifactPath: string): void {
 			`Fulltext native artifact ${artifactPath} does not provide telemetry API 1`,
 		);
 	}
+	if (typeof addon.__nativeExplain !== 'function') {
+		throw new FulltextError(
+			'E_NATIVE_CAPABILITY_MISMATCH',
+			`Fulltext native artifact ${artifactPath} does not provide score explanations`,
+		);
+	}
 	if (typeof addon.__nativeInspect !== 'function') {
 		throw new FulltextError(
 			'E_NATIVE_CAPABILITY_MISMATCH',

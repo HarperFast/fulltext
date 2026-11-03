@@ -183,6 +183,7 @@ for (const scenario of [
 		addon.__testDelayNextExpensiveSearch(handle, 150);
 		const fullHolder = searchExpensive();
 		await waitFor(() => addon.__testExpensiveSearchState(handle)[0] === 0);
+		const beforeBurstPreparation = index.telemetry().preparationRejections.search.total;
 		const burstPending = Array.from({ length: 48 }, () =>
 			searchExpensive().then(
 				() => 'completed',
@@ -196,6 +197,11 @@ for (const scenario of [
 		const burst = await Promise.all(burstPending);
 		assert(burst.includes('queue-full'));
 		assert(burst.includes('completed'));
+		if (scenario === 'explain') {
+			const telemetry = index.telemetry();
+			assert.strictEqual(telemetry.preparationRejections.search.total, beforeBurstPreparation);
+			assert(telemetry.native.operations.expensiveSearch.errors.E_QUEUE_FULL > 0n);
+		}
 		await Promise.all([fullOrdinary, fullHolder]);
 		assert.strictEqual((await index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' })).total, 2);
 

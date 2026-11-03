@@ -697,7 +697,9 @@ reveal index-wide statistics. Harper integration is tracked separately in
 
 [`examples/score-explanations.mjs`](examples/score-explanations.mjs) verifies snapshot and scorer
 parity for a supported BM25 shape, including when run from the packed consumer. This example does
-not qualify the blocked Boolean cases, huge trees or catalog-scale cost.
+not qualify the blocked Boolean cases or catalog-scale cost. Direct Rust fixtures separately
+exercise multi-segment scorer parity, duplicate live IDs, clause admission and actual native JSON
+at the per-tree and whole-response byte limits; those rejection tests are not capacity measurements.
 
 ## Deadlines and query isolation
 

@@ -643,6 +643,10 @@ pub const MAX_EXPLAIN_IDS: usize = 10;
 pub const MAX_EXPLAIN_BYTES: usize = 256 * 1024;
 pub const MAX_EXPLAIN_RESPONSE_BYTES: usize = 1024 * 1024;
 
+fn invalid_explain_id_count() -> FulltextError {
+	FulltextError::invalid(format!("explain requires between 1 and {MAX_EXPLAIN_IDS} distinct IDs"))
+}
+
 pub struct ExplainRequest {
 	pub search: SearchRequest,
 	pub ids: Vec<String>,
@@ -665,7 +669,7 @@ pub(crate) fn validate_explain(request: &ExplainRequest) -> Result<()> {
 		));
 	}
 	if request.ids.is_empty() || request.ids.len() > MAX_EXPLAIN_IDS {
-		return Err(FulltextError::invalid("explain requires between 1 and 10 distinct IDs"));
+		return Err(invalid_explain_id_count());
 	}
 	let mut seen = std::collections::HashSet::new();
 	for id in &request.ids {
@@ -691,29 +695,16 @@ pub fn decode_explain(bytes: &[u8]) -> Result<ExplainRequest> {
 	let mut cursor = Cursor::new(bytes, *b"FTEX")?;
 	let length = cursor.u32()? as usize;
 	let search = decode_search(cursor.take(length)?)?;
-	if search.offset != 0
-		|| search.limit != 1
-		|| search.exact_total
-		|| search.traversal
-		|| search.sort.is_some()
-		|| !search.aggregations.is_empty()
-	{
-		return Err(FulltextError::invalid(
-			"explain does not support pagination, sorting or aggregation",
-		));
-	}
 	let count = cursor.u16()? as usize;
 	if count == 0 || count > MAX_EXPLAIN_IDS {
-		return Err(FulltextError::invalid("explain requires between 1 and 10 distinct IDs"));
+		return Err(invalid_explain_id_count());
 	}
 	let mut ids = Vec::with_capacity(count);
 	for _ in 0..count {
 		ids.push(cursor.record_id()?);
 	}
 	let snapshot = if cursor.boolean()? {
-		let value = cursor.string()?;
-
-		Some(value)
+		Some(cursor.string()?)
 	} else {
 		None
 	};

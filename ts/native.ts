@@ -755,17 +755,17 @@ export class NativeFullTextIndex {
 		return this.#search(request, options, false);
 	}
 
-	async searchPage(request: SearchPageRequest, options: SearchExecutionOptions = {}): Promise<SearchPageResult> {
-		const result = await this.#search(request, options, true);
-		if (result.snapshot === undefined) throw new FulltextError('E_NATIVE_FAILURE', 'missing search-page snapshot');
-		return { ...result, snapshot: result.snapshot };
+	searchPage(request: SearchPageRequest, options: SearchExecutionOptions = {}): Promise<SearchPageResult> {
+		return this.#search(request, options, true);
 	}
 
+	#search(request: SearchPageRequest, options: SearchExecutionOptions, traversal: true): Promise<SearchPageResult>;
+	#search(request: SearchPageRequest, options: SearchExecutionOptions, traversal: false): Promise<SearchResult>;
 	async #search(
 		request: SearchPageRequest,
 		options: SearchExecutionOptions,
 		traversal: boolean,
-	): Promise<SearchResult & Partial<SearchPageResult>> {
+	): Promise<SearchResult | SearchPageResult> {
 		let nativeStarted = false;
 		try {
 			this.#assertPreparationOpen();
@@ -925,6 +925,8 @@ export class NativeFullTextIndex {
 		let nativeStarted = false;
 		try {
 			this.#assertPreparationOpen();
+			if (!request || typeof request !== 'object' || Array.isArray(request))
+				throw new FulltextError('E_INVALID_ARGUMENT', 'explain request must be an object');
 			if (request.mode !== undefined && request.operator !== undefined)
 				throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 			if (!Array.isArray(ids)) throw new FulltextError('E_INVALID_ARGUMENT', 'explanation IDs must be an array');
@@ -949,8 +951,9 @@ export class NativeFullTextIndex {
 				options.snapshot,
 			);
 			this.#assertPreparationOpen();
+			const addon = loadAddon();
 			nativeStarted = true;
-			const cursor = await invoke((callback) => loadAddon().__nativeExplain(this.#handle, frame, callback));
+			const cursor = await invoke((callback) => addon.__nativeExplain(this.#handle, frame, callback));
 			const snapshot = cursor.string();
 			if (!/^[0-9a-f]{64}$/.test(snapshot)) throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation snapshot');
 			const count = cursor.u16();
