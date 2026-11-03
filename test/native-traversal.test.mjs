@@ -124,7 +124,9 @@ test('preserves mixed-score and UTF-8 tie order across pages, filters and Boolea
 		assert.deepStrictEqual(hits, expected.hits);
 	}
 	const empty = await reader.searchPage({ text: 'absent' });
-	assert.deepStrictEqual(empty, { total: 0, totalRelation: 'exact', hits: [] });
+	const { snapshot, ...emptyResult } = empty;
+	assert.match(snapshot, /^[0-9a-f]{64}$/);
+	assert.deepStrictEqual(emptyResult, { total: 0, totalRelation: 'exact', hits: [] });
 	const exact = await pages(reader, { text: 'widget', limit: 30 }, 120);
 	assert.strictEqual(exact.length, 120);
 });

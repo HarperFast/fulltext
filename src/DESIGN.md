@@ -339,3 +339,27 @@ outcomes, so deleting production worker binding fails even when aggregate totals
 searcher, including request-order restoration after ascending per-segment seeks. Fuzzy and
 optional-scoring cases currently reproduce an upstream BooleanWeight explanation panic.
 The draft must not ship until those regressions pass against an approved native implementation.
+
+### Explanation engine boundary and qualification
+
+Verified against pinned Tantivy 0.27.0: `Engine::explain` calls the existing `Engine::query`, builds
+one native scoring `Weight` from its captured searcher and reuses one native scorer per addressed
+segment. IDs resolve through native postings and deletion masks. Sorting document addresses before
+seeking preserves the forward-only scorer invariant; output restores requested ID order. The
+multi-segment/replacement test retains a dedicated reader while the writer replaces and deletes IDs.
+
+`Weight::explain` remains upstream-owned. `BooleanWeight` can seek backward into a nonmatching
+child. `BoostWeight::scorer` propagates boosts inward, while `BoostWeight::explain` evaluates inner
+explanations before multiplying the enclosing boost. At extreme finite field weights an outer zero
+can yield an actual score of zero but nonfinite explanation descendants, serialized as null. Keep
+both regressions as release blockers and preserve finite-tree validation; do not copy native scoring
+or sanitize away invalid descendants in the wrapper.
+
+The optimized expensive-search admission fixture includes FTEX queue saturation, queued expiry,
+ordinary capacity and close. The packed consumer runs the BM25 explanation example. Response-byte
+limits and cooperative deadline checks are enforced in the native result path, but native tree
+construction remains uninterruptible, and large-tree byte/depth/node-limit and catalog-scale cost
+qualification remain open in [Expose score explanations for relevance debugging](https://github.com/HarperFast/fulltext/issues/56).
+
+Harper owns the privileged diagnostic API, source/version/expiry and authorization policy. Its
+adoption is tracked in [Expose authorized snapshot-bound full-text score explanations](https://github.com/HarperFast/harper/issues/3964).

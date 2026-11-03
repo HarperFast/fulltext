@@ -623,8 +623,8 @@ scores may differ between engine versions; continuation tokens remain reader-ins
 
 This implementation is not ready for release. Tantivy 0.27.0 `BooleanWeight::explain` seeks
 backward when a requested document precedes a nonmatching child's first match. The new
-real-index tests reproduce debug assertions for fuzzy, optional-scoring and nested OR expressions. The current regression run passes 12 of 15 cases; the other three reproduce this panic.
-No dependency patch or replacement scorer is included. Keep this change draft until the upstream
+real-index tests reproduce debug assertions for fuzzy, optional-scoring and nested OR expressions. Three regression cases reproduce this panic. A separate zero-boost case exposes nonfinite native explanation descendants despite a finite actual score.
+No dependency patch or replacement scorer is included. The draft also rejects a native tree containing nonfinite descendants: `boost(0, boost(2, term))` with a sufficiently large field weight can score zero while native explanation arithmetic overflows. Keep this change draft until the upstream
 behavior is fixed and the full typed-query contract and expensive-query cost have been qualified.
 
 The proposed `explain(request, ids, options)` method runs on the bounded expensive-search lane
@@ -680,6 +680,24 @@ can overrun the cooperative budget.
 Analysis is limited to 262,144 emitted tokens per value after synonym expansion. When that token
 ceiling, a span ceiling, or the response ceiling is reached, `complete` is false and later matches
 may be omitted.
+
+### Engine and application boundary
+
+`explain()` reuses fulltext's existing typed-query compiler to construct Tantivy queries, then
+uses a captured Tantivy `Searcher`, native `Weight`, per-segment scorer and `Weight::explain`. The separate `score` is the actual native float32 score;
+fulltext does not reconstruct BM25 or rewrite the native explanation tree. Native explanation
+values and descriptions are diagnostic; intermediate arithmetic can differ from scorer arithmetic.
+The finite-tree validator stays enabled even while the upstream overflow case blocks release.
+
+Fulltext owns typed request validation, bounded ID lookup, protocol/lifecycle/admission, snapshot
+checking and response validation. Applications own table/attribute authorization, source visibility,
+expiry/version checks and diagnostic access policy. A filtered query's explanations can still
+reveal index-wide statistics. Harper integration is tracked separately in
+[Expose authorized snapshot-bound full-text score explanations](https://github.com/HarperFast/harper/issues/3964).
+
+[`examples/score-explanations.mjs`](examples/score-explanations.mjs) verifies snapshot and scorer
+parity for a supported BM25 shape, including when run from the packed consumer. This example does
+not qualify the blocked Boolean cases, huge trees or catalog-scale cost.
 
 ## Deadlines and query isolation
 

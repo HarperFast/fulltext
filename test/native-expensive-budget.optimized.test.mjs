@@ -9,7 +9,18 @@ import { encodeOpen } from '../dist/codec.js';
 import { invoke } from '../dist/invoke.js';
 import { loadAddon } from '../dist/load-addon.js';
 
-for (const scenario of ['phrase', 'traversal', 'exists', 'missing', 'not', 'sort', 'stats', 'terms', 'histogram']) {
+for (const scenario of [
+	'explain',
+	'phrase',
+	'traversal',
+	'exists',
+	'missing',
+	'not',
+	'sort',
+	'stats',
+	'terms',
+	'histogram',
+]) {
 	test(`optimized ${scenario} searches preserve ordinary capacity and close queued expensive work`, async (context) => {
 		const indexPath = mkdtempSync(path.join(tmpdir(), 'fulltext-optimized-permit-'));
 		context.after(() => rmSync(indexPath, { recursive: true, force: true }));
@@ -60,6 +71,10 @@ for (const scenario of ['phrase', 'traversal', 'exists', 'missing', 'not', 'sort
 			filterFields: options.filterFields,
 		});
 		const searchExpensive = (executionOptions = {}) => {
+			if (scenario === 'explain')
+				return index
+					.explain({ text: 'trail', fields: ['title'] }, ['two', 'one'], executionOptions)
+					.then(({ records }) => ({ total: records.filter(({ matched }) => matched).length }));
 			if (scenario === 'traversal') return index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' }, executionOptions);
 			const request = { text: 'trail running' };
 			if (scenario === 'phrase') request.mode = 'phrase';

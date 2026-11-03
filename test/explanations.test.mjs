@@ -10,7 +10,7 @@ const documents = [
 	{ id: 'second', fields: { title: 'amber quartz', body: 'waterproof running shoe' }, filters: { enabled: true } },
 	{ id: 'third', fields: { title: 'quartz stone', body: 'waterproof boot' }, filters: { enabled: false } },
 ];
-async function fixture(context) {
+async function fixture(context, overrides = {}) {
 	const directory = await mkdtemp(path.join(tmpdir(), 'fulltext-explain-'));
 	const options = {
 		path: directory,
@@ -20,6 +20,7 @@ async function fixture(context) {
 		fields: [{ name: 'title', weight: 3 }, { name: 'body' }],
 		filterFields: [{ name: 'enabled', type: 'boolean' }],
 		surfaceTerms: true,
+		...overrides,
 		limits: {
 			indexingThreads: 1,
 			searchThreads: 2,
@@ -138,3 +139,63 @@ for (const [name, request] of [
 		);
 	});
 }
+
+test('explain preserves request order across multiple segments and replacement snapshots', async (context) => {
+	const { index, options } = await fixture(context);
+	for (const id of ['segment-two', 'segment-three']) {
+		await index.applyMutationBatch({ upserts: [{ id, fields: { title: 'amber amber' } }] });
+		await index.commit();
+		await index.reload();
+	}
+	const reader = await openNativeFullTextReader(options);
+	try {
+		assert(reader.telemetry().native.reader.segments >= 2n);
+		const request = { text: 'amber', fields: ['title'] };
+		const ids = ['segment-three', 'first', 'missing', 'segment-two', 'second'];
+		const old = await reader.searchPage({ ...request, limit: 10 });
+		const expected = new Map(old.hits.map(({ id, score }) => [id, score]));
+		const explained = await reader.explain(request, ids, { snapshot: old.snapshot });
+		assert.deepStrictEqual(
+			explained.records.map(({ id }) => id),
+			ids,
+		);
+		for (const record of explained.records) {
+			assert.strictEqual(record.matched, expected.has(record.id));
+			if (record.matched) assert.strictEqual(record.score, expected.get(record.id));
+		}
+		await index.applyMutationBatch({
+			deletes: ['segment-two'],
+			upserts: [{ id: 'first', fields: { title: 'quartz' } }],
+		});
+		await index.commit();
+		await index.reload();
+		assert.deepStrictEqual(await reader.explain(request, ids, { snapshot: old.snapshot }), explained);
+		const current = await index.explain(request, ['first', 'segment-two']);
+		assert(current.records.every(({ matched }) => !matched));
+		await reader.reload();
+		await assert.rejects(reader.explain(request, ids, { snapshot: old.snapshot }), { code: 'E_CURSOR_EXPIRED' });
+	} finally {
+		await reader.close();
+	}
+});
+
+test('explain preserves finite zero-boost scores when native intermediate explanations overflow', async (context) => {
+	const { index } = await fixture(context, { fields: [{ name: 'title', weight: 3e38 }, { name: 'body' }] });
+	await index.applyMutationBatch({
+		deletes: documents.map(({ id }) => id),
+		upserts: Array.from({ length: 10 }, (_, i) => ({
+			id: `overflow-${i}`,
+			fields: { title: i === 0 ? 'amber' : 'quartz' },
+		})),
+	});
+	await index.commit();
+	await index.reload();
+	const request = {
+		query: { operator: 'boost', boost: 0, clause: { operator: 'boost', boost: 2, clause: leaf('amber') } },
+	};
+	const searched = await index.search(request);
+	assert.strictEqual(searched.hits[0].score, 0);
+	const explained = await index.explain(request, ['overflow-0']);
+	assert.strictEqual(explained.records[0].score, searched.hits[0].score);
+	assert(Number.isFinite(explained.records[0].explanation.value));
+});
