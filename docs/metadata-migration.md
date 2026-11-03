@@ -4,7 +4,7 @@ Status: the metadata API shipped in 0.8.0. Kyle approved the API/migration direc
 Local procedure qualification passed, including a controlled local Harper Table catch-up/cutover
 rehearsal. Production cutover remains untested.
 
-Published 0.8.0 includes the metadata API and uses native ABI 13. The unreleased 0.9.0 facade/addon pair
+Published 0.8.0 includes the metadata API and uses native ABI 13. The 0.9.0 facade/addon pair
 requires ABI 14, query API 8 and telemetry API 1. Deploy matching versions together. Do not install 0.7.0 expecting the metadata API. Remaining qualification is
 tracked in [Qualify remaining native metadata collector resource tradeoffs](https://github.com/HarperFast/fulltext/issues/76).
 

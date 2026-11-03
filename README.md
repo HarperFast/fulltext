@@ -3,8 +3,8 @@
 Native Tantivy full-text indexing for Node.js.
 
 **Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.9.0.** The engine is compiled
-into the native addon; no separate Tantivy installation is required. Version 0.9.0 is not yet
-published. Its matching facade and addon require native ABI 14, query API 8 and telemetry API 1.
+into the native addon; no separate Tantivy installation is required. The matching 0.9.0 facade
+and addon require native ABI 14, query API 8 and telemetry API 1.
 Published 0.8.0 artifacts use ABI 13 / query API 7 and do not include scoring controls or telemetry.
 Deploy the facade and native package at the same version. See
 [Upgrading from 0.8.x](#upgrading-from-08x), [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
