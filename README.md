@@ -2,13 +2,11 @@
 
 Native Tantivy full-text indexing for Node.js.
 
-**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.9.0.** The engine is compiled
-into the native addon; no separate Tantivy installation is required. The matching 0.9.0 facade
-and addon require native ABI 14, query API 8 and telemetry API 1.
-Published 0.8.0 artifacts use ABI 13 / query API 7 and do not include scoring controls or telemetry.
-Deploy the facade and native package at the same version. See
-[Upgrading from 0.8.x](#upgrading-from-08x), [Upgrading from 0.7.x](#upgrading-from-07x) or [Upgrading from 0.6.x](#upgrading-from-06x)
-before deploying a build from this tree.
+**Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.9.0.**
+The engine is compiled into the native addon; no separate Tantivy installation is required.
+This source requires matching ABI 16, query API 9 and telemetry API 1. Published 0.9.0 uses
+ABI 14/query API 8; published 0.8.0 uses ABI 13/query API 7. The new Boolean tracing contract
+requires newly built matching artifacts and is not part of the published 0.9.0 package.
 
 This repository is under active development. The native entry point provides a standalone Tantivy
 index backed by `MmapDirectory`. Applications own their source records and may reuse compatible
@@ -39,7 +37,7 @@ separate search server.
 | `fuzzy`                     | Match misspelled terms with configurable edits and transpositions.         | Eligibility and term limits apply; this is not arbitrary spelling correction.    |
 | `fuzzy-prefix` **preview**  | Combine final-term autocomplete with typo tolerance.                       | Requires `surfaceTerms: true`; catalog-scale qualification remains pending.      |
 | Boolean queries and filters | Combine text clauses, restrict candidate IDs, or filter declared metadata. | Filters narrow results without adding relevance scores.                          |
-| `boost` and `optional`      | Adjust scores per request while preserving required matches.               | Requires the matching query API 8 facade and native addon.                       |
+| `boost` and `optional`      | Adjust scores per request while preserving required matches.               | Requires the matching query API 9 facade and native addon.                       |
 | Ranked traversal            | Continue through a large result set in a retained snapshot.                | Use `searchPage()` with a read-only handle.                                      |
 | Highlighting and snippets   | Locate matches in current source values supplied by your application.      | Requires `surfaceTerms: true`; returns offsets and optional fragments, not HTML. |
 
@@ -510,7 +508,7 @@ optional branch; callers must authorize access to all of those fields. Defined `
 ignore these properties. Nested text leaves now reject legacy `operator` mode aliases other than
 `any` and `all`; use `mode: 'prefix'` instead of `operator: 'prefix'` inside `query`.
 The top-level request's legacy `operator: 'prefix'` alias remains supported. The scoring and structural
-properties listed above treat `undefined` as absent; this does not apply to a present `text` property. These additions require a matching ABI 14 / query API 8 facade and addon.
+properties listed above treat `undefined` as absent; this does not apply to a present `text` property. The current source requires a matching ABI 16 / query API 9 facade and addon.
 
 ### Configurable query capacity
 
@@ -525,7 +523,7 @@ When constructing `NativeFullTextIndex` directly around a native handle, supply 
 in `searchLimits`; the constructor validates it but cannot inspect the native handle’s policy.
 Search requests cannot raise them. Apply the same policy to every worker serving a logical index;
 changing it requires reopening handles but no index rebuild. The facade and native addon must match
-ABI 14, query API 8, and packed protocol 8. The open frame retains its optional policy extension,
+ABI 16, query API 9, and packed protocol 8. The open frame retains its optional policy extension,
 with defaults when absent.
 
 The clause setting covers compiled text queries, including field multiplication and expansion.
@@ -660,7 +658,8 @@ contribute spans only when the required expression matches. Clauses inside NOT n
 spans, including nested negation. A matching negation-only expression can return a record with an
 empty `values` array. Candidates restrict the supplied source records. Metadata filters, sort,
 aggregation, pagination and exact counts are unsupported and rejected; omit those search-only
-properties when reusing a request for tracing.
+properties when reusing a request for tracing. This is a deliberate validation change: older
+facades silently ignored these extra properties on simple-clause traces.
 
 Tracing evaluates caller-supplied current values, not live indexed metadata or source versions.
 Full-fuzzy positive traces retain the existing surface-term fallback. Beneath NOT they use only
@@ -669,8 +668,9 @@ Prefix tracing still does not expand the live index dictionary.
 
 Boolean traces tokenize each selected value once per analyzer. In addition to the existing
 per-value ceiling, retained source analysis is limited to 524,288 emitted tokens per record,
-combined across analyzers; matching visits are limited to 8,388,608 tokens per request, including
-span collection. Exhaustion makes evidence unknown and sets `complete: false`. Unknown absence
+combined across needed analyzers, and 4,096 nonempty analyzed values per record. The matching
+budget is 8,388,608 tokens per request, including span collection. Each leaf/value evaluation
+reserves its needed retained-token count even if matching stops early. Exhaustion makes evidence unknown and sets `complete: false`. Unknown absence
 cannot satisfy NOT. A known matching OR branch can still provide spans. Membership is evaluated
 before positive spans consume the shared response/span budgets. Existing simple-clause trace
 frames and limits remain supported.
@@ -892,7 +892,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This unreleased source requires native ABI 16, query API 9, and packed protocol 8. Released 0.9.0 uses ABI 14/query API 8; select an unused synchronized package version before publishing this source. The loader rejects older addon
+This development source requires native ABI 16, query API 9, and packed protocol 8. Published 0.9.0 uses ABI 14/query API 8 and cannot load this facade. These source changes do not alter persisted index identity. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
 columns. Previously released string-metadata indexes must

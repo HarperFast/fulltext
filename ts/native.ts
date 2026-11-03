@@ -893,6 +893,8 @@ export class NativeFullTextIndex {
 		let nativeStarted = false;
 		try {
 			this.#assertPreparationOpen();
+			if (request.mode !== undefined && request.operator !== undefined)
+				throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 			const expression = normalizeSearchExpression(request, this.#queryLimits.maxQueryClauses);
 			for (const key of ['filter', 'offset', 'limit', 'sort', 'aggregations', 'exactTotal', 'continuation']) {
 				if ((request as Record<string, unknown>)[key] !== undefined)

@@ -79,12 +79,8 @@ fn validate_expression_options(expression: &SearchExpression) -> Result<bool> {
 
 pub(crate) fn validate_trace_admission(request: &SearchRequest, records: &[TraceRecord]) -> Result<()> {
 	validate_candidates(request.candidate_ids.as_deref())?;
+	validate_search_structure(&request.expression, MAX_CONFIGURED_QUERY_CLAUSES, MAX_FIELDS)?;
 	validate_expression_options(&request.expression)?;
-	crate::protocol::validate_search_structure(
-		&request.expression,
-		crate::protocol::MAX_CONFIGURED_QUERY_CLAUSES,
-		MAX_FIELDS,
-	)?;
 	if records.len() > MAX_TRACE_RECORDS {
 		return Err(FulltextError::invalid("trace record count exceeds 100"));
 	}
@@ -313,6 +309,15 @@ mod tests {
 		record.fields.truncate(1);
 		record.fields[0].1 = vec![String::new(); u16::MAX as usize + 1];
 		invalid(validate_trace_admission(&request, &[record]));
+	}
+
+	#[test]
+	fn trace_depth_is_bounded_before_recursive_option_validation() {
+		let mut request = request(SearchMode::Any);
+		for _ in 0..32 {
+			request.expression = SearchExpression::Not(Box::new(request.expression));
+		}
+		invalid(validate_trace_admission(&request, &[]));
 	}
 
 	#[test]

@@ -127,3 +127,69 @@ test('Boolean traces reject unsupported search options and invalid nested option
 	);
 	assert.strictEqual((await index.traceMatches({ query: boost(leaf('amber')) }, records)).complete, true);
 });
+
+test('Boolean fuzzy and phrase preparation share the indexed construction budget', async (context) => {
+	const index = await fixture(context);
+	const text = Array.from({ length: 16 }, (_, i) => `catalog${String.fromCharCode(97 + i)}`).join(' ');
+	const fuzzy = { ...leaf(text), mode: 'fuzzy', fuzzyDistance: 2 };
+	const query = or(...Array.from({ length: 5 }, () => fuzzy));
+	await assert.rejects(index.search({ query }), { code: 'E_INVALID_ARGUMENT' });
+	await assert.rejects(index.traceMatches({ query }, records), { code: 'E_INVALID_ARGUMENT' });
+	assert.strictEqual((await index.traceMatches({ query: boost(leaf('amber')) }, records)).complete, true);
+});
+
+test('surface analysis is retained only for fields that need it', async (context) => {
+	const index = await fixture(context);
+	const source = [{ id: 'large', fields: { body: 'marker ' + 'ox '.repeat(262_143), title: 'bar' } }];
+	const query = and(leaf('marker', ['body']), not(leaf('foo', ['title'], 'prefix')));
+	const result = await index.traceMatches({ query }, source);
+	assert.strictEqual(result.complete, true);
+	assert.deepStrictEqual(
+		result.records.map(({ id }) => id),
+		['large'],
+	);
+	assert.deepStrictEqual(result.records[0].values[0].spans, [{ start: 0, end: 6 }]);
+});
+
+test('per-record retained analysis and per-request matching work fail conservatively', async (context) => {
+	const index = await fixture(context);
+	const retained = await index.traceMatches({ query: boost(leaf('tail', ['body'], 'fuzzy')) }, [
+		{
+			id: 'large',
+			fields: { body: ['ox '.repeat(150_000), 'ox '.repeat(150_000), 'tail'] },
+		},
+	]);
+	assert.strictEqual(retained.complete, false);
+	assert.deepStrictEqual(retained.records, []);
+	const exhausted = await index.traceMatches(
+		{ query: or(...Array.from({ length: 128 }, () => leaf('absent', ['body']))) },
+		[
+			{
+				id: 'large',
+				fields: { body: 'ox '.repeat(100_000) },
+			},
+		],
+	);
+	assert.strictEqual(exhausted.complete, false);
+	assert.deepStrictEqual(exhausted.records, []);
+});
+
+test('legacy trace mode and operator remain mutually exclusive', async (context) => {
+	const index = await fixture(context);
+	await assert.rejects(index.traceMatches({ text: 'amber', mode: 'all', operator: 'any' }, records), {
+		code: 'E_INVALID_ARGUMENT',
+	});
+});
+
+test('Boolean cached-value capacity bounds zero-token metadata and preserves unknown absence', async (context) => {
+	const index = await fixture(context);
+	const empty = await index.traceMatches({ query: not(leaf('absent')) }, [
+		{ id: 'empty', fields: { title: Array(5_000).fill(' ') } },
+	]);
+	assert.strictEqual(empty.complete, true);
+	assert.deepStrictEqual(empty.records, [{ id: 'empty', values: [] }]);
+	const source = [{ id: 'many', fields: { title: [...Array(4_096).fill('oak'), 'forbidden'] } }];
+	const result = await index.traceMatches({ query: and(leaf('oak'), not(leaf('forbidden'))) }, source);
+	assert.strictEqual(result.complete, false);
+	assert.deepStrictEqual(result.records, []);
+});

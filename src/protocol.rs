@@ -2110,6 +2110,37 @@ mod tests {
 	}
 
 	#[test]
+	fn boolean_trace_frames_preserve_depth_header_and_truncation_guards() {
+		let mut frame = b"FTBT\x08\x00".to_vec();
+		frame.extend_from_slice(&[3, 0]);
+		frame.extend_from_slice(&0u32.to_le_bytes());
+		frame.extend_from_slice(&[0, 1, 1, 0, 0]);
+		frame.extend_from_slice(&[0; 3]);
+		frame.extend_from_slice(&100u32.to_le_bytes());
+		assert!(matches!(
+			decode_trace(&frame).unwrap().search.expression,
+			SearchExpression::Not(_)
+		));
+		validate_trace_header(&frame).unwrap();
+		assert_eq!(trace_budget(&frame).unwrap(), 100);
+		for length in 0..frame.len() {
+			assert!(decode_trace(&frame[..length]).is_err());
+		}
+		let mut trailing = frame.clone();
+		trailing.push(0);
+		assert!(decode_trace(&trailing).is_err());
+		let mut invalid = frame.clone();
+		invalid[6] = 255;
+		assert!(decode_trace(&invalid).is_err());
+		let mut deep = b"FTBT\x08\x00".to_vec();
+		deep.extend_from_slice(&[3; 9]);
+		deep.extend_from_slice(&frame[7..]);
+		assert!(decode_trace(&deep).is_err());
+		frame[4] = 9;
+		assert!(validate_trace_header(&frame).is_err());
+	}
+
+	#[test]
 	fn query_options_reject_out_of_range_and_irrelevant_policies() {
 		for (mode, options) in [
 			(
