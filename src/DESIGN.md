@@ -338,7 +338,7 @@ outcomes, so deleting production worker binding fails even when aggregate totals
 `explanations.test.mjs` compares production search and diagnostic scorer bits on a captured
 searcher, including request-order restoration after ascending per-segment seeks. Fuzzy, optional-scoring and nested OR
 cases currently reproduce an upstream BooleanWeight explanation panic.
-Production release tests separately verify those three fixtures retain scorer parity and pending
+Local manual production runs of the release tests separately verify those three fixtures retain scorer parity and pending
 writes when native debug assertions are disabled. The nonfinite nested-boost regression fails in
 both builds. The draft must not ship until all regressions pass against an approved native implementation.
 
@@ -366,3 +366,8 @@ uninterruptible. Large-tree depth/node-limit and catalog-scale cost qualificatio
 
 Harper owns the privileged diagnostic API, source/version/expiry and authorization policy. Its
 adoption is tracked in [Expose authorized snapshot-bound full-text score explanations](https://github.com/HarperFast/harper/issues/3964).
+
+Run blocked-draft production qualification independently with `npm run build:typescript`,
+`npm run build:native`, then `FULLTEXT_PREFER_LOCAL_BUILD=1 node --test test/explanations.release.test.mjs`.
+The existing combined Node command stops after a failed debug phase, so these observed production
+results are local evidence until the native debug blockers clear and CI reaches its release phase.

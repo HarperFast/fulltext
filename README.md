@@ -626,7 +626,7 @@ BooleanWeight explanation recursion seeks backward into a nonmatching child and 
 assertion for fuzzy, optional-scoring and nested OR fixtures. The panic poisons the shared handle
 and rolls back its pending writes. In production builds those assertions are disabled: the same
 three fixtures return finite trees with exact scorer parity and preserve pending writes, as checked
-by the release tests. That fixture coverage does not establish the complete typed-query contract.
+by local manual production runs of the release tests. That fixture coverage does not establish the complete typed-query contract.
 
 A separate nested zero-boost case has a finite search score but nonfinite native explanation
 descendants in both debug and production builds. Finite-tree validation rejects it with
