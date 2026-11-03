@@ -265,7 +265,7 @@ test('fuzzy options are snapshotted once and continuation identity uses resolved
 	assert.strictEqual((await index.search(request)).total, 2);
 	assert.strictEqual(reads, 1);
 	reads = 0;
-	await index.traceMatches({ ...request, exactTotal: undefined }, []);
+	await index.traceMatches(request, []);
 	assert.strictEqual(reads, 1);
 	for (const mode of ['fuzzy', 'fuzzy-prefix']) {
 		const request = { text: 'amber', mode, limit: 1 };

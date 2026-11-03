@@ -368,3 +368,16 @@ Harper owns source loading/version checks, visibility/expiry, table/attribute au
 product projection. Adoption is tracked in [Adopt Boolean-aware full-text highlights and snippets](https://github.com/HarperFast/harper/issues/3965).
 Harper must authorize membership-only fields even when those fields are not highlightable;
 removing their clauses before tracing would change Boolean truth.
+
+The Boolean benchmark in [trace-matching.mjs](../benchmarks/trace-matching.mjs) (`--boolean`)
+compares legacy, wrapped, 8-leaf and 64-leaf paths with matching and unmatched source. Recorded
+[methodology/results](../docs/benchmarks.md#boolean-source-tracing) expose the cost of decision
+vectors and the second positive-span pass. Keep work reservation conservative across the whole
+request; optimize buffers only against measured workloads while preserving failed-branch span
+suppression.
+
+Direct Rust tracing retains its existing `SearchRequest` carrier contract: candidates and source
+limits are validated, but search windows, filters and collectors are not executed by tracing.
+The public Node `TraceSearchRequest` is narrower and rejects supplied search-only controls. Do
+not turn the Rust compatibility behavior into a claim that trace applies indexed filters; callers
+must select complete source records themselves.

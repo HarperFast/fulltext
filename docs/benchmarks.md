@@ -32,6 +32,45 @@ for final-page version decoding, lazy native fuzzy-prefix matching, the retained
 and the benchmark methodology. These implementation changes preserve the public matching and
 pagination contracts; synthetic timings do not establish a general production speedup.
 
+## Boolean source tracing
+
+The default trace benchmark preserves its eight legacy fuzzy records. Add `--boolean` to compare
+the bare Any leaf, a boost-wrapped leaf, and flat OR expressions with 8 or 64 repeated leaves.
+Each case checks both membership and exact source spans; both unmatched streams and a single
+leading match are measured at 1,000, 10,000 and 100,000 tokens.
+
+```bash
+npm run build:native
+npm run build:typescript
+node scripts/run-local.mjs benchmarks/trace-matching.mjs . current --boolean
+```
+
+Observed on 2026-11-03: optimized native build, Apple M4 Pro, macOS arm64, Node 24.16.0,
+20 timed iterations after 5 warmups, sequential cases in one process. Each value below is p50
+milliseconds; the [raw records](../benchmarks/results/boolean-source-tracing-macos-arm64.jsonl)
+include p95 and completeness. Other local validation was running, so these are synthetic cost
+observations, not an isolated capacity result or a production speedup claim.
+
+| Tokens | Source            | Bare leaf | Wrapped leaf | 8 leaves | 64 leaves |
+| ------ | ----------------- | --------- | ------------ | -------- | --------- |
+| 1000   | no match          | 0.167     | 0.171        | 0.199    | 0.442     |
+| 1000   | one matching span | 0.145     | 0.142        | 0.192    | 0.431     |
+| 10000  | no match          | 1.245     | 1.270        | 1.433    | 2.890     |
+| 10000  | one matching span | 1.275     | 1.267        | 1.436    | 2.961     |
+| 100000 | no match          | 13.075    | 12.539       | 14.334   | 27.278    |
+| 100000 | one matching span | 12.639    | 13.383       | 14.087   | 16.871    |
+
+All cases return complete evidence except the 100,000-token matching 64-leaf expression. Its
+membership and span passes together exceed the conservative 8,388,608-token request reservation;
+it returns the matching record and span with `complete: false`. Callers must handle that flag,
+split source batches or simplify the expression. A wrapped leaf uses the Boolean two-phase path;
+it is included rather than assumed equivalent in cost to the legacy leaf path.
+
+The membership pass does not spend span capacity on branches that fail. The span pass revisits
+only selected positive leaves. Shared tokenization and matcher plans avoid repeated analysis;
+per-node decision vectors and matching scans still add work as the tree grows. This benchmark
+measures that cost without claiming per-request memory or catalog-scale qualification.
+
 ## Metadata sorting and aggregation
 
 `npm run benchmark:metadata` builds optimized artifacts, then runs the deterministic metadata

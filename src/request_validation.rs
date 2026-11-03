@@ -314,10 +314,15 @@ mod tests {
 	#[test]
 	fn trace_depth_is_bounded_before_recursive_option_validation() {
 		let mut request = request(SearchMode::Any);
+		if let SearchExpression::Clause(clause) = &mut request.expression {
+			clause.options.fuzzy_distance = 3;
+		}
 		for _ in 0..32 {
 			request.expression = SearchExpression::Not(Box::new(request.expression));
 		}
-		invalid(validate_trace_admission(&request, &[]));
+		let error = validate_trace_admission(&request, &[]).unwrap_err();
+		assert_eq!(error.code, "E_INVALID_ARGUMENT");
+		assert!(error.message.contains("nesting"));
 	}
 
 	#[test]

@@ -5279,7 +5279,7 @@ mod tests {
 		assert!(native.surface.is_none());
 		assert!(std::ptr::eq(native.surface_matcher(), &native.analyzed));
 		assert!(native.analyzed.automaton.get().is_none());
-		assert!(term.matches(Some(&vec!["shxe"]), "unmatched").unwrap());
+		assert!(term.matches(Some(&["shxe"]), "unmatched").unwrap());
 		let prepared = native.analyzed.automaton.get().unwrap();
 		assert!(term.matches(None, "shye").unwrap());
 		assert!(std::ptr::eq(

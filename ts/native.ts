@@ -893,6 +893,8 @@ export class NativeFullTextIndex {
 		let nativeStarted = false;
 		try {
 			this.#assertPreparationOpen();
+			if (!request || typeof request !== 'object' || Array.isArray(request))
+				throw new FulltextError('E_INVALID_ARGUMENT', 'trace request must be an object');
 			if (request.mode !== undefined && request.operator !== undefined)
 				throw new FulltextError('E_INVALID_ARGUMENT', 'mode and operator are mutually exclusive');
 			const expression = normalizeSearchExpression(request, this.#queryLimits.maxQueryClauses);

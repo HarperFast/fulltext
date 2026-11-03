@@ -239,3 +239,10 @@ test('Boolean tracing preserves synonym matches, value indices and UTF-16 offset
 		assert(value.fragments.length > 0);
 	}
 });
+
+test('trace request shape errors retain invalid-argument classification', async (context) => {
+	const index = await fixture(context);
+	for (const request of [null, undefined, 1, 'amber', []]) {
+		await assert.rejects(index.traceMatches(request, []), { code: 'E_INVALID_ARGUMENT' });
+	}
+});
