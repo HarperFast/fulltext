@@ -943,13 +943,13 @@ export class NativeFullTextIndex {
 			if (!Number.isInteger(maxFragments) || maxFragments < 1 || maxFragments > 5) {
 				throw new FulltextError('E_INVALID_ARGUMENT', 'maxFragmentsPerValue must be an integer between 1 and 5');
 			}
+			const frame = encodeTrace({
+				expression,
+				candidateIds: request.candidateIds,
+				records: packedRecords,
+				budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
+			});
 			const cursor = await invoke((callback) => {
-				const frame = encodeTrace({
-					expression,
-					candidateIds: request.candidateIds,
-					records: packedRecords,
-					budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
-				});
 				this.#assertPreparationOpen();
 				nativeStarted = true;
 				loadAddon().__nativeTraceMatches(this.#handle, frame, callback);

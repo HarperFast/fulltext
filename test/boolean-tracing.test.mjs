@@ -306,6 +306,28 @@ test('trace caller exceptions preserve identity before native submission', async
 		]),
 		(error) => error === sourceFailure,
 	);
+	for (const failure of [new Error('caller candidate getter'), 'caller primitive']) {
+		await assert.rejects(
+			index.traceMatches(
+				{
+					query: boost(leaf('amber')),
+					get candidateIds() {
+						throw failure;
+					},
+				},
+				records,
+			),
+			(error) => error === failure,
+		);
+		await assert.rejects(
+			index.traceMatches({ query: boost(leaf('amber')) }, records, {
+				get remainingBudgetMilliseconds() {
+					throw failure;
+				},
+			}),
+			(error) => error === failure,
+		);
+	}
 	await assert.rejects(index.traceMatches({ query: boost(leaf('amber', ['unknown'])) }, records), {
 		code: 'E_INVALID_ARGUMENT',
 	});
