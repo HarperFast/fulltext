@@ -371,8 +371,8 @@ removing their clauses before tracing would change Boolean truth.
 
 The Boolean benchmark in [trace-matching.mjs](../benchmarks/trace-matching.mjs) (`--boolean`)
 compares legacy, wrapped, 8-leaf and 64-leaf paths with matching and unmatched source. Recorded
-[methodology/results](../docs/benchmarks.md#boolean-source-tracing) expose the cost of decision
-vectors and the second positive-span pass. Keep work reservation conservative across the whole
+[methodology/results](../docs/benchmarks.md#boolean-source-tracing) expose the cost of additional
+leaves and the second positive-span pass. They do not isolate decision-vector allocation. Keep work reservation conservative across the whole
 request; optimize buffers only against measured workloads while preserving failed-branch span
 suppression.
 

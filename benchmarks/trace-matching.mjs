@@ -1,10 +1,9 @@
 import assert from 'node:assert';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { cpus, tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { cpus } from 'node:os';
 
 const root = path.resolve(process.argv[2] ?? '.');
 const label = process.argv[3] ?? 'current';
@@ -50,11 +49,12 @@ try {
 					for (let i = 0; i < 25; i++) {
 						const start = performance.now();
 						const result = await index.traceMatches(request, records);
+						const elapsed = performance.now() - start;
 						assert.strictEqual(result.records.length, Number(matched));
 						complete = result.complete;
 						assert.strictEqual(complete, !(matched && count === 64 && words === 100000));
 						if (matched) assert.deepStrictEqual(result.records[0].values[0].spans, [{ start: 0, end: 5 }]);
-						if (i >= 5) samples.push(performance.now() - start);
+						if (i >= 5) samples.push(elapsed);
 					}
 					samples.sort((a, b) => a - b);
 					console.log(
