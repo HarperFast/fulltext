@@ -27,6 +27,7 @@ import {
 	maxFilterStringBytes,
 	maxSearchBudgetMilliseconds,
 	maxTraceRecords,
+	maxExplainIds,
 	maxExpressionDepth,
 	maxQueryClauses,
 	resolveQueryLimits,
@@ -957,7 +958,7 @@ export class NativeFullTextIndex {
 			const snapshot = cursor.string();
 			if (!/^[0-9a-f]{64}$/.test(snapshot)) throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation snapshot');
 			const count = cursor.u16();
-			if (count !== requestedIds.length || count < 1 || count > 10)
+			if (count !== requestedIds.length || count < 1 || count > maxExplainIds)
 				throw new FulltextError('E_NATIVE_FAILURE', 'invalid explanation count');
 			const records: ExplainResult['records'] = [];
 			for (let i = 0; i < count; i++) {

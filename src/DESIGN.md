@@ -356,8 +356,8 @@ both regressions as release blockers and preserve finite-tree validation; do not
 or sanitize away invalid descendants in the wrapper.
 
 The optimized expensive-search admission fixture includes FTEX queue saturation, queued expiry,
-ordinary capacity and close. The packed consumer runs the BM25 explanation example. Direct Rust tests exercise three retained segments, caller order, scorer-bit parity across
-4,096 documents, duplicate live IDs, the 256-clause admission limit and real native JSON crossing
+ordinary capacity and close. The packed consumer runs the BM25 explanation example. Direct Rust tests exercise three retained segments, caller order, scorer-bit parity for four sampled IDs in a
+12,288-document index, duplicate live IDs, the 256-clause admission limit and real native JSON crossing
 the 256 KiB tree and 1 MiB response caps. These verify rejection at the configured limits, not
 production capacity. Cooperative deadline checks run around native work; tree construction remains
 uninterruptible. Large-tree depth/node-limit and catalog-scale cost qualification remain open in [Expose score explanations for relevance debugging](https://github.com/HarperFast/fulltext/issues/56).

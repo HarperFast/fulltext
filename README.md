@@ -653,6 +653,26 @@ one call and can rebuild fuzzy/prefix subtrees repeatedly; deadlines are checked
 and before returning. This has not been qualified for catalog-scale use. Native observations
 are included in `expensiveSearch`; facade preparation rejections are included in `search`.
 
+### Engine and application boundary
+
+`explain()` reuses fulltext's existing typed-query compiler to construct Tantivy queries, then
+uses a captured Tantivy `Searcher`, native `Weight`, per-segment scorer and `Weight::explain`. The separate `score` is the actual native float32 score;
+fulltext does not reconstruct BM25 or rewrite the native explanation tree. Native explanation
+values and descriptions are diagnostic; intermediate arithmetic can differ from scorer arithmetic.
+The finite-tree validator stays enabled even while the upstream overflow case blocks release.
+
+Fulltext owns typed request validation, bounded ID lookup, protocol/lifecycle/admission, snapshot
+checking and response validation. Applications own table/attribute authorization, source visibility,
+expiry/version checks and diagnostic access policy. A filtered query's explanations can still
+reveal index-wide statistics. Harper integration is tracked separately in
+[Expose authorized snapshot-bound full-text score explanations](https://github.com/HarperFast/harper/issues/3964).
+
+[`examples/score-explanations.mjs`](examples/score-explanations.mjs) verifies snapshot and scorer
+parity for a supported BM25 shape, including when run from the packed consumer. This example does
+not qualify the blocked Boolean cases or catalog-scale cost. Direct Rust fixtures separately
+exercise multi-segment scorer parity, duplicate live IDs, clause admission and actual native JSON
+at the per-tree and whole-response byte limits; those rejection tests are not capacity measurements.
+
 ## Highlighting and snippets
 
 Highlighting is opt-in and operates on caller-supplied current source values, so the library never
@@ -680,26 +700,6 @@ can overrun the cooperative budget.
 Analysis is limited to 262,144 emitted tokens per value after synonym expansion. When that token
 ceiling, a span ceiling, or the response ceiling is reached, `complete` is false and later matches
 may be omitted.
-
-### Engine and application boundary
-
-`explain()` reuses fulltext's existing typed-query compiler to construct Tantivy queries, then
-uses a captured Tantivy `Searcher`, native `Weight`, per-segment scorer and `Weight::explain`. The separate `score` is the actual native float32 score;
-fulltext does not reconstruct BM25 or rewrite the native explanation tree. Native explanation
-values and descriptions are diagnostic; intermediate arithmetic can differ from scorer arithmetic.
-The finite-tree validator stays enabled even while the upstream overflow case blocks release.
-
-Fulltext owns typed request validation, bounded ID lookup, protocol/lifecycle/admission, snapshot
-checking and response validation. Applications own table/attribute authorization, source visibility,
-expiry/version checks and diagnostic access policy. A filtered query's explanations can still
-reveal index-wide statistics. Harper integration is tracked separately in
-[Expose authorized snapshot-bound full-text score explanations](https://github.com/HarperFast/harper/issues/3964).
-
-[`examples/score-explanations.mjs`](examples/score-explanations.mjs) verifies snapshot and scorer
-parity for a supported BM25 shape, including when run from the packed consumer. This example does
-not qualify the blocked Boolean cases or catalog-scale cost. Direct Rust fixtures separately
-exercise multi-segment scorer parity, duplicate live IDs, clause admission and actual native JSON
-at the per-tree and whole-response byte limits; those rejection tests are not capacity measurements.
 
 ## Deadlines and query isolation
 

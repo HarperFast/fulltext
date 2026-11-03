@@ -4353,17 +4353,16 @@ mod tests {
 		let mut writer = engine.writer(&configuration).unwrap();
 		writer
 			.apply(MutationBatch {
-				upserts: (0..4096)
+				upserts: (0..12288)
 					.map(|i| crate::protocol::Upsert {
 						id: format!("{i:04}"),
 						version: None,
 						fields: vec![(
 							"title".to_owned(),
 							vec![match i {
-								0..=31 => "alpha bravo charlie delta",
-								32..=511 => "alpha charlie delta",
-								512..=2047 => "alpha delta",
-								_ => "alpha",
+								0..=511 => "alpha bravo charlie delta echo",
+								512..=4607 => "alpha bravo delta echo",
+								_ => "alpha delta echo",
 							}
 							.to_owned()],
 						)],
@@ -4377,22 +4376,42 @@ mod tests {
 		let searcher = engine.reader().unwrap().searcher();
 		assert_eq!(searcher.segment_readers().len(), 1);
 		let mut search = admission_request(SearchMode::Any);
-		search.expression = expression("alpha bravo charlie delta", SearchMode::Any, vec!["title".to_owned()]);
-		let query = engine.query(&searcher, &search).unwrap();
-		let expected = searcher
-			.search(query.query.as_ref(), &TopDocs::with_limit(4096).order_by_score())
-			.unwrap()
-			.into_iter()
-			.map(|(score, address)| (address.doc_id, score.to_bits()))
-			.collect::<HashMap<_, _>>();
-		let request = explanation_request(search, &["4095", "0999", "0000", "2048"]);
+		search.expression = expression(
+			"alpha bravo charlie delta echo",
+			SearchMode::Any,
+			vec!["title".to_owned()],
+		);
+		let mut page = search.clone();
+		page.traversal = true;
+		page.limit = 1000;
+		let mut expected = HashMap::new();
+		loop {
+			let result = engine.search(&searcher, &page).unwrap();
+			let (snapshot, more) = result.traversal.unwrap();
+			if more {
+				let last = result.hits.last().unwrap();
+				page.after = Some(crate::protocol::SearchBoundary {
+					snapshot,
+					score: last.score,
+					id: last.id.clone(),
+				});
+			}
+			for hit in result.hits {
+				expected.insert(hit.id, hit.score.to_bits());
+			}
+			if !more {
+				break;
+			}
+		}
+		assert_eq!(expected.len(), 12288);
+		let request = explanation_request(search, &["12287", "8704", "0000", "4608"]);
 		let actual = engine
 			.explain(&searcher, &request, Instant::now() + std::time::Duration::from_secs(10))
 			.unwrap();
 		for record in actual.records {
 			match record {
 				ExplainRecord::Matched { id, score, .. } => {
-					assert_eq!(score.to_bits(), expected[&id.parse::<u32>().unwrap()])
+					assert_eq!(score.to_bits(), expected[&id])
 				}
 				ExplainRecord::Unmatched { id } => panic!("missing indexed match {id}"),
 			}

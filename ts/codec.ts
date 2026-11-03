@@ -8,6 +8,7 @@ export const maxCommitPayloadBytes = 64 * 1024;
 export const maxSearchRequestBytes = 8 * 1024 * 1024;
 export const maxSearchBudgetMilliseconds = 30_000;
 export const maxTraceRecords = 100;
+export const maxExplainIds = 10;
 export const maxExpressionDepth = 8;
 export const maxQueryClauses = 256;
 const maxQueryTerms = 64;
@@ -734,8 +735,8 @@ function encodeBatchHeader(upserts: number, deletes: number): Buffer {
 }
 
 export function encodeExplain(search: PackedSearchRequest, ids: string[], snapshot?: string): Buffer {
-	if (!Array.isArray(ids) || ids.length < 1 || ids.length > 10)
-		throw new FulltextError('E_INVALID_ARGUMENT', 'explain requires between 1 and 10 distinct IDs');
+	if (!Array.isArray(ids) || ids.length < 1 || ids.length > maxExplainIds)
+		throw new FulltextError('E_INVALID_ARGUMENT', 'explain requires between 1 and ' + maxExplainIds + ' distinct IDs');
 	const copied = ids.slice();
 	if (new Set(copied).size !== copied.length)
 		throw new FulltextError('E_INVALID_ARGUMENT', 'explanation IDs must be distinct');
