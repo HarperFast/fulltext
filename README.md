@@ -39,6 +39,7 @@ separate search server.
 | `fuzzy`                     | Match misspelled terms with configurable edits and transpositions.         | Eligibility and term limits apply; this is not arbitrary spelling correction.    |
 | `fuzzy-prefix` **preview**  | Combine final-term autocomplete with typo tolerance.                       | Requires `surfaceTerms: true`; catalog-scale qualification remains pending.      |
 | Boolean queries and filters | Combine text clauses, restrict candidate IDs, or filter declared metadata. | Filters narrow results without adding relevance scores.                          |
+| `boost` and `optional`      | Adjust scores per request while preserving required matches.               | Requires the matching query API 8 facade and native addon.                       |
 | Ranked traversal            | Continue through a large result set in a retained snapshot.                | Use `searchPage()` with a read-only handle.                                      |
 | Highlighting and snippets   | Locate matches in current source values supplied by your application.      | Requires `surfaceTerms: true`; returns offsets and optional fragments, not HTML. |
 
@@ -889,16 +890,16 @@ try {
 }
 ```
 
-`runtimeInfo()` reports the package, Tantivy, ABI, query API, lifecycle API, mutation API, supported
+`runtimeInfo()` reports the package, Tantivy, ABI, query API, telemetry API, lifecycle API, mutation API, supported
 storage backend, and hard protocol limits. It does not open an index or create files. To verify the
 versions in the installed native addon:
 
 ```js
 import { runtimeInfo } from '@harperfast/fulltext/native';
 
-const { packageVersion, tantivyVersion } = await runtimeInfo();
-console.log({ packageVersion, tantivyVersion });
-// { packageVersion: '0.9.0', tantivyVersion: '0.27.0' }
+const { packageVersion, nativeAbiVersion, queryApiVersion, telemetryApiVersion } = await runtimeInfo();
+console.log({ packageVersion, nativeAbiVersion, queryApiVersion, telemetryApiVersion });
+// { packageVersion: '0.9.0', nativeAbiVersion: 14, queryApiVersion: 8, telemetryApiVersion: 1 }
 ```
 
 The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an
