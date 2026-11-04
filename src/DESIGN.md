@@ -51,7 +51,7 @@ and its UTF-16 spans independently of indexed stems.
 `QueryOptions` resolves fuzzy distance 0–2/default 1 and transpositions default true per leaf.
 The facade rejects supplied fuzzy controls on Boolean groups before reading their children;
 controls belong to text leaves and are never inherited.
-Protocol 8 encodes u8/bool after each mode; ABI 14/query API 8 require a matching facade. Options
+Protocol 8 encodes u8/bool after each mode; ABI 16/query API 9 require a matching facade. Options
 are absent from persisted identity and included in continuation digests. Nondefault fuzzy traces
 lazily use requested native automata on the existing analyzed/surface branches, sharing a matcher
 when query terms are identical. Distance zero uses equality/prefix checks without a DFA. Current-source
@@ -227,7 +227,7 @@ aggregation children map directly to native `sub_aggregation` trees. Resource ad
 for collector construction and possible parent instances before collection. Histogram parents use
 position spans, with native query-scoped probes when conservative admission fails. Histogram safety
 checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
-checks protect each recursive wire/API walker. Current packed protocol 8, query API 8 and ABI 14
+checks protect each recursive wire/API walker. Current packed protocol 8, query API 9 and ABI 16
 include metadata, query-capacity open support and per-leaf matching controls. Neither change alters persisted identity v8.
 
 Sorted snapshot continuation and metadata-derived score adjustment remain outside this
@@ -281,7 +281,7 @@ Raised-policy admission compares maximum per-leaf term cost and summed compiled-
 Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
 non-ASCII input conservatively uses the expensive lane because normalization can expand text.
 Default-policy classification is unchanged. The optimized two-handle regression pins ordinary
-isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 14
+isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 16
 require a matching facade/addon.
 
 The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
@@ -304,7 +304,7 @@ block-max rounding bound; the underlying two-term and cross-segment bounds remai
 
 Every nested boost, including one over an Any/All leaf, remains wrapped in native BoostQuery. This preserves outer-first float32 multiplication: folding an inner boost into a field weight can change rounding or overflow before an enclosing zero boost reaches it. Native-reference regressions cover fractional weights and a finite large field weight with an outer zero boost. Other root modes and composite subtrees also remain wrapped in native BoostQuery. At the root, that wrapper uses Tantivy's generic pruning iterator rather than the specialized Boolean block-WAND paths; optional required-All composition also incurs scoring work beyond the required-only intersection. The paired optimized workload in benchmarks/query-scoring.mjs compares total request costs. Its varied-score mode rules out boundary-tie reruns for the OR/AND pairs; it does not isolate pruning overhead or count skipped blocks. Recheck topology, score bits and these comparisons when upgrading Tantivy; the measurements do not establish a catalog-scale latency guarantee.
 
-Negative-zero boosts reject before execution. Direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts with native ABI 14 and query API 8. Persisted identity is unchanged.
+Negative-zero boosts reject before execution. Direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts with native ABI 16 and query API 9. Persisted identity is unchanged.
 
 ## Lifecycle state identity
 
@@ -332,3 +332,58 @@ The forced-admission helper checks queue availability and changes lifecycle stat
 queue mutex, before enqueueing rollback close. Unavailable queues therefore cannot turn a final
 poisoned state back into closing. The native loop regression inspects bank versus shared-fallback
 outcomes, so deleting production worker binding fails even when aggregate totals still conserve.
+
+## Boolean source tracing
+
+`TraceExpression::evaluate` uses three-valued membership: OR(true, unknown) is true,
+AND(false, unknown) is false, and NOT(unknown) is unknown. `boolean-tracing.test.mjs` pins
+truncation, positive-branch selection, and analyzed-only fuzzy evidence under negation.
+`trace_expression` owns shared per-record source tokens and bounds aggregate matching work;
+negative membership never spends highlight spans. Simple leaves retain the FTTM layout and
+existing evaluator; Boolean trees use FTBT, guarded by query API 9 / ABI 16.
+
+### Tantivy and application ownership
+
+Verified against pinned Tantivy 0.27.0 source: search uses the production `Engine::query`
+compiler, native queries/weights/scorers, postings and reader statistics. Tracing reuses the
+same tokenizer configuration, query normalization, synonym expansion and fuzzy matching
+predicates/automata. It does not establish indexed membership or calculate relevance scores.
+
+Tantivy's `SnippetGenerator::create` collects a flat `Query::query_terms` set, restricted by
+indexed document frequency. It loses occurrence polarity and matching-branch structure;
+`snippet_from_doc` joins field values. `SnippetGenerator::new` allows caller-supplied terms but
+still does not evaluate Boolean membership. Neither entry point implements this API's current-source
+fuzzy fallback, per-value UTF-16 spans or unknown evidence under truncated negation. An ephemeral
+in-memory index would require native indexing, commit and reader setup for each request and would
+still require source-offset projection. Do not add that lifecycle to highlighting.
+
+`TracePlan::needs_surface` identifies the analyzer streams each leaf actually reads. Full fuzzy
+membership under negation consumes analyzed tokens directly; it neither retains an unused
+surface copy nor builds a source-position map. Positive fuzzy tracing keeps the existing surface
+fallback and shares its matching predicates with the analyzed-only path. Regression tests
+prove that 300,000 analyzed tokens across values fit and unrelated prefix truncation cannot
+change the known membership of an analyzed-only negative leaf.
+
+Harper owns source loading/version checks, visibility/expiry, table/attribute authorization and
+product projection. Adoption is tracked in [Adopt Boolean-aware full-text highlights and snippets](https://github.com/HarperFast/harper/issues/3965).
+Harper must authorize membership-only fields even when those fields are not highlightable;
+removing their clauses before tracing would change Boolean truth.
+
+The Boolean benchmark in [trace-matching.mjs](../benchmarks/trace-matching.mjs) (`--boolean`)
+compares legacy, wrapped, 8-leaf and 64-leaf paths with matching and unmatched source. Recorded
+[methodology/results](../docs/benchmarks.md#boolean-source-tracing) expose the cost of additional
+leaves and the second positive-span pass. They do not isolate decision-vector allocation. Keep work reservation conservative across the whole
+request; optimize buffers only against measured workloads while preserving failed-branch span
+suppression.
+
+Direct Rust tracing retains its existing `SearchRequest` carrier contract: candidates and source
+limits are validated, but search windows, filters and collectors are not executed by tracing.
+The public Node `TraceSearchRequest` is narrower and rejects supplied search-only controls. Do
+not turn the Rust compatibility behavior into a claim that trace applies indexed filters; callers
+must select complete source records themselves.
+
+### Unique Boolean span admission
+
+Cross-leaf duplicates must not spend the shared span budget. Each value's leaf allowance includes its already retained spans before existing cross-leaf deduplication charges new spans. That sum stays within the 1,024-span ceiling. The overlapping-leaf regressions in `boolean-tracing.test.mjs` exercise exact capacity, over-cap unions and independent values. Clauses beneath NOT still contribute no spans, including nested NOT; the evaluator determines that without a redundant leaf flag.
+
+Facade caller exceptions retain their identity until native submission; native/response failures are normalized afterward. Empty-candidate requests retain query preparation validation rather than bypassing invalid fields or analyzer-dependent constraints.

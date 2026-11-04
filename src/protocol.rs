@@ -619,7 +619,7 @@ pub fn validate_trace_header(bytes: &[u8]) -> Result<()> {
 	if bytes.len() > MAX_SEARCH_REQUEST_BYTES {
 		return Err(FulltextError::invalid("packed trace request exceeds 8388608 bytes"));
 	}
-	let _ = Cursor::new(bytes, *b"FTTM")?;
+	let _ = Cursor::new(bytes, trace_magic(bytes))?;
 	Ok(())
 }
 
@@ -628,7 +628,7 @@ pub fn search_budget(bytes: &[u8]) -> Result<u32> {
 }
 
 pub fn trace_budget(bytes: &[u8]) -> Result<u32> {
-	packed_budget(bytes, *b"FTTM", "trace")
+	packed_budget(bytes, trace_magic(bytes), "trace")
 }
 
 fn packed_budget(bytes: &[u8], magic: [u8; 4], operation: &str) -> Result<u32> {
@@ -1332,22 +1332,42 @@ fn decode_search_expression(
 	}
 }
 
+fn trace_magic(bytes: &[u8]) -> [u8; 4] {
+	if bytes.starts_with(b"FTBT") {
+		*b"FTBT"
+	} else {
+		*b"FTTM"
+	}
+}
+
 pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
-	let mut cursor = Cursor::new(bytes, *b"FTTM")?;
-	let text = cursor.string()?;
-	if text.len() > MAX_QUERY_TEXT_BYTES {
-		return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
-	}
-	let mode = decode_search_mode(cursor.u8()?)?;
-	let options = decode_query_options(&mut cursor, mode)?;
-	let field_count = cursor.u16()? as usize;
-	if field_count > MAX_FIELDS || field_count > cursor.remaining() / 4 {
-		return Err(FulltextError::invalid("trace field count exceeds its packed request"));
-	}
-	let mut fields = Vec::with_capacity(field_count);
-	for _ in 0..field_count {
-		fields.push(cursor.string()?);
-	}
+	let boolean = bytes.starts_with(b"FTBT");
+	let mut cursor = Cursor::new(bytes, trace_magic(bytes))?;
+	let expression = if boolean {
+		let mut structure = SearchStructureBudget::new(MAX_CONFIGURED_QUERY_CLAUSES, MAX_FIELDS)?;
+		decode_search_expression(&mut cursor, 0, &mut structure)?
+	} else {
+		let text = cursor.string()?;
+		if text.len() > MAX_QUERY_TEXT_BYTES {
+			return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
+		}
+		let mode = decode_search_mode(cursor.u8()?)?;
+		let options = decode_query_options(&mut cursor, mode)?;
+		let field_count = cursor.u16()? as usize;
+		if field_count > MAX_FIELDS || field_count > cursor.remaining() / 4 {
+			return Err(FulltextError::invalid("trace field count exceeds its packed request"));
+		}
+		let mut fields = Vec::with_capacity(field_count);
+		for _ in 0..field_count {
+			fields.push(cursor.string()?);
+		}
+		SearchExpression::Clause(SearchClause {
+			text,
+			mode,
+			options,
+			fields,
+		})
+	};
 	let has_candidates = cursor.boolean()?;
 	let candidate_count = if has_candidates { cursor.u16()? as usize } else { 0 };
 	if candidate_count > MAX_CANDIDATE_IDS || candidate_count > cursor.remaining() / 4 {
@@ -1413,12 +1433,7 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 		search: SearchRequest {
 			sort: None,
 			aggregations: Vec::new(),
-			expression: SearchExpression::Clause(SearchClause {
-				text,
-				mode,
-				options,
-				fields,
-			}),
+			expression,
 			candidate_ids: has_candidates.then_some(candidate_ids),
 			filter: None,
 			offset: 0,
@@ -2092,6 +2107,37 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	#[test]
+	fn boolean_trace_frames_preserve_depth_header_and_truncation_guards() {
+		let mut frame = b"FTBT\x08\x00".to_vec();
+		frame.extend_from_slice(&[3, 0]);
+		frame.extend_from_slice(&0u32.to_le_bytes());
+		frame.extend_from_slice(&[0, 1, 1, 0, 0]);
+		frame.extend_from_slice(&[0; 3]);
+		frame.extend_from_slice(&100u32.to_le_bytes());
+		assert!(matches!(
+			decode_trace(&frame).unwrap().search.expression,
+			SearchExpression::Not(_)
+		));
+		validate_trace_header(&frame).unwrap();
+		assert_eq!(trace_budget(&frame).unwrap(), 100);
+		for length in 0..frame.len() {
+			assert!(decode_trace(&frame[..length]).is_err());
+		}
+		let mut trailing = frame.clone();
+		trailing.push(0);
+		assert!(decode_trace(&trailing).is_err());
+		let mut invalid = frame.clone();
+		invalid[6] = 255;
+		assert!(decode_trace(&invalid).is_err());
+		let mut deep = b"FTBT\x08\x00".to_vec();
+		deep.extend_from_slice(&[3; 9]);
+		deep.extend_from_slice(&frame[7..]);
+		assert!(decode_trace(&deep).is_err());
+		frame[4] = 9;
+		assert!(validate_trace_header(&frame).is_err());
 	}
 
 	#[test]

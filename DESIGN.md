@@ -17,3 +17,5 @@
 - [Telemetry worker banks](src/DESIGN.md#telemetry-worker-banks) — ticket ownership, shared fallbacks, and retained scalar-bank memory.
 
 - [Observability comparisons](benchmarks/DESIGN.md#observability-comparisons) — validation-excluded timing windows, staggered collection, and failure evidence.
+
+- [Boolean source tracing](src/DESIGN.md#boolean-source-tracing) — bounded shared analysis and conservative negated evidence.

@@ -48,6 +48,9 @@ const ANALYZER_NAME: &str = "english@2";
 const SURFACE_ANALYZER_NAME: &str = "english_surface@2";
 pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_TRACE_TOKENS_PER_VALUE: usize = 262_144;
+const MAX_TRACE_EXPRESSION_TOKENS: usize = 524_288;
+const MAX_TRACE_EXPRESSION_VALUES: usize = 4_096;
+const MAX_TRACE_WORK_TOKENS: usize = 8_388_608;
 const MAX_TOKEN_CHARACTERS: usize = 40;
 const MAX_NONSTARTERS: usize = 30;
 const DELETE_MERGE_RATIO: f32 = 0.5;
@@ -420,6 +423,93 @@ pub struct TraceResult {
 	pub records: Vec<TraceRecordMatch>,
 }
 
+struct TraceSource<'a> {
+	field: &'a str,
+	value_index: u32,
+	analyzed: Vec<SourceToken>,
+	surface: Vec<SourceToken>,
+	utf16: Option<Vec<u32>>,
+	analyzed_truncated: bool,
+	surface_truncated: bool,
+}
+
+struct TraceLeaf<'a> {
+	plan: TracePlan,
+	fields: HashSet<&'a str>,
+	analyzed_fuzzy: bool,
+}
+
+impl TraceLeaf<'_> {
+	fn needs_surface(&self) -> bool {
+		self.plan.needs_surface(self.analyzed_fuzzy)
+	}
+}
+
+enum TraceExpression {
+	Leaf(usize),
+	And(Vec<TraceExpression>),
+	Or(Vec<TraceExpression>),
+	Not(Box<TraceExpression>),
+	Optional(Box<TraceExpression>, Vec<TraceExpression>),
+}
+
+struct TraceDecision {
+	matched: Option<bool>,
+	leaves: Vec<usize>,
+}
+
+impl TraceExpression {
+	fn evaluate(&self, membership: &[Option<bool>]) -> TraceDecision {
+		match self {
+			Self::Leaf(index) => TraceDecision {
+				matched: membership[*index],
+				leaves: if membership[*index] == Some(true) {
+					vec![*index]
+				} else {
+					Vec::new()
+				},
+			},
+			Self::Not(child) => TraceDecision {
+				matched: child.evaluate(membership).matched.map(|value| !value),
+				leaves: Vec::new(),
+			},
+			Self::And(children) | Self::Or(children) => {
+				let and = matches!(self, Self::And(_));
+				let decisions: Vec<_> = children.iter().map(|child| child.evaluate(membership)).collect();
+				let matched = if decisions.iter().any(|child| child.matched == Some(!and)) {
+					Some(!and)
+				} else if decisions.iter().any(|child| child.matched.is_none()) {
+					None
+				} else {
+					Some(and)
+				};
+				let leaves = if matched == Some(true) {
+					decisions
+						.into_iter()
+						.filter(|child| child.matched == Some(true))
+						.flat_map(|child| child.leaves)
+						.collect()
+				} else {
+					Vec::new()
+				};
+				TraceDecision { matched, leaves }
+			}
+			Self::Optional(required, optional) => {
+				let mut result = required.evaluate(membership);
+				if result.matched == Some(true) {
+					for child in optional {
+						let child = child.evaluate(membership);
+						if child.matched == Some(true) {
+							result.leaves.extend(child.leaves);
+						}
+					}
+				}
+				result
+			}
+		}
+	}
+}
+
 #[derive(Clone)]
 struct SourceToken {
 	text: String,
@@ -557,7 +647,21 @@ impl FuzzyTraceTerm {
 		}
 	}
 
-	fn matches(&self, analyzed: Option<&Vec<&str>>, surface: &str) -> Result<bool> {
+	fn matches_analyzed(&self, analyzed: Option<&[&str]>) -> Result<bool> {
+		if let Some(terms) = analyzed {
+			for term in terms {
+				if match &self.matchers {
+					Some(matchers) => matchers.analyzed.matches(term)?,
+					None => within_one_edit(&self.analyzed, term),
+				} {
+					return Ok(true);
+				}
+			}
+		}
+		Ok(false)
+	}
+
+	fn matches(&self, analyzed: Option<&[&str]>, surface: &str) -> Result<bool> {
 		if let Some(matchers) = &self.matchers {
 			if let Some(terms) = analyzed {
 				for term in terms {
@@ -576,6 +680,10 @@ impl FuzzyTraceTerm {
 }
 
 impl TracePlan {
+	fn needs_surface(&self, analyzed_fuzzy: bool) -> bool {
+		matches!(self, Self::Prefix { .. }) || (!analyzed_fuzzy && matches!(self, Self::Fuzzy { .. }))
+	}
+
 	fn record_matches(&self, found: &HashSet<String>) -> bool {
 		// Each trace branch inserts only its own distinct terms or its private match marker.
 		match self {
@@ -1069,13 +1177,8 @@ impl Engine {
 	) -> Result<TraceResult> {
 		check_deadline(deadline)?;
 		crate::request_validation::validate_trace_admission(request, records)?;
-		let clause = match &request.expression {
-			SearchExpression::Clause(clause) => clause,
-			_ => {
-				return Err(FulltextError::invalid(
-					"traceMatches does not support boolean expressions",
-				))
-			}
+		let SearchExpression::Clause(clause) = &request.expression else {
+			return self.trace_expression(request, records, deadline);
 		};
 		let selected = self.selected_fields(&clause.fields)?;
 		self.require_surface_fields(&selected)?;
@@ -1184,6 +1287,255 @@ impl Engine {
 		})
 	}
 
+	fn prepare_trace_expression<'a>(
+		&'a self,
+		expression: &SearchExpression,
+		leaves: &mut Vec<TraceLeaf<'a>>,
+		negative: bool,
+		budget: &mut QueryConstructionBudget,
+	) -> Result<TraceExpression> {
+		Ok(match expression {
+			SearchExpression::Clause(clause) => {
+				let fields = self.selected_fields(&clause.fields)?;
+				self.require_surface_fields(&fields)?;
+				let plan = self.trace_plan(clause)?;
+				match &plan {
+					TracePlan::Phrase(terms) => budget.phrase(terms.len(), fields.len())?,
+					TracePlan::Fuzzy { fuzzy, .. } => {
+						budget.fuzzy(fuzzy.len(), fields.len(), clause.options.fuzzy_distance)?
+					}
+					TracePlan::Prefix { matcher, .. } => budget.fuzzy(
+						usize::from(matcher.is_some()),
+						fields.len(),
+						clause.options.fuzzy_distance,
+					)?,
+					_ => {}
+				}
+				let index = leaves.len();
+				leaves.push(TraceLeaf {
+					plan,
+					fields: fields.iter().map(|field| field.name.as_str()).collect(),
+					analyzed_fuzzy: negative,
+				});
+				TraceExpression::Leaf(index)
+			}
+			SearchExpression::And(children) => TraceExpression::And(
+				children
+					.iter()
+					.map(|child| self.prepare_trace_expression(child, leaves, negative, budget))
+					.collect::<Result<_>>()?,
+			),
+			SearchExpression::Or(children) => TraceExpression::Or(
+				children
+					.iter()
+					.map(|child| self.prepare_trace_expression(child, leaves, negative, budget))
+					.collect::<Result<_>>()?,
+			),
+			SearchExpression::Not(child) => {
+				TraceExpression::Not(Box::new(self.prepare_trace_expression(child, leaves, true, budget)?))
+			}
+			SearchExpression::Boost { clause, .. } => {
+				self.prepare_trace_expression(clause, leaves, negative, budget)?
+			}
+			SearchExpression::Optional { required, optional } => TraceExpression::Optional(
+				Box::new(self.prepare_trace_expression(required, leaves, negative, budget)?),
+				optional
+					.iter()
+					.map(|child| self.prepare_trace_expression(child, leaves, negative, budget))
+					.collect::<Result<_>>()?,
+			),
+		})
+	}
+
+	fn trace_expression(
+		&self,
+		request: &SearchRequest,
+		records: &[TraceRecord],
+		deadline: Option<Instant>,
+	) -> Result<TraceResult> {
+		crate::protocol::validate_search_structure(&request.expression, self.max_query_clauses, self.fields.len())?;
+		let mut leaves = Vec::new();
+		let expression = self.prepare_trace_expression(
+			&request.expression,
+			&mut leaves,
+			false,
+			&mut QueryConstructionBudget::default(),
+		)?;
+		let selected: HashSet<&str> = leaves.iter().flat_map(|leaf| leaf.fields.iter().copied()).collect();
+		let candidates = request
+			.candidate_ids
+			.as_ref()
+			.map(|ids| ids.iter().map(String::as_str).collect::<HashSet<_>>());
+		let mut result = TraceResult {
+			complete: true,
+			records: Vec::new(),
+		};
+		let mut remaining_spans = MAX_TRACE_SPANS;
+		let mut remaining_bytes = MAX_SEARCH_RESPONSE_BYTES - 3;
+		let mut work = MAX_TRACE_WORK_TOKENS;
+		let surface_fields: HashSet<&str> = leaves
+			.iter()
+			.filter(|leaf| leaf.needs_surface())
+			.flat_map(|leaf| leaf.fields.iter().copied())
+			.collect();
+		let mut analyzed_analyzer = self.index_analyzer.clone();
+		let mut surface_analyzer = self.surface_index_analyzer.clone();
+		for record in records {
+			check_deadline(deadline)?;
+			if candidates.as_ref().is_some_and(|ids| !ids.contains(record.id.as_str())) {
+				continue;
+			}
+			let mut sources = Vec::new();
+			let mut remaining_tokens = MAX_TRACE_EXPRESSION_TOKENS;
+			let mut missing_fields = HashSet::new();
+			for (field, values) in &record.fields {
+				if !self.field_lookup.contains_key(field) {
+					return Err(FulltextError::invalid(format!("unknown trace field {field}")));
+				}
+				if !selected.contains(field.as_str()) {
+					continue;
+				}
+				for (value_index, value) in values.iter().enumerate() {
+					if sources.len() == MAX_TRACE_EXPRESSION_VALUES || (remaining_tokens == 0 && !value.is_empty()) {
+						missing_fields.insert(field.as_str());
+						continue;
+					}
+					let (mut analyzed, mut analyzed_truncated) =
+						Self::source_tokens(&mut analyzed_analyzer, value, deadline)?;
+					if analyzed.len() > remaining_tokens {
+						analyzed.truncate(remaining_tokens);
+						analyzed_truncated = true;
+					}
+					remaining_tokens -= analyzed.len();
+					let (mut surface, mut surface_truncated) = if !surface_fields.contains(field.as_str()) {
+						(Vec::new(), false)
+					} else if remaining_tokens == 0 {
+						(Vec::new(), !value.is_empty())
+					} else {
+						Self::source_tokens(&mut surface_analyzer, value, deadline)?
+					};
+					if surface.len() > remaining_tokens {
+						surface.truncate(remaining_tokens);
+						surface_truncated = true;
+					}
+					remaining_tokens -= surface.len();
+					if analyzed.is_empty() && surface.is_empty() && !analyzed_truncated && !surface_truncated {
+						continue;
+					}
+					sources.push(TraceSource {
+						field: field.as_str(),
+						value_index: value_index as u32,
+						analyzed,
+						surface,
+						utf16: utf16_offsets(value),
+						analyzed_truncated,
+						surface_truncated,
+					});
+				}
+			}
+			let mut membership = Vec::with_capacity(leaves.len());
+			for leaf in &leaves {
+				let mut found = HashSet::new();
+				let mut unknown = leaf.fields.iter().any(|field| missing_fields.contains(*field));
+				for source in &sources {
+					if !leaf.fields.contains(source.field) {
+						continue;
+					}
+					let cost = source.analyzed.len() + if leaf.needs_surface() { source.surface.len() } else { 0 };
+					if cost > work {
+						unknown = true;
+						continue;
+					}
+					work -= cost;
+					let (_, terms, _, truncated) =
+						self.trace_tokens(&leaf.plan, source, 0, deadline, leaf.analyzed_fuzzy)?;
+					found.extend(terms);
+					unknown |= truncated;
+				}
+				membership.push(if leaf.plan.record_matches(&found) {
+					Some(true)
+				} else if unknown {
+					None
+				} else {
+					Some(false)
+				});
+				result.complete &= !unknown;
+			}
+			let decision = expression.evaluate(&membership);
+			if decision.matched != Some(true) {
+				continue;
+			}
+			let mut values = BTreeMap::<(&str, u32), BTreeSet<(u32, u32)>>::new();
+			let mut pending_spans = remaining_spans;
+			for index in decision.leaves {
+				let leaf = &leaves[index];
+				for source in &sources {
+					if !leaf.fields.contains(source.field) {
+						continue;
+					}
+					let cost = source.analyzed.len() + if leaf.needs_surface() { source.surface.len() } else { 0 };
+					if cost > work {
+						result.complete = false;
+						continue;
+					}
+					work -= cost;
+					let entry = values.entry((source.field, source.value_index)).or_default();
+					let candidate_spans = pending_spans + entry.len();
+					let (spans, _, truncated, _) =
+						self.trace_tokens(&leaf.plan, source, candidate_spans, deadline, false)?;
+					result.complete &= !truncated;
+					for span in spans {
+						if entry.contains(&(span.start, span.end)) {
+							continue;
+						}
+						if pending_spans == 0 {
+							result.complete = false;
+							break;
+						}
+						entry.insert((span.start, span.end));
+						pending_spans -= 1;
+					}
+				}
+			}
+			let mut record_bytes = 6 + record.id.len();
+			let mut matched_values = Vec::new();
+			for ((field, value_index), spans) in values {
+				let header = 10 + field.len();
+				let keep = spans
+					.len()
+					.min(remaining_bytes.saturating_sub(record_bytes + header) / 8);
+				if keep < spans.len() {
+					result.complete = false;
+				}
+				if keep == 0 {
+					continue;
+				}
+				let spans = spans
+					.into_iter()
+					.take(keep)
+					.map(|(start, end)| TraceSpan { start, end })
+					.collect();
+				record_bytes += header + keep * 8;
+				remaining_spans -= keep;
+				matched_values.push(TraceValueMatch {
+					field: field.to_owned(),
+					value_index,
+					spans,
+				});
+			}
+			if record_bytes > remaining_bytes {
+				result.complete = false;
+				continue;
+			}
+			remaining_bytes -= record_bytes;
+			result.records.push(TraceRecordMatch {
+				id: record.id.clone(),
+				values: matched_values,
+			});
+		}
+		Ok(result)
+	}
+
 	fn trace_plan(&self, request: &SearchClause) -> Result<TracePlan> {
 		match request.mode {
 			SearchMode::Any => Ok(TracePlan::Any(
@@ -1260,8 +1612,38 @@ impl Engine {
 		analyzed_source_analyzer: &mut TextAnalyzer,
 		surface_source_analyzer: &mut TextAnalyzer,
 	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool, bool)> {
-		let (analyzed, mut analysis_truncated) = Self::source_tokens(analyzed_source_analyzer, value, deadline)?;
-		let utf16_offsets = utf16_offsets(value);
+		let (analyzed, analyzed_truncated) = Self::source_tokens(analyzed_source_analyzer, value, deadline)?;
+		let needs_surface = plan.needs_surface(false);
+		let (surface, surface_truncated) = if needs_surface {
+			Self::source_tokens(surface_source_analyzer, value, deadline)?
+		} else {
+			(Vec::new(), false)
+		};
+		let source = TraceSource {
+			field: "",
+			value_index: 0,
+			analyzed,
+			surface,
+			utf16: utf16_offsets(value),
+			analyzed_truncated,
+			surface_truncated,
+		};
+		self.trace_tokens(plan, &source, max_spans, deadline, false)
+	}
+
+	fn trace_tokens(
+		&self,
+		plan: &TracePlan,
+		source: &TraceSource<'_>,
+		max_spans: usize,
+		deadline: Option<Instant>,
+		analyzed_fuzzy: bool,
+	) -> Result<(Vec<TraceSpan>, HashSet<String>, bool, bool)> {
+		let analyzed = &source.analyzed;
+		let surface = &source.surface;
+		let utf16_offsets = &source.utf16;
+		let needs_surface = plan.needs_surface(analyzed_fuzzy);
+		let analysis_truncated = source.analyzed_truncated || (needs_surface && source.surface_truncated);
 		let mut spans = Vec::new();
 		let mut seen_spans = HashSet::new();
 		let mut found = HashSet::new();
@@ -1277,7 +1659,7 @@ impl Engine {
 						spans_truncated |= push_trace_span(
 							&mut spans,
 							&mut seen_spans,
-							source_span(&utf16_offsets, token.start, token.end),
+							source_span(utf16_offsets, token.start, token.end),
 							max_spans,
 						);
 						if spans_truncated && plan.record_matches(&found) {
@@ -1322,7 +1704,7 @@ impl Engine {
 							spans_truncated |= push_trace_span(
 								&mut spans,
 								&mut seen_spans,
-								source_span(&utf16_offsets, anchor.start, final_token.end),
+								source_span(utf16_offsets, anchor.start, final_token.end),
 								max_spans,
 							);
 							if spans_truncated && plan.record_matches(&found) {
@@ -1337,8 +1719,6 @@ impl Engine {
 				prefix,
 				matcher,
 			} => {
-				let (surface, surface_truncated) = Self::source_tokens(surface_source_analyzer, value, deadline)?;
-				analysis_truncated |= surface_truncated;
 				for (index, token) in analyzed.iter().enumerate() {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
@@ -1348,7 +1728,7 @@ impl Engine {
 						spans_truncated |= push_trace_span(
 							&mut spans,
 							&mut seen_spans,
-							source_span(&utf16_offsets, token.start, token.end),
+							source_span(utf16_offsets, token.start, token.end),
 							max_spans,
 						);
 						if spans_truncated && plan.record_matches(&found) {
@@ -1369,7 +1749,7 @@ impl Engine {
 						spans_truncated |= push_trace_span(
 							&mut spans,
 							&mut seen_spans,
-							source_span(&utf16_offsets, token.start, token.end),
+							source_span(utf16_offsets, token.start, token.end),
 							max_spans,
 						);
 						if spans_truncated && plan.record_matches(&found) {
@@ -1379,26 +1759,36 @@ impl Engine {
 				}
 			}
 			TracePlan::Fuzzy { exact, fuzzy } => {
-				let (surface, surface_truncated) = Self::source_tokens(surface_source_analyzer, value, deadline)?;
-				analysis_truncated |= surface_truncated;
 				let mut analyzed_by_position = HashMap::<usize, Vec<&str>>::new();
-				for token in &analyzed {
-					analyzed_by_position
-						.entry(token.position)
-						.or_default()
-						.push(token.text.as_str());
+				if !analyzed_fuzzy {
+					for token in analyzed {
+						analyzed_by_position
+							.entry(token.position)
+							.or_default()
+							.push(token.text.as_str());
+					}
 				}
-				for (index, token) in surface.iter().enumerate() {
+				let tokens = if analyzed_fuzzy { analyzed } else { surface };
+				for (index, token) in tokens.iter().enumerate() {
 					if index % 256 == 0 {
 						check_deadline(deadline)?;
 					}
-					let source_terms = analyzed_by_position.get(&token.position);
+					let analyzed_term = [token.text.as_str()];
+					let source_terms = if analyzed_fuzzy {
+						Some(analyzed_term.as_slice())
+					} else {
+						analyzed_by_position.get(&token.position).map(Vec::as_slice)
+					};
 					let exact_match =
 						source_terms.and_then(|tokens| tokens.iter().find(|term| exact.contains(term)).copied());
 					let mut fuzzy_match = None;
 					if exact_match.is_none() {
 						for alternative in fuzzy {
-							if alternative.matches(source_terms, &token.text)? {
+							if if analyzed_fuzzy {
+								alternative.matches_analyzed(source_terms)?
+							} else {
+								alternative.matches(source_terms, &token.text)?
+							} {
 								fuzzy_match = Some(alternative.analyzed.as_str());
 								break;
 							}
@@ -1409,7 +1799,7 @@ impl Engine {
 						spans_truncated |= push_trace_span(
 							&mut spans,
 							&mut seen_spans,
-							source_span(&utf16_offsets, token.start, token.end),
+							source_span(utf16_offsets, token.start, token.end),
 							max_spans,
 						);
 					}
@@ -3574,6 +3964,42 @@ mod tests {
 	}
 
 	#[test]
+	fn direct_boolean_traces_use_current_source_and_positive_branch_spans() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let request = SearchRequest {
+			sort: None,
+			aggregations: Vec::new(),
+			expression: SearchExpression::And(vec![
+				expression("amber", SearchMode::Any, vec!["title".into()]),
+				SearchExpression::Not(Box::new(expression("stone", SearchMode::Any, vec!["title".into()]))),
+			]),
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 10,
+			exact_total: false,
+			budget_milliseconds: 0,
+			traversal: false,
+			after: None,
+		};
+		let result = engine
+			.trace_matches(
+				&request,
+				&[TraceRecord {
+					id: "one".into(),
+					fields: vec![("title".into(), vec!["amber quartz".into()])],
+				}],
+				None,
+			)
+			.unwrap();
+		assert!(result.complete);
+		assert_eq!(result.records[0].id, "one");
+		assert_eq!(result.records[0].values[0].spans, vec![TraceSpan { start: 0, end: 5 }]);
+	}
+
+	#[test]
 	fn ascii_admission_bound_dominates_native_analyzer_token_counts() {
 		let engine = Engine::open(RamDirectory::create(), &config()).unwrap();
 		let mut analyzer = engine.analyzer.clone();
@@ -4849,7 +5275,7 @@ mod tests {
 		assert!(native.surface.is_none());
 		assert!(std::ptr::eq(native.surface_matcher(), &native.analyzed));
 		assert!(native.analyzed.automaton.get().is_none());
-		assert!(term.matches(Some(&vec!["shxe"]), "unmatched").unwrap());
+		assert!(term.matches(Some(&["shxe"]), "unmatched").unwrap());
 		let prepared = native.analyzed.automaton.get().unwrap();
 		assert!(term.matches(None, "shye").unwrap());
 		assert!(std::ptr::eq(

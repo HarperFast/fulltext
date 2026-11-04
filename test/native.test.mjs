@@ -69,8 +69,8 @@ test('loads the artifact for the executing platform', async () => {
 	assert.deepStrictEqual(info, {
 		packageVersion: packageManifest.version,
 		tantivyVersion,
-		nativeAbiVersion: 14,
-		queryApiVersion: 8,
+		nativeAbiVersion: 16,
+		queryApiVersion: 9,
 		queryClassIsolationMinimumSearchThreads: 2,
 		lifecycleApiVersion: 1,
 		mutationBatchApiVersion: 5,

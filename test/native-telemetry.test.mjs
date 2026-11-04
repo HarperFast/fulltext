@@ -777,7 +777,7 @@ test('facade rejection labels whitelist codes and cannot replace a caller failur
 	assert.strictEqual(telemetry.native.operations.search.attempted, 0n);
 });
 
-test('trace encoding getters retain normalized API errors and count one preparation rejection', async (context) => {
+test('trace encoding getters preserve caller exceptions and normalize preparation telemetry', async (context) => {
 	const { index } = await fixture(context);
 	const original = new Error('caller encoding getter failed');
 	const typed = new FulltextError('E_INVALID_ARGUMENT', 'caller encoding getter rejected');
@@ -793,12 +793,7 @@ test('trace encoding getters retain normalized API errors and count one preparat
 				[],
 			),
 			(error) => {
-				assert(error instanceof FulltextError);
-				if (failure === typed) assert.strictEqual(error, typed);
-				else {
-					assert.strictEqual(error.code, 'E_NATIVE_FAILURE');
-					assert.strictEqual(error.cause, original);
-				}
+				assert.strictEqual(error, failure);
 				return true;
 			},
 		);
@@ -806,7 +801,7 @@ test('trace encoding getters retain normalized API errors and count one preparat
 	const telemetry = snapshot(index);
 	assert.deepStrictEqual(telemetry.preparationRejections.trace, {
 		total: 2n,
-		errors: { E_NATIVE_FAILURE: 1n, E_INVALID_ARGUMENT: 1n },
+		errors: { other: 1n, E_INVALID_ARGUMENT: 1n },
 	});
 	assert.strictEqual(telemetry.native.operations.trace.attempted, 0n);
 });

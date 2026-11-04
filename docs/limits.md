@@ -101,14 +101,17 @@ Fuzzy tracing retains
 analyzed and current-source surface branches, while indexed full-fuzzy membership uses analyzed
 terms. Source-surface matches are not a guarantee of indexed membership.
 
-| Bound                            | Value                                                     | Effect and recovery                                                                                                                                                         |
-| -------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Source records                   | 100                                                       | Oversized trace requests reject. Partition source records for tracing.                                                                                                      |
-| Combined source text             | 1 MiB UTF-8                                               | Oversized requests reject. Partition source requests without changing indexed-search semantics.                                                                             |
-| Analyzed tokens per source value | 262,144                                                   | Stops analysis with `complete: false`, including when a later unmatched token might have matched. Do not treat an incomplete empty trace as proof of no match.              |
-| Returned spans                   | 1,024 across the response, also bounded by response bytes | Signals incomplete tracing rather than silently claiming complete explanation. Inspect the response-level `complete` flag; there is no per-value truncation flag.           |
-| Snippet length                   | Default 160; accepted 32–512 UTF-16 code units            | Invalid options reject. This is a target length: preserving surrogate pairs can extend fragment boundaries. Snippets intentionally show excerpts; they are not full source. |
-| Fragments per value              | Default 3; accepted 1–5                                   | Invalid options reject. Fragment omission does not remove the underlying returned spans.                                                                                    |
+| Bound                            | Value                                                                        | Effect and recovery                                                                                                                                                         |
+| -------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source records                   | 100                                                                          | Oversized trace requests reject. Partition source records for tracing.                                                                                                      |
+| Combined source text             | 1 MiB UTF-8                                                                  | Oversized requests reject. Partition source requests without changing indexed-search semantics.                                                                             |
+| Analyzed tokens per source value | 262,144                                                                      | Stops analysis with `complete: false`, including when a later unmatched token might have matched. Do not treat an incomplete empty trace as proof of no match.              |
+| Retained Boolean source analysis | 524,288 emitted tokens per record, combined across needed analyzers          | Unretained source evidence is unknown and `complete` is false; an incomplete absence cannot satisfy NOT.                                                                    |
+| Cached Boolean values            | 4,096 nonempty analyzed values per record                                    | Additional source evidence is unknown and `complete` is false. Fully analyzed zero-token values need no retained entry.                                                     |
+| Boolean matching work            | 8,388,608 retained-token reservations per request, including span collection | Exhaustion sets `complete: false`; split source requests or simplify the expression.                                                                                        |
+| Returned spans                   | 1,024 across the response, also bounded by response bytes                    | Signals incomplete tracing rather than silently claiming complete explanation. Inspect the response-level `complete` flag; there is no per-value truncation flag.           |
+| Snippet length                   | Default 160; accepted 32–512 UTF-16 code units                               | Invalid options reject. This is a target length: preserving surrogate pairs can extend fragment boundaries. Snippets intentionally show excerpts; they are not full source. |
+| Fragments per value              | Default 3; accepted 1–5                                                      | Invalid options reject. Fragment omission does not remove the underlying returned spans.                                                                                    |
 
 ## Runtime and operational values
 
@@ -359,7 +362,7 @@ and cannot be negative zero. `SearchExpression` no longer implements `Eq` becaus
 float32 boosts; use its `PartialEq` implementation for comparisons and remove `Eq` derives from
 containing types that require it.
 
-The matching 0.9.0 facade and addon use packed protocol 8, native ABI 14, query API 8 and telemetry API 1.
+This development facade and addon use packed protocol 8, native ABI 16, query API 9 and telemetry API 1. Published 0.9.0 uses ABI 14/query API 8 and does not include Boolean tracing.
 
 ## Source reference
 

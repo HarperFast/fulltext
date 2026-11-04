@@ -4,7 +4,7 @@ use crate::error::{FulltextError, Result};
 use crate::protocol::{
 	validate_record_id, validate_search_structure, validate_search_window, SearchExpression, SearchMode, SearchRequest,
 	TraceRecord, MAX_AUTOCOMPLETE_RESULTS, MAX_CANDIDATE_BYTES, MAX_CANDIDATE_IDS, MAX_CONFIGURED_QUERY_CLAUSES,
-	MAX_FIELDS, MAX_QUERY_TEXT_BYTES, MAX_TRACE_RECORDS, MAX_TRACE_SOURCE_BYTES,
+	MAX_FIELDS, MAX_TRACE_RECORDS, MAX_TRACE_SOURCE_BYTES,
 };
 
 pub(crate) fn validate_candidates(ids: Option<&[String]>) -> Result<()> {
@@ -79,18 +79,8 @@ fn validate_expression_options(expression: &SearchExpression) -> Result<bool> {
 
 pub(crate) fn validate_trace_admission(request: &SearchRequest, records: &[TraceRecord]) -> Result<()> {
 	validate_candidates(request.candidate_ids.as_deref())?;
-	let SearchExpression::Clause(clause) = &request.expression else {
-		return Err(FulltextError::invalid(
-			"traceMatches does not support boolean expressions",
-		));
-	};
-	clause.options.validate(clause.mode)?;
-	if clause.text.len() > MAX_QUERY_TEXT_BYTES {
-		return Err(FulltextError::invalid("search text exceeds 65536 UTF-8 bytes"));
-	}
-	if clause.fields.len() > MAX_FIELDS {
-		return Err(FulltextError::invalid("trace field count exceeds 1024 fields"));
-	}
+	validate_search_structure(&request.expression, MAX_CONFIGURED_QUERY_CLAUSES, MAX_FIELDS)?;
+	validate_expression_options(&request.expression)?;
 	if records.len() > MAX_TRACE_RECORDS {
 		return Err(FulltextError::invalid("trace record count exceeds 100"));
 	}
@@ -133,6 +123,7 @@ pub(crate) fn validate_filter_number(value: f64) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::protocol::MAX_QUERY_TEXT_BYTES;
 	use crate::protocol::{QueryOptions, SearchBoundary, SearchClause};
 
 	fn request(mode: SearchMode) -> SearchRequest {
@@ -318,6 +309,20 @@ mod tests {
 		record.fields.truncate(1);
 		record.fields[0].1 = vec![String::new(); u16::MAX as usize + 1];
 		invalid(validate_trace_admission(&request, &[record]));
+	}
+
+	#[test]
+	fn trace_depth_is_bounded_before_recursive_option_validation() {
+		let mut request = request(SearchMode::Any);
+		if let SearchExpression::Clause(clause) = &mut request.expression {
+			clause.options.fuzzy_distance = 3;
+		}
+		for _ in 0..32 {
+			request.expression = SearchExpression::Not(Box::new(request.expression));
+		}
+		let error = validate_trace_admission(&request, &[]).unwrap_err();
+		assert_eq!(error.code, "E_INVALID_ARGUMENT");
+		assert!(error.message.contains("nesting"));
 	}
 
 	#[test]

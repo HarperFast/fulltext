@@ -99,7 +99,7 @@ test('fuzzy controls select edits and transpositions for full and prefix matchin
 				assert.deepStrictEqual(ids(result), expected.sort(), JSON.stringify(request));
 				assert.strictEqual(result.total, expected.length);
 				assert.strictEqual(result.hits[0].id, 'exact');
-				const trace = await index.traceMatches(request, records);
+				const trace = await index.traceMatches({ ...request, exactTotal: undefined }, records);
 				assert.deepStrictEqual(
 					trace.records
 						.filter(({ values }) => values.length)
@@ -228,7 +228,7 @@ test('controls retain field selection, Unicode tracing and independent fuzzy Boo
 	assert.deepStrictEqual(ids(filtered), ['unicode']);
 	assert.strictEqual(filtered.total, 1);
 	const request = { text: 'caféterix', mode: 'fuzzy', fuzzyDistance: 1, fuzzyTranspositions: false, fields: ['title'] };
-	const traced = await index.traceMatches(request, records);
+	const traced = await index.traceMatches({ ...request, exactTotal: undefined }, records);
 	assert.strictEqual(traced.complete, true);
 	assert.deepStrictEqual(traced.records.map(({ id }) => id).sort(), [
 		'disabled-match',
@@ -290,7 +290,7 @@ test('nondefault fuzzy traces retain current-source surface matches independentl
 		const result = await index.search({ ...request, exactTotal: true });
 		assert.deepStrictEqual(result.hits, []);
 		assert.strictEqual(result.total, 0);
-		const traced = await index.traceMatches(request, records);
+		const traced = await index.traceMatches({ ...request, exactTotal: undefined }, records);
 		assert.strictEqual(traced.complete, true);
 		assert.deepStrictEqual(
 			traced.records,
