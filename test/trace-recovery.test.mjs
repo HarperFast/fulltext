@@ -314,7 +314,7 @@ test('read-only recovery matches complete legacy traces across clause modes', as
 		{ text: 'ambe', mode: 'fuzzy-prefix' },
 		{ query: either(clause(), clause('stone')) },
 	]) {
-		const options = { snippets: true, fragmentSize: 32, maxFragmentsPerValue: 2 };
+		const options = { snippets: true, fragmentLength: 32, maxFragmentsPerValue: 2 };
 		const legacy = await reader.traceMatches(request, input, options);
 		assert.strictEqual(legacy.complete, true);
 		const page = await reader.traceMatchesPage(request, input, options);
