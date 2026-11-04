@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { openNativeFullTextIndex } from '@harperfast/fulltext/native';
+import { openNativeFullTextIndex, openNativeFullTextReader } from '@harperfast/fulltext/native';
 import { Cursor, decodeTraceProgress } from '../dist/codec.js';
 import { closeIndex } from '../benchmarks/metadata-cleanup.mjs';
 
@@ -20,9 +20,9 @@ const state = (id, membership = 'match', analysisComplete = true, spansComplete 
 const spanCount = (result) =>
 	result.records.reduce((sum, record) => sum + record.values.reduce((sum, value) => sum + value.spans.length, 0), 0);
 
-async function fixture(context) {
+async function fixture(context, readOnly = false) {
 	const directory = await mkdtemp(path.join(tmpdir(), 'fulltext-trace-recovery-'));
-	const index = await openNativeFullTextIndex({
+	const config = {
 		path: directory,
 		indexId: 'trace-recovery',
 		generation: 'one',
@@ -38,12 +38,18 @@ async function fixture(context) {
 			maxQueuedBytes: 8 * 1024 * 1024,
 			maxBatchBytes: 1024 * 1024,
 		},
-	});
+	};
+	const index = await openNativeFullTextIndex(config);
+	let reader;
 	context.after(async () => {
+		if (reader) await closeIndex(reader);
 		await closeIndex(index, { mode: 'rollback' });
 		await rm(directory, { recursive: true, force: true });
 	});
-	return index;
+	if (!readOnly) return index;
+	await index.commit();
+	reader = await openNativeFullTextReader(config);
+	return reader;
 }
 
 async function recover(index, request, input, options = {}) {
@@ -291,3 +297,29 @@ for (const [name, cursor, ids, matches, complete] of [
 	test(`recovery wire rejects ${name}`, () =>
 		assert.throws(() => decodeTraceProgress(cursor, ids, matches, complete), { code: 'E_NATIVE_FAILURE' }));
 }
+
+test('read-only recovery matches complete legacy traces across clause modes', async (context) => {
+	const reader = await fixture(context, true);
+	const input = [
+		{ id: 'a', fields: { title: ['amber stone', 'running trails'], body: 'quartz' } },
+		{ id: 'b', fields: { title: 'stone', body: 'amber trail' } },
+		{ id: 'none', fields: { title: 'quartz' } },
+	];
+	for (const request of [
+		{ text: 'amber', mode: 'any' },
+		{ text: 'amber stone', mode: 'all', fields: ['title'] },
+		{ text: 'amber stone', mode: 'phrase' },
+		{ text: 'amb', mode: 'prefix' },
+		{ text: 'ambr', mode: 'fuzzy' },
+		{ text: 'ambe', mode: 'fuzzy-prefix' },
+		{ query: either(clause(), clause('stone')) },
+	]) {
+		const options = { snippets: true, fragmentSize: 32, maxFragmentsPerValue: 2 };
+		const legacy = await reader.traceMatches(request, input, options);
+		assert.strictEqual(legacy.complete, true);
+		const page = await reader.traceMatchesPage(request, input, options);
+		assert.deepStrictEqual({ complete: page.complete, records: page.records }, legacy);
+		assert.strictEqual(page.nextRecord, input.length);
+		assert(page.states.every(({ analysisComplete, spansComplete }) => analysisComplete && spansComplete));
+	}
+});

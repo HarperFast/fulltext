@@ -40,18 +40,20 @@ try {
 	async function collect(input) {
 		const records = [];
 		const states = [];
+		const windowSize = 2; // Size windows for source bytes and expected match density.
 		let offset = 0;
 		let calls = 0;
 		while (offset < input.length) {
 			assert(++calls <= input.length, 'successful pages must advance');
 			const remainingBudgetMilliseconds = Math.floor(deadline - performance.now());
 			assert(remainingBudgetMilliseconds > 0, 'original recovery budget expired');
-			const page = await index.traceMatchesPage(request, input.slice(offset), { remainingBudgetMilliseconds });
-			assert(page.nextRecord > 0 && page.nextRecord <= input.length - offset);
+			const window = input.slice(offset, offset + windowSize);
+			const page = await index.traceMatchesPage(request, window, { remainingBudgetMilliseconds });
+			assert(page.nextRecord > 0 && page.nextRecord <= window.length);
 			assert.strictEqual(page.states.length, page.nextRecord);
 			assert.strictEqual(
 				page.complete,
-				page.nextRecord === input.length - offset &&
+				page.nextRecord === window.length &&
 					page.states.every(({ analysisComplete, spansComplete }) => analysisComplete && spansComplete),
 			);
 			assert.deepStrictEqual(
@@ -61,7 +63,7 @@ try {
 			records.push(...page.records);
 			states.push(...page.states);
 			offset += page.nextRecord;
-			// Incomplete consumed states are terminal; only the unconsumed suffix resumes.
+			// Advance globally; refill a bounded window without retrying consumed partial states.
 		}
 		return { records, states, calls };
 	}

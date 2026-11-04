@@ -682,11 +682,12 @@ frames and limits remain supported.
 [recoverable highlighting example](examples/recoverable-highlighting.mjs).
 
 ```js
-const page = await index.traceMatchesPage(request, sourceRecords, {
+const window = sourceRecords.slice(offset, offset + windowSize);
+const page = await index.traceMatchesPage(request, window, {
 	remainingBudgetMilliseconds: remainingRequestBudget,
 	snippets: true,
 });
-// Retain this successful page, then continue with sourceRecords.slice(page.nextRecord).
+// Retain this successful page, then advance the global offset by page.nextRecord.
 ```
 
 The result is `{ complete, records, nextRecord, states }`. `nextRecord` is an exclusive index
@@ -704,6 +705,12 @@ the page stops. Every consumed incomplete state is terminal for this input: do n
 to recover omitted spans or analysis. There is no within-record continuation. A nonempty successful
 page always advances; an empty request returns zero progress after normal validation.
 
+Recovery is stateless: each call encodes and submits every supplied source value again. Repeatedly
+submitting the entire remaining suffix can produce quadratic submitted bytes when each call consumes
+only one record. Use bounded input windows sized for source bytes and expected match density;
+advance a global offset by `nextRecord` and refill the next window. Deferred boundary analysis can
+repeat, so progress does not imply zero native rework or a performance improvement.
+
 Consumers choose whether explicitly truncated spans are acceptable. An incomplete analysis must
 not be treated as a complete nonmatch or an authorization/visibility decision. Simple requests keep
 the existing per-value analysis limits; Boolean requests retain their additional per-record analysis,
@@ -712,7 +719,8 @@ value and matching-work limits. Lower snippet fragment counts do not reduce nati
 Use one decreasing request budget across calls. Timeout, close or cancellation errors reject the
 current call without progress; keep earlier successful pages, stop the operation and do not retry
 the error. Native recovery holds no cross-call source state. Applications still own authorization,
-source loading/version checks, expiry and the policy for incomplete evidence.
+source loading/version checks, expiry and the policy for incomplete evidence. Harper integration is tracked in
+[Adopt recoverable full-text highlighting with per-record completeness](https://github.com/HarperFast/harper/issues/4016).
 
 ### Engine and application boundary
 

@@ -490,11 +490,17 @@ limits. It reports a consumed prefix through `nextRecord` and one ordered state 
 input: membership (`match`, `no-match`, `unknown`), `analysisComplete` and `spansComplete`.
 Missing output is not a progress signal; completed nonmatches and candidate exclusions advance.
 
-Shared-limit exhaustion on a later record defers the entire record. Keep earlier output and use
-`records.slice(nextRecord)` for the next call. If the first record itself exceeds a limit, it is
+Shared-limit exhaustion on a later record defers the entire record. Keep earlier output and advance
+a global input offset by `nextRecord`. Submit a bounded window from that offset, sized for source
+bytes and expected match density rather than always submitting the entire remaining suffix. If the first record itself exceeds a limit, it is
 consumed once with explicit terminal incomplete status and the page stops. Record-local analysis
 limits are terminal too. Neither splitting nor repeated singleton calls can recover all spans from
 a record exceeding the span ceiling. The API provides no within-record continuation or reason enums.
+
+Each call serializes and submits all supplied source text again; consuming one record per call
+while resubmitting the full suffix can produce quadratic submitted bytes. Bounded windows limit
+this repeated submission. Native boundary analysis can also repeat; processed-prefix progress is
+not a zero-rework guarantee. Respect source byte/count limits even when selecting small windows.
 
 Simple-clause recovery preserves legacy per-value limits and does not add the Boolean per-record
 value cap. Boolean recovery retains conservative three-valued membership and its existing shared

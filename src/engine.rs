@@ -1481,7 +1481,7 @@ impl Engine {
 			.collect();
 		let mut analyzed_analyzer = self.index_analyzer.clone();
 		let mut surface_analyzer = self.surface_index_analyzer.clone();
-		for record in records {
+		'records: for record in records {
 			check_deadline(deadline)?;
 			if candidates.as_ref().is_some_and(|ids| !ids.contains(record.id.as_str())) {
 				progress.consume(TraceRecordState {
@@ -1552,6 +1552,10 @@ impl Engine {
 					}
 					let cost = source.analyzed.len() + if leaf.needs_surface() { source.surface.len() } else { 0 };
 					if cost > work {
+						if progress.defer(true) {
+							result.complete = false;
+							break 'records;
+						}
 						shared_exhausted = true;
 						unknown = true;
 						continue;
@@ -1598,6 +1602,10 @@ impl Engine {
 					}
 					let cost = source.analyzed.len() + if leaf.needs_surface() { source.surface.len() } else { 0 };
 					if cost > work {
+						if progress.defer(true) {
+							result.complete = false;
+							break 'records;
+						}
 						shared_exhausted = true;
 						spans_complete = false;
 						result.complete = false;
@@ -1608,6 +1616,10 @@ impl Engine {
 					let candidate_spans = pending_spans + entry.len();
 					let (spans, _, truncated, _) =
 						self.trace_tokens(&leaf.plan, source, candidate_spans, deadline, false)?;
+					if truncated && progress.defer(true) {
+						result.complete = false;
+						break 'records;
+					}
 					result.complete &= !truncated;
 					shared_exhausted |= truncated;
 					spans_complete &= !truncated;
@@ -1616,6 +1628,10 @@ impl Engine {
 							continue;
 						}
 						if pending_spans == 0 {
+							if progress.defer(true) {
+								result.complete = false;
+								break 'records;
+							}
 							shared_exhausted = true;
 							spans_complete = false;
 							result.complete = false;
@@ -8376,6 +8392,35 @@ mod tests {
 			.unwrap();
 		assert!(resumed.trace.complete);
 		assert_eq!(resumed.next_record, records.len() - page.next_record);
+	}
+
+	#[test]
+	fn recovery_late_span_work_exhaustion_defers_a_whole_match() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let request = recovery_request(SearchExpression::Or(
+			(0..32)
+				.map(|_| expression("needle", SearchMode::Any, vec!["description".into()]))
+				.collect(),
+		));
+		let records: Vec<_> = (0..7)
+			.map(|i| recovery_record(&i.to_string(), vec![format!("needle {}", "x ".repeat(20_000))]))
+			.collect();
+		let page = engine.trace_matches_page(&request, &records, None).unwrap();
+		assert_eq!(page.next_record, 6);
+		assert_eq!(page.trace.records.len(), 6);
+		assert!(!page.trace.complete);
+		assert!(page
+			.states
+			.iter()
+			.all(|state| state.membership == Some(true) && state.analysis_complete && state.spans_complete));
+		let resumed = engine
+			.trace_matches_page(&request, &records[page.next_record..], None)
+			.unwrap();
+		assert_eq!(resumed.next_record, 1);
+		assert!(resumed.trace.complete);
+		assert_eq!(resumed.trace.records[0].id, "6");
 	}
 
 	#[test]

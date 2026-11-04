@@ -411,3 +411,9 @@ native evaluation. Prior accepted pages remain consumer-owned. The example carri
 budget and stops on errors. Applications own source identity/version/expiry, authorization and
 partial-highlight policy. ABI 17/query API 10 requires matching unreleased artifacts; development
 0.9.0 must not overwrite the published ABI 14 release.
+
+Stateless recovery re-encodes every submitted input on each call. Consumers should use bounded
+source windows and a global consumed offset; full-suffix resubmission can be quadratic in submitted
+bytes when one input advances per call. Window sizing depends on source bytes and expected span
+density. Deferred boundary evaluation can repeat, so progress accounting does not measure native
+work avoided.

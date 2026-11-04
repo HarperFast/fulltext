@@ -9,6 +9,10 @@ and reported `analysisComplete: true`, `spansComplete: false`.
 
 ## Reproduce and read the results
 
+Measured base: [4dc89f3](https://github.com/HarperFast/fulltext/commit/4dc89f37d53e22ade232025b4179dfee9e979513)
+plus the uncommitted work/span early-exit changes. Use the raw source/native hashes
+and final verification row to identify the measured implementation.
+
 Build the production addon, then run:
 
 ```sh
@@ -31,12 +35,12 @@ checks and recovery bookkeeping. These are local observations, without a speedup
 
 | Case                       | Pages               | Split on incomplete | Singletons          |
 | -------------------------- | ------------------- | ------------------- | ------------------- |
-| easy-batch                 | 1 / 0.208 / 0.245   | 1 / 0.204 / 0.216   | 24 / 0.685 / 1.211  |
-| late-nonmatches            | 1 / 0.113 / 0.121   | 1 / 0.099 / 0.123   | 24 / 0.553 / 0.574  |
-| spans-600x3                | 3 / 0.888 / 0.934   | 5 / 1.463 / 1.733   | 3 / 0.620 / 0.688   |
-| singleton-1100             | 1 / 0.343 / 0.368   | 1 / 0.356 / 0.365   | 1 / 0.349 / 0.368   |
-| multivalue-unicode-boolean | 1 / 0.066 / 0.077   | 1 / 0.063 / 0.073   | 4 / 0.142 / 0.202   |
-| work-bound-late            | 2 / 33.812 / 34.432 | 3 / 58.000 / 70.432 | 4 / 32.379 / 33.090 |
+| easy-batch                 | 1 / 0.305 / 0.586   | 1 / 0.256 / 0.273   | 24 / 0.907 / 1.054  |
+| late-nonmatches            | 1 / 0.115 / 0.120   | 1 / 0.105 / 0.134   | 24 / 0.594 / 0.629  |
+| spans-600x3                | 3 / 0.924 / 1.047   | 5 / 1.469 / 1.968   | 3 / 0.696 / 0.794   |
+| singleton-1100             | 1 / 0.341 / 0.356   | 1 / 0.349 / 0.358   | 1 / 0.341 / 0.386   |
+| multivalue-unicode-boolean | 1 / 0.076 / 0.091   | 1 / 0.065 / 0.102   | 4 / 0.189 / 0.466   |
+| work-bound-late            | 2 / 32.920 / 33.303 | 3 / 55.503 / 56.066 | 4 / 30.780 / 31.193 |
 
 ## Submission and memory scope
 
@@ -50,7 +54,7 @@ Observed per run:
   consumer inputs measure progress. Native provisional analysis/reprocessing is
   unobservable and explicitly recorded as `null`.
 - Sampled resident set size (RSS) is whole-process memory, including retained inputs
-  and comparison outcomes. Within-policy sampled growth ranged from 0 to 1.52 MiB;
+  and comparison outcomes. Within-policy sampled growth ranged from 0 to 2.84 MiB;
   this does not measure isolated allocations or a per-request native memory peak.
 
 ## Open items
