@@ -4,9 +4,9 @@ Native Tantivy full-text indexing for Node.js.
 
 **Embedded search engine: Tantivy 0.27.0 · Wrapper version: 0.9.0.**
 The engine is compiled into the native addon; no separate Tantivy installation is required.
-This source requires matching ABI 16, query API 9 and telemetry API 1. Published 0.9.0 uses
-ABI 14/query API 8; published 0.8.0 uses ABI 13/query API 7. The new Boolean tracing contract
-requires newly built matching artifacts and is not part of the published 0.9.0 package.
+This source requires matching ABI 17, query API 10 and telemetry API 1. Published 0.9.0 uses
+ABI 14/query API 8; published 0.8.0 uses ABI 13/query API 7. The new Boolean tracing and recoverable highlighting contracts
+require newly built matching artifacts and are not part of the published 0.9.0 package.
 
 This repository is under active development. The native entry point provides a standalone Tantivy
 index backed by `MmapDirectory`. Applications own their source records and may reuse compatible
@@ -37,7 +37,7 @@ separate search server.
 | `fuzzy`                     | Match misspelled terms with configurable edits and transpositions.         | Eligibility and term limits apply; this is not arbitrary spelling correction.    |
 | `fuzzy-prefix` **preview**  | Combine final-term autocomplete with typo tolerance.                       | Requires `surfaceTerms: true`; catalog-scale qualification remains pending.      |
 | Boolean queries and filters | Combine text clauses, restrict candidate IDs, or filter declared metadata. | Filters narrow results without adding relevance scores.                          |
-| `boost` and `optional`      | Adjust scores per request while preserving required matches.               | Requires the matching query API 9 facade and native addon.                       |
+| `boost` and `optional`      | Adjust scores per request while preserving required matches.               | Requires the matching query API 10 facade and native addon.                      |
 | Ranked traversal            | Continue through a large result set in a retained snapshot.                | Use `searchPage()` with a read-only handle.                                      |
 | Highlighting and snippets   | Locate matches in current source values supplied by your application.      | Requires `surfaceTerms: true`; returns offsets and optional fragments, not HTML. |
 
@@ -508,7 +508,7 @@ optional branch; callers must authorize access to all of those fields. Defined `
 ignore these properties. Nested text leaves now reject legacy `operator` mode aliases other than
 `any` and `all`; use `mode: 'prefix'` instead of `operator: 'prefix'` inside `query`.
 The top-level request's legacy `operator: 'prefix'` alias remains supported. The scoring and structural
-properties listed above treat `undefined` as absent; this does not apply to a present `text` property. The current source requires a matching ABI 16 / query API 9 facade and addon.
+properties listed above treat `undefined` as absent; this does not apply to a present `text` property. The current source requires a matching ABI 17 / query API 10 facade and addon.
 
 ### Configurable query capacity
 
@@ -523,7 +523,7 @@ When constructing `NativeFullTextIndex` directly around a native handle, supply 
 in `searchLimits`; the constructor validates it but cannot inspect the native handle’s policy.
 Search requests cannot raise them. Apply the same policy to every worker serving a logical index;
 changing it requires reopening handles but no index rebuild. The facade and native addon must match
-ABI 16, query API 9, and packed protocol 8. The open frame retains its optional policy extension,
+ABI 17, query API 10, and packed protocol 8. The open frame retains its optional policy extension,
 with defaults when absent.
 
 The clause setting covers compiled text queries, including field multiplication and expansion.
@@ -674,6 +674,53 @@ reserves its needed retained-token count even if matching stops early. Exhaustio
 cannot satisfy NOT. A known matching OR branch can still provide spans. Membership is evaluated
 before positive spans consume the shared response/span budgets. Existing simple-clause trace
 frames and limits remain supported.
+
+### Recoverable highlight batches
+
+`traceMatchesPage(request, records, options)` adds record-boundary progress to source tracing;
+`traceMatches()` and its result remain unchanged. See the runnable
+[recoverable highlighting example](examples/recoverable-highlighting.mjs).
+
+```js
+const window = sourceRecords.slice(offset, offset + windowSize);
+const page = await index.traceMatchesPage(request, window, {
+	remainingBudgetMilliseconds: remainingRequestBudget,
+	snippets: true,
+});
+// Retain this successful page, then advance the global offset by page.nextRecord.
+```
+
+The result is `{ complete, records, nextRecord, states }`. `nextRecord` is an exclusive index
+into this call's input; `states.length === nextRecord`. Every consumed input has an ordered
+`{ id, membership, analysisComplete, spansComplete }` state, including nonmatches and candidate
+exclusions. Membership is `'match'`, `'no-match'` or `'unknown'`; unknown evidence never proves
+absence under NOT. Only proven matches appear in `records`; a matching NOT-only record can have
+empty `values`. Known membership can coexist with incomplete analysis.
+
+`complete` is true only when all input was consumed and all analysis and spans are complete.
+A later record that exhausts a shared work/span/response limit is deferred whole, without a state
+or output. Resume from `nextRecord` with the same query, candidates and source snapshot. An
+oversized first record is consumed once with bounded partial output or unknown membership, then
+the page stops. Every consumed incomplete state is terminal for this input: do not retry it hoping
+to recover omitted spans or analysis. There is no within-record continuation. A nonempty successful
+page always advances; an empty request returns zero progress after normal validation.
+
+Recovery is stateless: each call encodes and submits every supplied source value again. Repeatedly
+submitting the entire remaining suffix can produce quadratic submitted bytes when each call consumes
+only one record. Use bounded input windows sized for source bytes and expected match density;
+advance a global offset by `nextRecord` and refill the next window. Deferred boundary analysis can
+repeat, so progress does not imply zero native rework or a performance improvement.
+
+Consumers choose whether explicitly truncated spans are acceptable. An incomplete analysis must
+not be treated as a complete nonmatch or an authorization/visibility decision. Simple requests keep
+the existing per-value analysis limits; Boolean requests retain their additional per-record analysis,
+value and matching-work limits. Lower snippet fragment counts do not reduce native span work.
+
+Use one decreasing request budget across calls. Timeout, close or cancellation errors reject the
+current call without progress; keep earlier successful pages, stop the operation and do not retry
+the error. Native recovery holds no cross-call source state. Applications still own authorization,
+source loading/version checks, expiry and the policy for incomplete evidence. Harper integration is tracked in
+[Adopt recoverable full-text highlighting with per-record completeness](https://github.com/HarperFast/harper/issues/4016).
 
 ### Engine and application boundary
 
@@ -906,7 +953,7 @@ the handoff lock while renaming the native directory on Windows. The library doe
 lock directory. The parent must permit creating this directory, and `.fulltext-locks` must remain
 writable while indices are opened or reset; failures name the lock-directory path.
 
-This development source requires native ABI 16, query API 9, and packed protocol 8. Published 0.9.0 uses ABI 14/query API 8 and cannot load this facade. These source changes do not alter persisted index identity. The loader rejects older addon
+This development source requires native ABI 17, query API 10, and packed protocol 8. Published 0.9.0 uses ABI 14/query API 8 and cannot load this facade. These source changes do not alter persisted index identity. The loader rejects older addon
 binaries. Identity sidecar v6 remains compatible for text-only indexes, and v7 remains compatible
 for numeric/Boolean-only metadata. Indexes with string metadata use v8 for their new raw fast
 columns. Previously released string-metadata indexes must
@@ -946,7 +993,7 @@ const { packageVersion, tantivyVersion, nativeAbiVersion, queryApiVersion, telem
 console.log({ packageVersion, tantivyVersion });
 // { packageVersion: '0.9.0', tantivyVersion: '0.27.0' }
 console.log({ nativeAbiVersion, queryApiVersion, telemetryApiVersion });
-// { nativeAbiVersion: 16, queryApiVersion: 9, telemetryApiVersion: 1 }
+// { nativeAbiVersion: 17, queryApiVersion: 10, telemetryApiVersion: 1 }
 ```
 
 The package version and engine version are independent. Use `runtimeInfo()` when diagnosing an

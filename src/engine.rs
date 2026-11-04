@@ -423,6 +423,52 @@ pub struct TraceResult {
 	pub records: Vec<TraceRecordMatch>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceRecordState {
+	pub membership: Option<bool>,
+	pub analysis_complete: bool,
+	pub spans_complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TracePageResult {
+	pub trace: TraceResult,
+	pub next_record: usize,
+	pub states: Vec<TraceRecordState>,
+}
+
+struct TraceProgress {
+	recovery: bool,
+	states: Vec<TraceRecordState>,
+}
+
+impl TraceProgress {
+	fn new(recovery: bool) -> Self {
+		Self {
+			recovery,
+			states: Vec::new(),
+		}
+	}
+
+	fn defer(&self, exhausted: bool) -> bool {
+		self.recovery && exhausted && !self.states.is_empty()
+	}
+
+	fn consume(&mut self, state: TraceRecordState) {
+		if self.recovery {
+			self.states.push(state);
+		}
+	}
+
+	fn finish(self, trace: TraceResult) -> TracePageResult {
+		TracePageResult {
+			trace,
+			next_record: self.states.len(),
+			states: self.states,
+		}
+	}
+}
+
 struct TraceSource<'a> {
 	field: &'a str,
 	value_index: u32,
@@ -1175,10 +1221,29 @@ impl Engine {
 		records: &[TraceRecord],
 		deadline: Option<Instant>,
 	) -> Result<TraceResult> {
+		Ok(self.trace_matches_inner(request, records, deadline, false)?.trace)
+	}
+
+	pub fn trace_matches_page(
+		&self,
+		request: &SearchRequest,
+		records: &[TraceRecord],
+		deadline: Option<Instant>,
+	) -> Result<TracePageResult> {
+		self.trace_matches_inner(request, records, deadline, true)
+	}
+
+	fn trace_matches_inner(
+		&self,
+		request: &SearchRequest,
+		records: &[TraceRecord],
+		deadline: Option<Instant>,
+		recovery: bool,
+	) -> Result<TracePageResult> {
 		check_deadline(deadline)?;
 		crate::request_validation::validate_trace_admission(request, records)?;
 		let SearchExpression::Clause(clause) = &request.expression else {
-			return self.trace_expression(request, records, deadline);
+			return self.trace_expression(request, records, deadline, recovery);
 		};
 		let selected = self.selected_fields(&clause.fields)?;
 		self.require_surface_fields(&selected)?;
@@ -1187,16 +1252,17 @@ impl Engine {
 			.candidate_ids
 			.as_ref()
 			.map(|ids| ids.iter().map(String::as_str).collect::<HashSet<_>>());
-		if candidates.as_ref().is_some_and(HashSet::is_empty) {
-			return Ok(TraceResult {
+		if !recovery && candidates.as_ref().is_some_and(HashSet::is_empty) {
+			return Ok(TraceProgress::new(false).finish(TraceResult {
 				complete: true,
 				records: Vec::new(),
-			});
+			}));
 		}
 		let plan = self.trace_plan(clause)?;
 		let mut complete = true;
 		let mut remaining_spans = MAX_TRACE_SPANS;
-		let mut response_bytes = 3usize;
+		let mut response_bytes = 3usize + if recovery { 2 + records.len() } else { 0 };
+		let mut progress = TraceProgress::new(recovery);
 		let mut matched_records = Vec::new();
 		let mut analyzed_source_analyzer = self.index_analyzer.clone();
 		let mut surface_source_analyzer = self.surface_index_analyzer.clone();
@@ -1206,8 +1272,14 @@ impl Engine {
 				.as_ref()
 				.is_some_and(|candidates| !candidates.contains(record.id.as_str()))
 			{
+				progress.consume(TraceRecordState {
+					membership: Some(false),
+					analysis_complete: true,
+					spans_complete: true,
+				});
 				continue;
 			}
+			let mut shared_exhausted = false;
 			let mut pending_values = Vec::new();
 			let mut found = HashSet::new();
 			let mut record_span_budget = remaining_spans;
@@ -1232,6 +1304,7 @@ impl Engine {
 					)?;
 					record_truncated |= spans_truncated || analysis_truncated;
 					record_analysis_truncated |= analysis_truncated;
+					shared_exhausted |= spans_truncated;
 					found.extend(terms);
 					if spans.is_empty() {
 						continue;
@@ -1241,9 +1314,10 @@ impl Engine {
 				}
 			}
 			complete &= !record_analysis_truncated;
-			if plan.record_matches(&found) {
+			let matched = plan.record_matches(&found);
+			if matched {
 				complete &= !record_truncated;
-				if pending_values.is_empty() {
+				if !recovery && pending_values.is_empty() {
 					continue;
 				}
 				let record_header_bytes = 6usize.saturating_add(record.id.len());
@@ -1258,6 +1332,7 @@ impl Engine {
 					let byte_limited_spans = available.saturating_sub(value_header_bytes) / 8;
 					let keep = spans.len().min(remaining_spans).min(byte_limited_spans);
 					if keep < spans.len() {
+						shared_exhausted = true;
 						complete = false;
 					}
 					if keep == 0 {
@@ -1271,8 +1346,14 @@ impl Engine {
 					remaining_spans -= keep;
 					record_bytes = record_bytes.saturating_add(value_header_bytes + keep * 8);
 				}
-				if values.is_empty() {
+				if !recovery && values.is_empty() {
 					continue;
+				}
+				shared_exhausted |=
+					record_header_bytes + record_bytes > MAX_SEARCH_RESPONSE_BYTES.saturating_sub(response_bytes);
+				if progress.defer(shared_exhausted) {
+					complete = false;
+					break;
 				}
 				response_bytes = response_bytes.saturating_add(record_header_bytes + record_bytes);
 				matched_records.push(TraceRecordMatch {
@@ -1280,11 +1361,29 @@ impl Engine {
 					values,
 				});
 			}
+			let state = TraceRecordState {
+				membership: if matched {
+					Some(true)
+				} else if record_analysis_truncated {
+					None
+				} else {
+					Some(false)
+				},
+				analysis_complete: !record_analysis_truncated,
+				spans_complete: !record_analysis_truncated && (!matched || !shared_exhausted),
+			};
+			progress.consume(state);
+			if recovery && shared_exhausted && matched {
+				break;
+			}
 		}
-		Ok(TraceResult {
+		if recovery {
+			complete &= progress.states.len() == records.len();
+		}
+		Ok(progress.finish(TraceResult {
 			complete,
 			records: matched_records,
-		})
+		}))
 	}
 
 	fn prepare_trace_expression<'a>(
@@ -1352,7 +1451,8 @@ impl Engine {
 		request: &SearchRequest,
 		records: &[TraceRecord],
 		deadline: Option<Instant>,
-	) -> Result<TraceResult> {
+		recovery: bool,
+	) -> Result<TracePageResult> {
 		crate::protocol::validate_search_structure(&request.expression, self.max_query_clauses, self.fields.len())?;
 		let mut leaves = Vec::new();
 		let expression = self.prepare_trace_expression(
@@ -1371,7 +1471,8 @@ impl Engine {
 			records: Vec::new(),
 		};
 		let mut remaining_spans = MAX_TRACE_SPANS;
-		let mut remaining_bytes = MAX_SEARCH_RESPONSE_BYTES - 3;
+		let mut remaining_bytes = MAX_SEARCH_RESPONSE_BYTES - 3 - if recovery { 2 + records.len() } else { 0 };
+		let mut progress = TraceProgress::new(recovery);
 		let mut work = MAX_TRACE_WORK_TOKENS;
 		let surface_fields: HashSet<&str> = leaves
 			.iter()
@@ -1380,11 +1481,19 @@ impl Engine {
 			.collect();
 		let mut analyzed_analyzer = self.index_analyzer.clone();
 		let mut surface_analyzer = self.surface_index_analyzer.clone();
-		for record in records {
+		'records: for record in records {
 			check_deadline(deadline)?;
 			if candidates.as_ref().is_some_and(|ids| !ids.contains(record.id.as_str())) {
+				progress.consume(TraceRecordState {
+					membership: Some(false),
+					analysis_complete: true,
+					spans_complete: true,
+				});
 				continue;
 			}
+			let mut shared_exhausted = false;
+			let mut analysis_complete = true;
+			let mut spans_complete = true;
 			let mut sources = Vec::new();
 			let mut remaining_tokens = MAX_TRACE_EXPRESSION_TOKENS;
 			let mut missing_fields = HashSet::new();
@@ -1443,6 +1552,11 @@ impl Engine {
 					}
 					let cost = source.analyzed.len() + if leaf.needs_surface() { source.surface.len() } else { 0 };
 					if cost > work {
+						if progress.defer(true) {
+							result.complete = false;
+							break 'records;
+						}
+						shared_exhausted = true;
 						unknown = true;
 						continue;
 					}
@@ -1460,9 +1574,22 @@ impl Engine {
 					Some(false)
 				});
 				result.complete &= !unknown;
+				analysis_complete &= !unknown;
 			}
 			let decision = expression.evaluate(&membership);
+			if progress.defer(shared_exhausted) {
+				result.complete = false;
+				break;
+			}
 			if decision.matched != Some(true) {
+				progress.consume(TraceRecordState {
+					membership: decision.matched,
+					analysis_complete,
+					spans_complete: analysis_complete,
+				});
+				if recovery && shared_exhausted {
+					break;
+				}
 				continue;
 			}
 			let mut values = BTreeMap::<(&str, u32), BTreeSet<(u32, u32)>>::new();
@@ -1475,6 +1602,12 @@ impl Engine {
 					}
 					let cost = source.analyzed.len() + if leaf.needs_surface() { source.surface.len() } else { 0 };
 					if cost > work {
+						if progress.defer(true) {
+							result.complete = false;
+							break 'records;
+						}
+						shared_exhausted = true;
+						spans_complete = false;
 						result.complete = false;
 						continue;
 					}
@@ -1483,12 +1616,24 @@ impl Engine {
 					let candidate_spans = pending_spans + entry.len();
 					let (spans, _, truncated, _) =
 						self.trace_tokens(&leaf.plan, source, candidate_spans, deadline, false)?;
+					if truncated && progress.defer(true) {
+						result.complete = false;
+						break 'records;
+					}
 					result.complete &= !truncated;
+					shared_exhausted |= truncated;
+					spans_complete &= !truncated;
 					for span in spans {
 						if entry.contains(&(span.start, span.end)) {
 							continue;
 						}
 						if pending_spans == 0 {
+							if progress.defer(true) {
+								result.complete = false;
+								break 'records;
+							}
+							shared_exhausted = true;
+							spans_complete = false;
 							result.complete = false;
 							break;
 						}
@@ -1505,6 +1650,8 @@ impl Engine {
 					.len()
 					.min(remaining_bytes.saturating_sub(record_bytes + header) / 8);
 				if keep < spans.len() {
+					shared_exhausted = true;
+					spans_complete = false;
 					result.complete = false;
 				}
 				if keep == 0 {
@@ -1525,15 +1672,34 @@ impl Engine {
 			}
 			if record_bytes > remaining_bytes {
 				result.complete = false;
-				continue;
+				if !recovery {
+					continue;
+				}
+				shared_exhausted = true;
+				spans_complete = false;
 			}
-			remaining_bytes -= record_bytes;
+			if progress.defer(shared_exhausted) {
+				result.complete = false;
+				break;
+			}
+			remaining_bytes = remaining_bytes.saturating_sub(record_bytes);
 			result.records.push(TraceRecordMatch {
 				id: record.id.clone(),
 				values: matched_values,
 			});
+			progress.consume(TraceRecordState {
+				membership: Some(true),
+				analysis_complete,
+				spans_complete: spans_complete && analysis_complete,
+			});
+			if recovery && shared_exhausted {
+				break;
+			}
 		}
-		Ok(result)
+		if recovery {
+			result.complete &= progress.states.len() == records.len();
+		}
+		Ok(progress.finish(result))
 	}
 
 	fn trace_plan(&self, request: &SearchClause) -> Result<TracePlan> {
@@ -8041,5 +8207,346 @@ mod tests {
 			assert_eq!(count("pending-b"), 0);
 			assert_eq!(engine.committed_payload().unwrap().as_deref(), Some("published"));
 		}
+	}
+	fn recovery_request(expression: SearchExpression) -> SearchRequest {
+		SearchRequest {
+			sort: None,
+			aggregations: vec![],
+			expression,
+			candidate_ids: None,
+			filter: None,
+			offset: 0,
+			limit: 100,
+			exact_total: false,
+			budget_milliseconds: 30_000,
+			traversal: false,
+			after: None,
+		}
+	}
+
+	fn recovery_record(id: &str, values: Vec<String>) -> TraceRecord {
+		TraceRecord {
+			id: id.into(),
+			fields: vec![("description".into(), values)],
+		}
+	}
+
+	#[test]
+	fn recovery_pages_preserve_whole_records_and_legacy_partial_output() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		for boolean in [false, true] {
+			let leaf = expression("needle", SearchMode::Any, vec!["description".into()]);
+			let request = recovery_request(if boolean {
+				SearchExpression::And(vec![leaf])
+			} else {
+				leaf
+			});
+			let records: Vec<_> = (0..3)
+				.map(|i| recovery_record(&i.to_string(), vec!["needle ".repeat(600)]))
+				.collect();
+			let legacy = engine.trace_matches(&request, &records, None).unwrap();
+			assert!(!legacy.complete);
+			assert_eq!(
+				legacy
+					.records
+					.iter()
+					.flat_map(|r| &r.values)
+					.map(|v| v.spans.len())
+					.sum::<usize>(),
+				1024
+			);
+			for start in 0..3 {
+				let page = engine.trace_matches_page(&request, &records[start..], None).unwrap();
+				assert_eq!(page.next_record, 1);
+				assert_eq!(page.trace.complete, start == 2);
+				assert_eq!(
+					page.states,
+					[TraceRecordState {
+						membership: Some(true),
+						analysis_complete: true,
+						spans_complete: true
+					}]
+				);
+				assert_eq!(page.trace.records[0].id, start.to_string());
+				assert_eq!(page.trace.records[0].values[0].spans.len(), 600);
+			}
+			let oversized = engine
+				.trace_matches_page(
+					&request,
+					&[recovery_record("large", vec!["needle ".repeat(1100)])],
+					None,
+				)
+				.unwrap();
+			assert_eq!(oversized.next_record, 1);
+			assert_eq!(
+				oversized.states[0],
+				TraceRecordState {
+					membership: Some(true),
+					analysis_complete: true,
+					spans_complete: false
+				}
+			);
+			assert_eq!(oversized.trace.records[0].values[0].spans.len(), 1024);
+			assert!(!oversized.trace.complete);
+		}
+	}
+
+	#[test]
+	fn recovery_simple_preserves_value_limits_and_ordered_nonmatches() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let mut request = recovery_request(expression("needle", SearchMode::Any, vec!["description".into()]));
+		let mut values = vec!["stone".into(); 4096];
+		values.push("needle".into());
+		let records = [
+			recovery_record("excluded", vec!["needle".into()]),
+			recovery_record("absent", vec!["stone".into()]),
+			recovery_record("found", values),
+		];
+		request.candidate_ids = Some(vec!["absent".into(), "found".into()]);
+		let page = engine.trace_matches_page(&request, &records, None).unwrap();
+		assert_eq!(page.next_record, 3);
+		assert!(page.trace.complete);
+		assert_eq!(
+			page.states.iter().map(|s| s.membership).collect::<Vec<_>>(),
+			[Some(false), Some(false), Some(true)]
+		);
+		assert_eq!(page.trace, engine.trace_matches(&request, &records, None).unwrap());
+		assert_eq!(page.trace.records[0].values[0].value_index, 4096);
+		let empty = engine.trace_matches_page(&request, &[], None).unwrap();
+		assert!(empty.trace.complete);
+		assert_eq!(empty.next_record, 0);
+		assert!(empty.states.is_empty());
+		assert_eq!(
+			engine
+				.trace_matches_page(&request, &records, Some(Instant::now()))
+				.unwrap_err()
+				.code,
+			"E_TIMEOUT"
+		);
+	}
+
+	#[test]
+	fn recovery_boolean_preserves_unknown_not_and_known_or_proofs() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let missing = expression("needle", SearchMode::Any, vec!["description".into()]);
+		let records = [recovery_record(
+			"one",
+			vec!["x ".repeat(MAX_TRACE_TOKENS_PER_VALUE + 1), "marker".into()],
+		)];
+		let request = recovery_request(SearchExpression::Not(Box::new(missing.clone())));
+		let unknown = engine.trace_matches_page(&request, &records, None).unwrap();
+		assert_eq!(unknown.next_record, 1);
+		assert_eq!(unknown.states[0].membership, None);
+		assert!(!unknown.states[0].analysis_complete);
+		assert!(!unknown.states[0].spans_complete);
+		assert!(unknown.trace.records.is_empty());
+		let request = recovery_request(SearchExpression::Or(vec![
+			SearchExpression::Not(Box::new(missing)),
+			expression("marker", SearchMode::Any, vec!["description".into()]),
+		]));
+		let known = engine.trace_matches_page(&request, &records, None).unwrap();
+		assert_eq!(known.states[0].membership, Some(true));
+		assert!(!known.states[0].analysis_complete);
+		assert_eq!(known.trace.records.len(), 1);
+		let request = recovery_request(SearchExpression::Not(Box::new(expression(
+			"needle",
+			SearchMode::Any,
+			vec!["description".into()],
+		))));
+		let zero = engine
+			.trace_matches_page(&request, &[recovery_record("zero", vec!["stone".into()])], None)
+			.unwrap();
+		assert!(zero.trace.complete);
+		assert_eq!(zero.states[0].membership, Some(true));
+		assert!(zero.trace.records[0].values.is_empty());
+	}
+
+	#[test]
+	fn recovery_late_shared_work_exhaustion_defers_a_whole_nonmatch() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let request = recovery_request(SearchExpression::And(
+			(0..32)
+				.map(|_| expression("absent", SearchMode::Any, vec!["description".into()]))
+				.collect(),
+		));
+		let records: Vec<_> = (0..14)
+			.map(|i| recovery_record(&i.to_string(), vec!["x ".repeat(20_000)]))
+			.collect();
+		let page = engine.trace_matches_page(&request, &records, None).unwrap();
+		assert_eq!(page.next_record, MAX_TRACE_WORK_TOKENS / (32 * 20_000));
+		assert!(!page.trace.complete);
+		assert!(page
+			.states
+			.iter()
+			.all(|s| s.membership == Some(false) && s.analysis_complete));
+		let resumed = engine
+			.trace_matches_page(&request, &records[page.next_record..], None)
+			.unwrap();
+		assert!(resumed.trace.complete);
+		assert_eq!(resumed.next_record, records.len() - page.next_record);
+	}
+
+	#[test]
+	fn recovery_late_span_work_exhaustion_defers_a_whole_match() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let request = recovery_request(SearchExpression::Or(
+			(0..32)
+				.map(|_| expression("needle", SearchMode::Any, vec!["description".into()]))
+				.collect(),
+		));
+		let records: Vec<_> = (0..7)
+			.map(|i| recovery_record(&i.to_string(), vec![format!("needle {}", "x ".repeat(20_000))]))
+			.collect();
+		let page = engine.trace_matches_page(&request, &records, None).unwrap();
+		assert_eq!(page.next_record, 6);
+		assert_eq!(page.trace.records.len(), 6);
+		assert!(!page.trace.complete);
+		assert!(page
+			.states
+			.iter()
+			.all(|state| state.membership == Some(true) && state.analysis_complete && state.spans_complete));
+		let resumed = engine
+			.trace_matches_page(&request, &records[page.next_record..], None)
+			.unwrap();
+		assert_eq!(resumed.next_record, 1);
+		assert!(resumed.trace.complete);
+		assert_eq!(resumed.trace.records[0].id, "6");
+	}
+
+	#[test]
+	fn recovery_response_boundary_never_skips_a_later_large_record() {
+		let field = "f".repeat(9000);
+		let mut config = config();
+		config.identity.surface_terms = true;
+		config.identity.fields[1].name = field.clone();
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		for boolean in [false, true] {
+			let leaf = expression("needle", SearchMode::Any, vec![field.clone()]);
+			let request = recovery_request(if boolean {
+				SearchExpression::And(vec![leaf])
+			} else {
+				leaf
+			});
+			let record = |id: &str, count| TraceRecord {
+				id: id.into(),
+				fields: vec![(field.clone(), vec!["needle".into(); count])],
+			};
+			let records = [record("first", 500), record("boundary", 500), record("small", 1)];
+			let page = engine.trace_matches_page(&request, &records, None).unwrap();
+			assert_eq!(page.next_record, 1);
+			assert_eq!(page.trace.records.len(), 1);
+			assert!(page.states[0].spans_complete);
+			let resumed = engine.trace_matches_page(&request, &records[1..], None).unwrap();
+			assert!(resumed.trace.complete);
+			assert_eq!(resumed.next_record, 2);
+			let singleton = engine
+				.trace_matches_page(&request, &[record("large", 1000)], None)
+				.unwrap();
+			assert_eq!(singleton.next_record, 1);
+			assert!(!singleton.states[0].spans_complete);
+			assert!(singleton.states[0].analysis_complete);
+			let byte_size = 3
+				+ 2 + 1 + 6 + "large".len()
+				+ singleton.trace.records[0]
+					.values
+					.iter()
+					.map(|v| 10 + v.field.len() + v.spans.len() * 8)
+					.sum::<usize>();
+			assert!(byte_size <= MAX_SEARCH_RESPONSE_BYTES);
+		}
+	}
+	#[test]
+	fn recovery_simple_retains_per_value_analysis_and_exact_span_boundary() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let request = recovery_request(expression("needle", SearchMode::Prefix, vec!["description".into()]));
+		let records = [recovery_record(
+			"many",
+			vec!["x ".repeat(150_000), format!("{}needle", "x ".repeat(150_000))],
+		)];
+		let page = engine.trace_matches_page(&request, &records, None).unwrap();
+		assert!(page.trace.complete);
+		assert_eq!(page.trace, engine.trace_matches(&request, &records, None).unwrap());
+		assert_eq!(
+			page.states[0],
+			TraceRecordState {
+				membership: Some(true),
+				analysis_complete: true,
+				spans_complete: true
+			}
+		);
+		let request = recovery_request(expression("needle", SearchMode::Any, vec!["description".into()]));
+		let exact = engine
+			.trace_matches_page(
+				&request,
+				&[recovery_record("exact", vec!["needle ".repeat(MAX_TRACE_SPANS)])],
+				None,
+			)
+			.unwrap();
+		assert!(exact.trace.complete);
+		assert!(exact.states[0].spans_complete);
+		let source = format!("{}needle", "x ".repeat(MAX_TRACE_TOKENS_PER_VALUE));
+		let unknown = engine
+			.trace_matches_page(&request, &[recovery_record("unknown", vec![source])], None)
+			.unwrap();
+		assert_eq!(
+			unknown.states[0],
+			TraceRecordState {
+				membership: None,
+				analysis_complete: false,
+				spans_complete: false
+			}
+		);
+		assert_eq!(unknown.next_record, 1);
+		assert!(!unknown.trace.complete);
+		assert!(unknown.trace.records.is_empty());
+	}
+
+	#[test]
+	fn recovery_boolean_first_work_exhaustion_and_value_limit_are_terminal() {
+		let mut config = config();
+		config.identity.surface_terms = true;
+		let engine = Engine::open(RamDirectory::create(), &config).unwrap();
+		let request = recovery_request(SearchExpression::Or(
+			(0..33)
+				.map(|_| expression("absent", SearchMode::Any, vec!["description".into()]))
+				.collect(),
+		));
+		let page = engine
+			.trace_matches_page(
+				&request,
+				&[recovery_record("large", vec!["x ".repeat(MAX_TRACE_TOKENS_PER_VALUE)])],
+				None,
+			)
+			.unwrap();
+		assert_eq!(page.next_record, 1);
+		assert_eq!(page.states[0].membership, None);
+		assert!(!page.states[0].analysis_complete);
+		assert!(!page.trace.complete);
+		let request = recovery_request(SearchExpression::Not(Box::new(expression(
+			"needle",
+			SearchMode::Any,
+			vec!["description".into()],
+		))));
+		let mut values = vec!["stone".into(); MAX_TRACE_EXPRESSION_VALUES];
+		values.push("needle".into());
+		let page = engine
+			.trace_matches_page(&request, &[recovery_record("values", values)], None)
+			.unwrap();
+		assert_eq!(page.next_record, 1);
+		assert_eq!(page.states[0].membership, None);
+		assert!(!page.states[0].analysis_complete);
+		assert!(page.trace.records.is_empty());
 	}
 }

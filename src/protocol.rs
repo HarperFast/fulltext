@@ -437,6 +437,7 @@ pub struct TraceRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TraceRequest {
+	pub recovery: bool,
 	pub search: SearchRequest,
 	pub records: Vec<TraceRecord>,
 }
@@ -1333,7 +1334,9 @@ fn decode_search_expression(
 }
 
 fn trace_magic(bytes: &[u8]) -> [u8; 4] {
-	if bytes.starts_with(b"FTBT") {
+	if bytes.starts_with(b"FTBR") {
+		*b"FTBR"
+	} else if bytes.starts_with(b"FTBT") {
 		*b"FTBT"
 	} else {
 		*b"FTTM"
@@ -1341,7 +1344,8 @@ fn trace_magic(bytes: &[u8]) -> [u8; 4] {
 }
 
 pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
-	let boolean = bytes.starts_with(b"FTBT");
+	let recovery = bytes.starts_with(b"FTBR");
+	let boolean = recovery || bytes.starts_with(b"FTBT");
 	let mut cursor = Cursor::new(bytes, trace_magic(bytes))?;
 	let expression = if boolean {
 		let mut structure = SearchStructureBudget::new(MAX_CONFIGURED_QUERY_CLAUSES, MAX_FIELDS)?;
@@ -1430,6 +1434,7 @@ pub fn decode_trace(bytes: &[u8]) -> Result<TraceRequest> {
 		)));
 	}
 	let request = TraceRequest {
+		recovery,
 		search: SearchRequest {
 			sort: None,
 			aggregations: Vec::new(),
@@ -2138,6 +2143,26 @@ mod tests {
 		assert!(decode_trace(&deep).is_err());
 		frame[4] = 9;
 		assert!(validate_trace_header(&frame).is_err());
+	}
+
+	#[test]
+	fn recovery_trace_frame_reuses_boolean_encoding_and_guards() {
+		let mut frame = b"FTBR\x08\x00".to_vec();
+		frame.extend_from_slice(&[0]);
+		frame.extend_from_slice(&0u32.to_le_bytes());
+		frame.extend_from_slice(&[0, 1, 1, 0, 0]);
+		frame.extend_from_slice(&[0; 3]);
+		frame.extend_from_slice(&100u32.to_le_bytes());
+		let request = decode_trace(&frame).unwrap();
+		assert!(request.recovery);
+		assert!(matches!(request.search.expression, SearchExpression::Clause(_)));
+		validate_trace_header(&frame).unwrap();
+		assert_eq!(trace_budget(&frame).unwrap(), 100);
+		for length in 0..frame.len() {
+			assert!(decode_trace(&frame[..length]).is_err());
+		}
+		frame.push(0);
+		assert!(decode_trace(&frame).is_err());
 	}
 
 	#[test]

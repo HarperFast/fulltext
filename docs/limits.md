@@ -362,7 +362,7 @@ and cannot be negative zero. `SearchExpression` no longer implements `Eq` becaus
 float32 boosts; use its `PartialEq` implementation for comparisons and remove `Eq` derives from
 containing types that require it.
 
-This development facade and addon use packed protocol 8, native ABI 16, query API 9 and telemetry API 1. Published 0.9.0 uses ABI 14/query API 8 and does not include Boolean tracing.
+This development facade and addon use packed protocol 8, native ABI 17, query API 10 and telemetry API 1. Published 0.9.0 uses ABI 14/query API 8 and does not include Boolean tracing.
 
 ## Source reference
 
@@ -482,3 +482,37 @@ ASCII token-run/selected-field estimates exceeding default bounds, and non-ASCII
 admission without analyzing on the event loop. Default-policy classification is unchanged. The
 query-capacity qualification driver reports process CPU, sampled RSS, latency and recovery at
 1/4/8 callers; this is not a production service objective or sustained-memory qualification.
+
+## Recoverable source tracing
+
+`traceMatchesPage()` preserves the existing source, token, span, response, queue and deadline
+limits. It reports a consumed prefix through `nextRecord` and one ordered state per consumed
+input: membership (`match`, `no-match`, `unknown`), `analysisComplete` and `spansComplete`.
+Missing output is not a progress signal; completed nonmatches and candidate exclusions advance.
+
+Shared-limit exhaustion on a later record defers the entire record. Keep earlier output and advance
+a global input offset by `nextRecord`. Submit a bounded window from that offset, sized for source
+bytes and expected match density rather than always submitting the entire remaining suffix. If the first record itself exceeds a limit, it is
+consumed once with explicit terminal incomplete status and the page stops. Record-local analysis
+limits are terminal too. Neither splitting nor repeated singleton calls can recover all spans from
+a record exceeding the span ceiling. The API provides no within-record continuation or reason enums.
+
+Each call serializes and submits all supplied source text again; consuming one record per call
+while resubmitting the full suffix can produce quadratic submitted bytes. Bounded windows limit
+this repeated submission. Native boundary analysis can also repeat; processed-prefix progress is
+not a zero-rework guarantee. Respect source byte/count limits even when selecting small windows.
+
+Simple-clause recovery preserves legacy per-value limits and does not add the Boolean per-record
+value cap. Boolean recovery retains conservative three-valued membership and its existing shared
+work and per-record retained-analysis/value limits. Unknown absence cannot satisfy NOT; known
+OR evidence may return spans despite incomplete analysis. `complete` requires every input consumed
+and every consumed state's analysis and spans complete.
+
+Count successful pages against the original request budget and stop on typed timeout, close or
+cancellation errors. A rejected call contributes no progress; earlier accepted pages remain usable.
+No error retry or hard native interruption guarantee is implied. An application may permit bounded
+partial spans while failing closed for incomplete match analysis; document that policy explicitly.
+
+This source requires ABI 17/query API 10 with matching facade/platform artifacts. Development
+version 0.9.0 is not permission to replace published 0.9.0 (ABI 14/query API 8). Choose an unused
+synchronized release version before publication; persisted index identity is unchanged.

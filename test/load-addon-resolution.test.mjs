@@ -88,7 +88,7 @@ function createFixture(context, options) {
 				? "throw new Error('fixture load failure');\n"
 				: `module.exports = {
 					source: 'platform',
-						runtimeInfo() { return { packageVersion: ${JSON.stringify(options.nativeVersion)}, nativeAbiVersion: 16, telemetryApiVersion: ${options.telemetryVersion ?? 1}, queryApiVersion: ${options.queryVersion ?? 9}, storageBackends: ['native'] }; },
+						runtimeInfo() { return { packageVersion: ${JSON.stringify(options.nativeVersion)}, nativeAbiVersion: 17, telemetryApiVersion: ${options.telemetryVersion ?? 1}, queryApiVersion: ${options.queryVersion ?? 10}, storageBackends: ['native'] }; },
 						${options.omitTelemetrySymbol === '__nativeCreateTelemetry' ? '' : '__nativeCreateTelemetry() {},'} ${options.omitTelemetrySymbol === '__nativeTelemetry' ? '' : '__nativeTelemetry() {},'} ${options.omitTelemetrySymbol === '__nativeConfigureTelemetry' ? '' : '__nativeConfigureTelemetry() {},'} __nativeInspect() {}, __nativeValidateOpen() {}, __nativeConfigureRuntime() {}, __nativeReset() {}, __nativeOpenReader() {}
 				};\n`,
 		);

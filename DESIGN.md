@@ -19,3 +19,5 @@
 - [Observability comparisons](benchmarks/DESIGN.md#observability-comparisons) — validation-excluded timing windows, staggered collection, and failure evidence.
 
 - [Boolean source tracing](src/DESIGN.md#boolean-source-tracing) — bounded shared analysis and conservative negated evidence.
+
+- [Recoverable source tracing](src/DESIGN.md#recoverable-source-tracing) — atomic record-prefix progress, terminal incomplete evidence and consumer-owned deadlines.

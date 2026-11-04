@@ -438,6 +438,7 @@ export interface PackedSearchRequest {
 }
 
 export type PackedTraceRequest = (PackedSearchClause | { expression: PackedSearchExpression }) & {
+	recoverable?: boolean;
 	candidateIds?: string[];
 	records: Array<{ id: string; fields: Array<{ name: string; values: string[] }> }>;
 	budgetMilliseconds: number;
@@ -913,8 +914,8 @@ export function encodeTrace(request: PackedTraceRequest): Buffer {
 	for (const record of request.records) validateRecordId(record.id);
 	const writer = new ByteWriter(maxSearchRequestBytes, 'E_INVALID_ARGUMENT');
 	const expression = 'expression' in request ? request.expression : request;
-	if ('operator' in expression) {
-		writer.header('FTBT');
+	if (request.recoverable || 'operator' in expression) {
+		writer.header(request.recoverable ? 'FTBR' : 'FTBT');
 		encodeSearchExpression(writer, expression, 0);
 	} else {
 		writer.header('FTTM');
@@ -960,6 +961,56 @@ function validateRecordId(id: string): void {
 			`record IDs must be non-empty, well-formed UTF-16, and at most ${maxRecordIdBytes} UTF-8 bytes`,
 		);
 	}
+}
+
+export interface TraceRecordState {
+	id: string;
+	membership: 'match' | 'no-match' | 'unknown';
+	analysisComplete: boolean;
+	spansComplete: boolean;
+}
+
+export function decodeTraceProgress(
+	cursor: Cursor,
+	inputIds: readonly string[],
+	matchedIds: readonly string[],
+	complete: boolean,
+): { nextRecord: number; states: TraceRecordState[] } {
+	const invalid = () => new FulltextError('E_NATIVE_FAILURE', 'invalid native trace progress');
+	if (cursor.remaining() < 2) throw invalid();
+	const nextRecord = cursor.u16();
+	if (cursor.remaining() !== nextRecord) throw invalid();
+	if (nextRecord > inputIds.length || (inputIds.length > 0 && nextRecord === 0)) throw invalid();
+	let matched = 0;
+	const states = Array.from({ length: nextRecord }, (_, index): TraceRecordState => {
+		const flags = cursor.u8();
+		const membership = flags & 3;
+		const analysisComplete = (flags & 4) !== 0;
+		const spansComplete = (flags & 8) !== 0;
+		if (
+			(flags & 0xf0) !== 0 ||
+			membership === 3 ||
+			(membership === 2 && analysisComplete) ||
+			(spansComplete && !analysisComplete)
+		)
+			throw invalid();
+		const id = inputIds[index];
+		if (membership === 1 && matchedIds[matched++] !== id) throw invalid();
+		return {
+			id,
+			membership: membership === 1 ? 'match' : membership === 0 ? 'no-match' : 'unknown',
+			analysisComplete,
+			spansComplete,
+		};
+	});
+	if (
+		matched !== matchedIds.length ||
+		(complete &&
+			(nextRecord !== inputIds.length || states.some((state) => !state.analysisComplete || !state.spansComplete)))
+	)
+		throw invalid();
+	cursor.finish();
+	return { nextRecord, states };
 }
 
 export function decodeResponse(value: Buffer): Cursor {
