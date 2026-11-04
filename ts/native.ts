@@ -13,6 +13,8 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { FulltextError, normalizeNativeError } from './errors.js';
 import {
 	decodeResponse,
+	decodeTraceProgress,
+	type TraceRecordState,
 	encodeBatch,
 	encodeBatchPartitions,
 	encodeInspect,
@@ -33,6 +35,7 @@ import {
 	encodeTrace,
 	MutationBatchFrameCursor,
 } from './codec.js';
+export type { TraceRecordState } from './codec.js';
 import { invoke } from './invoke.js';
 import { loadAddon } from './load-addon.js';
 import { PublicationState } from './publication.js';
@@ -71,7 +74,7 @@ export interface RuntimeInfo {
 	packageVersion: string;
 	tantivyVersion: string;
 	nativeAbiVersion: number;
-	queryApiVersion: 9;
+	queryApiVersion: 10;
 	queryClassIsolationMinimumSearchThreads: 2;
 	lifecycleApiVersion: 1;
 	mutationBatchApiVersion: 5;
@@ -348,6 +351,11 @@ export interface TraceValueMatch {
 export interface TraceMatchesResult {
 	complete: boolean;
 	records: Array<{ id: string; values: TraceValueMatch[] }>;
+}
+
+export interface TraceMatchesPageResult extends TraceMatchesResult {
+	nextRecord: number;
+	states: TraceRecordState[];
 }
 
 export interface TraceMatchesOptions extends SearchExecutionOptions {
@@ -885,11 +893,40 @@ export class NativeFullTextIndex {
 		}
 	}
 
-	async traceMatches(
+	traceMatches(
 		request: TraceSearchRequest,
 		records: TraceRecord[],
 		options: TraceMatchesOptions = {},
 	): Promise<TraceMatchesResult> {
+		return this.#traceMatches(request, records, options, false);
+	}
+
+	traceMatchesPage(
+		request: TraceSearchRequest,
+		records: TraceRecord[],
+		options: TraceMatchesOptions = {},
+	): Promise<TraceMatchesPageResult> {
+		return this.#traceMatches(request, records, options, true);
+	}
+
+	#traceMatches(
+		request: TraceSearchRequest,
+		records: TraceRecord[],
+		options: TraceMatchesOptions,
+		recoverable: true,
+	): Promise<TraceMatchesPageResult>;
+	#traceMatches(
+		request: TraceSearchRequest,
+		records: TraceRecord[],
+		options: TraceMatchesOptions,
+		recoverable: false,
+	): Promise<TraceMatchesResult>;
+	async #traceMatches(
+		request: TraceSearchRequest,
+		records: TraceRecord[],
+		options: TraceMatchesOptions,
+		recoverable: boolean,
+	): Promise<TraceMatchesResult | TraceMatchesPageResult> {
 		let nativeStarted = false;
 		try {
 			this.#assertPreparationOpen();
@@ -945,6 +982,7 @@ export class NativeFullTextIndex {
 			}
 			const frame = encodeTrace({
 				expression,
+				recoverable,
 				candidateIds: request.candidateIds,
 				records: packedRecords,
 				budgetMilliseconds: searchBudget(options.remainingBudgetMilliseconds),
@@ -954,8 +992,13 @@ export class NativeFullTextIndex {
 				nativeStarted = true;
 				loadAddon().__nativeTraceMatches(this.#handle, frame, callback);
 			});
-			const complete = cursor.u8() === 1;
+			const completeFlag = cursor.u8();
+			if (recoverable && completeFlag > 1)
+				throw new FulltextError('E_NATIVE_FAILURE', 'invalid native trace completeness');
+			const complete = completeFlag === 1;
 			const recordCount = cursor.u16();
+			if (recoverable && recordCount > packedRecords.length)
+				throw new FulltextError('E_NATIVE_FAILURE', 'invalid native trace record count');
 			const matched = Array.from({ length: recordCount }, () => {
 				const id = cursor.string();
 				const valueCount = cursor.u16();
@@ -976,6 +1019,15 @@ export class NativeFullTextIndex {
 				});
 				return { id, values };
 			});
+			if (recoverable) {
+				const progress = decodeTraceProgress(
+					cursor,
+					packedRecords.map(({ id }) => id),
+					matched.map(({ id }) => id),
+					complete,
+				);
+				return { complete, records: matched, ...progress };
+			}
 			cursor.finish();
 			return { complete, records: matched };
 		} catch (error) {
@@ -1126,6 +1178,14 @@ export class NativeFullTextReader {
 		options: TraceMatchesOptions = {},
 	): Promise<TraceMatchesResult> {
 		return this.#inner.traceMatches(request, records, options);
+	}
+
+	traceMatchesPage(
+		request: TraceSearchRequest,
+		records: TraceRecord[],
+		options: TraceMatchesOptions = {},
+	): Promise<TraceMatchesPageResult> {
+		return this.#inner.traceMatchesPage(request, records, options);
 	}
 
 	status(): FullTextStatus {
@@ -1401,7 +1461,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
 			packageVersion: info.packageVersion,
 			tantivyVersion: info.tantivyVersion,
 			nativeAbiVersion: info.nativeAbiVersion,
-			queryApiVersion: info.queryApiVersion as 9,
+			queryApiVersion: info.queryApiVersion as 10,
 			queryClassIsolationMinimumSearchThreads: info.queryClassIsolationMinimumSearchThreads as 2,
 			lifecycleApiVersion: 1,
 			mutationBatchApiVersion: 5,

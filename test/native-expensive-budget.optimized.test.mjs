@@ -9,7 +9,18 @@ import { encodeOpen } from '../dist/codec.js';
 import { invoke } from '../dist/invoke.js';
 import { loadAddon } from '../dist/load-addon.js';
 
-for (const scenario of ['phrase', 'traversal', 'exists', 'missing', 'not', 'sort', 'stats', 'terms', 'histogram']) {
+for (const scenario of [
+	'phrase',
+	'traversal',
+	'exists',
+	'missing',
+	'not',
+	'sort',
+	'stats',
+	'terms',
+	'histogram',
+	'trace-page',
+]) {
 	test(`optimized ${scenario} searches preserve ordinary capacity and close queued expensive work`, async (context) => {
 		const indexPath = mkdtempSync(path.join(tmpdir(), 'fulltext-optimized-permit-'));
 		context.after(() => rmSync(indexPath, { recursive: true, force: true }));
@@ -61,6 +72,12 @@ for (const scenario of ['phrase', 'traversal', 'exists', 'missing', 'not', 'sort
 		});
 		const searchExpensive = (executionOptions = {}) => {
 			if (scenario === 'traversal') return index.searchPage({ text: 'trai', mode: 'fuzzy-prefix' }, executionOptions);
+			if (scenario === 'trace-page')
+				return index.traceMatchesPage(
+					{ text: 'trail' },
+					['one', 'two'].map((id) => ({ id, fields: { title: 'trail running' } })),
+					executionOptions,
+				);
 			const request = { text: 'trail running' };
 			if (scenario === 'phrase') request.mode = 'phrase';
 			if (scenario === 'exists') request.filter = { field: 'price', comparator: 'exists' };
@@ -113,8 +130,24 @@ for (const scenario of ['phrase', 'traversal', 'exists', 'missing', 'not', 'sort
 			]),
 			'timeout',
 		);
-		assert.strictEqual((await first).total, 2);
-		assert.strictEqual((await long).total, 2);
+		const firstResult = await first;
+		const longResult = await long;
+		assert.strictEqual(
+			scenario === 'trace-page'
+				? firstResult.states.filter(({ membership }) => membership === 'match').length
+				: firstResult.total,
+			2,
+		);
+		assert.strictEqual(
+			scenario === 'trace-page'
+				? longResult.states.filter(({ membership }) => membership === 'match').length
+				: longResult.total,
+			2,
+		);
+		if (scenario === 'trace-page') {
+			addon.__testDelayNextExpensiveSearch(handle, 30);
+			await assert.rejects(searchExpensive({ remainingBudgetMilliseconds: 10 }), { code: 'E_TIMEOUT' });
+		}
 		const resumed = await index.searchPage({
 			text: 'trai',
 			mode: 'fuzzy-prefix',

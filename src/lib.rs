@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "test-panic")]
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const NATIVE_ABI_VERSION: u32 = 16;
+pub const NATIVE_ABI_VERSION: u32 = 17;
 pub const TANTIVY_VERSION: &str = "0.27.0";
 
 #[cfg(feature = "node-api")]
@@ -89,7 +89,7 @@ pub fn runtime_info() -> boundary::Result<RuntimeInfo> {
 		package_version: env!("CARGO_PKG_VERSION").to_owned(),
 		tantivy_version: TANTIVY_VERSION.to_owned(),
 		native_abi_version: NATIVE_ABI_VERSION,
-		query_api_version: 9,
+		query_api_version: 10,
 		telemetry_api_version: 1,
 		query_class_isolation_minimum_search_threads: 2,
 		storage_backends: vec!["native".to_owned()],

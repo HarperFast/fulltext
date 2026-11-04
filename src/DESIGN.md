@@ -51,7 +51,7 @@ and its UTF-16 spans independently of indexed stems.
 `QueryOptions` resolves fuzzy distance 0–2/default 1 and transpositions default true per leaf.
 The facade rejects supplied fuzzy controls on Boolean groups before reading their children;
 controls belong to text leaves and are never inherited.
-Protocol 8 encodes u8/bool after each mode; ABI 16/query API 9 require a matching facade. Options
+Protocol 8 encodes u8/bool after each mode; ABI 17/query API 10 require a matching facade. Options
 are absent from persisted identity and included in continuation digests. Nondefault fuzzy traces
 lazily use requested native automata on the existing analyzed/surface branches, sharing a matcher
 when query terms are identical. Distance zero uses equality/prefix checks without a DFA. Current-source
@@ -227,7 +227,7 @@ aggregation children map directly to native `sub_aggregation` trees. Resource ad
 for collector construction and possible parent instances before collection. Histogram parents use
 position spans, with native query-scoped probes when conservative admission fails. Histogram safety
 checks require ancestor presence, so non-contributing documents cannot reject descendants. Independent depth
-checks protect each recursive wire/API walker. Current packed protocol 8, query API 9 and ABI 16
+checks protect each recursive wire/API walker. Current packed protocol 8, query API 10 and ABI 17
 include metadata, query-capacity open support and per-leaf matching controls. Neither change alters persisted identity v8.
 
 Sorted snapshot continuation and metadata-derived score adjustment remain outside this
@@ -281,7 +281,7 @@ Raised-policy admission compares maximum per-leaf term cost and summed compiled-
 Raised-policy admission estimates ordinary ASCII queries using ASCII alphanumeric runs and selected fields;
 non-ASCII input conservatively uses the expensive lane because normalization can expand text.
 Default-policy classification is unchanged. The optimized two-handle regression pins ordinary
-isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 16
+isolation and shared expensive permits. The optional open-frame extension preserves its two-value layout; current protocol 8 and ABI 17
 require a matching facade/addon.
 
 The open-policy extension is exactly two u32 values; absent means default policy and a truncated or
@@ -304,7 +304,7 @@ block-max rounding bound; the underlying two-term and cross-segment bounds remai
 
 Every nested boost, including one over an Any/All leaf, remains wrapped in native BoostQuery. This preserves outer-first float32 multiplication: folding an inner boost into a field weight can change rounding or overflow before an enclosing zero boost reaches it. Native-reference regressions cover fractional weights and a finite large field weight with an outer zero boost. Other root modes and composite subtrees also remain wrapped in native BoostQuery. At the root, that wrapper uses Tantivy's generic pruning iterator rather than the specialized Boolean block-WAND paths; optional required-All composition also incurs scoring work beyond the required-only intersection. The paired optimized workload in benchmarks/query-scoring.mjs compares total request costs. Its varied-score mode rules out boundary-tie reruns for the OR/AND pairs; it does not isolate pruning overhead or count skipped blocks. Recheck topology, score bits and these comparisons when upgrading Tantivy; the measurements do not establish a catalog-scale latency guarantee.
 
-Negative-zero boosts reject before execution. Direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts with native ABI 16 and query API 9. Persisted identity is unchanged.
+Negative-zero boosts reject before execution. Direct Rust/wire parity and scorer-bit regressions plus query-scoring.test.mjs enforce these contracts with native ABI 17 and query API 10. Persisted identity is unchanged.
 
 ## Lifecycle state identity
 
@@ -340,7 +340,7 @@ AND(false, unknown) is false, and NOT(unknown) is unknown. `boolean-tracing.test
 truncation, positive-branch selection, and analyzed-only fuzzy evidence under negation.
 `trace_expression` owns shared per-record source tokens and bounds aggregate matching work;
 negative membership never spends highlight spans. Simple leaves retain the FTTM layout and
-existing evaluator; Boolean trees use FTBT, guarded by query API 9 / ABI 16.
+existing evaluator; Boolean trees use FTBT, guarded by query API 10 / ABI 17.
 
 ### Tantivy and application ownership
 
@@ -387,3 +387,27 @@ must select complete source records themselves.
 Cross-leaf duplicates must not spend the shared span budget. Each value's leaf allowance includes its already retained spans before existing cross-leaf deduplication charges new spans. That sum stays within the 1,024-span ceiling. The overlapping-leaf regressions in `boolean-tracing.test.mjs` exercise exact capacity, over-cap unions and independent values. Clauses beneath NOT still contribute no spans, including nested NOT; the evaluator determines that without a redundant leaf flag.
 
 Facade caller exceptions retain their identity until native submission; native/response failures are normalized afterward. Empty-candidate requests retain query preparation validation rather than bypassing invalid fields or analyzer-dependent constraints.
+
+## Recoverable source tracing
+
+`traceMatchesPage` adds consumed-prefix accounting while retaining both evaluators: simple
+requests use legacy per-value analysis without Boolean retained-value caps; Boolean requests keep
+shared analysis and three-valued membership. Legacy `traceMatches` results and frames stay unchanged.
+
+Recovery commits record output, status and budgets atomically. A shared-budget boundary after
+accepted input defers the whole record; first-input exhaustion consumes bounded partial/unknown
+evidence once and stops. Record-local analysis exhaustion is terminal. Every consumed input,
+including candidate exclusions and nonmatches, contributes one state. Consumed incomplete states
+cannot be resumed within the record. No successful nonempty page may have zero progress.
+
+The recovery response appends a u16 consumed count and one index-implicit status byte per consumed
+input to the existing trace body. Bits 0–1 encode no-match/match/unknown (3 invalid), bit 2 marks
+complete analysis and bit 3 complete spans; upper bits are reserved. Reserve `2 + input_count`
+bytes before span admission. The facade attaches IDs from the prepared input prefix and validates
+counts, flags and output membership. No reason strings or retained cross-call cursor are needed.
+
+Timeout/close/cancellation rejects the current call without progress, including failures after
+native evaluation. Prior accepted pages remain consumer-owned. The example carries one decreasing
+budget and stops on errors. Applications own source identity/version/expiry, authorization and
+partial-highlight policy. ABI 17/query API 10 requires matching unreleased artifacts; development
+0.9.0 must not overwrite the published ABI 14 release.

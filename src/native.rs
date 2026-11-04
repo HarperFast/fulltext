@@ -19,7 +19,8 @@ use tantivy::{IndexReader, Searcher};
 
 use crate::boundary;
 use crate::engine::{
-	persisted_index_id, Engine, InspectionResult, SearchResult, TotalRelation, TraceResult, Writer, IDENTITY_PATH,
+	persisted_index_id, Engine, InspectionResult, SearchResult, TotalRelation, TracePageResult, TraceResult, Writer,
+	IDENTITY_PATH,
 };
 use crate::error::{FulltextError, Result};
 use crate::protocol::{
@@ -2675,11 +2676,24 @@ fn execute_search_command(
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
 				}
-				let result = engine.trace_matches(&request.search, &request.records, Some(deadline))?;
+				let result = if request.recovery {
+					engine.trace_matches_page(&request.search, &request.records, Some(deadline))?
+				} else {
+					TracePageResult {
+						trace: engine.trace_matches(&request.search, &request.records, Some(deadline))?,
+						next_record: 0,
+						states: Vec::new(),
+					}
+				};
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
 				}
-				let response = success_envelope(trace_body(result));
+				let body = if request.recovery {
+					trace_page_body(result)
+				} else {
+					trace_body(result.trace)
+				};
+				let response = success_envelope(body);
 				if Instant::now() >= deadline {
 					return Err(search_timeout());
 				}
@@ -3636,6 +3650,20 @@ fn trace_body(result: TraceResult) -> Vec<u8> {
 	bytes
 }
 
+fn trace_page_body(result: TracePageResult) -> Vec<u8> {
+	let mut bytes = trace_body(result.trace);
+	bytes.extend_from_slice(&(result.next_record as u16).to_le_bytes());
+	for state in result.states {
+		let membership = match state.membership {
+			Some(false) => 0,
+			Some(true) => 1,
+			None => 2,
+		};
+		bytes.push(membership | ((state.analysis_complete as u8) << 2) | ((state.spans_complete as u8) << 3));
+	}
+	bytes
+}
+
 fn push_string(bytes: &mut Vec<u8>, value: &str) {
 	bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
 	bytes.extend_from_slice(value.as_bytes());
@@ -3668,6 +3696,53 @@ fn storage_error(error: impl std::fmt::Display) -> FulltextError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn trace_legacy_body_golden_and_recovery_status_suffix() {
+		use crate::engine::{TraceRecordMatch, TraceRecordState, TraceSpan, TraceValueMatch};
+		let trace = TraceResult {
+			complete: true,
+			records: vec![TraceRecordMatch {
+				id: "r".into(),
+				values: vec![TraceValueMatch {
+					field: "f".into(),
+					value_index: 2,
+					spans: vec![TraceSpan { start: 3, end: 5 }],
+				}],
+			}],
+		};
+		let expected = vec![
+			1, 1, 0, 1, 0, 0, 0, b'r', 1, 0, 1, 0, 0, 0, b'f', 2, 0, 0, 0, 1, 0, 3, 0, 0, 0, 5, 0, 0, 0,
+		];
+		assert_eq!(trace_body(trace.clone()), expected);
+		let states = vec![
+			TraceRecordState {
+				membership: Some(false),
+				analysis_complete: true,
+				spans_complete: true,
+			},
+			TraceRecordState {
+				membership: Some(true),
+				analysis_complete: true,
+				spans_complete: false,
+			},
+			TraceRecordState {
+				membership: None,
+				analysis_complete: false,
+				spans_complete: false,
+			},
+		];
+		let mut page_expected = expected;
+		page_expected.extend_from_slice(&[3, 0, 12, 5, 2]);
+		assert_eq!(
+			trace_page_body(TracePageResult {
+				trace,
+				next_record: 3,
+				states
+			}),
+			page_expected
+		);
+	}
 
 	fn telemetry_runtime_fixture() -> Arc<Runtime> {
 		let metrics = Metrics::new();
