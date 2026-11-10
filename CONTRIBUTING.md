@@ -33,15 +33,6 @@ to an empty scratch directory to retain these test fixtures locally; otherwise t
 their temporary directories. An artifact with an injected failure is expected in negative tests;
 use the failed test name and error to identify unexpected failures.
 
-## Automated review
-
-Maintainers can apply the `claude-review` or `gemini-review` label to run the corresponding
-AI-assisted pull-request review. The workflows use the shared, commit-pinned HarperFast review
-prompts and default to opt-in. Remove and reapply a review label after a new push to request another
-review. Maintainers can deliberately enable trusted-author automatic reviews with the
-`CLAUDE_ALWAYS_ON` or `GEMINI_ALWAYS_ON` repository variable. Fork and Dependabot pull requests
-cannot run these reviews because GitHub withholds the required provider secrets for those events.
-
 ## Design constraints
 
 - Keep search, indexing, scheduling, and lifecycle behavior independent from any host application.
