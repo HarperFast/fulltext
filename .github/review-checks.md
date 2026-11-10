@@ -4,9 +4,11 @@ layers: universal, repo-type/native-addon
 
 ## Repo-specific checks (@harperfast/fulltext)
 
-This is a Rust/Tantivy N-API addon with a hand-written TypeScript facade.
-The repo-type/native-addon layer carries the common native-addon checks.
-On top of it:
+This is a Rust/Tantivy N-API addon (`napi-rs`, npm-only, Node.js-only) with a
+hand-written TypeScript facade. The `repo-type/native-addon` layer carries the
+common native-addon checks (its C++/`binding.gyp`, pnpm, Bun/Deno,
+`test:stress`, `pnpm bench`, and `MaybePromise`/msgpackr items do not apply
+here). On top of it:
 
 - **Use the repository's real gates.** `npm run check` covers Prettier,
   TypeScript, Clippy, Rust tests, Node tests, examples, and package checks.
